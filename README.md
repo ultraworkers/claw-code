@@ -1,6 +1,10 @@
 # Rewriting Project Claw Code
 
 <p align="center">
+  <strong>⭐ The fastest repo in history to surpass 50K stars, reaching the milestone in just 2 hours after publication ⭐</strong>
+</p>
+
+<p align="center">
   <img src="assets/clawd-hero.jpeg" alt="Claw" width="300" />
 </p>
 
