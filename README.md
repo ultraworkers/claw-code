@@ -62,7 +62,7 @@ The whole thing was orchestrated end-to-end using [oh-my-codex (OmX)](https://gi
 
 The result is a clean-room Python rewrite that captures the architectural patterns of Claw Code's agent harness without copying any proprietary source. I'm now actively collaborating with [@bellman_ych](https://x.com/bellman_ych) — the creator of OmX himself — to push this further. The basic Python foundation is already in place and functional, but we're just getting started. **Stay tuned — a much more capable version is on the way.**
 
-The Rust port was scaffolded and architected with [oh-my-codex (OmX)](https://github.com/Yeachan-Heo/oh-my-codex). Additional implementation acceleration and verification support were used during later execution passes.
+The Rust port was scaffolded and architected with [oh-my-codex (OmX)](https://github.com/Yeachan-Heo/oh-my-codex). Additional implementation acceleration and verification support were provided in later execution passes with [oh-my-opencode (OmO)](https://github.com/instructkr/oh-my-opencode).
 
 https://github.com/instructkr/claw-code
 
@@ -189,7 +189,7 @@ The port now mirrors the archived root-entry file surface, top-level subsystem n
 This repository's porting, cleanroom hardening, and verification workflow was AI-assisted with Yeachan Heo's tooling stack, with **oh-my-codex (OmX)** as the primary scaffolding and orchestration layer.
 
 - [**oh-my-codex (OmX)**](https://github.com/Yeachan-Heo/oh-my-codex) — main branch credit: primary scaffolding, orchestration, and core porting workflow
-- oh-my-opencode (OmO) — secondary implementation support
+- [oh-my-opencode (OmO)](https://github.com/instructkr/oh-my-opencode) — secondary implementation support
 
 Key workflow patterns used during the port:
 
