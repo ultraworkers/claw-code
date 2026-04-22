@@ -1,13 +1,14 @@
 # Parity Status — claw-code Rust Port
 
-Last updated: 2026-04-03
+Last updated: 2026-04-23
 
 ## Summary
 
 - Canonical document: this top-level `PARITY.md` is the file consumed by `rust/scripts/run_mock_parity_diff.py`.
 - Requested 9-lane checkpoint: **All 9 lanes merged on `main`.**
-- Current `main` HEAD: `ee31e00` (stub implementations replaced with real AskUserQuestion + RemoteTrigger).
-- Repository stats at this checkpoint: **292 commits on `main` / 293 across all branches**, **9 crates**, **48,599 tracked Rust LOC**, **2,568 test LOC**, **3 authors**, date range **2026-03-31 → 2026-04-03**.
+- Current `main` HEAD: `ad1cf92` (doctrine loop canonical example).
+- Repository stats at this checkpoint: **979 commits on `main`**, **9 crates**, **80,789 tracked Rust LOC**, **4,533 test LOC**, **3 authors**, date **2026-04-23**.
+- **Growth since last PARITY update (2026-04-03):** Rust LOC +66% (48,599 → 80,789), Test LOC +76% (2,568 → 4,533), Commits +235% (292 → 979). Current phase: 13 branches awaiting review/integration.
 - Mock parity harness stats: **10 scripted scenarios**, **19 captured `/v1/messages` requests** in `rust/crates/rusty-claude-cli/tests/mock_parity_harness.rs`.
 
 ## Mock parity harness — milestone 1
