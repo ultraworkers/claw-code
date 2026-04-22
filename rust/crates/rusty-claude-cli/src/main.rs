@@ -1106,6 +1106,19 @@ fn parse_single_word_command_alias(
         return Some(Err(msg));
     }
 
+    // #160: reserved-semantic verbs (resume, compact, memory, commit, pr, issue)
+    // that have positional args should NOT fall through to Prompt dispatch.
+    // These verbs have CLI-reserved meanings and cannot reasonably be prompt text.
+    // Emit slash-command guidance instead.
+    if rest.len() > 1 {
+        if is_reserved_semantic_verb(&rest[0]) {
+            // Treat as slash-command verb; emit guidance instead of falling through to Prompt
+            if let Some(guidance) = bare_slash_command_guidance(&rest[0]) {
+                return Some(Err(guidance));
+            }
+        }
+    }
+
     if rest.len() != 1 {
         return None;
     }
@@ -1130,6 +1143,16 @@ fn parse_single_word_command_alias(
         "config" | "diff" => None,
         other => bare_slash_command_guidance(other).map(Err),
     }
+}
+
+fn is_reserved_semantic_verb(verb: &str) -> bool {
+    // #160: Verbs with CLI-reserved positional-arg semantics that should NOT
+    // fall through to Prompt dispatch when given args. These verbs have specific
+    // meaning (session ID, code target, etc.) and cannot be prompt text.
+    matches!(
+        verb,
+        "resume" | "compact" | "memory" | "commit" | "pr" | "issue" | "bughunter"
+    )
 }
 
 fn bare_slash_command_guidance(command_name: &str) -> Option<String> {
