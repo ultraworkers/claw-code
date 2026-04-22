@@ -9835,3 +9835,35 @@ Added two new subsections under "## Install / build the workspace":
 **Family:** Discoverability / bridge documentation. Related: #155 (help/USAGE parity).
 
 **Closed:** Yes — shipped in cycle #96, feature branch `feat/jobdori-168c-emission-routing`, commit `6212f17`.
+
+## Pinpoint #171. `unexpected extra arguments` errors classified as `unknown` — SHIPPED (cycle #97, 2026-04-23 08:01 Seoul)
+
+**Gap.** Probing #141 (claw subcommand --help inconsistency) revealed an additional classifier gap. `claw list-sessions --help` emits:
+
+```
+error: unexpected extra arguments after `claw list-sessions`: --help
+```
+
+This error pattern is used by multiple verbs that reject trailing positional args: `list-sessions`, `plugins` (and its subcommands), `config` (subcommands), `diff`, `load-session`.
+
+**Before fix:** `kind: "unknown"` (typed-error contract violation).
+
+**Fix shipped.** Commit `fbb0ab4`. Added classifier branch:
+
+```rust
+} else if message.contains("unexpected extra arguments after `claw") {
+    "cli_parse"
+}
+```
+
+**Side benefit (consistent with #169/#170):** Correctly classified `cli_parse` auto-triggers the #247 hint synthesizer ("Run `claw --help` for usage.").
+
+**Test added:** `classify_error_kind_covers_unexpected_extra_args_171` (4 positive + 1 sanity guard).
+
+**Tests:** 226/226 pass (+1 from #171).
+
+**Related #141 gap NOT closed:** `claw list-sessions --help` still errors instead of showing help. Requires separate parser fix — recognize `--help` as a distinct path even for verbs that don't accept positional args. Tracked as #141. This cycle only closes the classifier branch.
+
+**Family:** Typed-error family. Related: #121, #127, #129, #130, #164, #169, #170, #247.
+
+**Closed:** Yes (classifier axis) — shipped in cycle #97, feature branch `feat/jobdori-168c-emission-routing`, commit `fbb0ab4`.
