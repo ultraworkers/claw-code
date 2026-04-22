@@ -8593,3 +8593,18 @@ This is the **detection → closure → auditing** pattern for discoverability c
 
 ---
 
+
+---
+
+## Cycle #69 Closure: #161 Shipped
+
+**Status:** 🟢 REVIEW-READY on `fix/jobdori-161-worktree-git-sha` at commit `c5b6fa5` (cycle #69, 2026-04-23 03:46 Seoul).
+
+**Filed:** cycle #65. **Implemented:** cycle #69 (~3 min, same-session when dogfood cycle ran).
+
+**Shipped details:**
+- +25 lines in build.rs (resolve_git_head_path helper + conditional rerun-if-changed)
+- Verified: binary now reports correct SHA after commits in worktrees (test: build → commit → rebuild → check SHA updates)
+- Build passes (no regressions)
+- Diagnostic-strictness family member (joins #122, #122b)
+
