@@ -213,7 +213,16 @@ fn main() {
             // #77: classify error by prefix so downstream claws can route without
             // regex-scraping the prose. Split short-reason from hint-runbook.
             let kind = classify_error_kind(&message);
-            let (short_reason, hint) = split_error_hint(&message);
+            let (short_reason, mut hint) = split_error_hint(&message);
+            // #247: JSON envelope was losing the `Run claw --help for usage.`
+            // trailer that text-mode stderr includes. When the error is a
+            // cli_parse and the message itself carried no embedded hint,
+            // synthesize the trailer so typed-error consumers get the same
+            // actionable pointer that text-mode users see. Cross-channel
+            // consistency is a §4.44 typed-envelope contract requirement.
+            if hint.is_none() && kind == "cli_parse" && !short_reason.contains("`claw --help`") {
+                hint = Some("Run `claw --help` for usage.".to_string());
+            }
             eprintln!(
                 "{}",
                 serde_json::json!({
@@ -265,6 +274,12 @@ fn classify_error_kind(message: &str) -> &'static str {
     } else if message.contains("no managed sessions found") {
         "no_managed_sessions"
     } else if message.contains("unrecognized argument") || message.contains("unknown option") {
+        "cli_parse"
+    } else if message.contains("prompt subcommand requires") {
+        // #247: `claw prompt` with no argument — a parse error, not `unknown`.
+        "cli_parse"
+    } else if message.starts_with("empty prompt:") {
+        // #247: `claw ""` or `claw "   "` — a parse error, not `unknown`.
         "cli_parse"
     } else if message.contains("invalid model syntax") {
         "invalid_model_syntax"
@@ -10777,6 +10792,32 @@ mod tests {
         assert_eq!(
             classify_error_kind("something completely unknown"),
             "unknown"
+        );
+    }
+
+    #[test]
+    fn classify_error_kind_covers_prompt_parse_errors_247() {
+        // #247: prompt-related parse errors must classify as `cli_parse`,
+        // not fall through to `unknown`. Regression guard for ROADMAP #247
+        // (typed-error contract drift found in cycle #33 dogfood).
+        assert_eq!(
+            classify_error_kind("prompt subcommand requires a prompt string"),
+            "cli_parse",
+            "bare `claw prompt` must surface as cli_parse so typed-error consumers can dispatch"
+        );
+        assert_eq!(
+            classify_error_kind(
+                "empty prompt: provide a subcommand (run `claw --help`) or a non-empty prompt string"
+            ),
+            "cli_parse",
+            "`claw \"\"` must surface as cli_parse, not unknown"
+        );
+        // Sanity: the new patterns must be specific enough not to hijack
+        // genuinely unknown errors that happen to contain the word `prompt`.
+        assert_eq!(
+            classify_error_kind("some random prompt-adjacent failure we don't recognize"),
+            "unknown",
+            "generic prompt-containing text should still fall through to unknown"
         );
     }
 

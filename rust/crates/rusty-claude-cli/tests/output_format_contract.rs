@@ -388,6 +388,114 @@ fn assert_json_command(current_dir: &Path, args: &[&str]) -> Value {
     assert_json_command_with_env(current_dir, args, &[])
 }
 
+/// #247 regression helper: run claw expecting a non-zero exit and return
+/// the JSON error envelope parsed from stderr. Asserts exit != 0 and that
+/// the envelope includes `type: "error"` at the very least.
+fn assert_json_error_envelope(current_dir: &Path, args: &[&str]) -> Value {
+    let output = run_claw(current_dir, args, &[]);
+    assert!(
+        !output.status.success(),
+        "command unexpectedly succeeded; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // The JSON envelope is written to stderr for error cases (see main.rs).
+    let envelope: Value = serde_json::from_slice(&output.stderr).unwrap_or_else(|err| {
+        panic!(
+            "stderr should be a JSON error envelope but failed to parse: {err}\nstderr bytes:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+    });
+    assert_eq!(
+        envelope["type"], "error",
+        "envelope should carry type=error"
+    );
+    envelope
+}
+
+#[test]
+fn prompt_subcommand_without_arg_emits_cli_parse_envelope_with_hint_247() {
+    // #247: `claw prompt` with no argument must classify as `cli_parse`
+    // (not `unknown`) and the JSON envelope must carry the same actionable
+    // `Run claw --help for usage.` hint that text-mode stderr appends.
+    let root = unique_temp_dir("247-prompt-no-arg");
+    fs::create_dir_all(&root).expect("temp dir should exist");
+
+    let envelope = assert_json_error_envelope(&root, &["--output-format", "json", "prompt"]);
+    assert_eq!(
+        envelope["kind"], "cli_parse",
+        "prompt subcommand without arg should classify as cli_parse, envelope: {envelope}"
+    );
+    assert_eq!(
+        envelope["error"], "prompt subcommand requires a prompt string",
+        "short reason should match the raw error, envelope: {envelope}"
+    );
+    assert_eq!(
+        envelope["hint"],
+        "Run `claw --help` for usage.",
+        "JSON envelope must carry the same help-runbook hint as text mode, envelope: {envelope}"
+    );
+}
+
+#[test]
+fn empty_positional_arg_emits_cli_parse_envelope_247() {
+    // #247: `claw ""` must classify as `cli_parse`, not `unknown`. The
+    // message itself embeds a ``run `claw --help`` pointer so the explicit
+    // hint field is allowed to remain null to avoid duplication — what
+    // matters for the typed-error contract is that `kind == cli_parse`.
+    let root = unique_temp_dir("247-empty-arg");
+    fs::create_dir_all(&root).expect("temp dir should exist");
+
+    let envelope = assert_json_error_envelope(&root, &["--output-format", "json", ""]);
+    assert_eq!(
+        envelope["kind"], "cli_parse",
+        "empty-prompt error should classify as cli_parse, envelope: {envelope}"
+    );
+    let short = envelope["error"]
+        .as_str()
+        .expect("error field should be a string");
+    assert!(
+        short.starts_with("empty prompt:"),
+        "short reason should preserve the original empty-prompt message, got: {short}"
+    );
+}
+
+#[test]
+fn whitespace_only_positional_arg_emits_cli_parse_envelope_247() {
+    // #247: same rule for `claw "   "` — any whitespace-only prompt must
+    // flow through the empty-prompt path and classify as `cli_parse`.
+    let root = unique_temp_dir("247-whitespace-arg");
+    fs::create_dir_all(&root).expect("temp dir should exist");
+
+    let envelope = assert_json_error_envelope(&root, &["--output-format", "json", "   "]);
+    assert_eq!(
+        envelope["kind"], "cli_parse",
+        "whitespace-only prompt should classify as cli_parse, envelope: {envelope}"
+    );
+}
+
+#[test]
+fn unrecognized_argument_still_classifies_as_cli_parse_247_regression_guard() {
+    // #247 regression guard: the new empty-prompt / prompt-subcommand
+    // patterns must NOT hijack the existing #77 unrecognized-argument
+    // classification. `claw doctor --foo` must still surface as cli_parse
+    // with the runbook hint present.
+    let root = unique_temp_dir("247-unrecognized-arg");
+    fs::create_dir_all(&root).expect("temp dir should exist");
+
+    let envelope =
+        assert_json_error_envelope(&root, &["--output-format", "json", "doctor", "--foo"]);
+    assert_eq!(
+        envelope["kind"], "cli_parse",
+        "unrecognized-argument must remain cli_parse, envelope: {envelope}"
+    );
+    assert_eq!(
+        envelope["hint"],
+        "Run `claw --help` for usage.",
+        "unrecognized-argument hint should stay intact, envelope: {envelope}"
+    );
+}
+
 fn assert_json_command_with_env(current_dir: &Path, args: &[&str], envs: &[(&str, &str)]) -> Value {
     let output = run_claw(current_dir, args, envs);
     assert!(
