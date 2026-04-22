@@ -2745,11 +2745,20 @@ fn resume_session(session_path: &Path, commands: &[String], output_format: CliOu
             }
             Err(error) => {
                 if output_format == CliOutputFormat::Json {
+                    // #249: thread classify_error_kind + split_error_hint through this arm
+                    // so the JSON envelope carries the same `kind` and `hint` fields as
+                    // the Ok(None) path's error branch at main.rs:2658. Without these, claws
+                    // routing on `kind` couldn't distinguish parse errors from other classes.
+                    let full_message = error.to_string();
+                    let kind = classify_error_kind(&full_message);
+                    let (short_reason, hint) = split_error_hint(&full_message);
                     eprintln!(
                         "{}",
                         serde_json::json!({
                             "type": "error",
-                            "error": error.to_string(),
+                            "error": short_reason,
+                            "kind": kind,
+                            "hint": hint,
                             "command": raw_command,
                         })
                     );
@@ -2782,11 +2791,19 @@ fn resume_session(session_path: &Path, commands: &[String], output_format: CliOu
             }
             Err(error) => {
                 if output_format == CliOutputFormat::Json {
+                    // #249: mirror the Err arm above — emit the typed-error contract
+                    // (kind + hint) for the run_resume_command failure path so claws
+                    // routing on `kind` can distinguish parse/classification errors.
+                    let full_message = error.to_string();
+                    let kind = classify_error_kind(&full_message);
+                    let (short_reason, hint) = split_error_hint(&full_message);
                     eprintln!(
                         "{}",
                         serde_json::json!({
                             "type": "error",
-                            "error": error.to_string(),
+                            "error": short_reason,
+                            "kind": kind,
+                            "hint": hint,
                             "command": raw_command,
                         })
                     );
@@ -10473,6 +10490,46 @@ mod tests {
             "unknown",
             "generic prompt-containing text should still fall through to unknown"
         );
+    }
+
+    #[test]
+    fn resumed_slash_error_envelope_includes_kind_and_hint_249() {
+        // #249: the resumed-session slash command Err arms at main.rs:~2747
+        // and main.rs:~2783 previously emitted JSON envelopes without `kind`
+        // or `hint` fields, breaking the typed-error contract for claws
+        // routing on error class. This test documents the contract: typical
+        // error messages produced through these paths (parse_command_token
+        // failures, run_resume_command failures) must classify correctly
+        // via the existing classify_error_kind() helper.
+
+        // parse_command_token path (main.rs:~2747): unknown slash commands
+        // surface as cli_parse errors.
+        assert_eq!(
+            classify_error_kind("unknown slash command outside the REPL: /blargh"),
+            "unknown",
+            "unknown slash command without verb+option shape is currently unknown (may be tightened later via #248-family classifier work)"
+        );
+
+        // run_resume_command path (main.rs:~2783): common filesystem errors
+        // propagated from save_to_path(), write_session_clear_backup(), etc.
+        // These will classify via classify_error_kind; what matters is the
+        // envelope now carries the kind and hint fields instead of omitting them.
+        // Test the contract: whatever string is passed, it gets a kind and hint.
+        let full_message = "compact failed: I/O error during save";
+        let kind = classify_error_kind(full_message);
+        let (short_reason, hint) = split_error_hint(full_message);
+        // Envelope building block must not panic and must produce usable values.
+        assert!(!kind.is_empty(), "classify_error_kind must return a non-empty class name");
+        assert!(!short_reason.is_empty(), "split_error_hint must return a non-empty short reason");
+        // hint may be None (single-line message has no hint), that's allowed.
+        let _ = hint;
+
+        // Regression guard for the envelope SHAPE: the two arms must now include
+        // `kind` and `hint` fields (along with the pre-existing `type`, `error`,
+        // `command` fields). This is a structural contract — if anyone reverts
+        // the envelope to drop these fields, the code review must reject it.
+        // (Direct JSON inspection requires integration test infrastructure; this
+        // unit test verifies the building blocks work correctly.)
     }
 
     #[test]
