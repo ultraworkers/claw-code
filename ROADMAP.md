@@ -9053,3 +9053,62 @@ A consumer cannot dispatch on `kind` alone; they must first check if `type == "e
 
 ---
 
+
+---
+
+## Doctrine Refinement: Doc-Truthfulness Severity Scale (Cycle #79)
+
+**Parallel to diagnostic-strictness scale (cycles #57–#69).** Both are "truth-over-convenience" axes.
+
+**Discovered during sweeps (cycles #78–#79):** USAGE.md and ERROR_HANDLING.md contained claims the binary doesn't honor. Not just stale — actively harmful to downstream consumers.
+
+### Definition
+
+A documentation-vs-implementation divergence can cause different amounts of consumer harm:
+
+| Severity | Definition | Impact | Example | Fix Priority |
+|---|---|---|---|---|
+| **P0 — Active misdocumentation** | Doc claims X, binary does Y, consumer code built against X breaks at runtime | Consumer code crashes or misbehaves | USAGE.md claimed "consistent envelope with exit_code/command/timestamp"; binary doesn't emit those. ERROR_HANDLING.md showed `envelope['error']['message']`; binary has `error` as string, not object. Consumer Python code would crash. | Immediate. Misleading docs actively harm trust. |
+| **P1 — Stale documentation** | Doc describes old behavior; binary has moved on; consumer surprised but workaround exists | Consumer confusion, wasted debugging time, but not broken | README says "requires Python 3.8"; binary now requires 3.10. Consumer discovers via ImportError. | High. Saves debugging cycles. |
+| **P2 — Incomplete documentation** | Doc omits information; consumer must learn by probing/experimentation | Friction and discovery lag, but eventual success | USAGE.md omits `--envelope-version` flag (it doesn't exist yet, but v2.0 will have it). Consumer reads code to discover. | Medium. Nice-to-have for faster onboarding. |
+| **P3 — Terminology drift** | Doc uses different names than binary; consumer confused but can figure it out | Confusion but not breakage; naming is idiosyncratic | SCHEMAS.md calls it `error.kind`; binary exposes `kind` at top-level. Consumer learns to map terms. | Low. Annoying but survivable. |
+
+### Relationship to Diagnostic-Strictness (Cycles #57–#69)
+
+**Diagnostic-strictness scale:**
+- P0: Diagnostic surface reports incorrect state that runtime wouldn't catch (e.g., `doctor` says "auth=ok" when API key is invalid)
+- P1/P2/P3: Diagnostic surface incomplete or missing signals
+
+**Doc-truthfulness scale:**
+- P0: Documentation claims behavior that code doesn't provide
+- P1/P2/P3: Documentation incomplete or outdated
+
+**Both are "truth-over-convenience" constraints.** Diagnostic surfaces and user-facing docs both must not lie. P0 violations in either category are high-priority because they mislead automation.
+
+### Evidence (Cycles #78–#79)
+
+**P0 instances found and fixed:**
+
+1. **USAGE.md JSON section (cycle #78)**
+   - **Claim:** "Every invocation returns a consistent JSON envelope with `exit_code`, `command`, `timestamp`..."
+   - **Reality:** Binary doesn't emit those fields
+   - **Harm:** Consumer writes automation expecting those fields, automation breaks
+   - **Fixed:** Documented actual v1.0 shape + migration notice
+
+2. **ERROR_HANDLING.md code examples (cycle #79)**
+   - **Claim:** Python code accesses `envelope['error']['message']` (nested object)
+   - **Reality:** Binary emits `error` as string, `kind` at top-level
+   - **Harm:** Consumer copy-pastes example, code crashes with TypeError
+   - **Fixed:** Code now uses `envelope.get('error', '')` and `envelope.get('kind')`
+
+**Both violations involved the JSON envelope.** Root cause: SCHEMAS.md specifies v2.0 (nested), binary still emits v1.0 (flat), docs were aspirational rather than empirical.
+
+### Going Forward
+
+**Doc-truthfulness audits should:**
+1. Compare documentation against actual binary behavior (not against SCHEMAS.md aspirational design)
+2. Flag P0 violations immediately (misleading is worse than silent)
+3. Link forward to migration plans when docs describe target behavior (like USAGE.md + ERROR_HANDLING.md now link to FIX_LOCUS_164.md)
+
+**Formalized in ROADMAP as principle #11 (sibling to diagnostic-strictness §5).**
+
