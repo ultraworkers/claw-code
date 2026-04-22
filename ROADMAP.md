@@ -6670,3 +6670,103 @@ Two atomic changes:
 - #179 (parse-error real message quality) — claws consuming envelope expect truthful error
 - #181 (envelope.exit_code matches process exit) — cross-channel truthfulness
 - #30 (cycle #30: OPT_OUT rejection tests) — classification contracts deserve regression tests
+
+
+---
+
+## Pinpoint #249. Resumed-session slash command error envelopes omit `kind` field — typed-error contract violation at `main.rs:2747` and `main.rs:2783`
+
+**Gap.** The typed-error envelope contract (§4.44) specifies every error envelope MUST include a `kind` field so claws can dispatch without regex-scraping prose. The `--output-format json` path for resumed-session slash commands has TWO branches that emit error envelopes WITHOUT `kind`:
+
+1. **`main.rs:2747-2760`** (`SlashCommand::parse()` Err arm) — triggered when the raw command string is malformed or references an invalid slash structure. Fires for inputs like `claw --resume latest /session` (valid name, missing required subcommand arg).
+
+2. **`main.rs:2783-2793`** (`run_resume_command()` Err arm) — triggered when the slash command dispatch returns an error (including `SlashCommand::Unknown`). Fires for inputs like `claw --resume latest /xyz-unknown`.
+
+Both arms emit JSON envelopes of shape `{type, error, command}` but NOT `kind`, defeating typed-error dispatch for any claw routing on `error.kind`.
+
+Also observed: the `/xyz-unknown` path embeds a multi-line error string (`Unknown slash command: /xyz-unknown\n  Help ...`) directly into the `error` field without splitting the runbook hint into a separate `hint` field (per #77 `split_error_hint()` convention). JSON consumers get embedded newlines in the error string.
+
+**Repro.** Dogfooded 2026-04-22 on main HEAD `84466bb` (cycle #37, post-#247 merge):
+
+```bash
+$ cd /Users/yeongyu/clawd/claw-code/rust
+$ ./target/debug/claw --output-format json --resume latest /session
+{"command":"/session","error":"unsupported resumed slash command","type":"error"}
+# Observation: no `kind` field. Claws dispatching on error.kind get undefined.
+
+$ ./target/debug/claw --output-format json --resume latest /xyz-unknown
+{"command":"/xyz-unknown","error":"Unknown slash command: /xyz-unknown
+  Help             /help lists available slash commands","type":"error"}
+# Observation: no `kind` field AND multi-line error without split hint.
+
+$ ./target/debug/claw --output-format json --resume latest /session list
+{"active":"session-...","kind":"session_list",...}
+# Comparison: happy path DOES include kind field. Only the error path omits it.
+```
+
+Contrast with the `Ok(None)` arm at `main.rs:2735-2742` which DOES include `kind: "unsupported_resumed_command"` — proving the contract awareness exists, just not applied consistently across all Err arms.
+
+**Impact.**
+
+1. **Typed-error dispatch broken for slash-command errors.** A claw reading `{"type":"error", "error":"..."}` and switching on `error.kind` gets `undefined` for any resumed slash-command error. Must fall back to substring matching the `error` field, defeating the point of typed errors.
+
+2. **Family-internal inconsistency.** The same error path (`eprintln!` → exit(2)) has three arms: `Ok(None)` sets kind, `Err(error)` (parse) doesn't, `Err(error)` (dispatch) doesn't. Random omission is worse than uniform absence because claws can't tell whether they're hitting a kind-less arm or an untyped category.
+
+3. **Hint embedded in error field.** The `/xyz-unknown` path gets its runbook text inside the `error` string instead of a separate `hint` field, forcing consumers to post-process the message.
+
+**Recommended fix shape.**
+
+Two small, atomic edits in `main.rs`:
+
+1. **Parse-error envelope** (line 2747): Add `"kind": "cli_parse"` to the JSON object. Optionally call `classify_error_kind(&error.to_string())` to get a more specific kind.
+
+2. **Dispatch-error envelope** (line 2783): Same treatment. Classify using `classify_error_kind()`. Additionally, call `split_error_hint()` on `error.to_string()` to separate the short reason from any embedded hint (matches #77 convention used elsewhere).
+
+```rust
+// Before (line 2747):
+serde_json::json!({
+    "type": "error",
+    "error": error.to_string(),
+    "command": raw_command,
+})
+
+// After:
+let message = error.to_string();
+let kind = classify_error_kind(&message);
+let (short_reason, hint) = split_error_hint(&message);
+serde_json::json!({
+    "type": "error",
+    "error": short_reason,
+    "hint": hint,
+    "kind": kind,
+    "command": raw_command,
+})
+```
+
+**Regression coverage.** Add integration tests in `tests/output_format_contract.rs`:
+- `resumed_session_bare_slash_name_emits_kind_field_249` — `/session` without subcommand
+- `resumed_session_unknown_slash_emits_kind_field_249` — `/xyz-unknown`
+- `resumed_session_unknown_slash_splits_hint_249` — multi-line error gets hint split
+- Regression guard: `resumed_session_happy_path_session_list_unchanged_249` — confirm `/session list` JSON unchanged
+
+**Blocker.** None. ~15 lines Rust, bounded.
+
+**Priority.** Medium. Not red-state (errors ARE surfaced, exit code IS 2), but typed-error contract violation. Any claw doing `error.kind` dispatch on slash-command paths currently falls through to `undefined`.
+
+**Source.** Jobdori cycle #37 proactive dogfood 2026-04-22 23:15 KST in response to Clawhip pinpoint nudge. Probed slash-command JSON error envelopes post-#247 merge; found two Err arms emitting envelopes without `kind`. Joins §4.44 typed-envelope family:
+
+- #179 (parse-error real message quality) — closed
+- #181 (envelope exit_code matches process exit) — closed
+- #247 (classify_error_kind misses prompt-patterns + hint drop) — closed (cycle #34/#36)
+- **#248 (verb-qualified unknown option errors misclassified) — in-flight (another agent)**
+- **#249 (this: resumed-session slash command envelopes omit kind) — filed**
+
+Natural bundle: **#247 + #248 + #249** — classifier/envelope completeness sweep. All three fix the same kind of drift: typed-error envelopes missing or mis-set `kind` field on specific CLI paths. When all three land, the typed-envelope contract is uniformly applied across:
+- Top-level CLI argument parsing (#247)
+- Subcommand option parsing (#248)
+- Resumed-session slash command dispatch (#249)
+
+**Related prior work.**
+- §4.44 typed error envelope contract (2026-04-20)
+- #77 split_error_hint() — should be applied to slash-command error path too
+- #247 (model: add classifier branches + ensure envelope carries them)
