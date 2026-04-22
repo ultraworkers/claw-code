@@ -8698,3 +8698,67 @@ Not needed yet (17 branches can be merged manually), but the pattern scales.
 
 ---
 
+
+---
+
+## Pinpoint #163. `claw help --help` emits `missing_credentials` instead of showing help for the `help` verb
+
+**Status: 📋 FILED (cycle #71, 2026-04-23 04:01 Seoul).**
+
+**Surface.** `claw help --help` falls through to Prompt dispatch and triggers auth requirements (`missing_credentials`). Every other verb's `--help` correctly routes to its help topic.
+
+**Reproduction:**
+```bash
+$ claw help --help
+[error-kind: missing_credentials]
+error: missing Anthropic credentials; export ANTHROPIC_AUTH_TOKEN or ANTHROPIC_API_KEY before calling the Anthropic API — hint: I see OPENAI_API_KEY is set...
+```
+
+**Expected:**
+```
+$ claw help --help
+Help
+  Usage            claw help
+  Aliases          claw --help · claw -h
+  Purpose          show the top-level usage summary for claw
+```
+(similar to how other verbs respond: `claw version --help` shows a specific Version help topic).
+
+**Impact.** Low-medium. User discovers the `help` verb exists (it's in `--help` output), tries `claw help --help` to learn its specifics, gets an auth error instead. This breaks the discoverability chain (#68 principle violation).
+
+**Root cause.** The `help` verb parser/dispatcher does not handle `--help` flag. Other verbs (like `doctor`, `version`, `bootstrap-plan`) have explicit `--help` handlers in their command modules; `help` either lacks one or falls through to prompt parsing before the `--help` check fires.
+
+**Fix shape (~10-15 lines in `rust/crates/rusty-claude-cli/src/main.rs`):**
+
+In the dispatch of the `help` verb, add a `--help` flag guard similar to other verbs:
+
+```rust
+// Before dispatching to the top-level help summary
+if rest.iter().any(|arg| arg == "--help" || arg == "-h") {
+    println!("Help");
+    println!("  Usage            claw help");
+    println!("  Aliases          claw --help · claw -h");
+    println!("  Purpose          show the top-level usage summary for claw");
+    return Ok(0);
+}
+```
+
+Or alternately, since `claw help` and `claw --help` are aliases, `claw help --help` could just emit `claw help`'s output (since "help for the help command is... help itself").
+
+**Acceptance.**
+- `claw help --help` shows help topic for `help` verb (not missing_credentials)
+- Other verbs' `--help` still work unchanged
+- `claw --help` still works
+- `cargo test` passes
+
+**Classification.** Help-parity family member (joins #130c, #130d, #130e). Specifically: dispatch-order anomaly (help flag not handled before prompt fallback).
+
+**Dogfood session.** Cycle #71 probe on `/tmp/jobdori-161/rust/target/debug/claw`. Discovered via systematic `--help` audit across all 15 verbs. 14 of 15 work correctly; only `help --help` fails.
+
+**Related to discoverability-chain principle (cycle #68):**
+- `help` verb is discoverable from `claw --help`
+- User tries to learn via `claw help --help` (natural next step)
+- Chain broken: gets auth error instead of learning path
+
+---
+
