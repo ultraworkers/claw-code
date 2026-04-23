@@ -11910,3 +11910,77 @@ Current estimate: 2 / 147 ≈ 1.4% (very low).
 **#193 locked to ROADMAP. No code changed. Phase 0 branch state integrity preserved.**
 
 🪨
+
+---
+
+## Doctrine #33 Formalized (gaebal-gajae cross-claw validation, 2026-04-23 14:01 Seoul)
+
+### Statement
+
+**"Merge-wait steady state reports as a vector, not narrative."**
+
+### Operational Protocol
+
+When the dogfood cycle nudge fires during merge-wait mode, validate against the canonical 4-element state vector:
+
+```
+ready_branches:    <count>
+prs:               <count>
+repo_drift:        <count of new commits since last cycle>
+external_gate:     <unchanged | <new state>>
+```
+
+**If all four match prior cycle:**
+- Brief Discord post (vector + 1-line justification) OR silent acknowledgment for internal-only nudges
+- No prose narrative
+- No re-explanation of barriers
+- No re-justification of mode
+
+**If any element changes:**
+- That change IS the cycle's content
+- Report what moved + why + implication
+- Apply other doctrines as needed
+
+### Anti-pattern Prevented
+
+**중복 확인 로그** (duplicate check logs): Re-posting full merge-wait narrative every cycle when state hasn't moved. Generates Discord noise, wastes attention budget, and degrades signal-to-noise ratio for cycles that DO have content.
+
+### Validation History
+
+- **Cycle #124** (gaebal-gajae): Compression introduced — "two ready branches / zero PRs / zero drift / one external gate"
+- **Cycle #129** (Jobdori): First field-test — vector-only post (5 lines vs 30+)
+- **Cycle #129 closure** (gaebal-gajae): Cross-claw validation — "Doctrine #33 적용도 맞습니다"
+
+### Cross-Claw Coherence Test
+
+When Doctrine #33 fires, both claws should converge on:
+1. Same vector values (verified by independent fetch + branch + PR queries)
+2. Same conclusion (merge-wait holds OR vector changed)
+3. Same response pattern (vector-only or content-rich)
+
+If claws diverge in vector values: substance check (one claw may have stale data).
+If claws diverge in conclusion despite same vector: doctrinal interpretation gap (file as new pinpoint).
+
+**Cycle #129 result:** Both claws converged on vector + conclusion. Doctrine validated.
+
+### Doctrine #33 vs Earlier Doctrines
+
+| Doctrine | Scope |
+|---|---|
+| #29 | Discovery termination is a deliverable (closure) |
+| #30 | Modes are state, not suggestions (state guard) |
+| #31 | Merge-wait requires remote visibility (readiness check) |
+| #32 | External blocks → boundary separation + escalation (failure handling) |
+| **#33** | **Steady-state reports as vector, not narrative (signal economy)** |
+
+Pattern: Each doctrine #29-#33 operationalizes a previously-implicit rule after it was tested in practice. #33's specific contribution is **noise prevention during legitimate hold states**.
+
+### Doctrine Count
+
+**33 formalized.** Provisional → formal upon cross-claw cycle validation.
+
+---
+
+**Doctrine #33 promoted from provisional to formal status. Cross-claw coherence verified at cycle #129. Merge-wait steady-state reporting now standardized.**
+
+🪨
