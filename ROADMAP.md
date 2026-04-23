@@ -873,6 +873,29 @@ The #134/#135 session-identity work tightened model-syntax validation but the te
 - `cargo test --workspace` passes with 0 failures on the `feat/134-135-session-identity` branch
 - No regression on the 162 tests currently passing
 
+### 196. Local branch namespace accumulation — no branch-lifecycle cleanup, no stale-branch visibility in doctor
+
+**Filed:** 2026-04-23 from dogfood cycle check (Jobdori).
+
+**Problem:** `git branch` on the live `claw-code` workspace shows **123 local branches**, the majority of which are stale batch-lane branches (`feat/b3-*`, `feat/b4-*`, `feat/b5-*`, `feat/b6-*`, `feat/b7-*`, plus dozens of `feat/jobdori-*` fix branches). There is no product surface that:
+- counts or reports stale local branches in `claw doctor` or `claw state` output
+- enforces a branch cleanup lifecycle at post-batch-complete or post-merge points
+- emits a `branch_namespace_degraded` warning when stale count exceeds a threshold
+
+This mirrors the prunable-worktree accumulation gap (#194/#195) but at the branch layer. Git operations slow down, `git branch` output is unreadable for monitoring, and each new dogfood batch silently extends the debt.
+
+**Fix shape:**
+- Add `branch_health` section to `claw doctor --output-format json`: emit `stale_merged_count`, `stale_unmerged_count`, `active_count`, `total_count`
+- Emit `branch_namespace_degraded` advisory when stale-merged branch count exceeds threshold (suggest 30)
+- Add `claw branch prune` (or `claw doctor --prune-branches`) action that deletes merged local branches and reports the delta
+- Wire a post-batch-complete hook to auto-delete the local batch lane branch after confirmed merge
+
+**Acceptance:**
+- `claw doctor --output-format json` includes `{branch_health: {stale_merged: N, active: N, total: N}}`
+- `claw doctor` warns when stale branch count > 30: `"N stale merged branches; run 'claw branch prune' to reclaim"`
+- A single `claw branch prune` reduces stale-merged count to 0 and reports the delta
+- Post-batch-complete lifecycle deletes the batch branch so N+1 cycle starts clean
+
 ### 194. Prunable-worktree accumulation — no gate, no `claw state` visibility, no auto-prune lifecycle contract
 
 **Filed:** 2026-04-23 from dogfood cycle #130 observation (Jobdori).
