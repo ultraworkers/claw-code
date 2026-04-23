@@ -12007,3 +12007,35 @@ Pattern: Each doctrine #29-#33 operationalizes a previously-implicit rule after 
 **Doctrine #33 promoted from provisional to formal status. Cross-claw coherence verified at cycle #129. Merge-wait steady-state reporting now standardized.**
 
 🪨
+
+---
+
+## Pinpoint #195 — Worktree-age opacity: no timestamp, no `doctor` signal (Jobdori, cycle #130)
+
+**Filed:** 2026-04-23 20:00 KST
+**Cluster:** diagnostic-strictness / worktree hygiene
+**Branch:** `feat/jobdori-195-worktree-age-opacity` (not yet created)
+
+### Observation
+
+`git worktree list` returns 109 prunable worktrees with no creation timestamp, no last-access time, and no staleness threshold signal. `claw doctor` does not surface prunable worktree count or flag aged-out worktrees. A claw auditing its own workspace has no machine-readable way to distinguish a worktree that was active 5 minutes ago from one dead for 3 days.
+
+### Gap
+
+- No structured output includes worktree age or creation time
+- `claw doctor` has no prunable-count check or age-threshold warning
+- Claws must fall back to filesystem `stat` heuristics or manual `git worktree prune --dry-run` to infer staleness
+- Pinpoint #194 (filed prior cycle) identified accumulation; #195 isolates the root cause: missing age metadata in structured output
+
+### Proposed Fix
+
+1. `claw doctor` to report: prunable worktree count + oldest worktree age (if computable)
+2. `git worktree list --porcelain` already exposes `HEAD` sha — consider pairing with `git log -1 --format=%ci <sha>` to derive last-commit age as a proxy
+3. Structured output (`--output-format json`) for any worktree-listing command should include `created_at` or `last_commit_at` field
+
+### Relation to #194
+
+#194: prunable worktrees accumulate with no lifecycle enforcement
+#195: root cause — no timestamp/age metadata available to doctor or structured output, making enforcement impossible without external heuristics
+
+**Status:** Open. Merge-wait mode. No code changed.
