@@ -58,8 +58,8 @@ impl SessionStore {
         let workspace_root = workspace_root.as_ref();
         // #151: canonicalize workspace_root for consistent fingerprinting
         // across equivalent path representations.
-        let canonical_workspace = fs::canonicalize(workspace_root)
-            .unwrap_or_else(|_| workspace_root.to_path_buf());
+        let canonical_workspace =
+            fs::canonicalize(workspace_root).unwrap_or_else(|_| workspace_root.to_path_buf());
         let sessions_root = data_dir
             .as_ref()
             .join("sessions")
@@ -158,10 +158,9 @@ impl SessionStore {
     }
 
     pub fn latest_session(&self) -> Result<ManagedSessionSummary, SessionControlError> {
-        self.list_sessions()?
-            .into_iter()
-            .next()
-            .ok_or_else(|| SessionControlError::Format(format_no_managed_sessions(&self.sessions_root)))
+        self.list_sessions()?.into_iter().next().ok_or_else(|| {
+            SessionControlError::Format(format_no_managed_sessions(&self.sessions_root))
+        })
     }
 
     pub fn load_session(

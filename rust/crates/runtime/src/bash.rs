@@ -172,7 +172,7 @@ async fn execute_bash_async(
 ) -> io::Result<BashCommandOutput> {
     // Detect and emit ship provenance for git push operations
     detect_and_emit_ship_prepared(&input.command);
-    
+
     let mut command = prepare_tokio_command(&input.command, &cwd, &sandbox_status, true);
 
     let output_result = if let Some(timeout_ms) = input.timeout {
