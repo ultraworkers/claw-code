@@ -11797,3 +11797,116 @@ Gate status:           Blocked pending author/owner intervention
 **Cycle #117 deliverable: Boundary of PR-creation permission barrier experimentally isolated. Merge-readiness state cleanly separated from authorization state. Doctrine #32 formalized. Author/owner intervention required.**
 
 🪨
+
+---
+
+## §4.45 Pinpoint #193 — Session/Worktree Hygiene Readability Gap
+
+**Class:** Dogfood methodology pinpoint (not claw-code binary)
+**Scope:** State readability / hygiene — NOT codegen, NOT test, NOT binary behavior
+**Filed:** 2026-04-23 13:33 Seoul (cycles #123-#125, gaebal-gajae framing + authorization)
+**Mode:** Filed during merge-wait (per Doctrine #29 precedent: doc-only ROADMAP entry on frozen branch)
+
+### Title
+
+**"Session/worktree hygiene debt makes active delivery state harder to read than the actual code state."**
+
+Short form: *"branch/worktree proliferation outpaced merge/cleanup visibility."*
+
+### Gap Description
+
+Four distinct branch states are visually indistinguishable on the same surface when claws inspect `git branch` or `/tmp/`:
+
+1. **Ready branch** — merge-ready, gated externally (e.g., `feat/jobdori-168c-emission-routing`, `feat/134-135-session-identity`)
+2. **Blocked branch** — abandoned due to architectural dead-end or reviewer pushback (indistinguishable from ready)
+3. **Stale abandoned branch** — filed pinpoints that got superseded or merged differently (no cleanup)
+4. **Dirty scratch worktree** — experimental `/tmp/jobdori-*` or `/tmp/clawcode-*` (may be active or abandoned, no signal)
+
+**Effect:** A claw starting a new dogfood cycle cannot tell which branches represent active delivery lanes vs. archaeological debris. Cost of identifying the actual active delivery lane grows linearly with every unmerged/unpruned branch.
+
+### Observable Evidence (2026-04-23 13:32 Seoul)
+
+```bash
+$ git -C /Users/yeongyu/clawd/claw-code branch | wc -l
+147
+
+$ ls /tmp/ | grep -cE "(clawcode|claw-code|jobdori)"
+30
+
+# Sample feature branch families
+feat/b3-* (10 branches)
+feat/b4-* (7 branches)
+feat/b5-* (multiple: compact-mode, config-validate, context-compress, ...)
+docs/*, feat/134-135-session-identity, feat/jobdori-168c-emission-routing, ...
+
+# Stale bridge logs
+/tmp/clawcode-127-impl-bridge.log (2026-04-20, 3 days old)
+/tmp/clawcode-129-impl-bridge.log (2026-04-20, 3 days old)
+/tmp/clawcode-134-135 (4 commits unpushed to main)
+```
+
+### Why This Is Not a Code Gap
+
+- **Codegen gap?** No — claw-code binary behaves correctly when invoked.
+- **Test gap?** No — 564 tests pass.
+- **Binary behavior gap?** No — the binary can't know about operator's branch hygiene.
+
+**It IS:** a state readability / hygiene gap in the dogfood methodology layer. The claws' ability to orient within the repo's actual merge state is degraded by accumulated unpruned artifacts that mimic active work visually.
+
+### Framing Family
+
+Sibling to §4.44 (error envelope contract drift) and §5 (failure taxonomy) — both deal with opacity of state. §4.44 is about **failure state opacity in runtime outputs**. #193 is about **delivery lane state opacity in repo surface**.
+
+Different scope (runtime vs repo), same structural pattern (important operational state collapsed into an indistinguishable surface).
+
+### Doctrine #29 Compliance
+
+Filed during merge-wait mode as doc-only ROADMAP entry. No code change to frozen Phase 0 branch. No new probe against claw-code binary. Methodology observation only.
+
+**This is the second case of filing-without-fixing on a frozen branch** (first: cycle #100 bundle freeze decisions).
+
+### Priority / Remediation Plan
+
+**Priority:** Post-Phase-1 (not a Phase 1 bundle member).
+
+**Proposed remediation categories:**
+
+1. **Branch state surfacing** — extend `git branch` or add custom tooling that tags:
+   - `ready:external-gated` (PR visible, merge pending)
+   - `ready:internal-gated` (tests pending, awaiting CI)
+   - `blocked:abandoned` (author-tagged abandoned)
+   - `stale:merged-alternate` (superseded by alternate merge path)
+   - `scratch:temporary` (intentionally ephemeral)
+
+2. **Worktree lifecycle discipline** — `/tmp/clawcode-*` convention for cycle-scoped work with auto-cleanup on bridge termination.
+
+3. **ROADMAP ↔ branch mapping** — each pinpoint entry should link to its canonical branch. Unmapped branches surface as hygiene debt.
+
+**Not proposed:** Mass deletion of current branches. This would destroy archaeology before framing is complete.
+
+### State Readability Metric (proposed)
+
+For future dogfood cycles to measure hygiene drift:
+```
+hygiene_score = |ready_pinpointed| / (|ready_pinpointed| + |stale_unpinpointed|)
+```
+Current estimate: 2 / 147 ≈ 1.4% (very low).
+
+### Sources
+
+- Cycle #120 Jobdori substance check (147 branches surfaced)
+- Cycle #123 Jobdori evidence collation (30 worktrees, bridge log ages)
+- Cycle #124 gaebal-gajae framing refinement (4-state readability gap)
+- Cycle #125 gaebal-gajae authorization + final framing ("state readability / hygiene gap")
+
+### Pinpoint Count Update
+
+**Before #193:** 82 total filed, 67 genuinely open.
+**After #193:** 83 total filed, 68 genuinely open.
+#193 is the first **dogfood methodology pinpoint** (vs. claw-code binary pinpoints).
+
+---
+
+**#193 locked to ROADMAP. No code changed. Phase 0 branch state integrity preserved.**
+
+🪨
