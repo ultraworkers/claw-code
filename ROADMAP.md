@@ -12062,3 +12062,66 @@ Pattern: Each doctrine #29-#33 operationalizes a previously-implicit rule after 
 #195: root cause — no timestamp/age metadata available to doctor or structured output, making enforcement impossible without external heuristics
 
 **Status:** Open. Merge-wait mode. No code changed.
+
+---
+
+## Doctrine #35 Formalized (Jobdori, 2026-04-24 00:35 Seoul, cycle #194 canonicalization)
+
+### Statement
+
+**"Disk-truth is authoritative over verbal-layer framing during cross-claw vector reports."**
+
+### Operational Protocol
+
+When two claws report divergent meanings for the same pinpoint ID during a vector cycle, resolve by reading ROADMAP.md at commit HEAD — not by negotiating verbal framings. The committed ledger is the source of truth; verbal summaries drift.
+
+**Resolution sequence when claw A says "#N = X" and claw B says "#N = Y":**
+
+1. Query disk: `grep -nE "^### ${N}\. " ROADMAP.md` at HEAD.
+2. If exactly one match, that is the canonical meaning of `#N`.
+3. The other framing is **verbal-layer drift** and must be either:
+   - Filed as a new pinpoint with a distinct number, OR
+   - Retracted as mislabeling of an existing pinpoint, OR
+   - Acknowledged as narrative-only observation without ledger status
+4. No negotiation between claws about "which framing is right" before disk check.
+
+### Anti-pattern Prevented
+
+**Verbal taxonomy arbitration** (구두 분류 협상): Two claws debating which framing of `#N` is correct when the committed ROADMAP.md already resolves the question. Wastes cycle budget, pollutes lineage tracking, and risks stacking more filings on an ambiguous identity. The committed artifact cannot be outvoted by verbal reports.
+
+### Validation History
+
+- **Cycle #131 (Jobdori)**: Filed `#196` = "local branch namespace accumulation" (committed `3497851`)
+- **Cycles #187-#193 (verbal layer)**: Gaebal-gajae started using `#196` to mean "CI blocked on `cargo fmt`" in verbal cycle reports — a different observation
+- **Cycle #194 (Jobdori, 00:34 KST)**: Grep-at-HEAD showed `### 196. Local branch namespace accumulation` is the sole committed meaning; `cargo fmt` framing has no ledger entry
+- **Cycle #194 closure (gaebal-gajae)**: "ledger on disk is clean... committed taxonomy 기준으로는 틀렸습니다. `#196` = branch namespace accumulation"
+
+### Cross-Claw Coherence Test
+
+When Doctrine #35 fires, both claws should:
+
+1. Stop negotiating verbal meanings immediately.
+2. Run `grep -nE "^### N\. " ROADMAP.md` independently.
+3. Converge on the committed string.
+4. Retract or re-number any conflicting verbal framings.
+
+### Doctrine #35 vs Earlier Doctrines
+
+| Doctrine | Scope |
+|---|---|
+| #32 | External blocks → boundary separation + escalation (failure handling) |
+| #33 | Steady-state reports as vector, not narrative (signal economy) |
+| **#35** | **Disk-truth wins over verbal drift during taxonomy disputes (ledger authority)** |
+
+Pattern: #35 complements #33 — where #33 prevents repetitive narrative during stable states, #35 prevents verbal-layer drift from polluting the filed ledger during state changes.
+
+### Doctrine Count
+
+**34 formalized (#1-#33 + #35).** #34 (companion pinpoint during merge-wait) remains strong candidate pending second field instance.
+
+---
+
+**Doctrine #35 formalized from cycle #194 disk-vs-verbal reconciliation. Cross-claw coherence verified: both claws independently agreed ROADMAP.md at HEAD is authoritative. Numeric gap (#34 unoccupied) preserved for the companion-pinpoint doctrine currently in field validation.**
+
+🪨
+
