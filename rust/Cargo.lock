@@ -43,6 +43,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "aspect-core"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "70188b9bf884266a6c7117e30af44f38229bc5ac56916bd16512b3e49f90fe20"
+
+[[package]]
+name = "aspect-macros"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "176e7db9b6a7bb4f117b8d97054d2d5a7bdc43b95c19c15c751fb8dcb9bc8a5c"
+dependencies = [
+ "aspect-core",
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
+name = "aspect-std"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ba7d130884fda30ec0acabcadc8f4711267d1cc21edc8f85283e91a011d699fa"
+dependencies = [
+ "aspect-core",
+ "log",
+ "parking_lot",
+]
+
+[[package]]
 name = "atomic-waker"
 version = "1.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1839,8 +1868,12 @@ name = "tools"
 version = "0.1.0"
 dependencies = [
  "api",
+ "aspect-core",
+ "aspect-macros",
+ "aspect-std",
  "commands",
  "flate2",
+ "log",
  "plugins",
  "reqwest",
  "runtime",
