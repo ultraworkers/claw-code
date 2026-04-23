@@ -10207,3 +10207,54 @@ claw --output-format json skills install .
 **Status:** FILED. Per freeze doctrine, no fix on 168c.
 
 **Pinpoint count update:** 69 filed (+1 from #179), 55 genuinely open.
+
+## Pinpoint #180. USAGE.md incomplete verb coverage — doc-truthfulness gap — FILED (cycle #103, 2026-04-23 10:24 Seoul)
+
+**Gap.** USAGE.md claims claw has 3 main entry modes but actual `--help` lists 13+ standalone verbs. Doc is **selectively truthful but incomplete**.
+
+**Claimed in USAGE.md (intro section):**
+```markdown
+This guide covers the current Rust workspace under `rust/` and the `claw` CLI binary.
+```
+
+Then immediately jumps to "Quick-start health check" → `claw` (REPL) → `/doctor` (slash command).
+
+**Actual --help output lists:**
+```
+claw help
+claw version
+claw status
+claw sandbox
+claw doctor          ← REPL-less mode exists but USAGE.md calls it /doctor only
+claw acp [serve]
+claw dump-manifests
+claw bootstrap-plan
+claw agents
+claw mcp
+claw skills
+claw system-prompt
+claw init
+claw export
+```
+
+That's 14 verbs not covered by USAGE.md's "quick-start" framing.
+
+**Impact:**
+- Users reading USAGE.md might think `claw doctor` only works inside the REPL
+- No explanation of when to use `claw status` vs. `/status` vs. `--resume latest /status`
+- `claw mcp`, `claw skills`, `claw agents` exist but aren't in the doc
+- `claw export` is mentioned once at the end of the visible help but not in USAGE.md narrative
+
+**Fix shape:**
+1. Add "## Non-interactive verbs" or "## Standalone commands" section to USAGE.md
+2. Document each verb: `claw status`, `claw doctor`, `claw mcp`, `claw skills`, `claw agents`, `claw export`, `claw init`, `claw sandbox`, `claw system-prompt`, `claw bootstrap-plan`, `claw dump-manifests`
+3. Cross-reference with `--help` output for parity guarantee
+4. Explain REPL vs. non-interactive trade-offs (session state, stdin handling, etc.)
+
+**Family:** Doc-truthfulness family (#76, #79, #82, #172, #180). **First verb-coverage gap** (previous gaps were schema details).
+
+**Regression test needed:** Docstring audit — `claw --help` output lines must be covered by USAGE.md somewhere. Could be a script that greps USAGE.md for each verb.
+
+**Status:** FILED. Per freeze doctrine, no doc changes on 168c. Proposed separate branch: `feat/jobdori-180-usage-verb-coverage`.
+
+**Pinpoint count:** 70 filed, 56 genuinely open.
