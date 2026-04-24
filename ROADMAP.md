@@ -12275,3 +12275,34 @@ claw status --session clawcode-human  # → no approval-blocked indicator
 **Status:** Open. No code changed. Merge-wait mode. Filed from DOGFOOD_FINDINGS.md evidence (gaebal-gajae).
 
 🪨
+
+---
+
+## Pinpoint #200 — SCHEMAS.md / classifier comments self-documenting drift: declarative claims diverge from implementation with no derive-from-source enforcement (Q *YeonGyu Kim, cycle #304)
+
+**Observed:** SCHEMAS.md action-field counts and classifier comments claim coverage over implementation-enumerable facts (e.g. event kinds, action verbs, field lists). Over time these declarative claims silently diverge from actual code — pattern already observed at #170 (classifier 4-verb sweep) and #172 (action-field count drift). No test enforces that SCHEMAS.md reflects current implementation; document can go stale without any CI signal.
+
+**Gap:**
+- SCHEMAS.md field/kind enumerations are hand-maintained with no automated sync
+- Classifier comments referencing "N action verbs" or "M event types" have no derive-from-source test
+- Divergence is invisible until a human audits both doc and code manually
+- Pattern recurs: #170 found 4-verb classifier claim vs actual 6-verb set; #172 found action-field count mismatch
+
+**Repro:**
+```
+# Check SCHEMAS.md event kind list vs actual runtime event kinds
+grep -E 'kind:' SCHEMAS.md | wc -l
+grep -rE 'kind:.*=' src/ | grep -v test | wc -l
+# Counts diverge with no CI gate
+```
+
+**Expected:** A derive-from-source test (e.g. `test_schemas_md_event_kinds_complete`) that parses SCHEMAS.md claimed enumerations and asserts they match implementation-enumerable facts. Fails loudly on drift.
+
+**Fix sketch:**
+1. Add `tests/test_schemas_doc_parity.py` — parse SCHEMAS.md event-kind list, compare to runtime-emitted kinds
+2. Add similar check for classifier action-verb claims vs actual classifier verb set
+3. Gate on CI so SCHEMAS.md updates are forced when implementation changes
+
+**Status:** Open. No code changed. Merge-wait mode. Filed from Q *YeonGyu Kim cycle #304 observation.
+
+🪨
