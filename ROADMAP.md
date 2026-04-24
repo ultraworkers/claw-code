@@ -12306,3 +12306,39 @@ grep -rE 'kind:.*=' src/ | grep -v test | wc -l
 **Status:** Open. No code changed. Merge-wait mode. Filed from Q *YeonGyu Kim cycle #304 observation.
 
 🪨
+
+---
+
+## Pinpoint #201 — `parse_tool_arguments` silent fallback: malformed JSON tool args wrapped as `{"raw": ...}`, no structured error event emitted (Jobdori, cycle #134)
+
+**Observed:** In `rust/crates/api/src/providers/openai_compat.rs`, `parse_tool_arguments()` (line ~1223) silently converts malformed JSON tool arguments to `json!({ "raw": arguments })` with no error event, no log entry, and no structured signal. Downstream consumers receive what appears to be a valid parsed object with a `raw` field — the parse failure is completely invisible.
+
+**Gap:**
+- A tool call with malformed arguments (e.g. `arguments: "not json"`) is silently normalized to `{"raw": "not json"}`
+- No `tool_parse_error` event or `parse_error` field is emitted
+- Classifier and orchestrator see an apparently-valid tool args object — they cannot distinguish "arguments parsed cleanly" from "arguments were garbage and got wrapped"
+- Error surfaces only when downstream logic tries to access expected keys and gets `None` — attribution is lost by then
+
+**Repro:**
+```
+# Simulate a provider returning malformed tool call arguments
+# claw receives chunk with: tool_call.function.arguments = "not valid json {"
+# parse_tool_arguments("not valid json {") → Ok({"raw": "not valid json {"})
+# No error logged, no event emitted, session continues as if parse succeeded
+```
+
+**Expected:** 
+- `parse_tool_arguments` returns a typed result: either parsed object or a `ToolParseError { raw: String, error: String }`
+- On parse failure, emit structured event: `{ "kind": "tool_arg_parse_error", "tool_index": N, "raw": "...", "parse_error": "..." }`
+- Session status reflects parse failure; `claw doctor` can surface it
+- Downstream code can distinguish clean parse from fallback wrap
+
+**Fix sketch:**
+1. Change return type of `parse_tool_arguments` to `Result<Value, ToolArgParseError>`
+2. On error path, emit `tool_arg_parse_error` event before returning fallback
+3. Include `parse_error` field alongside `raw` in fallback value so downstream can detect it: `json!({ "raw": arguments, "__parse_error": err.to_string() })`
+4. Add to classifier's recognized error taxonomy
+
+**Status:** Open. No code changed. Filed 2026-04-25 05:02 KST. Branch: feat/jobdori-168c-emission-routing. HEAD: b780c80.
+
+🪨
