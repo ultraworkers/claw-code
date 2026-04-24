@@ -12190,6 +12190,62 @@ cat ~/.claw/settings.json
 
 ---
 
+## Pinpoint #199 — `claw config` JSON envelope omits deprecation warnings: `merged_keys` count only, no key names, values, or `deprecated_keys` field (Jobdori, cycle #133)
+
+**Observed:** `claw config --output-format json` emits deprecation prose warnings to stderr but the structured JSON body contains only `{cwd, files, kind, loaded_files, merged_keys}`. When a deprecated key is loaded (`enabledPlugins`), `merged_keys: 1` confirms something loaded but does not surface:
+- which key(s) were loaded
+- their current values
+- whether any are deprecated
+- the replacement key name
+
+Deprecation warnings are stderr-only prose — invisible to any automation consuming `--output-format json`.
+
+### Repro
+
+```bash
+# Settings file has deprecated key
+cat ~/.claw/settings.json
+# → {"enabledPlugins": {"example-bundled@bundled": false}}
+
+# JSON output has no deprecation info
+./rust/target/release/claw config --output-format json 2>/dev/null
+# → {"cwd":"...","files":[...],"kind":"config","loaded_files":1,"merged_keys":1}
+# Keys: ['cwd', 'files', 'kind', 'loaded_files', 'merged_keys']
+# No 'warnings', 'deprecated_keys', 'values', or 'config' field.
+
+# Deprecation only surfaces on stderr
+./rust/target/release/claw config --output-format json
+# stderr: warning: ...settings.json: field "enabledPlugins" is deprecated...
+```
+
+### Gap
+
+1. Automation scripts consuming `--output-format json` cannot detect deprecated config keys without parsing stderr prose
+2. `merged_keys: 1` gives a count but no names — you can't tell what was loaded or if it's healthy
+3. No `values` or `config` key in the envelope — `claw config` JSON is a file-list report, not a config dump
+4. Deprecation-warning deduplication (filed as #197) doesn't help automation even if fixed — JSON path is still silent
+5. `claw doctor` also doesn't surface this (linked gap from #197)
+
+### Proposed Fix
+
+1. Add `warnings` array to config JSON envelope: `[{"kind": "deprecated_key", "key": "enabledPlugins", "replacement": "plugins.enabled", "file": "..."}]`
+2. Add `values` or `merged_config` object showing the resolved effective config (anonymized if needed)
+3. Or at minimum: add `deprecated_keys` array listing key names that triggered deprecation warnings
+4. Spec this as part of the `config` kind output contract in SCHEMAS.md
+
+### Acceptance Criteria
+
+- `claw config --output-format json` JSON body includes `warnings` array when deprecated keys are present
+- `warnings` entries are structured (kind, key, replacement, file, line) not prose
+- Automation can detect deprecated config state without parsing stderr
+- SCHEMAS.md updated with `config` kind output contract
+
+**Status:** Open. No code changed. Filed 2026-04-24 19:50 KST. Scratch dir: /tmp/cdZ HEAD: c48c913.
+
+🪨
+
+---
+
 ## Pinpoint #198 — MCP approval-prompt opacity: no `blocked.mcp_approval` state, pane-scrape required to detect approval-blocked sessions (gaebal-gajae, cycle #135 / Jobdori cross-filed cycle #248)
 
 **Observed:** `clawcode-human` session alive but blocked on `omx_memory.project_memory_read(...)` TUI approval prompt (`Allow / Allow for this session / Always allow / Cancel`). From outside (clawhip, downstream monitors), the session emits no typed blocked state — it appears identical to ordinary idle/live work. Operator cannot distinguish "waiting for human MCP approval" from "working quietly" without pane scraping.
