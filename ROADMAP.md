@@ -12342,3 +12342,41 @@ grep -rE 'kind:.*=' src/ | grep -v test | wc -l
 **Status:** Open. No code changed. Filed 2026-04-25 05:02 KST. Branch: feat/jobdori-168c-emission-routing. HEAD: b780c80.
 
 🪨
+
+---
+
+## Pinpoint #202 — `sanitize_tool_message_pairing` silent drop: orphaned tool messages removed with no event, no log, no diagnostic visibility (Jobdori, cycle #135)
+
+**Observed:** In `rust/crates/api/src/providers/openai_compat.rs`, `sanitize_tool_message_pairing()` (called at line ~868) silently drops any `role:"tool"` message whose `tool_call_id` has no matching preceding `assistant` turn with a `tool_calls[].id`. The drop is intentional (prevents 400s from OpenAI-compat backends) but produces zero structured signal: no event, no log entry, no field in the request envelope indicating N messages were removed.
+
+**Gap:**
+- A session with compaction, editing, or resume can arrive at the request boundary with orphaned tool messages
+- These are quietly dropped; the provider receives a request with fewer messages than the session history claims
+- No `tool_message_dropped` event or `history_sanitized` field is emitted
+- `claw doctor`, the event log, and downstream observers cannot distinguish "all tool messages sent" from "N tool messages silently omitted"
+- Debugging mismatch between session history and what the provider actually received requires source-level tracing
+
+**Repro:**
+```
+# Craft a session where a tool result has no matching assistant tool_calls entry
+# (e.g. resume after compaction that dropped the assistant turn but kept the result)
+# sanitize_tool_message_pairing() drops the orphan silently
+# Event log shows no drop event
+# Provider receives history minus the orphaned message; caller sees no indication
+```
+
+**Expected:**
+- On any drop, emit structured event: `{ "kind": "tool_message_dropped", "tool_call_id": "...", "count": N, "reason": "no_paired_assistant_turn" }`
+- Optionally: include `{ "history_sanitized": { "dropped_tool_messages": N } }` in request metadata
+- `claw doctor` can surface sessions where tool message sanitization occurred
+- Clawability: agents replaying or resuming sessions can detect the gap and re-issue the tool call or warn
+
+**Fix sketch:**
+1. Change `sanitize_tool_message_pairing` to return `(Vec<Value>, Vec<DroppedToolMessage>)` or emit events via a callback/channel
+2. At call site (line ~868), if any drops occurred, emit `tool_message_dropped` event(s) before sending request
+3. Add `dropped_tool_messages` count to request diagnostic envelope if non-zero
+4. Add to classifier's recognized event taxonomy
+
+**Status:** Open. No code changed. Filed 2026-04-25 06:09 KST. Branch: feat/jobdori-168c-emission-routing. HEAD: 5e0228d.
+
+🪨
