@@ -12380,3 +12380,42 @@ grep -rE 'kind:.*=' src/ | grep -v test | wc -l
 **Status:** Open. No code changed. Filed 2026-04-25 06:09 KST. Branch: feat/jobdori-168c-emission-routing. HEAD: 5e0228d.
 
 🪨
+
+---
+
+## Pinpoint #203 — `AutoCompactionEvent` is summary-only: no streaming SSE event emitted when auto-compaction fires mid-turn (Jobdori, cycle #136)
+
+**Observed:** In `rust/crates/runtime/src/conversation.rs`, `maybe_auto_compact()` (line ~555) fires compaction between turns and returns an `AutoCompactionEvent { removed_message_count }`. This event is attached to `TurnSummary.auto_compaction` and only surfaces in the post-turn struct returned by `run_turn()`. It is not emitted as a streaming SSE event at the moment compaction occurs.
+
+**Gap:**
+- A claw monitoring the SSE stream during a long multi-turn session cannot detect that compaction fired until the final `TurnSummary` JSON arrives (or, in JSON output mode, until the CLI prints the final response envelope)
+- Between compaction firing and the final summary, the session history has already been truncated — any mid-turn state the claw was tracking against the old history is now stale
+- No `session_compacted` or `auto_compaction` SSE event exists; the classifier's event taxonomy has no entry for it
+- `claw doctor` cannot surface "this session has been auto-compacted N times" or "compaction removed M messages in the last turn"
+- Claws relying on replay-by-session-history for context reconstruction silently receive a shorter history with no notification
+
+**Repro:**
+```
+# Run a session long enough to trigger auto-compaction
+# Monitor the SSE stream during the turn
+# Observe: no event with kind=session_compacted or similar appears in the stream
+# The only signal is the post-turn auto_compaction field in the JSON summary
+# If running in interactive TUI mode, the only signal is the printed compaction notice
+```
+
+**Expected:**
+- When `maybe_auto_compact()` removes messages, emit a streaming SSE event immediately: `{ "kind": "session_compacted", "removed_message_count": N, "retained_message_count": M, "trigger": "auto" }`
+- `claw doctor` surfaces sessions with auto-compaction history and message counts
+- Classifier recognizes `session_compacted` as a first-class event kind
+- `/compact` manual command similarly emits this event (currently only prints a user-facing string)
+
+**Fix sketch:**
+1. Add `session_compacted` to the `StreamEvent` enum (or as a diagnostic event channel alongside it)
+2. In `maybe_auto_compact()`, after compaction, push `session_compacted` event through the event channel before continuing the turn
+3. Expose count in the event: `{ kind: "session_compacted", removed_message_count: N }`
+4. Wire manual `/compact` command to emit the same event
+5. Add to classifier event taxonomy and `claw doctor` output
+
+**Status:** Open. No code changed. Filed 2026-04-25 07:47 KST. Branch: feat/jobdori-168c-emission-routing. HEAD: 0730183.
+
+🪨
