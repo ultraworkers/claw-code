@@ -13055,3 +13055,197 @@ assert_eq!(cost.total_cost_usd(), 90.0);
 **Status:** Open. No code changed. Filed 2026-04-25 19:30 KST. Branch: feat/jobdori-168c-emission-routing. HEAD: c20d033. Cost-parity cluster: #204 (token emission) + #207 (token preservation) + #209 (cost estimation). Sibling-shape cluster (silent-fallback / silent-drop / silent-strip / silent-misnomer at provider boundary): #201/#202/#203/#206/#207/#208/#209 — eight pinpoints, one diagnostic-event refactor closes them all.
 
 🪨
+
+## Pinpoint #210 — `rusty-claude-cli` shadows `api::max_tokens_for_model` with a stripped two-branch fork that ignores the model_token_limit registry, bypasses the plugin `maxOutputTokens` override, and silently sends a 4x-over-limit `max_tokens` for kimi-k2.5 and other registry-known models (Jobdori, cycle #362 / extends #168c emission-routing audit / parity-shape sibling of #209)
+
+**Observed:** `rust/crates/rusty-claude-cli/src/main.rs:150-156` defines a private `max_tokens_for_model` that exists alongside — and shadows — the canonical `api::max_tokens_for_model` already imported in the same crate. The two implementations disagree on what they know:
+
+```rust
+// rusty-claude-cli/src/main.rs:150-156 — the CLI's local copy
+fn max_tokens_for_model(model: &str) -> u32 {
+    if model.contains("opus") {
+        32_000
+    } else {
+        64_000
+    }
+}
+
+// api/src/providers/mod.rs:254-266 — the canonical implementation
+pub fn max_tokens_for_model(model: &str) -> u32 {
+    model_token_limit(model).map_or_else(
+        || {
+            let canonical = resolve_model_alias(model);
+            if canonical.contains("opus") { 32_000 } else { 64_000 }
+        },
+        |limit| limit.max_output_tokens,
+    )
+}
+
+// api/src/providers/mod.rs:277-300 — the registry the CLI's fork ignores
+pub fn model_token_limit(model: &str) -> Option<ModelTokenLimit> {
+    let canonical = resolve_model_alias(model);
+    match canonical.as_str() {
+        "claude-opus-4-6" => Some(ModelTokenLimit { max_output_tokens: 32_000, .. }),
+        "claude-sonnet-4-6" | "claude-haiku-4-5-20251213" => Some(/* 64_000 */),
+        "grok-3" | "grok-3-mini" => Some(/* 64_000 */),
+        "kimi-k2.5" | "kimi-k1.5" => Some(ModelTokenLimit {
+            max_output_tokens: 16_384,             // <- canonical knows kimi caps at 16_384
+            context_window_tokens: 256_000,
+        }),
+        _ => None,
+    }
+}
+```
+
+The CLI imports the canonical `api::*` re-exports at line 26-31 but never imports `max_tokens_for_model` from `api::` (or from `runtime::` which also re-exports it). At line 7921, the actual hot-path request build calls the *local* fork:
+
+```rust
+// rusty-claude-cli/src/main.rs:7916-7929 — the production callsite
+let message_request = MessageRequest {
+    model: self.model.clone(),
+    max_tokens: max_tokens_for_model(&self.model),   // <- local fork, not api::
+    ...
+};
+```
+
+**Source sites (verified by `grep -n "max_tokens_for_model" rust/crates/rusty-claude-cli/src/main.rs` — exactly two hits, both pointing at the local fork):**
+
+```
+150:fn max_tokens_for_model(model: &str) -> u32 {
+7921:            max_tokens: max_tokens_for_model(&self.model),
+```
+
+No `use api::max_tokens_for_model` line exists anywhere in the file. The two hits are definition + call. Result: every CLI-driven session uses the stripped two-branch logic, regardless of what the canonical registry knows.
+
+**Blast radius (verified by `cargo run -- --help` invocation paths and `grep -rn "AnthropicRuntimeClient" rust/crates/rusty-claude-cli/src/main.rs`):**
+
+- `AnthropicRuntimeClient::stream` (the only `ApiClient` impl in the CLI) — every `claw prompt`, `claw chat`, `claw resume`, every interactive-mode turn
+- The kimi-k2.5 path gets `max_tokens: 64_000` even though `model_token_limit("kimi-k2.5").max_output_tokens == 16_384`. DashScope's `/compatible-mode/v1/chat/completions` will either reject the request (`max_tokens exceeds model limit`) or silently clamp without warning. Either way, the user-visible request and the registry's truth disagree by 4x.
+- `tools/src/lib.rs:4588` calls `api::max_tokens_for_model` (the canonical one, via the `use api::{max_tokens_for_model, ...}` at line 7) — so the bughunter chain has the right value, but the user-facing `claw prompt` does not. Two paths in the same crate, two answers, no test catches the divergence.
+- The plugin override path is **completely absent** from the CLI hot path. `max_tokens_for_model_with_override(model, plugin_override)` exists in `api/src/providers/mod.rs:272`, has a regression test (`plugin_config_max_output_tokens_overrides_model_default` at line 619), and is never called from `rusty-claude-cli/src/main.rs`. A user who sets `"plugins": { "maxOutputTokens": 12345 }` in `~/.claw/settings.json` watches the CLI ignore that setting on every turn. The override is a feature that ships configured-but-unwired.
+
+**Gap:**
+
+1. **Two implementations of the same function name in one crate, the wrong one wins on the hot path.** The local fork at line 150 is reachable as `max_tokens_for_model` from anywhere in `main.rs` because Rust name resolution prefers the local module item over a glob-imported re-export — except `max_tokens_for_model` is *not* glob-imported here. The CLI just never imports it. The local fork shadows by virtue of being the only thing in scope. A reader scanning the call site at line 7921 cannot tell from the call alone which implementation runs. Same anti-pattern shape as #209's misnomer (`default_sonnet_tier` returns Opus values): the name does not predict the behavior.
+
+2. **Registry-aware models silently overshoot.** `kimi-k2.5` has a published `max_output_tokens: 16_384` in the canonical registry (lines 294-296 of `providers/mod.rs`). The CLI sends `max_tokens: 64_000`. DashScope's behavior on out-of-range `max_tokens`:
+   - Some endpoints reject with HTTP 400 (`max_tokens exceeds model limit`) — surfaces as `ApiError::Other` with a provider-supplied string, no structured taxonomy
+   - Some endpoints silently clamp to the model's real ceiling — no event, no log, the user sees a truncated response and assumes it's normal completion
+   - The CLI has no preflight against `model_token_limit().max_output_tokens`; only against `context_window_tokens` (`preflight_message_request` at line 302)
+
+3. **Plugin override completely bypassed.** `max_tokens_for_model_with_override` exists, has a passing test, and has zero production call sites in `rusty-claude-cli`. `grep -n "max_tokens_for_model_with_override" rust/crates/rusty-claude-cli/` returns nothing. The plugin manager is loaded earlier in the same function (`PluginManager::new` somewhere in CLI startup) but the resolved `max_output_tokens()` from that manager never reaches the request builder. A user can set the override, the test will pass, the docs will say "plugins can override max_tokens," and the actual binary will ignore the setting.
+
+4. **No test catches the divergence.** The api crate has `keeps_existing_max_token_heuristic` (line 614, asserts opus=32_000, grok-3=64_000) and `plugin_config_max_output_tokens_overrides_model_default` (line 619, proves the override works on the canonical function). Neither test runs against the CLI's local fork. There is no integration test that asserts the CLI's actual outbound `max_tokens` field for a given `--model kimi-k2.5` invocation matches `model_token_limit("kimi-k2.5").max_output_tokens`. A future contributor fixing one of the two implementations leaves the other silently wrong.
+
+5. **No event signal that max_tokens was clamped or rejected.** Sibling pattern to #201/#202/#203/#206/#207/#208/#209. When DashScope clamps a 64_000 request to 16_384, no `StreamEvent::MaxTokensClamped { requested, applied, source }` fires. The user sees a normal-looking truncated response. Operators tracing "why did my session terminate at output_tokens: 16_384" cannot distinguish "model emitted stop_sequence" from "provider silently clamped my max_tokens."
+
+6. **Same shape as the cycle #168c emission-routing audit.** This branch (`feat/jobdori-168c-emission-routing`) has been collecting eight pinpoints (#201 through #209) all of the form "behavior diverges from declared contract at the provider boundary, no event surfaces the divergence." #210 extends the audit one layer up: the CLI's own request-construction layer diverges from the api crate's declared contract, and the divergence is invisible because the function names match. The fix shape is identical: replace the local fork with a call to the canonical function (with override), add a `MaxTokensResolved` / `MaxTokensClamped` event to the diagnostic taxonomy, regress with a test that asserts the outbound `max_tokens` matches the registry for every model in the registry.
+
+7. **Three other bash-runner / config-loader callsites already use the canonical version.** `tools/src/lib.rs:4588` (`bughunter` chain) imports and calls `api::max_tokens_for_model` correctly. The CLI is the outlier. The fix is mechanical: remove the local fork at line 150, add `max_tokens_for_model` to the `use api::{...}` block at line 26-31 (or use `api::max_tokens_for_model_with_override` with the resolved plugin override), update the call site at line 7921. ~10 LOC, one test addition asserting CLI hot path matches canonical for `kimi-k2.5`.
+
+**Repro:**
+
+```bash
+# 1. The two implementations disagree for kimi-k2.5
+cd rust
+cargo test -p api -- max_tokens   # passes — canonical knows kimi=16_384
+grep -n 'fn max_tokens_for_model' crates/rusty-claude-cli/src/main.rs
+# rust/crates/rusty-claude-cli/src/main.rs:150:fn max_tokens_for_model(model: &str) -> u32 {
+# Local fork has only two branches: opus → 32_000, else → 64_000
+# 'kimi-k2.5' falls into 'else' → 64_000 outbound
+# Canonical max_tokens_for_model('kimi-k2.5') → 16_384
+```
+
+```rust
+// 2. Demonstrative test that should exist and currently does not
+#[test]
+fn cli_outbound_max_tokens_matches_registry_for_kimi() {
+    let runtime_client = AnthropicRuntimeClient::new("kimi-k2.5".to_string(), /* ... */);
+    let request = runtime_client.build_message_request(/* empty conversation */);
+    let canonical = api::max_tokens_for_model("kimi-k2.5");
+    assert_eq!(
+        request.max_tokens, canonical,
+        "CLI sent max_tokens={} but registry says kimi-k2.5 caps at {}",
+        request.max_tokens, canonical
+    );
+    // Currently fails: 64_000 != 16_384.
+}
+
+// 3. Demonstrative test that the plugin override is unwired
+#[test]
+fn cli_outbound_max_tokens_respects_plugin_override() {
+    // Given a settings.json with { "plugins": { "maxOutputTokens": 12345 } }
+    // and an active CLI session loaded with that config,
+    let runtime_client = AnthropicRuntimeClient::new(/* with plugin manager */);
+    let request = runtime_client.build_message_request(/* empty conversation */);
+    assert_eq!(request.max_tokens, 12345,
+               "plugin maxOutputTokens override should win over model default");
+    // Currently fails: 64_000 (or 32_000) regardless of plugin setting.
+}
+```
+
+**Verification check:**
+
+- `grep -n "max_tokens_for_model" rust/crates/rusty-claude-cli/src/main.rs` returns exactly two lines: 150 (definition) and 7921 (call). No `use api::max_tokens_for_model` line exists.
+- `grep -n "max_tokens_for_model_with_override" rust/crates/rusty-claude-cli/src/main.rs` returns zero hits — plugin-override-aware variant is never imported, never called.
+- `grep -n "max_tokens_for_model" rust/crates/tools/src/lib.rs` returns lines 7 (import) and 4588 (call). The bughunter chain uses the canonical function correctly. The CLI does not.
+- `grep -n "kimi-k2.5" rust/crates/api/src/providers/mod.rs` returns line 295 with `max_output_tokens: 16_384` and `context_window_tokens: 256_000`.
+- `cargo run -p rusty-claude-cli -- prompt --model kimi-k2.5 "hi"` (with DashScope auth) produces an outbound request with `"max_tokens": 64000` — verifiable via mock transport / wireshark capture / `RUST_LOG=api::providers::openai_compat=trace`. Canonical registry says 16_384.
+- No `StreamEvent::MaxTokensClamped` variant exists. `grep -rn "MaxTokensClamped\|max_tokens_clamped" rust/crates/` returns zero hits.
+- The test `keeps_existing_max_token_heuristic` (api/src/providers/mod.rs:614) asserts the canonical function's behavior, not the CLI's. The CLI's local fork has no test covering it.
+- Real published max_output_tokens (verified 2026-04-25 via Moonshot/DashScope docs):
+  - kimi-k2.5: 16_384 (canonical: 16_384, CLI fork: 64_000 — 4x over)
+  - kimi-k1.5: 16_384 (canonical: 16_384, CLI fork: 64_000 — 4x over)
+  - claude-sonnet-4-6: 64_000 (canonical: 64_000, CLI fork: 64_000 — match by accident)
+  - claude-haiku-4-5-20251213: 64_000 (canonical: 64_000, CLI fork: 64_000 — match by accident)
+  - claude-opus-4-6: 32_000 (canonical: 32_000, CLI fork: 32_000 — match)
+  - grok-3 / grok-3-mini: 64_000 (canonical: 64_000, CLI fork: 64_000 — match)
+  - Future kimi-k3 / qwen-plus-equivalent / o5 / claude-haiku-5: whatever the canonical registry adds. The CLI fork won't know.
+
+**Expected:**
+
+- The local `fn max_tokens_for_model` at line 150 is deleted.
+- The CLI imports the canonical `max_tokens_for_model_with_override` from the `api` crate.
+- The plugin manager's resolved `max_output_tokens` is threaded through `AnthropicRuntimeClient` (or read inline from the loaded `Plugins` config) and passed to `max_tokens_for_model_with_override` at the request-build site.
+- A `StreamEvent::MaxTokensResolved { model, source: MaxTokensSource, value }` event fires at first turn. `MaxTokensSource` enum: `Registry`, `RegistryFallback { rule: "opus_heuristic" | "default_64k" }`, `PluginOverride { value }`.
+- A `StreamEvent::MaxTokensRejected { model, requested, provider_response }` fires when the provider returns a 400 citing max_tokens (DashScope path).
+- Regression test: `cli_outbound_max_tokens_matches_canonical_for_every_registry_model` iterates every model in `model_token_limit`, builds an `AnthropicRuntimeClient`, asserts the outbound `MessageRequest.max_tokens` equals `api::max_tokens_for_model(model)`.
+- Regression test: `cli_outbound_max_tokens_uses_plugin_override_when_set` constructs a `PluginManager` with `maxOutputTokens: 12345`, builds the CLI request, asserts `max_tokens == 12345`.
+- Negative test: `cli_local_max_tokens_fork_no_longer_exists` is a `compile_error!`-style or `assert_eq!(file_contains_pattern, false)` test that catches any future re-introduction of a local fork.
+- USAGE.md / SCHEMAS.md document the resolution order: plugin override > registry > opus heuristic > 64_000 default.
+
+**Fix sketch:**
+
+1. Delete `fn max_tokens_for_model` at `rust/crates/rusty-claude-cli/src/main.rs:150-156`. ~7 LOC removed.
+2. Add `max_tokens_for_model_with_override` to the `use api::{...}` block at line 26-31. ~1 LOC.
+3. Plumb the plugin override into `AnthropicRuntimeClient`. The struct already has fields for tool registry and runtime; add a `max_output_tokens_override: Option<u32>` field, populated at construction from the loaded plugin config. ~6 LOC across struct definition, constructor, and one new field initializer at the call site that builds the client.
+4. Replace line 7921's `max_tokens_for_model(&self.model)` with `max_tokens_for_model_with_override(&self.model, self.max_output_tokens_override)`. ~1 LOC.
+5. Add the `StreamEvent::MaxTokensResolved` variant in `api/src/types.rs` and emit it once per session at first turn from `AnthropicRuntimeClient::stream`. ~30 LOC including SCHEMAS.md update.
+6. Add the regression test at the CLI level that builds an `AnthropicRuntimeClient` for every registry model and asserts the outbound `max_tokens` matches the canonical. ~40 LOC.
+7. (Stretch) Add `claw doctor --max-tokens` (or extend `claw doctor --json`) to surface the resolved `MaxTokensSource` and value for the active session's model. ~25 LOC.
+8. (Stretch) Add a `StreamEvent::MaxTokensRejected` variant and wire it into the `openai_compat` 400-error path when the provider's error message contains `max_tokens` (or the equivalent DashScope error code). ~40 LOC.
+
+**Why this matters for clawability:**
+
+- **Two functions, same name, one crate, divergent behavior.** Pinpoint #200 locked the principle that declarative claims must derive from source. #209 documented the same anti-pattern at the misnomer layer (`default_sonnet_tier` returns Opus values). #210 documents it at the function-shadowing layer: two definitions agree on the type signature and disagree on the values they return. A reader of the call site at line 7921 cannot infer from the source alone which `max_tokens_for_model` runs — they must trace imports, find none, then realize the local fork at line 150 is the resolved target. The bug is invisible at the call site.
+- **The plugin override is ship-blocked at the CLI but ships in the api crate.** A user reading the api crate's docs (or the test name `plugin_config_max_output_tokens_overrides_model_default`) reasonably believes setting `maxOutputTokens` in their config affects their CLI sessions. It does not. The feature is half-shipped. Either the override is real (and the CLI is broken) or the override is dead code (and the test is misleading). #210 forces the resolution.
+- **Registry-aware kimi-k2.5 is silently 4x over its limit on every CLI request.** This is not a parity gap with anomalyco/opencode — it is a parity gap with the project's own registry. The canonical `model_token_limit("kimi-k2.5")` returns 16_384. The CLI sends 64_000. The provider clamps or rejects. The user doesn't know. Operators tracing kimi sessions see truncated outputs and assume it's normal completion.
+- **Sibling-shape cluster extends to nine pinpoints.** #201 (silent tool-arg fallback), #202 (silent tool-message drop), #203 (auto-compaction no SSE event), #204 (reasoning_tokens emission gap), #206 (silent finish_reason pass-through), #207 (silent usage-detail drop), #208 (silent param strip on serialization), #209 (silent pricing fallback under a misnamed function), #210 (silent max_tokens overshoot under a shadowed function name). All nine close on the same pattern: behavior diverges from contract at a provider/CLI boundary, no event surfaces the divergence, no test asserts the contract holds end-to-end.
+- **Mechanical fix, high coverage.** Unlike #209 which requires an enum redesign and a new diagnostic event channel, #210's primary fix is delete-7-lines-and-add-1-import. The complexity lives in the test (assert the CLI's outbound `max_tokens` matches the canonical for every registry model) and in the optional event variant (`MaxTokensResolved`). Even shipping just the deletion + canonical import + plugin override threading closes the worst-case bug (kimi-k2.5 silently 4x over) with under 20 LOC and one new test.
+- **Future-proofing.** The local fork's `else { 64_000 }` branch is a forever-bug factory: every new model added to `model_token_limit` (qwen-plus, o4, gpt-5.2, claude-haiku-5, kimi-k3, ...) starts life with the CLI silently sending 64_000 regardless of the registry's truth. Removing the fork makes "add a model to the registry" a one-place change. Leaving the fork makes it a two-place change with no compiler enforcement — exactly the conditions under which #209's misnomer was born.
+
+**Acceptance criteria:**
+
+- The local `fn max_tokens_for_model` in `rusty-claude-cli/src/main.rs` is removed.
+- The CLI's request-build site calls `api::max_tokens_for_model_with_override` (or equivalent) with the resolved plugin override.
+- A regression test iterates `model_token_limit`'s known models and asserts the CLI's outbound `MessageRequest.max_tokens` matches the canonical resolution for each.
+- A regression test asserts the plugin `maxOutputTokens` override reaches the outbound request from the CLI.
+- A `StreamEvent::MaxTokensResolved` (or sibling diagnostic) variant is emitted at least once per session with `{ model, source, value }`.
+- USAGE.md / SCHEMAS.md document the max_tokens resolution order (plugin override > registry > opus heuristic > 64_000 default).
+- (Stretch) A `StreamEvent::MaxTokensRejected` variant fires when the provider rejects a request citing max_tokens.
+- (Stretch) `claw doctor --json` surfaces the active session's resolved `MaxTokensSource`.
+- A future contributor adding `kimi-k3` (or any new model) to the registry needs to make exactly one source change for the CLI to pick it up.
+
+**Status:** Open. No code changed. Filed 2026-04-25 20:00 KST. Branch: feat/jobdori-168c-emission-routing. HEAD: 134e945. Sibling-shape cluster (silent-fallback / silent-drop / silent-strip / silent-misnomer / silent-shadow at provider-or-CLI boundary): #201/#202/#203/#206/#207/#208/#209/#210 — nine pinpoints, one diagnostic-event refactor + one mechanical de-shadowing close them all. Cost-parity cluster grows: #204 (token emission) + #207 (token preservation) + #209 (cost estimation) + #210 (max_tokens parity with own registry).
+
+🪨
