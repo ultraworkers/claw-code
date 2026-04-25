@@ -12461,3 +12461,48 @@ grep -rE 'kind:.*=' src/ | grep -v test | wc -l
 **Status:** Open. No code changed. Filed 2026-04-25 12:00 KST. Branch: feat/jobdori-168c-emission-routing. Parity gap with anomalyco/opencode #24233.
 
 🪨
+
+---
+
+## Pinpoint #205 — prunable worktree set has no lifecycle audit trail: no creation timestamp, no associated pinpoint ID, no merged/abandoned status, no doctor visibility (Q *YeonGyu Kim, cycle #137 / Jobdori cycle #351)
+
+**Observed:** Probing the b3/b4/b5 worktree batch reveals 19 worktrees in `/tmp/` all flagged prunable, with zero machine-readable accounting. There is no record of:
+- When each worktree was created
+- Which pinpoint or issue it targets
+- Whether its associated branch is merged, abandoned, or in-flight
+- What state the work is in (dirty/clean/blocked)
+
+`claw doctor` does not surface worktree state — operators cannot distinguish "abandoned worktree safe to prune" from "in-flight work parked overnight" without manual inspection of each.
+
+**Gap:**
+- `git worktree list --porcelain` provides path/HEAD/branch but no creation time, no purpose, no lifecycle stage
+- Pinpoint-driven worktrees (e.g. `feat/jobdori-XXX-pinpoint-name`) carry intent in the branch name only — not in any structured metadata
+- Stale worktrees accumulate indefinitely; `b3/b4/b5` batch shows 19 prunable with no trail of when/why they were created
+- This compounds with #196 (local branch namespace accumulation) and #194 (prunable-worktree accumulation, no gate)
+
+**Repro:**
+```
+cd /tmp && git worktree list --porcelain
+# Shows N worktrees
+# Each line: worktree <path>, HEAD <sha>, branch <name>
+# No creation timestamp, no pinpoint ID, no status field
+claw doctor
+# No worktree section, no audit trail
+```
+
+**Expected:**
+- Worktree metadata sidecar (`.git/worktree-meta.json` or per-worktree `WORKTREE_META`) recording: creation timestamp, target pinpoint/issue ID, intent string, status enum
+- `claw doctor --worktrees` sub-report listing all worktrees with creation age, pinpoint ID, branch state (ahead/behind origin), dirty status
+- Auto-prune candidate detection: worktrees older than N days with no commits ahead of origin AND associated branch merged
+- Optional: `claw worktree create --pinpoint #N --intent "..."` CLI to enforce metadata at creation
+
+**Fix sketch:**
+1. Add `WorktreeMetadata { created_at_ms, pinpoint_id, intent, status }` struct
+2. Persist sidecar at worktree creation time (~/.claw/worktrees/<worktree-name>.json or .git/worktree-meta/<name>.json)
+3. Add `claw doctor --worktrees` subcommand that lists worktrees + metadata + computed status
+4. Add prune-candidate detection logic
+5. ~40 LOC + integration test
+
+**Status:** Open. No code changed. Filed 2026-04-25 17:16 KST by Q *YeonGyu Kim, formalized to ROADMAP by Jobdori cycle #351. Branch: feat/jobdori-168c-emission-routing.
+
+🪨
