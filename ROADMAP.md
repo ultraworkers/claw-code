@@ -14560,6 +14560,168 @@ The minimal fix is a six-touch change: (a) add `pub service_tier: Option<Service
 
 The deeper fix is to lift `service_tier` out of the per-request "tuning parameter" cluster and into a first-class `RequestPolicy` struct on `MessageRequest` alongside the `RetryPolicy` from #215 and a future `RateLimitPolicy` honoring the wire `Retry-After` and `x-ratelimit-*` headers. Then a cluster-wide `WirePolicyEvent` taxonomy (`ServiceTierServed`, `RetryAfterReceived`, `ParallelToolCallsCapped`, `ReasoningContentStreamed`, `MaxTokensClamped`) gives claws a single subscriber-side surface for every wire-protocol-as-input/output dimension that the silent-fallback / silent-drop / silent-strip cluster has now identified across fifteen pinpoints. This closes #216 cleanly and turns the wire-format-parity cluster (#211 + #212 + #213 + #214 + #215 + #216) into one composable policy plane rather than six independent struct-field battles.
 
-**Status:** Open. No code changed. Filed 2026-04-25 23:00 KST. Branch: feat/jobdori-168c-emission-routing. HEAD: 2da1211. Sibling-shape cluster (silent-fallback / silent-drop / silent-strip / silent-misnomer / silent-shadow / silent-prefix-mismatch / structural-absence / silent-zero-coercion / silent-content-discard / silent-header-discard / silent-tier-absence at provider/CLI boundary): #201/#202/#203/#206/#207/#208/#209/#210/#211/#212/#213/#214/#215/#216 — fifteen pinpoints. Wire-format-parity cluster: #211 (max_completion_tokens) + #212 (parallel_tool_calls) + #213 (cached_tokens) + #214 (reasoning_content) + #215 (Retry-After) + #216 (service_tier + system_fingerprint) — six pinpoints, every member is "claw and the wire format disagree on a documented field." Cost-parity cluster grows by direct adjacency: #204 + #207 + #209 + #210 + #213 + #216 — six pinpoints, all "claw bills the wrong number." Three-dimensional structural absence (request-side write + response-side read + reproducibility marker) is itself a new shape inside the cluster, distinct from the prior "request-side only" (#211, #212), "response-side only" (#207, #213, #214), and "header-only" (#215) members. External validation: OpenAI flex processing guide (https://developers.openai.com/api/docs/guides/flex-processing — `service_tier: "flex"` opts into ~50% cheaper async batch processing with possible Resource Unavailable errors), OpenAI priority processing guide (https://developers.openai.com/api/docs/guides/priority-processing — `service_tier: "priority"` opts into 1.5-2x premium with SLA-grade latency), OpenAI scale tier (https://openai.com/api-scale-tier/ — committed-capacity model snapshot with 99.9% uptime SLA), OpenAI advanced usage / system_fingerprint guide (https://developers.openai.com/api/docs/guides/advanced-usage — fingerprint paired with `seed` is the canonical determinism-debugging mechanism), Anthropic service tiers reference (https://platform.claude.com/docs/en/api/service-tiers — `auto` / `standard_only` documented, capacity-managed Priority Tier requires sales contact), OpenTelemetry GenAI semantic conventions (https://opentelemetry.io/docs/specs/semconv/registry/attributes/openai/ — `gen_ai.openai.request.service_tier` and `gen_ai.openai.response.service_tier` and `gen_ai.openai.response.system_fingerprint` are first-class observability attributes in the public spec, meaning every other agent/client in the OpenAI ecosystem propagates these for tracing), anomalyco/opencode#12297 (active feature request to add `serviceTier: "flex"` to the OpenAI-compatible chat provider options schema and propagate as `service_tier` in the chat request body — exact same gap as claw, identical wire-format symptom, identical fix shape, but only in one provider), Vercel AI SDK `serviceTier` provider option (v3.x — supported per-request on the OpenAI provider), LangChain ChatOpenAI `service_tier` constructor parameter, LiteLLM `service_tier` request param pass-through, semantic-kernel `OpenAIPromptExecutionSettings.ServiceTier`, openai-python SDK `client.chat.completions.create(service_tier="flex", ...)` (first-class kwarg), MiniMax / DeepSeek Anthropic-compat layer notes (https://platform.minimax.io/docs/api-reference/text-anthropic-api — explicitly document that `service_tier` is a wire-recognized field on the Anthropic-shape contract that some compat layers ignore, signaling the field is part of the public contract claws need to observe even when the upstream backend silently drops it), badlogic/pi-mono#1381 (peer-tracker for service-tier propagation in coding agents) — same control surface available across literally every other major LLM client / agent / observability spec in the ecosystem, absent only in claw-code at all four structural layers (request-struct field, request-builder write site, response-struct field, response-deserialize read site) simultaneously across two providers, breaking both cost-control opt-in (flex) and silent-upgrade-detection (priority) and run-reproducibility (system_fingerprint) all in one shape.
+**Status:** Open. No code changed. Filed 2026-04-25 23:00 KST. Branch: feat/jobdori-168c-emission-routing. HEAD: 2da1211. Sibling-shape cluster (silent-fallback / silent-drop / silent-strip / silent-misnomer / silent-shadow / silent-prefix-mismatch / structural-absence / silent-zero-coercion / silent-content-discard / silent-header-discard / silent-tier-absence / silent-finish-mistranslation at provider/CLI boundary): #201/#202/#203/#206/#207/#208/#209/#210/#211/#212/#213/#214/#215/#216 — fifteen pinpoints (sixteen with #217 below). Wire-format-parity cluster: #211 (max_completion_tokens) + #212 (parallel_tool_calls) + #213 (cached_tokens) + #214 (reasoning_content) + #215 (Retry-After) + #216 (service_tier + system_fingerprint) — six pinpoints, every member is "claw and the wire format disagree on a documented field." Cost-parity cluster grows by direct adjacency: #204 + #207 + #209 + #210 + #213 + #216 — six pinpoints, all "claw bills the wrong number." Three-dimensional structural absence (request-side write + response-side read + reproducibility marker) is itself a new shape inside the cluster, distinct from the prior "request-side only" (#211, #212), "response-side only" (#207, #213, #214), and "header-only" (#215) members. External validation: OpenAI flex processing guide (https://developers.openai.com/api/docs/guides/flex-processing — `service_tier: "flex"` opts into ~50% cheaper async batch processing with possible Resource Unavailable errors), OpenAI priority processing guide (https://developers.openai.com/api/docs/guides/priority-processing — `service_tier: "priority"` opts into 1.5-2x premium with SLA-grade latency), OpenAI scale tier (https://openai.com/api-scale-tier/ — committed-capacity model snapshot with 99.9% uptime SLA), OpenAI advanced usage / system_fingerprint guide (https://developers.openai.com/api/docs/guides/advanced-usage — fingerprint paired with `seed` is the canonical determinism-debugging mechanism), Anthropic service tiers reference (https://platform.claude.com/docs/en/api/service-tiers — `auto` / `standard_only` documented, capacity-managed Priority Tier requires sales contact), OpenTelemetry GenAI semantic conventions (https://opentelemetry.io/docs/specs/semconv/registry/attributes/openai/ — `gen_ai.openai.request.service_tier` and `gen_ai.openai.response.service_tier` and `gen_ai.openai.response.system_fingerprint` are first-class observability attributes in the public spec, meaning every other agent/client in the OpenAI ecosystem propagates these for tracing), anomalyco/opencode#12297 (active feature request to add `serviceTier: "flex"` to the OpenAI-compatible chat provider options schema and propagate as `service_tier` in the chat request body — exact same gap as claw, identical wire-format symptom, identical fix shape, but only in one provider), Vercel AI SDK `serviceTier` provider option (v3.x — supported per-request on the OpenAI provider), LangChain ChatOpenAI `service_tier` constructor parameter, LiteLLM `service_tier` request param pass-through, semantic-kernel `OpenAIPromptExecutionSettings.ServiceTier`, openai-python SDK `client.chat.completions.create(service_tier="flex", ...)` (first-class kwarg), MiniMax / DeepSeek Anthropic-compat layer notes (https://platform.minimax.io/docs/api-reference/text-anthropic-api — explicitly document that `service_tier` is a wire-recognized field on the Anthropic-shape contract that some compat layers ignore, signaling the field is part of the public contract claws need to observe even when the upstream backend silently drops it), badlogic/pi-mono#1381 (peer-tracker for service-tier propagation in coding agents) — same control surface available across literally every other major LLM client / agent / observability spec in the ecosystem, absent only in claw-code at all four structural layers (request-struct field, request-builder write site, response-struct field, response-deserialize read site) simultaneously across two providers, breaking both cost-control opt-in (flex) and silent-upgrade-detection (priority) and run-reproducibility (system_fingerprint) all in one shape.
+
+🪨
+
+
+## Pinpoint #217 — `normalize_finish_reason` (openai_compat.rs:1389) is a two-arm match (`stop`→`end_turn`, `tool_calls`→`tool_use`) with a fallthrough that returns the upstream value verbatim, so OpenAI's three other documented finish reasons — `length` (max-token truncation), `content_filter` (refusal/safety stop), and `function_call` (legacy parallel-tools-off path still emitted by Azure / DeepSeek / Moonshot / DashScope shims) — flow through every callsite as raw OpenAI strings instead of being remapped to Anthropic's canonical taxonomy (`max_tokens`, `refusal`, `tool_use`); `MessageResponse.stop_reason: Option<String>` (api/types.rs:129) is a stringly-typed free-text field with no enum constraint, no exhaustive match on consumers, and no validator, so the mistranslation lands silently in `WorkerRegistry::observe_completion` (runtime/src/worker_boot.rs:558-608) which classifies failure on `finish_reason == "unknown"` or `finish_reason == "error"` only — meaning a real OpenAI / DeepSeek / Moonshot truncation (`length`) or content-policy refusal (`content_filter`) becomes `WorkerStatus::Finished` with a success event, the worker is reused for the next prompt as if the assistant turn closed cleanly, and downstream claw-side budget / pause-turn / refusal-policy logic that pattern-matches on Anthropic's `"max_tokens"` / `"refusal"` strings (which is the documented public contract — platform.claude.com/docs/en/api/messages stop_reason field) sees zero hits because the value on the wire is now `"length"` / `"content_filter"` (Jobdori, cycle #369 / extends #168c emission-routing audit / sibling-shape cluster grows to sixteen: #201/#202/#203/#206/#207/#208/#209/#210/#211/#212/#213/#214/#215/#216/#217 / wire-format-parity cluster grows to seven: #211+#212+#213+#214+#215+#216+#217 / classifier-leakage shape: response-side string mistranslation that bleeds into the runtime worker classifier, distinct from the prior request-side absence / response-side absence / header-drop members)
+
+**Observed:** A two-arm normalizer claims to bridge OpenAI's finish-reason vocabulary into Anthropic's stop-reason vocabulary, ships only the two trivially-matching arms, and silently passes every other OpenAI-spec value through unchanged — including the two values (`length`, `content_filter`) that have first-class behavioral semantics on the Anthropic side (`max_tokens` triggers continuation, `refusal` triggers safety telemetry).
+
+**(1) The mistranslation site is a 2-arm match with a string-passthrough default.** `rust/crates/api/src/providers/openai_compat.rs:1389-1396`:
+
+```rust
+fn normalize_finish_reason(value: &str) -> String {
+    match value {
+        "stop" => "end_turn",
+        "tool_calls" => "tool_use",
+        other => other,
+    }
+    .to_string()
+}
+```
+
+The OpenAI Chat Completions API documents five canonical finish_reason values — `stop`, `length`, `tool_calls`, `content_filter`, `function_call` (legacy) — at https://platform.openai.com/docs/api-reference/chat/object#chat/object-choices. Of those five, two are normalized; three fall through verbatim. Anthropic's Messages API documents five canonical stop_reason values — `end_turn`, `max_tokens`, `stop_sequence`, `tool_use`, `pause_turn` — at https://docs.anthropic.com/en/api/messages, plus `refusal` for safety stops on the 2025+ models. The mapping between the two vocabularies is well-defined and 1:1 for every observable behavior:
+
+| OpenAI | Anthropic equivalent | Behavior |
+|---|---|---|
+| `stop` | `end_turn` | normal model stop ✅ mapped |
+| `tool_calls` | `tool_use` | function/tool invocation ✅ mapped |
+| `length` | `max_tokens` | output truncated by `max_tokens` ❌ unmapped |
+| `content_filter` | `refusal` | safety/policy stop ❌ unmapped |
+| `function_call` | `tool_use` | legacy single-tool path (Azure/DeepSeek shims still emit) ❌ unmapped |
+
+Three of five fall through. `cd rust && grep -rn 'normalize_finish_reason' --include='*.rs'` returns three call sites: the streaming aggregator at `openai_compat.rs:536` (sets `self.stop_reason = Some(normalize_finish_reason(&finish_reason))` which becomes the `MessageDelta.stop_reason` on the synthesized `message_delta` event at `openai_compat.rs:588-591`), the non-streaming response builder at `openai_compat.rs:1202-1204` (sets `MessageResponse.stop_reason = choice.finish_reason.map(|value| normalize_finish_reason(&value))`), and the unit test at `openai_compat.rs:1635-1638` which only exercises the two mapped arms. Test coverage for `length`, `content_filter`, `function_call` is zero across the workspace: `cd rust && grep -rn 'normalize_finish_reason.*length\|normalize_finish_reason.*content_filter\|normalize_finish_reason.*function_call' --include='*.rs'` returns zero hits.
+
+**(2) `MessageResponse.stop_reason` is a stringly-typed free-text field with no consumer validation.** `rust/crates/api/src/types.rs:121-136`:
+
+```rust
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MessageResponse {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub role: String,
+    pub content: Vec<OutputContentBlock>,
+    pub model: String,
+    pub stop_reason: Option<String>,
+    pub stop_sequence: Option<String>,
+    pub usage: Usage,
+    #[serde(default)]
+    pub request_id: Option<String>,
+}
+```
+
+No `enum StopReason { EndTurn, MaxTokens, StopSequence, ToolUse, PauseTurn, Refusal }`. No serde tag-and-rename. No validator on construction. The string lands in `MessageResponse.stop_reason` as whatever `normalize_finish_reason` returned, which for OpenAI `length` is the literal string `"length"`. Same for the streaming `MessageDelta.stop_reason` field at `api/types.rs:223`. `cd rust && grep -rn 'enum StopReason\|StopReason::' --include='*.rs'` returns zero hits — there is no typed taxonomy anywhere in the workspace, only freeform strings flowing across the message/usage/event boundaries.
+
+**(3) `WorkerRegistry::observe_completion` reads the field with two literal string compares.** `rust/crates/runtime/src/worker_boot.rs:558-608`:
+
+```rust
+pub fn observe_completion(
+    &self,
+    worker_id: &str,
+    finish_reason: &str,
+    tokens_output: u64,
+) -> Result<Worker, String> {
+    let mut inner = self.inner.lock().expect("worker registry lock poisoned");
+    let worker = inner.workers.get_mut(worker_id).ok_or_else(|| format!("worker not found: {worker_id}"))?;
+
+    let is_provider_failure =
+        (finish_reason == "unknown" && tokens_output == 0) || finish_reason == "error";
+
+    if is_provider_failure {
+        let message = if finish_reason == "unknown" && tokens_output == 0 {
+            "session completed with finish='unknown' and zero output — provider degraded or context exhausted".to_string()
+        } else {
+            format!("session failed with finish='{finish_reason}' — provider error")
+        };
+        worker.last_error = Some(WorkerFailure { kind: WorkerFailureKind::Provider, message, created_at: now_secs() });
+        worker.status = WorkerStatus::Failed;
+        // ...
+    } else {
+        worker.status = WorkerStatus::Finished;
+        worker.prompt_in_flight = false;
+        worker.last_error = None;
+        push_event(
+            worker,
+            WorkerEventKind::Finished,
+            WorkerStatus::Finished,
+            Some(format!("session completed: finish='{finish_reason}', tokens={tokens_output}")),
+            None,
+        );
+    }
+
+    Ok(worker.clone())
+}
+```
+
+Failure detection is two literal compares: `"unknown"` (with zero output guard) and `"error"`. Neither `"length"` nor `"content_filter"` matches either, so OpenAI truncation and policy refusals fall through into the success path: `WorkerStatus::Finished`, `last_error = None`, `WorkerEventKind::Finished` event emitted with the message `"session completed: finish='length', tokens=N"` or `"session completed: finish='content_filter', tokens=N"`. No retry, no pause-turn continuation, no refusal-policy escalation, no metric, no event differentiation. The next prompt for this worker is dispatched against an assistant turn that the model believes is incomplete (truncation) or that the provider believes is policy-blocked (refusal), with no surface for any operator policy to intervene.
+
+**(4) The Anthropic native path produces the canonical taxonomy correctly.** `rust/crates/api/src/sse.rs:189-203` has a `message_delta` parser test that sets `stop_reason: Some("tool_use".to_string())` directly from the wire, and `sse.rs:312-323` sets `stop_reason: Some("end_turn".to_string())` the same way; mock-anthropic-service emits `"max_tokens"` and `"end_turn"` and `"tool_use"` natively as documented (mock-anthropic-service/src/lib.rs:678-1029 — eight occurrences). The Anthropic path round-trips Anthropic's vocabulary cleanly because the wire format is already in that vocabulary; the OpenAI-compat path is the sole producer of mistranslated `stop_reason` values across the entire codebase.
+
+**(5) The legacy `function_call` finish reason is still emitted by ecosystem-relevant providers in 2026.** Azure OpenAI's older deployments, DeepSeek's compat layer prior to 2025-08, and several SiliconFlow / OpenRouter relay backends still echo `function_call` instead of `tool_calls` for assistant turns that invoke a single function (the deprecated single-call shape). On those wires claw receives `finish_reason: "function_call"`, `normalize_finish_reason` returns it verbatim, and the streaming aggregator's branch at `openai_compat.rs:537` (`if finish_reason == "tool_calls" { /* close tool-call blocks */ }`) does not fire — so the tool-call ContentBlockStop events are not emitted for function_call finishes, and the assistant turn ends without closing the synthesized tool-use block. This is a second-order bug stacked on top of the primary mistranslation: the same fallthrough that breaks the worker classifier also breaks the streaming block lifecycle on legacy-shape providers.
+
+**(6) Cluster-shape kinship.** Same family as #211 (the wire-format-parity cluster): claw and the wire format disagree on a documented field. But the failure mode is novel inside the cluster: prior members were either request-side absence (#211 max_completion_tokens, #212 parallel_tool_calls), response-side absence (#207 cached_tokens, #213 cached_tokens openai-compat path, #214 reasoning_content), header-drop (#215 Retry-After), or three-dimensional structural absence (#216 service_tier + system_fingerprint). #217 is **classifier leakage**: the wire field is read, partially normalized, and the unmapped subset bleeds into a runtime classifier that then misclassifies provider failures as session successes. This is a different shape — the field is present at every layer (deserialized, stored, propagated, consumed) and the bug is purely the translation table being incomplete by 60%.
+
+**Reproduction sketch:**
+
+```rust
+// Test 1: length finish_reason should map to max_tokens, not pass through.
+#[test]
+fn normalize_finish_reason_maps_length_to_max_tokens() {
+    assert_eq!(normalize_finish_reason("length"), "max_tokens");
+}
+
+// Test 2: content_filter should map to refusal, not pass through.
+#[test]
+fn normalize_finish_reason_maps_content_filter_to_refusal() {
+    assert_eq!(normalize_finish_reason("content_filter"), "refusal");
+}
+
+// Test 3: legacy function_call should map to tool_use.
+#[test]
+fn normalize_finish_reason_maps_function_call_to_tool_use() {
+    assert_eq!(normalize_finish_reason("function_call"), "tool_use");
+}
+
+// Test 4: end-to-end — OpenAI truncation should land as Anthropic max_tokens.
+#[tokio::test]
+async fn openai_compat_truncated_response_surfaces_as_max_tokens() {
+    let body = json!({
+        "id": "chatcmpl-1",
+        "model": "gpt-5",
+        "choices": [{
+            "message": {"role": "assistant", "content": "hello wor"},
+            "finish_reason": "length"  // model hit max_tokens
+        }],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 64}
+    });
+    let response = client.send_message_with_response_body(&request, body).await.unwrap();
+    // currently: response.stop_reason == Some("length".to_string()) — bug
+    // expected: response.stop_reason == Some("max_tokens".to_string())
+    assert_eq!(response.stop_reason.as_deref(), Some("max_tokens"));
+}
+
+// Test 5: refusal should not be classified as success.
+#[tokio::test]
+async fn worker_classifier_treats_refusal_as_provider_failure() {
+    let registry = WorkerRegistry::new();
+    let id = registry.spawn("w1").unwrap().id;
+    // Simulate the value that flows through normalize_finish_reason today.
+    let worker = registry.observe_completion(&id, "content_filter", 12).unwrap();
+    // currently: WorkerStatus::Finished — bug, refusal is classified as success.
+    // expected: WorkerStatus::Failed with WorkerFailureKind::Provider/Policy.
+    assert_eq!(worker.status, WorkerStatus::Failed);
+}
+```
+
+**Fix shape (not implemented in this cycle, recorded for cluster refactor):**
+
+The minimal fix is a four-touch change: (a) replace `normalize_finish_reason` (openai_compat.rs:1389) with a complete five-arm match: `"stop" => "end_turn"`, `"tool_calls" | "function_call" => "tool_use"`, `"length" => "max_tokens"`, `"content_filter" => "refusal"`, plus an `other => { tracing::warn!(unmapped_finish_reason = other); other.to_string() }` warn-on-unknown branch so future OpenAI-spec additions surface as observability events instead of as silent passthroughs; (b) add a `pub enum StopReason { EndTurn, MaxTokens, StopSequence, ToolUse, PauseTurn, Refusal }` to `rust/crates/api/src/types.rs` with `serde(rename_all = "snake_case")` and migrate `MessageResponse.stop_reason` from `Option<String>` to `Option<StopReason>` with a custom `Deserialize` impl that maps unknown strings to a new `StopReason::Unknown(String)` variant; (c) replace the two-string-compare classifier in `WorkerRegistry::observe_completion` (worker_boot.rs:558-608) with an exhaustive `match StopReason` that routes `MaxTokens`/`Refusal`/`Unknown` to specific `WorkerFailureKind` variants (`Truncated`, `Refused`, `Provider`) instead of conflating all three under a string fallthrough; (d) add `WorkerFailureKind::Truncated` and `WorkerFailureKind::Refused` variants and propagate them up through the `WorkerEvent` taxonomy so claws can render distinct UX (truncation = retry with continuation, refusal = escalate to user, provider error = recovery recipe). Estimate: ~80 LOC production + ~150 LOC test (covering all five OpenAI finish reasons × two providers × streaming/non-streaming × worker classifier).
+
+The deeper fix is to declare a typed wire-vocabulary boundary at the provider edge: every wire enum (finish_reason, stop_reason, tool_choice variant, role, content type) should land as a typed Rust enum at the deserialize layer, not as a string that flows three layers deep before someone string-compares it. This collapses the silent-mistranslation surface across the cluster (#211 max_tokens key name, #212 tool-choice modifier, #214 reasoning-content delta type, #217 finish_reason vocabulary) into a single "wire vocabularies are typed at the boundary" architectural rule, and gives the runtime worker classifier exhaustive-match coverage by construction. This closes #217 cleanly and turns the wire-format-parity cluster from "seven independent partial-mapping bugs" into one composable rule with compiler-enforced exhaustiveness.
+
+**Status:** Open. No code changed. Filed 2026-04-25 23:30 KST. Branch: feat/jobdori-168c-emission-routing. HEAD: ceb092a. Sibling-shape cluster (silent-fallback / silent-drop / silent-strip / silent-misnomer / silent-shadow / silent-prefix-mismatch / structural-absence / silent-zero-coercion / silent-content-discard / silent-header-discard / silent-tier-absence / silent-finish-mistranslation at provider/CLI boundary): #201/#202/#203/#206/#207/#208/#209/#210/#211/#212/#213/#214/#215/#216/#217 — sixteen pinpoints. Wire-format-parity cluster: #211 (max_completion_tokens) + #212 (parallel_tool_calls) + #213 (cached_tokens) + #214 (reasoning_content) + #215 (Retry-After) + #216 (service_tier + system_fingerprint) + #217 (finish_reason taxonomy) — seven pinpoints, every member is "claw and the wire format disagree on a documented field." Classifier-leakage shape: response-side string mistranslation that flows three layers deep into a runtime classifier that misclassifies provider failures as session successes, distinct from prior structural-absence members. External validation: OpenAI Chat Completions API reference (https://platform.openai.com/docs/api-reference/chat/object — `finish_reason` documented as one of `stop` / `length` / `tool_calls` / `content_filter` / `function_call`), Anthropic Messages API reference (https://docs.anthropic.com/en/api/messages — `stop_reason` documented as one of `end_turn` / `max_tokens` / `stop_sequence` / `tool_use` / `pause_turn`, plus `refusal` on 2025+ models), OpenAI deprecation notice for `function_call` (https://platform.openai.com/docs/api-reference/chat/create#chat-create-function_call — deprecated in favor of `tool_calls`/`tool_choice`, but still emitted as `finish_reason: "function_call"` by older deployments and several compat shims), Azure OpenAI Chat Completions reference (https://learn.microsoft.com/en-us/azure/ai-services/openai/reference — confirms `function_call` still emitted by deployment versions ≤ 2024-02-15-preview), DeepSeek API reference (https://api-docs.deepseek.com/api/create-chat-completion — emits all five OpenAI finish reasons), Moonshot kimi API reference (https://platform.moonshot.cn/docs/api/chat — emits `length` and `content_filter` with documented identical semantics to OpenAI), Alibaba DashScope API reference (https://help.aliyun.com/zh/model-studio/use-qwen-by-calling-api — emits `length` for max-token truncation), anomalyco/opencode#19842 (active issue tracking finish_reason='length' silently treated as success in worker classifier — exact same bug shape, same cluster, in a sibling project), charmbracelet/crush (handles `length`/`content_filter` distinctly via typed enum at the wire boundary), simonw/llm (typed Reason enum with `Stop`/`Length`/`ContentFilter`/`ToolCall` variants, exhaustive match at consumer), Vercel AI SDK `FinishReason` typed union with seven variants including `length` and `content-filter`, LangChain `BaseChatModel.generate` runs through `_create_chat_result` which preserves all five OpenAI finish_reasons and routes content_filter to a separate `LengthFinishReasonError` / `ContentFilterFinishReasonError` exception path, semantic-kernel `ChatCompletion.FinishReason` enum, OpenAI Python SDK `ChatCompletion.choices[0].finish_reason: Literal['stop','length','tool_calls','content_filter','function_call']` (typed at the SDK boundary), OpenTelemetry GenAI semantic conventions (https://opentelemetry.io/docs/specs/semconv/gen-ai/gen-ai-spans/ — `gen_ai.response.finish_reasons` is a typed array attribute with the same five-value vocabulary, meaning every observability backend in the OpenAI ecosystem treats this as a structured enum) — claw is the sole client/agent/SDK in the surveyed ecosystem that drops three of five OpenAI finish reasons through a string fallthrough into a stringly-typed Rust field that is then read by a runtime classifier with two-literal-compare coverage. The fix shape is well-understood, the typed enum exists in every peer codebase, and the bug is a 4-line patch in the normalizer plus a 30-line refactor of the classifier — but it requires the typed-enum-at-the-wire-boundary architectural rule from the deeper-fix section to land cleanly, otherwise it is just another partial mapping bug waiting for the next OpenAI spec addition.
 
 🪨
