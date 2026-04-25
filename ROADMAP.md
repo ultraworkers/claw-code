@@ -12419,3 +12419,45 @@ grep -rE 'kind:.*=' src/ | grep -v test | wc -l
 **Status:** Open. No code changed. Filed 2026-04-25 07:47 KST. Branch: feat/jobdori-168c-emission-routing. HEAD: 0730183.
 
 🪨
+
+---
+
+## Pinpoint #204 — `TokenUsage` omits `reasoning_tokens`: reasoning models silently merge reasoning tokens into `output_tokens`, breaking cost estimation parity (Jobdori, cycle #336 / anomalyco/opencode #24233 parity gap)
+
+**Observed:** `rust/crates/runtime/src/usage.rs` defines `TokenUsage` with four fields: `input_tokens`, `output_tokens`, `cache_creation_input_tokens`, `cache_read_input_tokens`. There is no `reasoning_tokens` field. `grep -rn "reasoning_tokens" rust/crates/` returns zero results. When reasoning models (OpenAI o3/o4-mini, xAI grok-3-mini, Alibaba QwQ/Qwen3-Thinking) are used, the chain-of-thought / reasoning tokens are indistinguishably merged into `output_tokens`.
+
+**Gap:**
+- Provider APIs (OpenAI, Anthropic, xAI) return separate `reasoning_tokens` counts in their usage responses for reasoning models
+- claw-code's `TokenUsage` struct discards this information — it is never parsed, stored, or surfaced
+- `UsageCostEstimate` (also in `usage.rs`) prices `output_tokens` at a flat rate (`DEFAULT_OUTPUT_COST_PER_MILLION: f64 = 75.0`). Reasoning tokens are typically priced differently from regular completion tokens (often cheaper or differently tiered)
+- Cost estimates for reasoning-model sessions are therefore materially inaccurate
+- anomalyco/opencode PR #24233 (`fix(provider): honor per-model reasoning token pricing`) exists to fix exactly this in the reference implementation; claw-code has the same gap with no tracking field
+- `claw doctor` cannot report "this session used X reasoning tokens" or price them separately
+
+**Repro:**
+```
+# Run a session with o3 or grok-3-mini
+# Provider response includes usage.reasoning_tokens = 5000, completion_tokens = 500
+# claw-code TokenUsage records: input_tokens=..., output_tokens=5500 (merged)
+# UsageCostEstimate prices all 5500 at $75/million regular output rate
+# Actual cost should be: 500 reasoning tokens @ reasoning_rate + 5000 output @ output_rate
+```
+
+**Expected:**
+- `TokenUsage` includes `reasoning_tokens: u32`
+- Provider response parsing extracts `reasoning_tokens` when present (OpenAI `usage.completion_tokens_details.reasoning_tokens`, Anthropic `usage.output_tokens` breakdown, etc.)
+- `UsageCostEstimate` includes `reasoning_cost_usd` priced via per-model `reasoning_cost_per_million`
+- `claw doctor` surfaces reasoning token counts and their cost contribution
+- Event taxonomy includes `reasoning_tokens` field
+
+**Fix sketch:**
+1. Add `reasoning_tokens: u32` to `TokenUsage` struct (with backward-compatible default 0)
+2. Update provider response parsers (OpenAI-compat, Anthropic, xAI) to extract reasoning token counts from provider-specific usage fields
+3. Add `reasoning_cost_per_million: f64` to `ModelPricing` with per-model defaults
+4. Update `UsageCostEstimate` to include `reasoning_cost_usd` and `total_cost_usd()` to sum it
+5. Update `usage_to_json` / `usage_from_json` to serialize/deserialize `reasoning_tokens`
+6. Add to classifier event taxonomy and `claw doctor` output
+
+**Status:** Open. No code changed. Filed 2026-04-25 12:00 KST. Branch: feat/jobdori-168c-emission-routing. Parity gap with anomalyco/opencode #24233.
+
+🪨
