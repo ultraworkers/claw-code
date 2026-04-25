@@ -14413,3 +14413,153 @@ The deeper fix is a unified `RateLimitContext` struct on `ApiError::Api` that co
 **Status:** Open. No code changed. Filed 2026-04-25 22:40 KST. Branch: feat/jobdori-168c-emission-routing. HEAD: 959bdf8. Sibling-shape cluster (silent-fallback / silent-drop / silent-strip / silent-misnomer / silent-shadow / silent-prefix-mismatch / structural-absence / silent-zero-coercion / silent-content-discard / silent-header-discard at provider/CLI boundary): #201/#202/#203/#206/#207/#208/#209/#210/#211/#212/#213/#214/#215 — fourteen pinpoints. Upstream-contract-honoring trio (the wire-protocol-as-input dimension that #214 left half-covered): #211 (max_completion_tokens — claw chooses the wrong request param) + #213 (cached_tokens — claw drops upstream-counted cache hits) + #215 (Retry-After — claw ignores upstream-specified wait) — three pinpoints, all "upstream told us; claw was not listening." Wire-format-parity cluster: #211 + #212 + #213 + #214 + #215. External validation: Anthropic rate-limits docs (https://platform.claude.com/docs/en/api/rate-limits — `Retry-After` is the documented mechanism), OpenAI cookbook on rate limits (https://developers.openai.com/cookbook/examples/how_to_handle_rate_limits — `Retry-After` is the documented mechanism), DeepSeek rate-limit docs (https://api-docs.deepseek.com/quick_start/rate_limit), RFC 7231 §7.1.3 (the canonical wire spec for the header — both delta-seconds and HTTP-date), openai-python SDK (parses `retry-after-ms` + `Retry-After` natively — https://github.com/openai/openai-python/issues/957), Vercel AI SDK `LanguageModelV1RateLimit.retryAfter` (v3.4+), LangChain `BaseChatOpenAI` retry-after handling, anomalyco/opencode#16993/#16994/#9091/#17583 (active issue cluster — same gap reported and partially fixed in the upstream peer; opencode#11705 specifically calls out hanging on 429), charmbracelet/crush retry-after honoring, simonw/llm rate-limit handling, LiteLLM `Router.retry_after_strategy`, semantic-kernel Azure-OpenAI retry policy, alexwlchan/handling-http-429-with-tenacity (canonical Python pattern) — same control surface available across the entire ecosystem, absent only in claw-code at three structural layers (wire-read, error-shape, scheduler-input) simultaneously.
 
 🪨
+
+## Pinpoint #216 — Neither `MessageRequest` nor `MessageResponse` has any `service_tier` field; `build_chat_completion_request` (openai_compat.rs:845) writes thirteen optional fields to the wire payload (model, max_tokens/max_completion_tokens, messages, stream, stream_options, tools, tool_choice, temperature, top_p, frequency_penalty, presence_penalty, stop, reasoning_effort) and does not write `service_tier`; the Anthropic side serializes only the same `MessageRequest` struct via `AnthropicRequestProfile::render_json_body` (telemetry/lib.rs:107) which has no field for it either; `OpenAiUsage` (openai_compat.rs:709) and `MessageResponse` (api/types.rs:121) deserialize `id/model/choices/usage` and `id/kind/role/content/model/stop_reason/stop_sequence/usage/request_id` respectively, dropping the upstream-echoed `service_tier` confirmation and the `system_fingerprint` reproducibility marker that OpenAI documents as the canonical "what backend actually served you" signal — claw cannot opt into OpenAI flex tier (~50% cheaper, documented at developers.openai.com/api/docs/guides/flex-processing), cannot opt into OpenAI priority tier (~1.5-2x premium for SLA latency, developers.openai.com/api/docs/guides/priority-processing), cannot opt into Anthropic priority tier (`service_tier: "auto" | "standard_only"`, platform.claude.com/docs/en/api/service-tiers), and cannot detect at the response layer whether a request was downgraded to Standard, served under flex, or hit a different backend snapshot than a previous run with the same `seed` (Jobdori, cycle #368 / extends #168c emission-routing audit / sibling-shape cluster grows to fifteen / wire-format-parity cluster grows to six)
+
+**Observed:** Three structural absences in one shape — request-side write, response-side read, response-side reproducibility marker — across both providers symmetrically.
+
+**(1) `MessageRequest` request-side absence.** In `rust/crates/api/src/types.rs:6-34` the entire wire-input surface is:
+
+```rust
+pub struct MessageRequest {
+    pub model: String,
+    pub max_tokens: u32,
+    pub messages: Vec<InputMessage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub system: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<ToolDefinition>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<ToolChoice>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frequency_penalty: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub presence_penalty: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+}
+```
+
+There is no `service_tier: Option<String>` (or strongly-typed `ServiceTier` enum). `cd rust && grep -rn "service_tier\|ServiceTier" --include="*.rs"` returns zero hits across the entire workspace.
+
+**(2) `build_chat_completion_request` does not write the field.** In `rust/crates/api/src/providers/openai_compat.rs:845-928` the wire payload is constructed, then incrementally extended for each optional field that the request struct exposes:
+
+```rust
+let mut payload = json!({
+    "model": wire_model,
+    max_tokens_key: request.max_tokens,
+    "messages": messages,
+    "stream": request.stream,
+});
+
+if request.stream && should_request_stream_usage(config) {
+    payload["stream_options"] = json!({ "include_usage": true });
+}
+
+if let Some(tools) = &request.tools { /* write tools */ }
+if let Some(tool_choice) = &request.tool_choice { /* write tool_choice */ }
+
+if !is_reasoning_model(&request.model) {
+    if let Some(temperature)        = request.temperature        { payload["temperature"]        = json!(temperature); }
+    if let Some(top_p)              = request.top_p              { payload["top_p"]              = json!(top_p); }
+    if let Some(frequency_penalty)  = request.frequency_penalty  { payload["frequency_penalty"]  = json!(frequency_penalty); }
+    if let Some(presence_penalty)   = request.presence_penalty   { payload["presence_penalty"]   = json!(presence_penalty); }
+}
+if let Some(stop) = &request.stop { /* write stop */ }
+if let Some(effort) = &request.reasoning_effort { payload["reasoning_effort"] = json!(effort); }
+
+payload
+```
+
+Thirteen distinct write sites for thirteen distinct OpenAI tuning parameters; zero write site for `service_tier`. The function is `pub fn` — exercised directly by `bench/openai_compat_chat_request.rs` and indirectly by every send path in `OpenAiCompatClient`. If a caller wanted flex-tier processing for an asynchronous batch agent (the textbook flex-tier use case — non-interactive code review, plan generation, summary compaction — exactly what claw runs), there is no field on `MessageRequest` to set, no place in the builder to write it, and no env-var or config knob anywhere downstream. Even hand-mutating the returned `Value` outside the function does not help: every send path in `OpenAiCompatClient::send_with_retry` calls `build_chat_completion_request` itself and uses the returned payload directly with no caller-injection hook between build and send.
+
+**(3) Anthropic side: same absence, same root cause.** `AnthropicClient::send_raw_request` (rust/crates/api/src/providers/anthropic.rs:466-475) renders the body via `self.request_profile.render_json_body(request)`, which `serde_json::to_value`s the same `MessageRequest` struct from (1) and then merges in `extra_body` from `AnthropicRequestProfile::extra_body` (telemetry/lib.rs:60). The `extra_body` merge (telemetry/lib.rs:114-116) is per-client, not per-request — set once on the profile and applied to every outbound message. Anthropic's documented `service_tier: "auto" | "standard_only"` (platform.claude.com/docs/en/api/service-tiers) cannot be set per-call without constructing a fresh `AnthropicClient` for every request whose tier policy differs, which the runtime's session-pinned client architecture does not contemplate. There is also no helper symmetric to OpenAI's `with_extra_body_param` on `OpenAiCompatClient` (anthropic.rs:233-235 has `with_extra_body_param`; openai_compat.rs has zero hits for `extra_body` — `cd rust && grep -rn "extra_body" --include="*.rs"` returns four hits, all in the Anthropic provider and the telemetry crate). The escape hatch is asymmetric across the two providers, and even on the Anthropic side it is per-client not per-request.
+
+**(4) Response-side: `service_tier` echo and `system_fingerprint` are both dropped at deserialize time.** OpenAI documents that the response body echoes the actual tier that served the request (so a request submitted with `service_tier: "auto"` returns `service_tier: "default" | "flex" | "scale" | "priority"` indicating which one was used), and OpenAI emits a `system_fingerprint` string identifying the backend snapshot (developers.openai.com/api/docs/guides/advanced-usage — paired with `seed` for determinism debugging). In `rust/crates/api/src/providers/openai_compat.rs:672-679` the entire response shape claw deserializes is:
+
+```rust
+#[derive(Debug, Deserialize)]
+struct ChatCompletionResponse {
+    id: String,
+    model: String,
+    choices: Vec<ChatChoice>,
+    #[serde(default)]
+    usage: Option<OpenAiUsage>,
+}
+```
+
+Four fields. `service_tier` and `system_fingerprint` are absent from the struct, so serde discards them at parse time before any caller can observe them. Same drop for streaming: `ChatCompletionChunk` (openai_compat.rs:719-728) reads `id/model/choices/usage` only. The unified `MessageResponse` (rust/crates/api/src/types.rs:121-136) that both providers populate has nine fields (`id/kind/role/content/model/stop_reason/stop_sequence/usage/request_id`) and zero of them are tier-policy or backend-identity fields. The Anthropic native parser at `anthropic.rs:986+` has the same gap: `service_tier` echo on the message-stop event (Anthropic emits it as part of the final usage block) is silently absent from the destination type.
+
+**(5) Cluster-shape kinship.** This is the same kinship signature as #211 (max_completion_tokens: claw chose the wrong wire param) + #212 (parallel_tool_calls / disable_parallel_tool_use: claw could not express either) + #213 (cached_tokens: claw discarded a wire-counted field at deserialize) + #214 (reasoning_content: claw discarded a wire-streamed field at deserialize) + #215 (Retry-After: claw discarded a wire header at the failure path). Each member is one of: claw cannot ask for X (request-side absence), claw cannot hear X (response-side absence at deserialize), claw cannot honor X (header/contract drop at the failure path). #216 is all three at once, on both providers, for the same canonical wire field — request-side absence for the input, response-side absence for the echo, response-side absence for the reproducibility marker. The 1.5-3x cost-pricing-tier delta (flex → standard → priority) directly compounds the cost-parity cluster (#204 + #207 + #209 + #210 + #213): even after fixing every cache-hit and pricing-table gap in that cluster, claw still bills sessions at standard-tier pricing with no opt-in to flex's ~50% discount and no opt-out from accidental priority-tier surprise upgrades that could 2x bill a misconfigured prod deployment.
+
+**Reproduction sketch:**
+
+```rust
+// Test that flex-tier flag round-trips into the wire payload — currently impossible
+// to write because MessageRequest has no field for it.
+#[test]
+fn openai_compat_request_can_request_flex_tier() {
+    let request = MessageRequest {
+        model: "gpt-5".to_string(),
+        max_tokens: 256,
+        messages: vec![InputMessage::user_text("hello")],
+        // currently: cannot set service_tier: "flex" — field does not exist
+        // expected: service_tier: Some(ServiceTier::Flex)
+        ..MessageRequest::default()
+    };
+    let payload = build_chat_completion_request(&request, openai_config());
+    // currently: payload.get("service_tier") is None — bug
+    // expected: payload["service_tier"] == "flex"
+    assert_eq!(payload.get("service_tier").and_then(|v| v.as_str()), Some("flex"));
+}
+
+// Test that response service_tier echo round-trips — currently impossible to read.
+#[tokio::test]
+async fn openai_compat_response_surfaces_service_tier_echo() {
+    let body = json!({
+        "id": "chatcmpl-1",
+        "model": "gpt-5",
+        "service_tier": "default",       // "auto" got served by default
+        "system_fingerprint": "fp_abc",
+        "choices": [{ "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop" }],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+    });
+    let mock = mock_server::respond_with_json(StatusCode::OK, body);
+    let response = client.send_message(&request).await.unwrap();
+    // currently: response.service_tier() does not exist — bug
+    // expected: response.service_tier() == Some(ServiceTier::Default)
+    assert_eq!(response.service_tier(), Some(ServiceTier::Default));
+    assert_eq!(response.system_fingerprint(), Some("fp_abc"));
+}
+
+// Test that an unsolicited tier upgrade is observable — currently impossible.
+#[tokio::test]
+async fn unsolicited_priority_upgrade_emits_event() {
+    // Request submitted with service_tier omitted; OpenAI echoes "priority" anyway
+    // (project-level default override). Claw should emit StreamEvent::ServiceTierServed
+    // so a 2x cost surprise cannot land silently.
+    let body = json!({ /* ... service_tier: "priority" ... */ });
+    let events = collect_stream_events(client, request, body).await;
+    let tier_events: Vec<_> = events.iter().filter(|e| matches!(e, StreamEvent::ServiceTierServed { .. })).collect();
+    assert_eq!(tier_events.len(), 1);
+    // currently: 0 events — bug
+}
+```
+
+**Fix shape (not implemented in this cycle, recorded for cluster refactor):**
+
+The minimal fix is a six-touch change: (a) add `pub service_tier: Option<ServiceTier>` to `MessageRequest` in `rust/crates/api/src/types.rs:6-34`, where `ServiceTier` is a typed `enum { Auto, Default, Flex, Priority, Scale, StandardOnly }` (the union of OpenAI's documented values and Anthropic's `auto`/`standard_only`) with `serde(rename_all = "snake_case", skip_serializing_if = "Option::is_none")`; (b) extend `build_chat_completion_request` (openai_compat.rs:845) with a single `if let Some(tier) = &request.service_tier { payload["service_tier"] = json!(tier); }` block, validated by `is_service_tier_supported(wire_model)` so unsupported model families silently strip the field with a `StreamEvent::ServiceTierStripped { model, tier, reason }` emission for visibility (sibling to the silent-strip pattern called out in #208 / #211 / #214); (c) populate the request body on the Anthropic path by adding the same per-request field — `render_json_body` already serializes whatever `MessageRequest` declares, so this is zero code in the telemetry crate, just a model-eligibility check at `AnthropicClient::send_raw_request` that strips the field before send for non-priority-eligible Anthropic models; (d) add `service_tier: Option<ServiceTier>` and `system_fingerprint: Option<String>` to `MessageResponse` in `types.rs:121` and to the wire deserialize structs `ChatCompletionResponse` (openai_compat.rs:672) and `ChatCompletionChunk` (openai_compat.rs:719) plus the Anthropic native parser at `anthropic.rs:986+`; (e) populate them through both `chat_completion_to_message_response` and the streaming aggregator so all four send paths surface the echo; (f) emit `StreamEvent::ServiceTierServed { requested: Option<ServiceTier>, served: Option<ServiceTier>, system_fingerprint: Option<String> }` after every request so claws can render an honest "you asked for X, you got Y" panel and detect silent project-level upgrades that would otherwise show up only as bill shock at month-end. Estimate: ~120 LOC production + ~180 LOC test (httpmock or wiremock-rs based, both providers, both streaming and non-streaming).
+
+The deeper fix is to lift `service_tier` out of the per-request "tuning parameter" cluster and into a first-class `RequestPolicy` struct on `MessageRequest` alongside the `RetryPolicy` from #215 and a future `RateLimitPolicy` honoring the wire `Retry-After` and `x-ratelimit-*` headers. Then a cluster-wide `WirePolicyEvent` taxonomy (`ServiceTierServed`, `RetryAfterReceived`, `ParallelToolCallsCapped`, `ReasoningContentStreamed`, `MaxTokensClamped`) gives claws a single subscriber-side surface for every wire-protocol-as-input/output dimension that the silent-fallback / silent-drop / silent-strip cluster has now identified across fifteen pinpoints. This closes #216 cleanly and turns the wire-format-parity cluster (#211 + #212 + #213 + #214 + #215 + #216) into one composable policy plane rather than six independent struct-field battles.
+
+**Status:** Open. No code changed. Filed 2026-04-25 23:00 KST. Branch: feat/jobdori-168c-emission-routing. HEAD: 2da1211. Sibling-shape cluster (silent-fallback / silent-drop / silent-strip / silent-misnomer / silent-shadow / silent-prefix-mismatch / structural-absence / silent-zero-coercion / silent-content-discard / silent-header-discard / silent-tier-absence at provider/CLI boundary): #201/#202/#203/#206/#207/#208/#209/#210/#211/#212/#213/#214/#215/#216 — fifteen pinpoints. Wire-format-parity cluster: #211 (max_completion_tokens) + #212 (parallel_tool_calls) + #213 (cached_tokens) + #214 (reasoning_content) + #215 (Retry-After) + #216 (service_tier + system_fingerprint) — six pinpoints, every member is "claw and the wire format disagree on a documented field." Cost-parity cluster grows by direct adjacency: #204 + #207 + #209 + #210 + #213 + #216 — six pinpoints, all "claw bills the wrong number." Three-dimensional structural absence (request-side write + response-side read + reproducibility marker) is itself a new shape inside the cluster, distinct from the prior "request-side only" (#211, #212), "response-side only" (#207, #213, #214), and "header-only" (#215) members. External validation: OpenAI flex processing guide (https://developers.openai.com/api/docs/guides/flex-processing — `service_tier: "flex"` opts into ~50% cheaper async batch processing with possible Resource Unavailable errors), OpenAI priority processing guide (https://developers.openai.com/api/docs/guides/priority-processing — `service_tier: "priority"` opts into 1.5-2x premium with SLA-grade latency), OpenAI scale tier (https://openai.com/api-scale-tier/ — committed-capacity model snapshot with 99.9% uptime SLA), OpenAI advanced usage / system_fingerprint guide (https://developers.openai.com/api/docs/guides/advanced-usage — fingerprint paired with `seed` is the canonical determinism-debugging mechanism), Anthropic service tiers reference (https://platform.claude.com/docs/en/api/service-tiers — `auto` / `standard_only` documented, capacity-managed Priority Tier requires sales contact), OpenTelemetry GenAI semantic conventions (https://opentelemetry.io/docs/specs/semconv/registry/attributes/openai/ — `gen_ai.openai.request.service_tier` and `gen_ai.openai.response.service_tier` and `gen_ai.openai.response.system_fingerprint` are first-class observability attributes in the public spec, meaning every other agent/client in the OpenAI ecosystem propagates these for tracing), anomalyco/opencode#12297 (active feature request to add `serviceTier: "flex"` to the OpenAI-compatible chat provider options schema and propagate as `service_tier` in the chat request body — exact same gap as claw, identical wire-format symptom, identical fix shape, but only in one provider), Vercel AI SDK `serviceTier` provider option (v3.x — supported per-request on the OpenAI provider), LangChain ChatOpenAI `service_tier` constructor parameter, LiteLLM `service_tier` request param pass-through, semantic-kernel `OpenAIPromptExecutionSettings.ServiceTier`, openai-python SDK `client.chat.completions.create(service_tier="flex", ...)` (first-class kwarg), MiniMax / DeepSeek Anthropic-compat layer notes (https://platform.minimax.io/docs/api-reference/text-anthropic-api — explicitly document that `service_tier` is a wire-recognized field on the Anthropic-shape contract that some compat layers ignore, signaling the field is part of the public contract claws need to observe even when the upstream backend silently drops it), badlogic/pi-mono#1381 (peer-tracker for service-tier propagation in coding agents) — same control surface available across literally every other major LLM client / agent / observability spec in the ecosystem, absent only in claw-code at all four structural layers (request-struct field, request-builder write site, response-struct field, response-deserialize read site) simultaneously across two providers, breaking both cost-control opt-in (flex) and silent-upgrade-detection (priority) and run-reproducibility (system_fingerprint) all in one shape.
+
+🪨
