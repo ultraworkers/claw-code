@@ -12716,3 +12716,163 @@ assert_eq!(usage.completion_tokens, 675); // ok
 **Status:** Open. No code changed. Filed 2026-04-25 18:35 KST. Branch: feat/jobdori-168c-emission-routing. HEAD: 0e9cff5. Sibling/fix-pair: #204 (TokenUsage struct extension). Parity reference: anomalyco/opencode #24233.
 
 🪨
+
+## Pinpoint #208 — Silent request-side param strip on OpenAI-compat path: `build_chat_completion_request` discards 4 tuning params for reasoning models and `translate_message` discards `is_error` for kimi models, both with self-documenting `// silently strip` comments and no event emission (Jobdori, cycle #359 / sibling of #207, completing the silent-drop boundary audit)
+
+**Observed:** `rust/crates/api/src/providers/openai_compat.rs` carries two **outbound** silent-strip sites that mirror the inbound silent-drop pattern just locked in #207. Both have self-incriminating comments in source. Neither emits a structured event when user intent is discarded. Tests assert the strip behavior is *correct*, but no test asserts visibility of the discard.
+
+**Site A — tuning-param strip for reasoning models** (`openai_compat.rs:898-920`):
+
+```rust
+// OpenAI-compatible tuning parameters — only included when explicitly set.
+// Reasoning models (o1/o3/o4/grok-3-mini) reject these params with 400;
+// silently strip them to avoid cryptic provider errors.
+if !is_reasoning_model(&request.model) {
+    if let Some(temperature) = request.temperature {
+        payload["temperature"] = json!(temperature);
+    }
+    if let Some(top_p) = request.top_p {
+        payload["top_p"] = json!(top_p);
+    }
+    if let Some(frequency_penalty) = request.frequency_penalty {
+        payload["frequency_penalty"] = json!(frequency_penalty);
+    }
+    if let Some(presence_penalty) = request.presence_penalty {
+        payload["presence_penalty"] = json!(presence_penalty);
+    }
+}
+```
+
+When `is_reasoning_model(model) == true`, **all four tuning params are silently dropped** from the wire payload. The user explicitly set `temperature: Some(0.7)` on the `MessageRequest`; the provider receives a request with no `temperature` field; the user has no observable signal that their intent was discarded.
+
+`is_reasoning_model` (line 780) matches `o1*`, `o3*`, `o4*`, `grok-3-mini`, `qwen-qwq*`, `qwq*`, and any model containing `thinking`. As reasoning-model adoption climbs, this strip path covers an increasingly large share of traffic — silently.
+
+**Site B — `is_error` strip for kimi models** (`openai_compat.rs:947-1010`, via `model_rejects_is_error_field` at line 935):
+
+```rust
+let supports_is_error = !model_rejects_is_error_field(model);
+// ... later, inside ToolResult translation ...
+if supports_is_error {
+    msg["is_error"] = json!(is_error);
+}
+```
+
+When the model name starts with `kimi`, the `is_error` field is stripped from every tool-result message. The semantic difference between a successful tool call and an erroring one is *erased on the wire*. The provider only sees `{ "role": "tool", "tool_call_id": ..., "content": ... }` with no error signal. Whether the tool errored or succeeded, the request looks identical.
+
+The in-source comment is direct about the producer-side intent ("would cause 400 Bad Request") but says nothing about the consumer-side cost: the model can no longer condition its next turn on tool-error semantics, and any downstream consumer reading the SSE event stream cannot tell what was sent.
+
+**Gap:**
+
+1. **Outbound-side mirror of #207.** #207 documented silent *drop* on the inbound deserialization side (`prompt_tokens_details.cached_tokens`, `completion_tokens_details.reasoning_tokens` parsed off the wire then thrown away). #208 documents silent *strip* on the outbound serialization side (user intent never reaches the wire). The two sides bracket the OpenAI-compat boundary; closing only one half leaves operators with provider-shaped blind spots. With #208 filed, the boundary audit is symmetric.
+
+2. **No structured event when user intent is discarded.** The codebase has zero hits for `param_stripped`, `field_stripped`, `param_dropped`, or `silently_stripped` event names (`grep -rn "param_stripped\|silently_stripped" rust/crates/` returns nothing). `StreamEvent` (`api/src/types.rs:259`) has only six variants — `MessageStart`, `MessageDelta`, `ContentBlockStart`, `ContentBlockDelta`, `ContentBlockStop`, `MessageStop`. No diagnostic taxonomy. A claw inspecting the event stream cannot distinguish "this o1 session got temperature 0.7" (which never happened) from "this o1 session got default sampling" (what actually went on the wire).
+
+3. **Tests assert the strip is correct, never assert visibility.** `reasoning_model_strips_tuning_params` (line 1666) asserts `payload.get("temperature").is_none()` for `o1-mini`. `translate_message_excludes_is_error_for_kimi_models` (line 2004) asserts `tool_msg.get("is_error").is_none()` for `kimi-k2.5`. Both confirm the *removal* is happening but neither asserts that an `unmapped_param` or `param_stripped` event was emitted alongside the removal. The tests bake silence into the contract.
+
+4. **Provider-asymmetric semantics, no taxonomy bridge.** The Anthropic provider (`anthropic.rs`) does not strip these params — Claude accepts `temperature` for all models including reasoning variants, and Anthropic's tool-result API has no `is_error` rejection. So the *same* `MessageRequest` produces a wire request with `temperature` on the Anthropic path and without `temperature` on the OpenAI-compat path for `o1-mini`. Pinpoint #200 already locked the principle that declarative claims must derive from source; the request-building path violates the spirit by silently transforming requests in a way that no schema documents.
+
+5. **`is_error` strip is semantically lossy in a way `temperature` strip is not.** A reasoning model has fixed sampling — stripping `temperature` discards a hint the model would have ignored anyway. A `kimi` tool-result with `is_error: true` carries information the model *would* have used to decide whether to retry the tool, surface the error to the user, or skip downstream tool calls. After strip, that signal is gone. The two sites share a code shape but have very different operator impact; the silent-strip taxonomy must be able to mark this distinction (e.g. severity `info` vs `warn`).
+
+6. **Fragmentation across two helper functions.** The reasoning-model strip lives in `build_chat_completion_request`; the `is_error` strip lives in `translate_message` via `model_rejects_is_error_field`. Future strip rules (e.g. provider-specific `stop` clamping, `max_completion_tokens` rewrites) will accrete in still other places without a shared abstraction. There is no central "silent-strip registry" — each new model quirk adds another silent transformation that no event captures.
+
+7. **No `claw doctor --json` surface.** `claw doctor` cannot report "this session is running on a reasoning model and the following user-set fields will be discarded on every request: temperature, top_p, frequency_penalty, presence_penalty." The operator only finds out by reading the source. For tool-call retry logic in claw orchestration, this opacity makes it impossible to set up correct fallback chains for kimi vs non-kimi.
+
+**Repro:**
+
+```rust
+use claw_code_api::types::MessageRequest;
+use claw_code_api::providers::openai_compat::{
+    build_chat_completion_request, translate_message, OpenAiCompatConfig,
+};
+use claw_code_api::types::{InputContentBlock, InputMessage, ToolResultContentBlock};
+
+// Site A: reasoning model silently drops tuning params
+let req = MessageRequest {
+    model: "o1-mini".to_string(),
+    max_tokens: 1024,
+    temperature: Some(0.7),       // user explicitly sets this
+    top_p: Some(0.9),
+    frequency_penalty: Some(0.5),
+    presence_penalty: Some(0.3),
+    ..Default::default()
+};
+let payload = build_chat_completion_request(&req, OpenAiCompatConfig::openai());
+assert!(payload.get("temperature").is_none());        // user intent vanished
+assert!(payload.get("top_p").is_none());
+assert!(payload.get("frequency_penalty").is_none());
+assert!(payload.get("presence_penalty").is_none());
+// No event emitted. No log. No `param_stripped` taxonomy entry.
+
+// Site B: kimi silently drops is_error from tool result
+let msg = InputMessage {
+    role: "user".to_string(),
+    content: vec![InputContentBlock::ToolResult {
+        tool_use_id: "call_1".to_string(),
+        content: vec![ToolResultContentBlock::Text { text: "DB connection refused".to_string() }],
+        is_error: true,                              // tool DID error
+    }],
+};
+let translated = translate_message(&msg, "kimi-k2.5");
+assert!(translated[0].get("is_error").is_none());    // signal vanished on the wire
+// Model receives content as if no error happened. No event tells the
+// orchestrator that the error semantics were stripped before send.
+```
+
+**Verification check:**
+
+- `grep -n "silently strip\|silently drop" rust/crates/api/src/providers/openai_compat.rs` returns lines 900 and 1049 — the source self-documents two silent-transformation sites
+- `grep -rn "param_stripped\|field_stripped\|silently_stripped\|unmapped_param" rust/crates/` returns zero hits — no event taxonomy exists for these
+- `grep -nE "StreamEvent::|pub enum StreamEvent" rust/crates/api/src/types.rs` shows six variants, none diagnostic
+- `grep -n "reasoning_model_strips\|excludes_is_error" rust/crates/api/src/providers/openai_compat.rs` shows tests at 1666 and 2004 that assert removal but **no** test asserts a paired event
+- Cross-reference with anthropic.rs: `grep -n "silently strip\|is_reasoning_model\|reject" rust/crates/api/src/providers/anthropic.rs` shows no equivalent strip path — confirming the asymmetry
+
+**Expected:**
+
+- A single `param_stripped` (or equivalent) event variant is added to `StreamEvent` (or a sibling diagnostic-event channel if `StreamEvent` is reserved for content). Schema: `{ provider: String, model: String, field: String, reason: "reasoning_model" | "kimi_rejection" | …, original_value: serde_json::Value }`.
+- Both silent-strip sites emit the event:
+  - `build_chat_completion_request` emits one event per dropped tuning param when `is_reasoning_model` is true
+  - `translate_message` emits one event per `is_error` strip when `model_rejects_is_error_field` is true
+- Tests assert event presence, not just removal: "given temperature=0.7 on o1-mini, payload has no temperature *and* event stream contains `param_stripped { field: \"temperature\", reason: \"reasoning_model\" }`."
+- A central `param_strip_rules.rs` (or registry inside `openai_compat`) lists every rule with `(model_predicate, field, reason)` so future strips slot in via one path.
+- SCHEMAS.md gains a section under "Provider-side request transformations" enumerating which fields each predicate strips. The Anthropic-vs-OpenAI-compat asymmetry is documented alongside #207's cache-bucket asymmetry.
+- `claw doctor --json` surfaces, per active session, the list of fields that will be silently transformed on the wire given the current model.
+- Test coverage gap closed: at least one regression test per site asserting `(payload_strip + event_emission)` as a paired contract.
+
+**Fix sketch:**
+
+1. Add `StreamEvent::ParamStripped(ParamStrippedEvent { provider, model, field, reason, original_value })` (or a new `DiagnosticEvent` channel if `StreamEvent` should remain content-only). ~30 LOC including serde derives and `SCHEMAS.md` update.
+2. Replace the 4 inline tuning-param insertions in `build_chat_completion_request:901-919` with a small helper `apply_tuning_param(&mut payload, field_name, value, model, &mut events)` that handles the strip+event-emit decision in one place. ~25 LOC.
+3. Refactor `translate_message`'s `supports_is_error` branch to emit `param_stripped { field: "is_error", reason: "kimi_rejection" }` when the strip path fires. The event needs to surface through the streamer — depending on architecture, this may require threading the diagnostic stream through `translate_message`'s call sites or a deferred-emit pattern. ~20 LOC.
+4. Add three new tests in `openai_compat` test module:
+   - `reasoning_model_emits_param_stripped_event` — assert event count == 4 for o1-mini with all four params set
+   - `kimi_emits_param_stripped_event_for_is_error` — assert one event per tool-result strip
+   - `non_reasoning_non_kimi_emits_no_strip_events` — negative case for gpt-4o + claude-style tool result
+   ~80 LOC test additions.
+5. Update SCHEMAS.md with a "Silent-strip rules" table: predicate → field set → reason → severity. Cross-reference #207 for the deserialization symmetry.
+6. (Optional, follow-up) Wire `claw doctor --json` to evaluate strip rules against the active session's model and emit a pre-flight "these fields will be silently dropped" diagnostic. Defer if scope creeps.
+
+**Why this matters for clawability:**
+
+- **Symmetry with #207.** Same boundary, opposite direction: #207 = inbound deserialization silent drop. #208 = outbound serialization silent strip. With both filed, the OpenAI-compat boundary's silent-transformation perimeter is fully mapped. Closing only one half leaves operators with half-blind sessions.
+- **Principle #3 ("Events are too log-shaped").** The current solution is to emit no event at all — strictly worse than log-shaped. The taxonomy must include the strip-and-discard case as a first-class event.
+- **Principle #5 ("Partial success is first-class").** A request that goes out without `temperature: 0.7` because the model rejects the field is a partial-success state — the request will execute, but not as the user specified. The provider knows. The strip code knows. The user does not.
+- **Sibling chain extended.** With #208 filed, the silent-fallback / silent-drop / silent-strip family is: #201 (silent tool-arg parse fallback), #202 (silent tool-message drop), #203 (auto-compaction no SSE event), #204 (reasoning_tokens not surfaced), #206 (silent finish_reason pass-through), #207 (silent usage-detail drop on deserialization), #208 (silent param/field strip on serialization). Seven pinpoints, all the same anti-pattern at the same provider boundary, all closeable by the same structured-event refactor. The cluster argues for a single "diagnostic event channel" feature rather than seven independent fixes.
+- **Reasoning-model adoption is climbing.** The strip path runs on every o-series, o4, grok-3-mini, qwen-qwq, qwen-thinking, qwq-plus session. As reasoning-model traffic grows, the share of silently-transformed requests grows with it. The fix's value compounds.
+- **Kimi `is_error` strip is semantically lossy.** Unlike the reasoning-model tuning strip (where the model would have ignored the values anyway), the `is_error` strip removes signal the model *could* have acted on. The taxonomy needs severity grading so claws can route on "this strip changed the model's input space" vs "this strip discarded a hint."
+- **Test contracts encode silence.** The two existing tests (lines 1666 and 2004) lock in a contract that the code is *correct* to silently strip. Without #208, those tests will continue passing forever even if a future operator-visibility layer is added — the contract needs to change to assert visibility, not just removal.
+
+**Acceptance criteria:**
+
+- `StreamEvent` (or a sibling diagnostic stream) gains a `param_stripped` (or equivalent) variant with documented schema in SCHEMAS.md
+- `build_chat_completion_request` emits one event per stripped tuning param when `is_reasoning_model` returns true
+- `translate_message` emits one event per `is_error` strip when `model_rejects_is_error_field` returns true
+- Regression test asserts: given `temperature=0.7, top_p=0.9, frequency_penalty=0.5, presence_penalty=0.3` on `o1-mini`, the event stream contains 4 `param_stripped` events with the correct `field` and `reason="reasoning_model"`
+- Regression test asserts: given a kimi tool result with `is_error=true`, the event stream contains 1 `param_stripped` event with `field="is_error"` and `reason="kimi_rejection"`
+- Negative test asserts: gpt-4o with all tuning params set emits zero `param_stripped` events
+- SCHEMAS.md documents the Anthropic-vs-OpenAI-compat asymmetry: which params survive on which provider for which model class
+- The two existing tests (`reasoning_model_strips_tuning_params`, `translate_message_excludes_is_error_for_kimi_models`) are updated to also assert event emission, not just removal
+- (Stretch) `claw doctor --json` surfaces a pre-flight strip-rules summary for the active session's model
+
+**Status:** Open. No code changed. Filed 2026-04-25 19:00 KST. Branch: feat/jobdori-168c-emission-routing. HEAD: ba3a34d. Sibling chain: #201/#202/#203/#204/#206/#207. Closes the OpenAI-compat boundary audit started at #201 (inbound silent fallback) and locked at #207 (inbound silent drop) — #208 covers the outbound silent strip side.
+
+🪨
