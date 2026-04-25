@@ -13766,3 +13766,197 @@ fn openai_compat_serializes_parallel_tool_calls_top_level() {
 **Status:** Open. No code changed. Filed 2026-04-25 21:10 KST. Branch: feat/jobdori-168c-emission-routing. HEAD: f004f74. Sibling-shape cluster (silent-fallback / silent-drop / silent-strip / silent-misnomer / silent-shadow / silent-prefix-mismatch / structural-absence at provider/CLI boundary): #201/#202/#203/#206/#207/#208/#209/#210/#211/#212 — eleven pinpoints, one unified-registry refactor (`MODEL_PARAM_REQUIREMENTS` with four columns: `tuning_params_strip`, `max_output_tokens`, `max_tokens_param_name`, `default_parallel_tool_calls`) closes them all. Wire-format-parity cluster: #211 (max_tokens parameter name) + #212 (parallel_tool_calls / disable_parallel_tool_use). External validation: Anthropic parallel-tool-use docs (https://platform.claude.com/docs/en/agents-and-tools/tool-use/parallel-tool-use), OpenAI Chat Completions API reference (https://platform.openai.com/docs/api-reference/chat/create#chat-create-parallel_tool_calls), LangChain BaseChatOpenAI parallel_tool_calls (https://reference.langchain.com/javascript/langchain-openai/BaseChatOpenAICallOptions/parallel_tool_calls), Stack Overflow #79332599 (LangGraph + Anthropic disable_parallel_tool_use), advanced-stack.com OpenAI parallel function calling guide — same control surface available across the entire ecosystem, absent only in claw-code.
 
 🪨
+
+
+## Pinpoint #213 — `OpenAiUsage` struct does not deserialize `prompt_tokens_details.cached_tokens`; openai_compat path hardcodes `cache_creation_input_tokens: 0` and `cache_read_input_tokens: 0` at four sites; cost estimator computes $0 cache savings for every OpenAI/DeepSeek/Moonshot kimi request even when upstream prompt cache is hitting; Anthropic path correctly populates the same fields from native wire format (Jobdori, cycle #365 / extends #168c emission-routing audit / sibling-shape cluster grows to twelve)
+
+**Observed:** OpenAI's Chat Completions API has emitted `prompt_tokens_details.cached_tokens` since automatic prompt caching launched 2024-10-01 (https://platform.openai.com/docs/guides/prompt-caching); DeepSeek emits `prompt_cache_hit_tokens` and `prompt_cache_miss_tokens`; both fields surface the cache-hit token count that the cost estimator needs to compute the discounted cache-read price. Claw-code's `OpenAiUsage` deserializer reads only `prompt_tokens` and `completion_tokens` — `prompt_tokens_details` is absent from the struct so serde drops it on the floor. Then four call sites in `openai_compat.rs` construct the upstream `Usage` with the cache fields hardcoded to `0`. The cost estimator (`runtime/src/usage.rs`) consumes those zeros and multiplies by `cache_read_cost_per_million` — producing `$0.00` cache cost for every OpenAI-compat request, regardless of how many tokens the upstream actually served from cache.
+
+The Anthropic native path (`anthropic.rs` + `sse.rs`) does not have this bug: it deserializes Anthropic's wire `usage` object directly into `Usage`, which has `cache_creation_input_tokens` and `cache_read_input_tokens` as native serde fields. The asymmetry is exactly the kind of upstream-divergence the openai-compat boundary is supposed to translate, and the boundary translates nothing — it just zeros the field.
+
+**Source sites (verified by `grep -rn "cache_creation_input_tokens" rust/crates/api/src/providers/openai_compat.rs`):**
+
+```
+rust/crates/api/src/providers/openai_compat.rs:709-714   struct OpenAiUsage   // <- only prompt_tokens + completion_tokens, no prompt_tokens_details
+rust/crates/api/src/providers/openai_compat.rs:476-481   StreamState::ingest_chunk MessageStart construction   // <- cache_creation_input_tokens: 0, cache_read_input_tokens: 0
+rust/crates/api/src/providers/openai_compat.rs:486-492   StreamState::ingest_chunk usage update from chunk     // <- cache_creation_input_tokens: 0, cache_read_input_tokens: 0
+rust/crates/api/src/providers/openai_compat.rs:594-601   StreamState::finish MessageDelta usage fallback        // <- cache_creation_input_tokens: 0, cache_read_input_tokens: 0
+rust/crates/api/src/providers/openai_compat.rs:1196-1218 normalize_response Usage construction                  // <- cache_creation_input_tokens: 0, cache_read_input_tokens: 0
+```
+
+```rust
+// rust/crates/api/src/providers/openai_compat.rs:709-714 — current OpenAiUsage struct
+#[derive(Debug, Deserialize)]
+struct OpenAiUsage {
+    #[serde(default)]
+    prompt_tokens: u32,
+    #[serde(default)]
+    completion_tokens: u32,
+}
+// No `prompt_tokens_details` field.
+// No `prompt_cache_hit_tokens` field for DeepSeek.
+// No `cached_tokens` accessor.
+// The wire-format field is silently discarded by serde.
+```
+
+```rust
+// rust/crates/api/src/providers/openai_compat.rs:486-492 — usage propagation in stream
+if let Some(usage) = chunk.usage {
+    self.usage = Some(Usage {
+        input_tokens: usage.prompt_tokens,
+        cache_creation_input_tokens: 0,        // <- always 0
+        cache_read_input_tokens: 0,            // <- always 0
+        output_tokens: usage.completion_tokens,
+    });
+}
+```
+
+```rust
+// rust/crates/api/src/providers/openai_compat.rs:1196-1218 — non-streaming normalize_response
+Ok(MessageResponse {
+    // ...
+    usage: Usage {
+        input_tokens: response.usage.as_ref().map_or(0, |usage| usage.prompt_tokens),
+        cache_creation_input_tokens: 0,        // <- always 0
+        cache_read_input_tokens: 0,            // <- always 0
+        output_tokens: response.usage.as_ref().map_or(0, |usage| usage.completion_tokens),
+    },
+    // ...
+})
+```
+
+`grep -rn "cached_tokens\|prompt_tokens_details\|prompt_cache_hit_tokens\|prompt_cache_miss_tokens" rust/ src/ tests/ docs/`: 0 matches. The repository is a clean slate on this surface — there is no incomplete implementation, no TODO, no feature flag, no half-typed accessor. The upstream contract simply does not exist in the local taxonomy.
+
+**Blast radius (verified by `grep -rn "openai_compat::normalize_response\|build_chat_completion_request" rust/crates/`):**
+
+- Every `claw prompt` invocation against any model routed through `OpenAiCompatConfig` — OpenAI gpt-4o/gpt-4o-mini/gpt-5.x, OpenAI o1/o3/o4-mini, xAI grok, DashScope qwen, Moonshot kimi, DeepSeek deepseek-chat/deepseek-coder, any custom OpenAI-compatible endpoint — receives the upstream `usage.prompt_tokens_details.cached_tokens` field on the wire and discards it in deserialization. The `Usage` that reaches the runtime always has `cache_creation_input_tokens: 0` and `cache_read_input_tokens: 0` for these providers.
+
+- Cost estimator `runtime/src/usage.rs:102-110` multiplies `cache_creation_input_tokens` by `cache_creation_cost_per_million` and `cache_read_input_tokens` by `cache_read_cost_per_million`; with both inputs hardcoded to 0, every `UsageCostEstimate` for an openai-compat request reports `cache_creation_cost_usd: 0.0` and `cache_read_cost_usd: 0.0`. **Result:** users running a heavy session with OpenAI prompt caching active (system prompt + tool defs + history exceeding the 1024-token cache threshold) see zero cache cost — but they are charged the discounted rate upstream while the local estimate computes the full rate. The estimate is wrong in the user's favor on the input side and zero on the cache side; the apparent total looks right by coincidence, but the cache savings are completely invisible.
+
+- Sessions where the upstream serves a large fraction of tokens from cache (typical agentic loop: same system prompt + tools every turn, only the last user message changes) see `prompt_tokens` reported as the full prefix count without the breakdown. The user has no signal that caching is working — the cost line shows `input: $X.XX (full rate)` and there is no `cache_read: -$Y.YY (90% discount)` row. They can't tell whether their `~/.claw/config.toml` cache configuration is helping or doing nothing.
+
+- DeepSeek-specific: DeepSeek's API documentation (https://api-docs.deepseek.com/quick_start/pricing) explicitly bills cache-hit tokens at 1/10 the input rate. Users who select `deepseek/deepseek-chat` for cost optimization specifically because of cache hits — claw-code's cost ledger silently computes the no-cache price. The user's bill from DeepSeek shows the discounted total; the user's claw cost projection shows the full total. Reconciliation is impossible from claw's session JSON alone.
+
+- Sibling pattern to #209 (cost estimation) and #207 (token preservation): both compose with #213 to render the entire openai-compat cost path untrustworthy. #209 is "wrong rate per million," #207 is "wrong token count," #213 is "missing token category entirely." Stacking all three: users on `gpt-5.2` see input rate of ~$0.30/M when reality is `$0.30 base × (1.0 - cache_hit_ratio × 0.9)` — claw cannot compute the second factor because it cannot read the wire field.
+
+- `runtime/src/cost_emitter.rs` and `telemetry/src/lib.rs` emit `cost_estimate` events with `cache_creation_cost_usd` and `cache_read_cost_usd` as zero for every openai-compat session. Downstream consumers (cubic dev AI, akiflow tracking, anomalyco compatibility tooling) building cost dashboards on the SSE stream see a dataset where openai-compat traffic has structurally zero cache activity — even when the underlying provider bills the user for the cache discount. This is the same opacity-pattern as #203 (no AutoCompactionEvent) and #202 (no tool-message-drop event): the wire fact does not surface in claw's event taxonomy.
+
+- `prompt_cache.rs` (the local response cache) is unaffected — it operates on Anthropic-only paths and uses `Usage::cache_creation_input_tokens` from the Anthropic SSE stream, which is correctly populated. The bug is exclusively in the openai-compat upstream-usage deserialization: the upstream reports cache stats, claw's serde model has no field to receive them.
+
+**Gap:**
+
+1. **One upstream contract, two flavors, zero claw-code representation.** OpenAI emits `usage.prompt_tokens_details.cached_tokens` (since 2024-10), DeepSeek emits `usage.prompt_cache_hit_tokens` and `usage.prompt_cache_miss_tokens` (since 2024-08). Both are documented as the canonical signal that upstream caching saved money. The local taxonomy has neither — and since `prompt_tokens_details` is a nested object, even adding a top-level `cached_tokens: Option<u32>` field would not deserialize OpenAI's wire format without a nested `OpenAiPromptTokensDetails` struct. The asymmetry shape is: one global field name (`cached_tokens` accessor needed), two upstream wire spellings, claw-code has neither reader.
+
+2. **Hardcoded `0` at four call sites — five if you count `Usage::default()` literals.** `grep -n "cache_creation_input_tokens: 0" rust/crates/api/src/providers/openai_compat.rs` returns lines 477, 489, 597, 1211. Every site that constructs a `Usage` from an `OpenAiUsage` does this. There is no `Usage::from_openai_usage(usage: OpenAiUsage)` helper that would centralize the translation; the same 4-line block is copy-pasted four times. Adding cached-token plumbing requires editing four locations, or refactoring to a single helper — same anti-pattern as #210 (max_tokens shadow function with two branches at one site).
+
+3. **No event surfaces the cache-hit count.** Sibling pattern to #201 (silent tool-arg fallback), #202 (silent tool-message drop), #203 (no AutoCompactionEvent), #208 (silent param strip), #211 (silent prefix-mismatch), #212 (no parallel-tool-emission event). When the upstream serves 50% of a 100k-token prefix from cache, claw emits `MessageDelta { usage: Usage { input_tokens: 100000, cache_read_input_tokens: 0, ... } }`. There is no `StreamEvent::CachedTokensReceived { count }` event, no diagnostic SSE frame, no telemetry counter, no log line. The cache hit is invisible in the event stream taxonomy. Same opacity pattern as the cluster.
+
+4. **No CLI flag, no plugin override, no environment variable.** `claw prompt --show-cache-stats` does not exist (verified by `grep -rn "show.cache\|cache.stats\|--cache" rust/crates/rusty-claude-cli/`). `~/.claw/config.toml` has no `[telemetry] cache_visibility = true` knob. Plugins cannot inject the missing field through `extra_body` or post-processing because the field is dropped at serde-deserialize time, before any plugin sees it. The visibility is unreachable from any user-facing surface.
+
+5. **Tests do not assert cache-token visibility on the openai-compat path.** `grep -n "fn .*cache\|fn .*cached" rust/crates/api/src/providers/openai_compat.rs` returns 0 matches. There is no test that constructs an `OpenAiUsage` JSON with `prompt_tokens_details.cached_tokens: 5000` and asserts the resulting `Usage` has `cache_read_input_tokens: 5000`. The test gap mirrors the production gap — same shape as #211 (no test for o-series max_tokens) and #212 (no test for parallel-tool modifier).
+
+6. **OpenAI vs DeepSeek wire spelling — local representation needs to absorb both.** OpenAI's 2024-10 schema: `usage.prompt_tokens_details.cached_tokens`. DeepSeek's schema: `usage.prompt_cache_hit_tokens` (sibling field at usage root, not nested). A correct local representation needs either: (a) a `cached_tokens()` accessor on `OpenAiUsage` that tries both wire shapes via `serde(alias)` and a manual deserializer for the nested OpenAI form, or (b) a per-provider `OpenAiCompatConfig` setting selecting which wire shape to read. The current design has chosen neither, which is the gap. anomalyco/opencode handles both via Vercel AI SDK's `LanguageModelV1Usage` with `cachedInputTokens: number` (https://github.com/vercel/ai/blob/main/packages/ai/core/types/language-model.ts) — the abstraction already exists in the JS ecosystem.
+
+7. **Same shape as the cycle #168c emission-routing audit.** This branch (`feat/jobdori-168c-emission-routing`) has been collecting eleven pinpoints (#201, #202, #203, #206, #207, #208, #209, #210, #211, #212, and now #213) all of the form: "behavior diverges from declared upstream contract at the provider boundary, no event surfaces the divergence, the fact is encoded in a hardcoded check or completely absent." #213 extends the cluster to twelve and forms a tight subgroup with #207 (token preservation) and #209 (cost estimation): the trio of openai-compat cost-fidelity gaps. Fixing only one is half-measure; the user's cost view is wrong until all three are fixed.
+
+8. **External validation — multiple downstream agents have already shipped this control.** anomalyco/opencode tracks this same gap in active issues #17223, #17121, #17056, #11995 (verified via web search 2026-04-25), and the actual fix landed via `promptCacheKey` parameter wiring in Vercel AI SDK with measured 87% per-request cost reduction (https://www.ddhigh.com/en/2026/03/26/fix-opencode-prompt-caching-with-third-party-proxy/, portkey.ai/blog/opencode-token-usage-costs-and-access-control). charmbracelet/crush surfaces cached_tokens via `usage.cache_input_tokens` on the openai-compat path. simonw/llm exposes `--show-cached-tokens` as a CLI flag. Vercel AI SDK exposes `cachedInputTokens` as a top-level `LanguageModelV1Usage` field. claw-code is the only OpenAI-compat agent in the cluster without any cache-visibility surface.
+
+**Repro (verified 2026-04-25 21:30 KST):**
+
+```bash
+# 1. Confirm zero hits across the entire repository
+cd ~/clawd/claw-code
+grep -rn "cached_tokens\|prompt_tokens_details\|prompt_cache_hit_tokens\|prompt_cache_miss_tokens" rust/ src/ tests/ docs/ 2>/dev/null
+# Output: (empty — verified)
+
+# 2. Confirm OpenAiUsage struct lacks any cache field
+grep -A 6 "^struct OpenAiUsage" rust/crates/api/src/providers/openai_compat.rs
+# struct OpenAiUsage {
+#     #[serde(default)]
+#     prompt_tokens: u32,
+#     #[serde(default)]
+#     completion_tokens: u32,
+# }
+
+# 3. Confirm four call sites with hardcoded zero
+grep -n "cache_creation_input_tokens: 0\|cache_read_input_tokens: 0" rust/crates/api/src/providers/openai_compat.rs
+# 477:                        cache_creation_input_tokens: 0,
+# 478:                        cache_read_input_tokens: 0,
+# 489:                cache_creation_input_tokens: 0,
+# 490:                cache_read_input_tokens: 0,
+# 597:                    cache_creation_input_tokens: 0,
+# 598:                    cache_read_input_tokens: 0,
+# 1211:            cache_creation_input_tokens: 0,
+# 1212:            cache_read_input_tokens: 0,
+
+# 4. Confirm Anthropic native path correctly deserializes the same Usage struct
+grep -n "pub cache_creation_input_tokens\|pub cache_read_input_tokens" rust/crates/api/src/types.rs
+# 172:    pub cache_creation_input_tokens: u32,
+# 174:    pub cache_read_input_tokens: u32,
+# (the struct has the fields — they populate naturally on Anthropic SSE because the wire format matches)
+
+# 5. Confirm cost estimator multiplies these zeros (silent zero cost)
+grep -A 4 "cache_read_cost_usd: cost_for_tokens" rust/crates/runtime/src/usage.rs
+# cache_read_cost_usd: cost_for_tokens(
+#     self.cache_read_input_tokens,           // <- always 0 for openai-compat
+#     pricing.cache_read_cost_per_million,    // <- e.g. 0.25 for OpenAI gpt-5.2
+# ),
+
+# 6. Confirm zero test coverage for cache-token visibility on openai-compat path
+grep -n "fn .*cache\|fn .*cached" rust/crates/api/src/providers/openai_compat.rs
+# (empty)
+```
+
+```rust
+// 7. Demonstrative tests that should exist and currently do not
+#[test]
+fn openai_streaming_usage_extracts_cached_tokens_from_prompt_tokens_details() {
+    // OpenAI's 2024-10 wire format — nested cached_tokens accessor
+    let chunk_json = r#"{
+        "id": "chatcmpl-1",
+        "model": "gpt-5.2",
+        "choices": [],
+        "usage": {
+            "prompt_tokens": 100000,
+            "prompt_tokens_details": { "cached_tokens": 50000 },
+            "completion_tokens": 200
+        }
+    }"#;
+    let chunk: ChatCompletionChunk = serde_json::from_str(chunk_json).unwrap();
+    let mut state = StreamState::new("gpt-5.2".to_string());
+    state.ingest_chunk(chunk).unwrap();
+    let usage = state.usage.unwrap();
+    assert_eq!(usage.input_tokens, 100000);
+    assert_eq!(usage.cache_read_input_tokens, 50000); // currently 0 — bug
+}
+
+#[test]
+fn deepseek_normalize_response_extracts_cache_hit_tokens() {
+    // DeepSeek wire format — sibling field at usage root
+    let response_json = r#"{
+        "id": "deepseek-1",
+        "model": "deepseek-chat",
+        "choices": [{"message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+        "usage": {
+            "prompt_tokens": 10000,
+            "prompt_cache_hit_tokens": 8000,
+            "prompt_cache_miss_tokens": 2000,
+            "completion_tokens": 50
+        }
+    }"#;
+    let response: ChatCompletionResponse = serde_json::from_str(response_json).unwrap();
+    let normalized = normalize_response(response, "deepseek-chat").unwrap();
+    assert_eq!(normalized.usage.input_tokens, 10000);
+    assert_eq!(normalized.usage.cache_read_input_tokens, 8000); // currently 0 — bug
+}
+```
+
+**Fix shape (not implemented in this cycle, recorded for cluster refactor):**
+
+The minimal fix is a four-touch change: (a) add `prompt_tokens_details: Option<OpenAiPromptTokensDetails>` to `OpenAiUsage` with a nested `struct OpenAiPromptTokensDetails { cached_tokens: u32 }`; (b) add `prompt_cache_hit_tokens: u32` to `OpenAiUsage` for DeepSeek; (c) introduce `impl OpenAiUsage { fn cached_tokens(&self) -> u32 { ... } }` returning the populated field; (d) replace the four hardcoded `0` sites with `usage.cached_tokens()`. Plus a `StreamEvent::CachedTokensReceived { count: u32 }` for cluster-wide event-emission parity (sibling fix to #201/#202/#203/#208/#211/#212).
+
+The deeper fix is a unified-registry refactor (`MODEL_PARAM_REQUIREMENTS` table — sibling fix shape recorded in #211/#212) that adds a fifth column `cache_token_wire_shape: NestedDetails | RootSibling` describing how each provider reports cache tokens, plus a cluster-wide `Usage::from_provider_usage(provider, openai_usage)` helper that owns the per-provider translation. This closes #201/#202/#203/#206/#207/#208/#209/#210/#211/#212/#213 in one structural change.
+
+**Status:** Open. No code changed. Filed 2026-04-25 21:30 KST. Branch: feat/jobdori-168c-emission-routing. HEAD: c009818. Sibling-shape cluster (silent-fallback / silent-drop / silent-strip / silent-misnomer / silent-shadow / silent-prefix-mismatch / structural-absence / silent-zero-coercion at provider/CLI boundary): #201/#202/#203/#206/#207/#208/#209/#210/#211/#212/#213 — twelve pinpoints, one unified-registry refactor (`MODEL_PARAM_REQUIREMENTS` with five columns: `tuning_params_strip`, `max_output_tokens`, `max_tokens_param_name`, `default_parallel_tool_calls`, `cache_token_wire_shape`) closes them all. Cost-parity cluster: #204 (token emission) + #207 (token preservation) + #209 (cost estimation) + #210 (max_tokens registry parity) + #213 (cache token visibility) — five pinpoints, all openai-compat boundary. Wire-format-parity cluster: #211 (max_tokens parameter name) + #212 (parallel_tool_calls / disable_parallel_tool_use) + #213 (cached_tokens / prompt_cache_hit_tokens). External validation: OpenAI prompt caching docs (https://platform.openai.com/docs/guides/prompt-caching), DeepSeek pricing docs (https://api-docs.deepseek.com/quick_start/pricing), anomalyco/opencode#17223/#17121/#17056/#11995 (active issues on identical pattern), Vercel AI SDK `LanguageModelV1Usage.cachedInputTokens`, charmbracelet/crush usage telemetry, simonw/llm `--show-cached-tokens`, ddhigh.com (2026-03-26) third-party proxy fix with 87% per-request cost reduction — same control surface available across the entire ecosystem, absent only in claw-code.
+
+🪨
