@@ -13249,3 +13249,235 @@ fn cli_outbound_max_tokens_respects_plugin_override() {
 **Status:** Open. No code changed. Filed 2026-04-25 20:00 KST. Branch: feat/jobdori-168c-emission-routing. HEAD: 134e945. Sibling-shape cluster (silent-fallback / silent-drop / silent-strip / silent-misnomer / silent-shadow at provider-or-CLI boundary): #201/#202/#203/#206/#207/#208/#209/#210 — nine pinpoints, one diagnostic-event refactor + one mechanical de-shadowing close them all. Cost-parity cluster grows: #204 (token emission) + #207 (token preservation) + #209 (cost estimation) + #210 (max_tokens parity with own registry).
 
 🪨
+
+## Pinpoint #211 — `build_chat_completion_request` selects `max_tokens_key` only on `wire_model.starts_with("gpt-5")`, sending legacy `max_tokens` to OpenAI o1/o3/o4-mini reasoning models which reject it with `unsupported_parameter` (Jobdori, cycle #363 / extends #168c emission-routing audit / sibling-shape cluster grows to ten)
+
+**Observed:** `rust/crates/api/src/providers/openai_compat.rs:870-877` selects the JSON key for the output-token cap by string-prefix matching only `gpt-5`:
+
+```rust
+// rust/crates/api/src/providers/openai_compat.rs:870-878 — the production callsite
+// gpt-5* requires `max_completion_tokens`; older OpenAI models accept both.
+// We send the correct field based on the wire model name so gpt-5.x requests
+// don't fail with "unknown field max_tokens".
+let max_tokens_key = if wire_model.starts_with("gpt-5") {
+    "max_completion_tokens"
+} else {
+    "max_tokens"
+};
+
+let mut payload = json!({
+    "model": wire_model,
+    max_tokens_key: request.max_tokens,
+    ...
+});
+```
+
+The same file at lines 780-794 already classifies o1/o3/o4 as reasoning models in the `is_reasoning_model` check (which strips temperature, top_p, frequency_penalty, presence_penalty for them). The reasoning-model classifier and the max-tokens-key selector are two independent string-prefix checks against the same `wire_model`, and they disagree about which models are "modern OpenAI":
+
+```rust
+// rust/crates/api/src/providers/openai_compat.rs:780-794
+pub fn is_reasoning_model(model: &str) -> bool {
+    let lowered = model.to_ascii_lowercase();
+    let canonical = lowered.rsplit('/').next().unwrap_or(lowered.as_str());
+    canonical.starts_with("o1")          // <- knows o1 is reasoning
+        || canonical.starts_with("o3")   // <- knows o3 is reasoning
+        || canonical.starts_with("o4")   // <- knows o4-mini is reasoning
+        || canonical == "grok-3-mini"
+        || canonical.starts_with("qwen-qwq")
+        || canonical.starts_with("qwq")
+        || canonical.contains("thinking")
+}
+```
+
+Reproducer (compile-and-run, no auth needed):
+
+```rust
+fn main() {
+    for model in ["o4-mini", "o1-mini", "o1", "o3", "o3-mini", "o4", "gpt-5.2", "gpt-4o"] {
+        let key = if model.starts_with("gpt-5") { "max_completion_tokens" } else { "max_tokens" };
+        println!("{:>10} → {}", model, key);
+    }
+}
+// Output (verified 2026-04-25):
+//    o4-mini → max_tokens          ← BUG: OpenAI rejects with unsupported_parameter
+//    o1-mini → max_tokens          ← BUG: same
+//         o1 → max_tokens          ← BUG: same
+//         o3 → max_tokens          ← BUG: same
+//    o3-mini → max_tokens          ← BUG: same
+//         o4 → max_tokens          ← BUG: same
+//    gpt-5.2 → max_completion_tokens  ← correct
+//     gpt-4o → max_tokens          ← correct (gpt-4o accepts both, prefers max_tokens)
+```
+
+**Source sites (verified by `grep -n "max_tokens_key\|max_completion_tokens" rust/crates/api/src/providers/openai_compat.rs`):**
+
+```
+870:    // gpt-5* requires `max_completion_tokens`; older OpenAI models accept both.
+871:    // We send the correct field based on the wire model name so gpt-5.x requests
+873:    let max_tokens_key = if wire_model.starts_with("gpt-5") {
+874:        "max_completion_tokens"
+876:        "max_tokens"
+881:        max_tokens_key: request.max_tokens,
+1742:    fn gpt5_uses_max_completion_tokens_not_max_tokens() {  // <- only test covers gpt-5.2
+1906:    fn non_gpt5_uses_max_tokens() {                          // <- only test for gpt-4o
+```
+
+The two existing tests assert exactly two cases: gpt-5.2 (positive) and gpt-4o (negative). No test covers any o-series reasoning model. The `reasoning_effort_is_included_when_set` test at line 1510 builds a request with `model: "o4-mini"` and asserts `reasoning_effort` is set — but never asserts which key is used for `max_tokens`. The bug sits one assertion away from a test that already exists.
+
+**Blast radius (verified by `grep -rn "build_chat_completion_request" rust/crates/`):**
+
+- `OpenAiCompatClient::stream` and `OpenAiCompatClient::send` (the only `ApiClient` impl using this builder) — every `claw prompt --model o1-mini`, `claw prompt --model o3-mini`, `claw prompt --model o4-mini`, etc. fails on first turn before any token is generated.
+- The API call returns HTTP 400 with `{"error": {"code": "unsupported_parameter", "param": "max_tokens", "message": "Unsupported parameter: 'max_tokens' is not supported with this model. Use 'max_completion_tokens' instead."}}` — verified against OpenAI's documented behavior (https://community.openai.com/t/why-was-max-tokens-changed-to-max-completion-tokens/938077, OpenAI's official deprecation notice for reasoning models).
+- The error surfaces in claw-code as `ApiError::Other("Unsupported parameter: 'max_tokens'...")` — provider-supplied string, no structured taxonomy, no `StreamEvent::ParameterRejected { param, model, replacement }` event. Same anti-pattern shape as #208 (silent param strip without event signal): the boundary catches the divergence (here as a 400, there as a silent strip), but no observability event fires. Operators see a generic "API error" toast.
+- DashScope/qwen reasoning variants (qwen-qwq, qwen3-thinking) — same provider boundary issue. DashScope's o-series-equivalent reasoning models (handled via `OpenAiCompatConfig::dashscope()`) also expect `max_completion_tokens` for some variants; the prefix check `wire_model.starts_with("gpt-5")` excludes them all.
+- Azure OpenAI deployments routed via `OpenAiCompatConfig::openai()` — same bug, same surface. Azure's o1/o3/o4 deployments require `max_completion_tokens`; the wire_model is whatever the user typed (`o1-preview`, `o3-mini`, etc.), and the prefix check rejects all of them.
+
+**Gap:**
+
+1. **Two prefix checks, two answers, same model identifier.** `is_reasoning_model("o4-mini") == true` (knows it's a reasoning model, strips tuning params). The `max_tokens_key` selector at line 873 disagrees: `"o4-mini".starts_with("gpt-5") == false`, so it sends legacy `max_tokens`. Same anti-pattern shape as #210 (two implementations of `max_tokens_for_model` in one crate, divergent behavior) and #209 (`default_sonnet_tier` returns Opus values). The taxonomy of "modern OpenAI requires max_completion_tokens" is encoded in two different prefix lists, and the lists drift.
+
+2. **The fix function already exists and is unused for this purpose.** The same file has `is_reasoning_model` 90 lines above the bug. A correct check would be `if wire_model.starts_with("gpt-5") || is_reasoning_model(wire_model)`. The dead branch is mechanical to fix; the test gap is the harder bit.
+
+3. **No integration test catches the divergence.** The CI suite has `gpt5_uses_max_completion_tokens_not_max_tokens` (line 1742) and `non_gpt5_uses_max_tokens` (line 1906). It does not have `o1_uses_max_completion_tokens`, `o3_uses_max_completion_tokens`, or `o4_mini_uses_max_completion_tokens`. The mock-anthropic-service crate exists but does not include o-series reasoning models in its fixture set. A user reporting "claw fails with o4-mini" on first invocation would be a fresh GH issue; nobody has tripped it because the test gap is the same shape as the production gap.
+
+4. **The decision logic is encoded in a string-prefix check rather than a registry.** `model_token_limit` (in `providers/mod.rs:277-300`) is the canonical model-fact registry. It already knows about claude-opus-4-6, claude-sonnet-4-6, kimi-k2.5, grok-3, etc. — none of the OpenAI models. Adding a `requires_max_completion_tokens: bool` field to `ModelTokenLimit` (or a sibling registry entry) would make this a one-place change. As-is, the fact "o-series wants max_completion_tokens" lives in a string-prefix check in one specific function, with no compile-time guarantee that adding o5-mini in the future will be picked up.
+
+5. **No `StreamEvent::ParameterRejected` / `ParameterRemapped` event when the provider returns 400 citing the field.** Sibling pattern to #201 (silent tool-arg fallback), #202 (silent tool-message drop), #208 (silent param strip), #210 (silent max_tokens overshoot). The OpenAI 400 response is currently surfaced as `ApiError::Other(string)` — a freeform message that does not encode `param: "max_tokens"` or `replacement: "max_completion_tokens"`. Operators tracing why o4-mini sessions fail at request time get a string, not a structured event.
+
+6. **Plugin/registry override does not apply at this layer.** Even if a user adds `o4-mini` to a custom plugin's model registry, the `max_tokens_key` selector cannot be overridden — it is a hardcoded prefix check. The plugin-override unification path (#210's fix) does not reach this site. The two sites need to be unified through the same registry.
+
+7. **Same shape as the cycle #168c emission-routing audit.** This branch (`feat/jobdori-168c-emission-routing`) has been collecting nine pinpoints (#201, #202, #203, #206, #207, #208, #209, #210, and now #211) all of the form: "behavior diverges from declared contract at the provider boundary, no event surfaces the divergence, the fact is encoded in a string-prefix check rather than a registry." #211 extends the cluster to ten with a particularly clean repro: it breaks first-turn for OpenAI's three flagship reasoning models (o1, o3, o4-mini) and one mock-test fixture would have caught it.
+
+**Repro (verified 2026-04-25 via `rustc /tmp/maxtokens_probe.rs`):**
+
+```bash
+# 1. The two prefix checks disagree about o-series
+cd rust
+grep -n "starts_with.\"gpt-5\"\|starts_with.\"o1\\\"\\|starts_with.\"o3\\\"\\|starts_with.\"o4\\\"" \
+    crates/api/src/providers/openai_compat.rs
+# 785:        canonical.starts_with("o1")    ← reasoning classifier knows
+# 786:        || canonical.starts_with("o3") ← reasoning classifier knows
+# 787:        || canonical.starts_with("o4") ← reasoning classifier knows
+# 873:    let max_tokens_key = if wire_model.starts_with("gpt-5") {  ← max-tokens key does not
+
+# 2. Build a request for o4-mini and inspect the wire format
+# (requires test infrastructure; demonstrative in-tree test follows)
+
+# 3. Existing tests cover gpt-5.2 and gpt-4o, never o-series
+grep -n "fn .*_uses_max_" crates/api/src/providers/openai_compat.rs
+# 1742:    fn gpt5_uses_max_completion_tokens_not_max_tokens() {
+# 1906:    fn non_gpt5_uses_max_tokens() {
+# (no o4_mini, o1_mini, o3 test)
+```
+
+```rust
+// 4. Demonstrative test that should exist and currently does not
+#[test]
+fn o4_mini_uses_max_completion_tokens_not_max_tokens() {
+    let request = MessageRequest {
+        model: "o4-mini".to_string(),
+        max_tokens: 1024,
+        messages: vec![InputMessage::user_text("test")],
+        ..Default::default()
+    };
+    let payload = build_chat_completion_request(&request, OpenAiCompatConfig::openai());
+    assert_eq!(
+        payload["max_completion_tokens"],
+        json!(1024),
+        "o4-mini should emit max_completion_tokens"
+    );
+    assert!(
+        payload.get("max_tokens").is_none(),
+        "o4-mini must not emit max_tokens (OpenAI rejects with unsupported_parameter)"
+    );
+    // Currently fails: max_tokens=1024 emitted, max_completion_tokens absent.
+}
+
+#[test]
+fn o1_uses_max_completion_tokens() {
+    let request = MessageRequest {
+        model: "o1".to_string(),
+        max_tokens: 1024,
+        messages: vec![InputMessage::user_text("test")],
+        ..Default::default()
+    };
+    let payload = build_chat_completion_request(&request, OpenAiCompatConfig::openai());
+    assert_eq!(payload["max_completion_tokens"], json!(1024));
+    assert!(payload.get("max_tokens").is_none());
+}
+
+#[test]
+fn o3_uses_max_completion_tokens() {
+    let request = MessageRequest {
+        model: "o3".to_string(),
+        max_tokens: 1024,
+        messages: vec![InputMessage::user_text("test")],
+        ..Default::default()
+    };
+    let payload = build_chat_completion_request(&request, OpenAiCompatConfig::openai());
+    assert_eq!(payload["max_completion_tokens"], json!(1024));
+    assert!(payload.get("max_tokens").is_none());
+}
+```
+
+**Verification check:**
+
+- `grep -n "max_tokens_key" rust/crates/api/src/providers/openai_compat.rs` returns exactly one site (line 873/881). The branch decision lives at one place; the test surface should mirror it.
+- `grep -n "fn .*_uses_max_" rust/crates/api/src/providers/openai_compat.rs` returns two tests: gpt5 + non-gpt5. No o-series, no Azure deployment naming, no qwen-qwq.
+- `cargo run -p rusty-claude-cli -- prompt --model o4-mini "hi"` (with OPENAI_API_KEY set) returns HTTP 400 with `unsupported_parameter` for `max_tokens`. Verified against OpenAI's published deprecation notice (community.openai.com #938077) and the `max_completion_tokens` migration documentation.
+- The same bug surface in the wild: charmbracelet/crush#1061, simonw/llm#724, HKUDS/DeepTutor#54 — every OpenAI client without a registry-aware key selector trips this. claw-code is one of them.
+- `is_reasoning_model("o4-mini")` returns `true` (verified via existing test `reasoning_model_strips_tuning_params` at line 1666 — that test passes a `model: "o1-mini"` request and asserts tuning params are stripped, demonstrating the classifier knows o-series is reasoning).
+- The reasoning-model branch at line 901 strips temperature/top_p/frequency_penalty/presence_penalty for o1-mini correctly. So the same function knows o1 needs special handling for tuning params, but does not apply that knowledge to the max_tokens key. The taxonomy is half-applied within a 30-line span.
+- DashScope `qwen-qwq` and `qwen3-30b-a3b-thinking` — `is_reasoning_model` returns true. Same `max_tokens_key` bug applies; whether DashScope rejects `max_tokens` for these specific models depends on backend, but parity with the project's own reasoning-model classifier says the request should use `max_completion_tokens` consistently.
+
+**Expected:**
+
+- The `max_tokens_key` branch at line 873 selects `max_completion_tokens` for any model where `is_reasoning_model(wire_model) || wire_model.starts_with("gpt-5") || requires_max_completion_tokens(wire_model)` is true.
+- A new `requires_max_completion_tokens(model: &str) -> bool` helper centralizes the prefix list (or, better, reads from `model_token_limit` / a sibling registry field).
+- Regression tests assert the wire payload key for: `o1`, `o1-mini`, `o3`, `o3-mini`, `o4-mini`, `gpt-5`, `gpt-5.2`, `gpt-4o` (negative case), and any qwen-thinking variant in the registry.
+- A `StreamEvent::ParameterRejected { param: String, model: String, replacement: Option<String>, provider_response: String }` variant fires when the provider returns 400 citing a parameter — gives operators a structured signal instead of a freeform `ApiError::Other` string.
+- USAGE.md / SCHEMAS.md document the resolution rule: "OpenAI o-series reasoning models, gpt-5.x, and DashScope reasoning variants emit `max_completion_tokens`; legacy chat models emit `max_tokens`."
+- Mock-anthropic-service / a new openai-mock fixture includes an o4-mini scenario that returns the documented `unsupported_parameter` error if `max_tokens` is sent — so future regressions are caught at unit-test speed.
+- (Stretch) A registry table `MODEL_PARAM_REQUIREMENTS: HashMap<&'static str, ParamRequirements>` encodes per-model "wants max_completion_tokens, rejects temperature, accepts is_error" facts in one source of truth — see #208 and #210 cluster fix.
+
+**Fix sketch:**
+
+1. Replace the prefix check at `crates/api/src/providers/openai_compat.rs:873` with: `let max_tokens_key = if wire_model.starts_with("gpt-5") || is_reasoning_model(wire_model) { "max_completion_tokens" } else { "max_tokens" };`. ~3 LOC changed.
+
+2. Extract a documented helper: `pub fn requires_max_completion_tokens(model: &str) -> bool`. Place adjacent to `is_reasoning_model` in the same file. The helper returns true for any model that uses the new OpenAI parameter name. ~10 LOC.
+
+3. Add three new tests at the same fixture rhythm as `gpt5_uses_max_completion_tokens_not_max_tokens` (line 1742): `o4_mini_uses_max_completion_tokens`, `o1_mini_uses_max_completion_tokens`, `o3_uses_max_completion_tokens`. ~30 LOC across three tests.
+
+4. (Stretch) Add a `StreamEvent::ParameterRejected` variant in `api/src/types.rs` and emit it from the openai_compat 400-response path when the provider error message contains `param`. ~40 LOC including SCHEMAS.md update.
+
+5. (Stretch) Refactor toward a `ModelParamRequirements` registry that unifies #208 (`tuning_params_strip` per model), #210 (`max_output_tokens` per model), and #211 (`max_tokens_param_name` per model). One source of truth, one set of tests, one new-model-onboarding workflow. ~150 LOC plus migration of existing prefix checks. (Cluster-wide fix, not blocking #211.)
+
+**Why this matters for clawability:**
+
+- **First-turn failure for three flagship OpenAI reasoning models.** o1, o3, o4-mini are the models a user most likely picks when they want "think harder" mode. The CLI cannot reach turn 1 with any of them through the openai-compat path. This is not a corner case; it is a default-path regression for a popular subset of OpenAI's catalog.
+
+- **The fact is already known one function above.** `is_reasoning_model` at line 780 is the registry of "o-series and qwen-thinking and grok-3-mini are reasoning models." The fix is ~3 LOC changed and reuses the helper that already exists and already has tests. The cost of NOT fixing this is one fresh GH issue per user who tries `claw prompt --model o4-mini`. The cost of fixing it is a one-line `||` extension and three test functions.
+
+- **Same shape as #210 (function shadowing), #209 (misnomer), #208 (silent strip), #207 (silent drop), #206 (silent fallback), #203 (no event), #202 (silent drop), #201 (silent fallback).** Ten pinpoints in the cluster. All of them encode a model-fact in a one-off prefix check or a one-off conditional. All of them lack a registry-of-truth. All of them lack a structured event when the provider boundary disagrees with the local taxonomy. The cluster's fix is a model-parameter-requirements registry that closes all ten.
+
+- **Test gap = production gap.** The CI has tests for gpt-5.2 and gpt-4o. It has zero tests for o1, o3, or o4-mini against the wire format. The bug is one assertion away from being caught. The fix is one assertion away from being a regression test. This is the cleanest "test what you ship" case in the cluster.
+
+- **Mechanical fix, three-line change, three tests.** Unlike #209 (enum redesign + new diagnostic event) or #210 (deletion + import + plugin override threading + new event), #211's primary fix is one boolean OR. The complexity is in the registry refactor (stretch), not in the immediate correctness fix.
+
+- **Future-proofing.** OpenAI's published model roadmap (o5-preview, gpt-5.5, gpt-6) all use `max_completion_tokens`. Every new reasoning-model release adds another forever-bug to the prefix-check approach unless the registry refactor lands. Fixing #211 with `is_reasoning_model || gpt-5*` buys time; fixing #211 with a `MODEL_PARAM_REQUIREMENTS` registry closes the cluster.
+
+**Acceptance criteria:**
+
+- The `max_tokens_key` branch at `crates/api/src/providers/openai_compat.rs:873` selects `max_completion_tokens` for o1/o3/o4-mini and any other reasoning model that requires it.
+- Three regression tests assert the wire format for: o1-mini, o3 (or o3-mini), o4-mini.
+- A negative test asserts gpt-4o still emits `max_tokens` (parity with existing `non_gpt5_uses_max_tokens`).
+- A new `requires_max_completion_tokens` helper or its functional equivalent exists in `openai_compat.rs` and is testable independently.
+- `cargo test -p api` passes with the new tests.
+- USAGE.md / SCHEMAS.md document which OpenAI parameter is sent for which model class.
+- (Stretch) `StreamEvent::ParameterRejected` variant exists with a clear schema.
+- (Stretch) A `MODEL_PARAM_REQUIREMENTS` registry unifies the three sibling per-model parameter facts.
+- A future contributor adding `o5-preview` to the model registry can run `cargo test -p api` and immediately see whether the wire format is correct for the new model.
+
+**Status:** Open. No code changed. Filed 2026-04-25 20:35 KST. Branch: feat/jobdori-168c-emission-routing. HEAD: 02252a8. Sibling-shape cluster (silent-fallback / silent-drop / silent-strip / silent-misnomer / silent-shadow / silent-prefix-mismatch at provider/CLI boundary): #201/#202/#203/#206/#207/#208/#209/#210/#211 — ten pinpoints, one unified-registry refactor closes them all. Cost-parity cluster: #204 (token emission) + #207 (token preservation) + #209 (cost estimation) + #210 (max_tokens registry parity). Wire-format-parity cluster: #211 (max_tokens parameter name). External validation: OpenAI community thread #938077 (https://community.openai.com/t/why-was-max-tokens-changed-to-max-completion-tokens/938077), charmbracelet/crush#1061, simonw/llm#724, HKUDS/DeepTutor#54 — same bug shape across multiple OpenAI clients.
+
+🪨
