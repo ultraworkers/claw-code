@@ -13480,4 +13480,289 @@ fn o3_uses_max_completion_tokens() {
 
 **Status:** Open. No code changed. Filed 2026-04-25 20:35 KST. Branch: feat/jobdori-168c-emission-routing. HEAD: 02252a8. Sibling-shape cluster (silent-fallback / silent-drop / silent-strip / silent-misnomer / silent-shadow / silent-prefix-mismatch at provider/CLI boundary): #201/#202/#203/#206/#207/#208/#209/#210/#211 — ten pinpoints, one unified-registry refactor closes them all. Cost-parity cluster: #204 (token emission) + #207 (token preservation) + #209 (cost estimation) + #210 (max_tokens registry parity). Wire-format-parity cluster: #211 (max_tokens parameter name). External validation: OpenAI community thread #938077 (https://community.openai.com/t/why-was-max-tokens-changed-to-max-completion-tokens/938077), charmbracelet/crush#1061, simonw/llm#724, HKUDS/DeepTutor#54 — same bug shape across multiple OpenAI clients.
 
+## Pinpoint #212 — `MessageRequest` and `ToolChoice` enum cannot express either `parallel_tool_calls` (OpenAI top-level field) or `disable_parallel_tool_use` (Anthropic `tool_choice` modifier); both providers default to parallel-on; claw-code has zero opt-out path; no event when the model fans out N parallel tool calls in one assistant turn (Jobdori, cycle #364 / extends #168c emission-routing audit / sibling-shape cluster grows to eleven)
+
+**Observed:** Both upstream providers expose a wire-level switch to disable parallel tool calls — OpenAI as a top-level boolean, Anthropic as a per-`tool_choice` modifier — and claw-code's request schema represents neither.
+
+```rust
+// rust/crates/api/src/types.rs:5-35 — the entire MessageRequest schema
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct MessageRequest {
+    pub model: String,
+    pub max_tokens: u32,
+    pub messages: Vec<InputMessage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub system: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<ToolDefinition>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<ToolChoice>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stream: bool,
+    // tuning params: temperature, top_p, frequency_penalty, presence_penalty, stop, reasoning_effort
+    // ...
+}
+
+// rust/crates/api/src/types.rs:113-118 — the entire ToolChoice taxonomy
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ToolChoice {
+    Auto,
+    Any,
+    Tool { name: String },
+}
+```
+
+Verified by exhaustive repo grep (`grep -rn "parallel_tool\|disable_parallel" rust/ src/ tests/ docs/`): zero hits across the entire repository for either upstream parameter name. The single `"parallel"` string match in `rusty-claude-cli/src/main.rs:8416` is an LSP run-mode literal, unrelated.
+
+Reproducer (verified 2026-04-25 21:05 KST via `cargo run --quiet` against a stub crate that mirrors the production schema):
+
+```rust
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct MessageRequest {
+    pub model: String,
+    pub max_tokens: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<ToolChoice>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ToolChoice { Auto, Any, Tool { name: String } }
+
+fn main() {
+    let req = MessageRequest {
+        model: "claude-sonnet-4-6".to_string(),
+        max_tokens: 1024,
+        tool_choice: Some(ToolChoice::Auto),
+    };
+    let body = serde_json::to_value(&req).unwrap();
+    println!("Wire body: {}", serde_json::to_string(&body).unwrap());
+}
+```
+
+```
+Wire body: {"max_tokens":1024,"model":"claude-sonnet-4-6","tool_choice":{"type":"auto"}}
+```
+
+What the upstream APIs actually accept (verified against published docs, 2026-04-25):
+
+```jsonc
+// Anthropic /v1/messages — tool_choice supports a disable_parallel_tool_use modifier
+// (https://platform.claude.com/docs/en/agents-and-tools/tool-use/parallel-tool-use)
+{
+  "tool_choice": {
+    "type": "auto",                     // or "any" or "tool"
+    "disable_parallel_tool_use": true   // <-- claw cannot emit this
+  }
+}
+
+// OpenAI /v1/chat/completions — parallel_tool_calls is a top-level boolean
+// (https://platform.openai.com/docs/api-reference/chat/create#chat-create-parallel_tool_calls)
+{
+  "tool_choice": "auto",
+  "parallel_tool_calls": false          // <-- claw cannot emit this
+}
+```
+
+Claw-code's `ToolChoice::Auto` serializes as `{"type": "auto"}` with no modifier slot, and `MessageRequest` has no top-level `parallel_tool_calls` field. The wire payload that exits `render_json_body` (anthropic.rs:471) and `build_chat_completion_request` (openai_compat.rs:845) cannot carry either knob.
+
+**Source sites (verified by `grep -rn "parallel_tool\|disable_parallel\|ToolChoice" rust/crates/api/`):**
+
+```
+rust/crates/api/src/types.rs:15        pub tool_choice: Option<ToolChoice>,    // <- field exists
+rust/crates/api/src/types.rs:113-118    pub enum ToolChoice {                    // <- enum has 3 variants, no modifiers
+rust/crates/api/src/types.rs            (no parallel_tool_calls field anywhere)
+rust/crates/api/src/providers/anthropic.rs:1292,1529   // tests pass tool_choice: None only
+rust/crates/api/src/providers/openai_compat.rs:1158-1166  fn openai_tool_choice              // <- 3-arm match, no parallel mapping
+rust/crates/api/src/providers/openai_compat.rs:845-892   build_chat_completion_request    // <- payload has 5 conditional fields, no parallel_tool_calls
+rust/crates/api/src/providers/mod.rs:705                tool_choice: Some(ToolChoice::Auto)  // test only
+rust/crates/rusty-claude-cli/src/main.rs              (no --parallel-tool-calls flag)
+```
+
+`grep -rn "parallel_tool\|disable_parallel" rust/crates/`: 0 matches. `grep -rn "parallel_tool\|disable_parallel" rust/` (broader): 0 matches. The repository is a clean slate on this surface — there is no incomplete implementation, no TODO, no opt-out flag, no feature-gated branch. The contract simply does not exist.
+
+**Blast radius (verified by `grep -rn "build_chat_completion_request\|render_json_body" rust/crates/`):**
+
+- Every `claw prompt` invocation against any tool-using model — Anthropic, OpenAI, xAI, DashScope, Moonshot kimi — ships with provider-default parallel-tool-use behavior. Anthropic's default is parallel-on for `tool_choice: auto`/`any`/`tool` (https://platform.claude.com/docs/en/agents-and-tools/tool-use/parallel-tool-use); OpenAI's default for `parallel_tool_calls` is true (https://platform.openai.com/docs/api-reference/chat/create#chat-create-parallel_tool_calls). The CLI cannot ask either provider to serialize.
+
+- Sessions where the model fans out N parallel tool calls in a single assistant turn arrive at the `StreamState::ingest_chunk` path (`openai_compat.rs:462-549`) and at `normalize_response` (`openai_compat.rs:1190+`); claw collects the multiple tool_calls into the BTreeMap and emits them as multiple `ContentBlockStart`/`ContentBlockDelta` pairs. The runtime then executes them (`runtime/src/tool_executor.rs` and `tools/src/lib.rs`). There is no `StreamEvent::ParallelToolCallsEmitted { count }` event surfacing the fan-out.
+
+- Tools with implicit ordering dependencies — `Read` then `Edit` on the same path, `Bash` setup-then-test, `WebFetch` before `WebSearch`-on-results — can be emitted as parallel tool_calls by either provider. claw's tool runtime serializes execution at the runtime layer (good), but the model's planning layer does not know the runtime serializes; the model may still emit interdependent calls in parallel and the runtime just runs them in BTreeMap iteration order (which is sorted by openai-side index — not necessarily the dependency-correct order).
+
+- Providers that route through `OpenAiCompatConfig::xai()` / `dashscope()` / `openai()` — every model exposed through the openai-compat boundary is affected. The `openai_tool_choice` mapper at line 1158 has no path for the parallel knob; it is a 3-arm match on `ToolChoice::Auto/Any/Tool`. Adding a fourth arm is impossible because the enum has no fourth variant, and adding a modifier requires a struct, not an enum.
+
+- Anthropic native path: `render_json_body` (telemetry/src/lib.rs:107) serializes `MessageRequest` to JSON and inserts `extra_body`/`betas` keys. The serializer faithfully renders whatever is on `MessageRequest`. Since `parallel_tool_calls` and `disable_parallel_tool_use` are absent from the struct, they are absent from the wire — there is no way for a downstream caller (test, adapter, plugin) to inject them through the typed API. A user could in principle inject via `extra_body`, but that is a string-keyed escape hatch, not a typed contract.
+
+- DashScope qwen/Moonshot kimi parallel-tool-use behavior: undefined in claw-code. The openai-compat config does not strip or transform parallel-tool fields (because they don't exist), but the upstream backends may or may not honor `parallel_tool_calls` semantically. Without a typed field, claw cannot opt-out for non-OpenAI openai-compat providers either — even if the upstream supports it.
+
+**Gap:**
+
+1. **Two upstream providers, two wire-level knobs, zero claw-code representation.** Same anti-pattern shape as #211 (max_tokens key) and #210 (max_tokens cap): the model-fact lives in two different upstream contracts (`tool_choice.disable_parallel_tool_use` vs top-level `parallel_tool_calls`); the local taxonomy has neither. The asymmetry is exactly the kind of upstream-divergence the openai-compat boundary is supposed to translate, and the boundary translates nothing.
+
+2. **`ToolChoice` is an enum, not a struct — no slot for a modifier.** Anthropic's `disable_parallel_tool_use` is per-`tool_choice` (you can disable parallel for `auto` but allow for `any`, etc.). Encoding this requires a per-variant boolean: `ToolChoice::Auto { disable_parallel_tool_use: bool }` etc., or a wrapper struct `ToolChoice { kind: ToolChoiceKind, disable_parallel_tool_use: Option<bool> }`. The current 3-variant tagged enum cannot grow into either shape without a breaking change to every caller and serialization.
+
+3. **No `StreamEvent::ParallelToolCallsEmitted` event when N tool_calls fan out in one assistant turn.** Sibling pattern to #201 (silent tool-arg fallback), #202 (silent tool-message drop), #203 (no AutoCompactionEvent emission), #208 (silent param strip), #211 (silent prefix-mismatch). When a model emits 4 tool_calls with `finish_reason: tool_calls`, claw collects them into the BTreeMap, emits 4 `ContentBlockStart`+`ContentBlockDelta` pairs, and runs them through the runtime — operators see no aggregate event saying "4 parallel tool_calls emitted in one turn". The fan-out is invisible in the SSE stream taxonomy; only by counting `ContentBlockStart` events with `tool_use` block kind between two `MessageDelta` events can a consumer reconstruct the count. Same opacity pattern as the cluster.
+
+4. **No CLI flag, no plugin override, no environment variable.** `claw prompt --model gpt-5.2 --serialize-tool-calls` does not exist. `~/.claw/config.toml` has no `[tool_use] parallel = false` knob (verified by `grep -rn "parallel" rust/crates/runtime/src/config.rs` — no matches). Plugins cannot inject the flag through `extra_body` without bypassing typed validation. The opt-out is unreachable from any user-facing surface.
+
+5. **Tests do not assert parallel-tool semantics.** `grep -n "fn .*parallel\|fn .*tool_choice" rust/crates/api/src/providers/openai_compat.rs` returns: `tool_choice_translation_supports_required_function` (line 1577) — checks `Any → "required"` and `Tool → {type: function, function: {name}}`. No test for the parallel modifier because the modifier doesn't exist in the type. Same test-gap-mirrors-production-gap shape as #211.
+
+6. **`disable_parallel_tool_use` and `parallel_tool_calls` semantics differ — claw's unification surface needs to absorb both.** Anthropic's modifier scopes per-`tool_choice` (you can have `auto` with no parallel, `any` with parallel, both in the same conversation as different requests). OpenAI's top-level boolean is global to the request. A correct local representation needs either: (a) per-`tool_choice` modifier mapping to Anthropic native and to a request-level field for OpenAI, or (b) a request-level field that the openai-compat side serializes top-level and the anthropic side maps onto whatever `tool_choice` is set. Either choice is non-trivial; the current design has chosen neither, which is the gap.
+
+7. **Same shape as the cycle #168c emission-routing audit.** This branch (`feat/jobdori-168c-emission-routing`) has been collecting ten pinpoints (#201, #202, #203, #206, #207, #208, #209, #210, #211, and now #212) all of the form: "behavior diverges from declared upstream contract at the provider boundary, no event surfaces the divergence, the fact is encoded in a hardcoded check or completely absent." #212 extends the cluster to eleven by absence: the feature is so absent there is no string to grep for, no TODO comment, no half-implementation. It is a structural gap in the type system itself.
+
+8. **External validation — multiple downstream agents have already shipped this control.** anomalyco/opencode exposes `parallel_tool_calls` in its provider config (https://github.com/anomalyco/opencode — see `model.tools.parallel`); charmbracelet/crush #1061 (linked in #211) tracks the same OpenAI-side gap; LangChain's `bind_tools(parallel_tool_calls=False)` (https://python.langchain.com/docs/integrations/chat/openai/#tool-calling) has supported it since 2024. claw-code is the only OpenAI-compat agent in the cluster without this control.
+
+**Repro (verified 2026-04-25 21:05 KST):**
+
+```bash
+# 1. Confirm zero hits across the entire repository
+cd ~/clawd/claw-code
+grep -rn "parallel_tool\|disable_parallel" rust/ src/ tests/ docs/ 2>/dev/null
+# Output: (empty — verified)
+
+# 2. Confirm ToolChoice is a 3-variant enum with no modifier slot
+grep -A 6 "^pub enum ToolChoice" rust/crates/api/src/types.rs
+# pub enum ToolChoice {
+#     Auto,
+#     Any,
+#     Tool { name: String },
+# }
+
+# 3. Confirm openai_tool_choice mapper is a 3-arm match — no parallel path
+grep -A 8 "fn openai_tool_choice" rust/crates/api/src/providers/openai_compat.rs
+# fn openai_tool_choice(tool_choice: &ToolChoice) -> Value {
+#     match tool_choice {
+#         ToolChoice::Auto => Value::String("auto".to_string()),
+#         ToolChoice::Any => Value::String("required".to_string()),
+#         ToolChoice::Tool { name } => json!({ "type": "function", "function": { "name": name } }),
+#     }
+# }
+
+# 4. Confirm build_chat_completion_request payload has no parallel_tool_calls field
+grep -n "parallel\|payload\[" rust/crates/api/src/providers/openai_compat.rs | grep -v "//"
+# (only payload assignments for max_tokens_key, stream_options, tools, tool_choice, tuning params, stop, reasoning_effort)
+
+# 5. Build a stub crate that mirrors the production schema, prove the wire body has no parallel knob
+cargo run --quiet --manifest-path /tmp/parallel_probe_crate/Cargo.toml
+# Wire body: {"max_tokens":1024,"model":"claude-sonnet-4-6","tool_choice":{"type":"auto"}}
+# Anthropic expects (with disable_parallel_tool_use): {"tool_choice": {"type": "auto", "disable_parallel_tool_use": true}}
+# OpenAI expects (with parallel_tool_calls=false top-level): {"parallel_tool_calls": false, "tool_choice": "auto"}
+# Claw cannot emit either: no field on MessageRequest, no modifier on ToolChoice.
+```
+
+```rust
+// 6. Demonstrative tests that should exist and currently do not
+#[test]
+fn anthropic_tool_choice_can_disable_parallel() {
+    let request = MessageRequest {
+        model: "claude-sonnet-4-6".to_string(),
+        max_tokens: 1024,
+        messages: vec![InputMessage::user_text("test")],
+        tool_choice: Some(ToolChoice::Auto), // currently has no parallel modifier
+        ..Default::default()
+    };
+    let body = serde_json::to_value(&request).unwrap();
+    assert_eq!(
+        body["tool_choice"]["disable_parallel_tool_use"],
+        json!(true),
+        "Anthropic tool_choice should carry disable_parallel_tool_use modifier"
+    );
+    // Currently fails: tool_choice serializes as {"type":"auto"} with no modifier.
+}
+
+#[test]
+fn openai_compat_serializes_parallel_tool_calls_top_level() {
+    let request = MessageRequest {
+        model: "gpt-5.2".to_string(),
+        max_tokens: 1024,
+        messages: vec![InputMessage::user_text("test")],
+        // No way to express parallel_tool_calls=false; field doesn't exist on MessageRequest.
+        ..Default::default()
+    };
+    let payload = build_chat_completion_request(&request, OpenAiCompatConfig::openai());
+    assert_eq!(payload["parallel_tool_calls"], json!(false));
+    // Currently fails: payload has no parallel_tool_calls key.
+}
+```
+
+**Verification check:**
+
+- `grep -rn "parallel_tool\|disable_parallel" rust/crates/`: 0 matches. Verified clean.
+- `grep -A 6 "^pub enum ToolChoice" rust/crates/api/src/types.rs`: 3 variants, no struct, no modifiers. Verified.
+- `grep -A 8 "fn openai_tool_choice" rust/crates/api/src/providers/openai_compat.rs`: 3-arm match, no parallel path. Verified.
+- `cargo build -p api 2>&1 | grep -i parallel`: empty (no compile-time hint of the gap). Verified by absence.
+- The `MessageRequest` Default-derive includes `tool_choice: None`. Adding fields is API-additive (Default still works); the gap is the absence of a field, not a misnaming.
+- Anthropic's reference: https://platform.claude.com/docs/en/agents-and-tools/tool-use/parallel-tool-use — "By default, Claude may use multiple tools in a single response. To disable parallel tool use, set `disable_parallel_tool_use: true` on `tool_choice`."
+- OpenAI's reference: https://platform.openai.com/docs/api-reference/chat/create#chat-create-parallel_tool_calls — "Whether to enable parallel function calling during tool use. Defaults to `true`."
+- Stack Overflow #79332599 (LangGraph + Anthropic): users hitting the same control surface in other clients — proves the parameter is widely used and widely needed.
+- LangChain `BaseChatOpenAI.parallel_tool_calls`: https://reference.langchain.com/javascript/langchain-openai/BaseChatOpenAICallOptions/parallel_tool_calls — proves competitor agent frameworks ship the typed control.
+
+**Expected:**
+
+- `MessageRequest` gains a top-level `parallel_tool_calls: Option<bool>` field with `#[serde(skip_serializing_if = "Option::is_none")]`.
+- `ToolChoice` migrates from a 3-variant enum to either: (a) per-variant struct with `disable_parallel_tool_use: bool`, or (b) wrapper `pub struct ToolChoice { pub kind: ToolChoiceKind, pub disable_parallel_tool_use: Option<bool> }`. Choice depends on the breaking-change budget on this branch.
+- `openai_tool_choice` and `build_chat_completion_request` both consume the new field/modifier and emit the correct wire shape per provider.
+- `render_json_body` (anthropic side) emits `tool_choice.disable_parallel_tool_use` when the modifier is set.
+- A `StreamEvent::ParallelToolCallsEmitted { turn_id: String, count: u32 }` variant fires when more than one `ContentBlockStart` with `tool_use` block kind precedes the next `MessageDelta` — surfaces the fan-out as a structured event for operators.
+- Regression tests: (a) Anthropic path emits `disable_parallel_tool_use` when set, (b) OpenAI-compat path emits top-level `parallel_tool_calls`, (c) both paths default to absent (provider-default behavior preserved), (d) per-variant Anthropic check: `Auto + disable=true` works, `Any + disable=true` works, `Tool + disable=true` works.
+- USAGE.md / SCHEMAS.md document the new request field and the per-provider mapping.
+- A new CLI flag `claw prompt --serialize-tool-calls` (or `--no-parallel-tool-use`) that sets the request-level field on the wire.
+- `~/.claw/config.toml` gains a `[tool_use] parallel = false` knob with proper merge semantics.
+- (Stretch) A `MODEL_PARAM_REQUIREMENTS` registry entry per model encoding `default_parallel_tool_calls: bool` and `supports_parallel_disable: bool` — closes the cluster's per-model-fact unification with #208/#210/#211.
+
+**Fix sketch:**
+
+1. Add `parallel_tool_calls: Option<bool>` to `MessageRequest` (`crates/api/src/types.rs:5-35`). Add `#[serde(skip_serializing_if = "Option::is_none")]`. ~3 LOC.
+
+2. Refactor `ToolChoice` from enum to struct: `pub struct ToolChoice { pub kind: ToolChoiceKind, pub disable_parallel_tool_use: Option<bool> }`. Migrate the 3 variants into a `ToolChoiceKind` enum. Update all `ToolChoice::Auto` literals (4 sites: `providers/openai_compat.rs:1454,1577`, `providers/mod.rs:705`, plus tests in `prompt_cache.rs`, `anthropic.rs`) to use the new shape. ~30 LOC mechanical changes.
+
+3. Update `openai_tool_choice` (`crates/api/src/providers/openai_compat.rs:1158`) to consume the new struct: emit just the kind to `tool_choice` and emit `parallel_tool_calls` separately at the top level of the payload in `build_chat_completion_request`. ~15 LOC.
+
+4. Update `render_json_body` (`crates/telemetry/src/lib.rs:107`) — actually, since serde renders whatever is on `MessageRequest`, the struct-with-modifier serializes correctly without telemetry-side changes. Just verify with a serde test.
+
+5. Add three regression tests at the same fixture rhythm as `tool_choice_translation_supports_required_function` (line 1577): `disable_parallel_serializes_on_anthropic_tool_choice`, `parallel_tool_calls_serializes_top_level_on_openai_compat`, `default_omits_both_fields`. ~40 LOC across three tests.
+
+6. (Stretch) Add `StreamEvent::ParallelToolCallsEmitted { count, turn_id }` variant in `crates/api/src/types.rs` and emit it from `StreamState::finish` (line 555+) when `self.tool_calls.len() > 1`. ~25 LOC including SCHEMAS.md update.
+
+7. (Stretch) CLI flag `--serialize-tool-calls` in `crates/rusty-claude-cli/src/main.rs`. ~20 LOC.
+
+8. (Stretch) `MODEL_PARAM_REQUIREMENTS` registry entry per model — unifies #208/#210/#211/#212. ~150 LOC plus migration. (Cluster-wide fix.)
+
+**Why this matters for clawability:**
+
+- **Provider-default-on parallel tool use breaks ordering-dependent tool sequences.** The most common shape — Read → Edit on the same path; Bash setup → Bash test; WebFetch → WebSearch over the result — gets emitted as parallel tool_calls by both flagship providers (Sonnet 4.6 and gpt-5.2 default to parallel-on with `tool_choice: auto`). claw's runtime serializes execution but the model's plan was for parallel; the runtime ordering is BTreeMap iteration order (sorted by openai_index), not dependency order. Subtle ordering bugs leak into tool outputs.
+
+- **The control surface is industry-standard.** LangChain, anomalyco/opencode, charmbracelet/crush, LangGraph, the OpenAI SDK, and the Anthropic SDK all expose it. claw-code is the only OpenAI-compat agent in the visibility cluster without typed support. New users coming from any of those frameworks expect the knob.
+
+- **The fix is type-additive on one side, breaking on the other.** `parallel_tool_calls: Option<bool>` is purely additive (default=None, serialize-skip). `ToolChoice` enum→struct is breaking. The branch budget (`feat/jobdori-168c-emission-routing` is a feature branch with 11 pinpoints under review) can absorb the breaking change because it's documented, the migration is mechanical (~30 LOC across 4 sites), and the result is a cleaner taxonomy that absorbs future modifiers (`tool_choice.input_schema` overrides, `tool_choice.json_mode`, etc.).
+
+- **Sibling pattern to #208/#210/#211.** All four pinpoints encode the same shape: a per-model wire-format fact lives in a hardcoded check (or, here, in absence). The cluster fix is a `MODEL_PARAM_REQUIREMENTS` registry. With #212, the registry needs four columns: `tuning_params_strip` (#208), `max_output_tokens` (#210), `max_tokens_param_name` (#211), `default_parallel_tool_calls` (#212). One source of truth, one set of tests, one new-model-onboarding workflow.
+
+- **Test gap = production gap.** No test asserts the wire format with the parallel modifier set. Adding a typed field forces tests to instantiate it; the test gap closes when the production gap closes. Same shape as #211.
+
+- **Mechanical fix, ~70 LOC for the additive primary fix.** The breaking enum-to-struct migration is ~30 LOC across 4 sites; the additive `parallel_tool_calls: Option<bool>` is ~3 LOC; the openai-compat top-level mapping is ~5 LOC; three regression tests are ~40 LOC. The complexity is in the cluster-wide registry refactor (stretch), not the immediate correctness fix.
+
+- **Future-proofing.** Anthropic's roadmap continues to add `tool_choice` modifiers (the public docs reference an `input_schema` modifier in development; `json_mode`-style toggles are likely). OpenAI's `parallel_tool_calls` is permanent. Every new `tool_choice` modifier or top-level tool field will hit the same absence-shape unless `ToolChoice` becomes a struct with a modifiers slot. Closing #212 with the struct refactor opens the lane for #213/#214 modifiers without churn.
+
+**Acceptance criteria:**
+
+- `MessageRequest::parallel_tool_calls: Option<bool>` exists with `#[serde(skip_serializing_if = "Option::is_none")]`.
+- `ToolChoice` (or its replacement struct) carries a `disable_parallel_tool_use: Option<bool>` modifier slot.
+- `build_chat_completion_request` emits top-level `parallel_tool_calls` when set, omits when None.
+- `render_json_body` (Anthropic) emits `tool_choice.disable_parallel_tool_use` when set; the modifier round-trips through serde without bespoke serialization.
+- Three regression tests assert wire format: Anthropic with disable=true, OpenAI with parallel=false, both paths default to absent.
+- A negative test asserts the existing `tool_choice_translation_supports_required_function` still passes (parity with current behavior preserved when modifier is None).
+- `cargo test -p api` and `cargo test -p rusty-claude-cli` pass with the new tests.
+- USAGE.md / SCHEMAS.md document the new field and the per-provider mapping.
+- (Stretch) `StreamEvent::ParallelToolCallsEmitted` variant exists with a clear schema.
+- (Stretch) CLI flag `--serialize-tool-calls` and config knob `[tool_use] parallel = bool`.
+- (Stretch) `MODEL_PARAM_REQUIREMENTS` registry unifies the four sibling per-model parameter facts.
+- A future contributor adding a new model can declare its parallel-tool default in one registry row and immediately see whether the wire format is correct.
+
+**Status:** Open. No code changed. Filed 2026-04-25 21:10 KST. Branch: feat/jobdori-168c-emission-routing. HEAD: f004f74. Sibling-shape cluster (silent-fallback / silent-drop / silent-strip / silent-misnomer / silent-shadow / silent-prefix-mismatch / structural-absence at provider/CLI boundary): #201/#202/#203/#206/#207/#208/#209/#210/#211/#212 — eleven pinpoints, one unified-registry refactor (`MODEL_PARAM_REQUIREMENTS` with four columns: `tuning_params_strip`, `max_output_tokens`, `max_tokens_param_name`, `default_parallel_tool_calls`) closes them all. Wire-format-parity cluster: #211 (max_tokens parameter name) + #212 (parallel_tool_calls / disable_parallel_tool_use). External validation: Anthropic parallel-tool-use docs (https://platform.claude.com/docs/en/agents-and-tools/tool-use/parallel-tool-use), OpenAI Chat Completions API reference (https://platform.openai.com/docs/api-reference/chat/create#chat-create-parallel_tool_calls), LangChain BaseChatOpenAI parallel_tool_calls (https://reference.langchain.com/javascript/langchain-openai/BaseChatOpenAICallOptions/parallel_tool_calls), Stack Overflow #79332599 (LangGraph + Anthropic disable_parallel_tool_use), advanced-stack.com OpenAI parallel function calling guide — same control surface available across the entire ecosystem, absent only in claw-code.
+
 🪨
