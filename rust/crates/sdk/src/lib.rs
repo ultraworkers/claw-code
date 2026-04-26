@@ -35,6 +35,7 @@ mod session;
 mod session_manager;
 mod session_tree;
 mod session_tree_log;
+mod setup;
 mod tool_registry;
 
 pub use agent_context::{AgentContext, AgentTask, TaskRegistry};
@@ -52,6 +53,10 @@ pub use session::{AgentSession, AgentSessionBuilder, BoxedApiClient, DummyApiCli
 pub use session_manager::{SessionManager, SessionManagerConfig};
 pub use session_tree::{SessionTree, SessionTreeNode};
 pub use session_tree_log::{SessionTreeLog, TreeEntry};
+pub use setup::{
+    check_tool, detect_providers, detect_tools, template_library, DetectedProvider, DetectedTool,
+    SessionTemplate, SetupReport,
+};
 pub use tool_registry::{
     create_builtin_tools, define_tool, FnToolHandler, SchemaValidationError, SchemaValidator,
     SdkToolExecutor, ToolDefinition, ToolDefinitionBuilder, ToolHandler, ToolRegistry,
