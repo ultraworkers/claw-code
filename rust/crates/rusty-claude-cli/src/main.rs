@@ -9,6 +9,7 @@
 mod init;
 mod input;
 mod render;
+mod setup_wizard;
 
 use std::collections::BTreeSet;
 use std::env;
@@ -413,6 +414,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         CliAction::Acp { output_format } => print_acp_status(output_format)?,
         CliAction::State { output_format } => run_worker_state(output_format)?,
         CliAction::Init { output_format } => run_init(output_format)?,
+        CliAction::Setup { .. } => setup_wizard::run_setup_wizard()?,
         // #146: dispatch pure-local introspection. Text mode uses existing
         // render_config_report/render_diff_report; JSON mode uses the
         // corresponding _json helpers already exposed for resume sessions.
@@ -575,6 +577,9 @@ enum CliAction {
     },
     // prompt-mode formatting is only supported for non-interactive runs
     Help {
+        output_format: CliOutputFormat,
+    },
+    Setup {
         output_format: CliOutputFormat,
     },
 }
@@ -1131,6 +1136,7 @@ fn parse_single_word_command_alias(
         "sandbox" => Some(Ok(CliAction::Sandbox { output_format })),
         "doctor" => Some(Ok(CliAction::Doctor { output_format })),
         "state" => Some(Ok(CliAction::State { output_format })),
+        "setup" => Some(Ok(CliAction::Setup { output_format })),
         // #146: let `config` and `diff` fall through to parse_subcommand
         // where they are wired as pure-local introspection, instead of
         // producing the "is a slash command" guidance. Zero-arg cases
@@ -1152,6 +1158,7 @@ fn bare_slash_command_guidance(command_name: &str) -> Option<String> {
             | "init"
             | "prompt"
             | "export"
+            | "setup"
     ) {
         return None;
     }
@@ -1599,7 +1606,8 @@ fn config_permission_mode_for_current_dir() -> Option<PermissionMode> {
 fn config_model_for_current_dir() -> Option<String> {
     let cwd = env::current_dir().ok()?;
     let loader = ConfigLoader::default_for(&cwd);
-    loader.load().ok()?.model().map(ToOwned::to_owned)
+    let config = loader.load().ok()?;
+    config.model().map(ToOwned::to_owned).or_else(|| config.provider().model().map(ToOwned::to_owned))
 }
 
 fn resolve_repl_model(cli_model: String) -> String {
@@ -3731,7 +3739,8 @@ fn run_resume_command(
         | SlashCommand::Ide { .. }
         | SlashCommand::Tag { .. }
         | SlashCommand::OutputStyle { .. }
-        | SlashCommand::AddDir { .. } => Err("unsupported resumed slash command".into()),
+        | SlashCommand::AddDir { .. }
+        | SlashCommand::Setup => Err("unsupported resumed slash command".into()),
     }
 }
 
@@ -4815,6 +4824,16 @@ impl LiveCli {
             }
             SlashCommand::Init => {
                 run_init(CliOutputFormat::Text)?;
+                false
+            }
+            SlashCommand::Setup => {
+                setup_wizard::run_setup_wizard()?;
+                // Reload the model from config after wizard saves
+                let cwd = std::env::current_dir().unwrap_or_default();
+                let config = runtime::ConfigLoader::default_for(&cwd).load().ok();
+                if let Some(new_model) = config.as_ref().and_then(|c| c.provider().model().map(str::to_string)) {
+                    self.set_model(Some(new_model))?;
+                }
                 false
             }
             SlashCommand::Diff => {
