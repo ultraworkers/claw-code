@@ -7102,6 +7102,16 @@ fn run_repl(
                 cli.record_prompt_history(&trimmed);
                 cli.run_turn(&trimmed)?;
             }
+            input::ReadOutcome::ProviderSwap => {
+                // Ctrl+P triggered — launch setup wizard and hot-swap model
+                setup_wizard::run_setup_wizard()?;
+                let cwd = std::env::current_dir().unwrap_or_default();
+                let config = runtime::ConfigLoader::default_for(&cwd).load().ok();
+                if let Some(new_model) = config.as_ref().and_then(|c| c.provider().model().map(str::to_string)) {
+                    cli.set_model(Some(new_model))?;
+                }
+                println!("{}", format_connected_line(&cli.model));
+            }
             input::ReadOutcome::Cancel => {}
             input::ReadOutcome::Exit => {
                 cli.persist_session()?;
