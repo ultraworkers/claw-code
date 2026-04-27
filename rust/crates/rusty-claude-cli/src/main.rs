@@ -6926,6 +6926,7 @@ fn run_resume_command(
         | SlashCommand::Tag { .. }
         | SlashCommand::OutputStyle { .. }
 <<<<<<< HEAD
+<<<<<<< HEAD
         | SlashCommand::AddDir { .. }
 <<<<<<< HEAD
         | SlashCommand::Team { .. }
@@ -6938,6 +6939,10 @@ fn run_resume_command(
         | SlashCommand::Lsp { .. }
 >>>>>>> e9582034 (feat: full LSP (Language Server Protocol) integration)
         | SlashCommand::Setup => Err("unsupported resumed slash command".into()),
+=======
+        | SlashCommand::AddDir { .. }
+        | SlashCommand::Lsp { .. } => Err("unsupported resumed slash command".into()),
+>>>>>>> 0b227b62 (fix: resolve cherry-pick conflicts and remove non-LSP artifacts)
     }
 }
 

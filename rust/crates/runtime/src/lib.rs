@@ -72,6 +72,7 @@ pub use config::{
 <<<<<<< HEAD
 <<<<<<< HEAD
 <<<<<<< HEAD
+<<<<<<< HEAD
     clear_user_provider_settings, default_config_home, save_user_provider_settings,
     suppress_config_warnings_for_json_mode, ApiTimeoutConfig, ConfigEntry, ConfigError,
     ConfigFileReport, ConfigFileStatus, ConfigInspection, ConfigLoader, ConfigSource,
@@ -85,6 +86,9 @@ pub use config::{
 =======
 >>>>>>> e9582034 (feat: full LSP (Language Server Protocol) integration)
     clear_user_provider_settings, save_user_provider_settings, ConfigEntry, ConfigError,
+=======
+    ConfigEntry, ConfigError,
+>>>>>>> 0b227b62 (fix: resolve cherry-pick conflicts and remove non-LSP artifacts)
     ConfigLoader, ConfigSource, LspServerConfig, McpConfigCollection, McpManagedProxyServerConfig,
     McpOAuthConfig, McpRemoteServerConfig, McpSdkServerConfig, McpServerConfig,
     McpStdioServerConfig, McpTransport, McpWebSocketServerConfig, OAuthConfig,

@@ -5425,9 +5425,12 @@ pub fn handle_slash_command(
         | SlashCommand::Setup
 =======
         | SlashCommand::Lsp { .. }
+<<<<<<< HEAD
         | SlashCommand::Setup
         | SlashCommand::Unknown(_) => None,
 >>>>>>> e9582034 (feat: full LSP (Language Server Protocol) integration)
+=======
+>>>>>>> 0b227b62 (fix: resolve cherry-pick conflicts and remove non-LSP artifacts)
         | SlashCommand::Unknown(_) => None,
     }
 }
