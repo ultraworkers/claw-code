@@ -108,6 +108,7 @@ pub fn compact_session(session: &Session, config: CompactionConfig) -> Compactio
         .first()
         .and_then(extract_existing_compacted_summary);
     let compacted_prefix_len = usize::from(existing_summary.is_some());
+<<<<<<< HEAD
     // When preserve_recent_messages is 0, the caller wants maximum compaction
     // (no recent messages preserved). Without this guard, saturating_sub(0)
     // returns messages.len(), which later indexes past the end of the array
@@ -119,6 +120,12 @@ pub fn compact_session(session: &Session, config: CompactionConfig) -> Compactio
             .messages
             .len()
             .saturating_sub(config.preserve_recent_messages)
+=======
+    let raw_keep_from = if config.preserve_recent_messages == 0 {
+        session.messages.len()
+    } else {
+        session.messages.len().saturating_sub(config.preserve_recent_messages)
+>>>>>>> 1ff5617c (fix: sync all bug fixes to combined branch)
     };
     // Ensure we do not split a tool-use / tool-result pair at the compaction
     // boundary. If the first preserved message is a user message whose first

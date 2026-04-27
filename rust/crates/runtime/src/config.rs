@@ -126,6 +126,17 @@ pub struct RuntimePluginConfig {
 }
 
 <<<<<<< HEAD
+<<<<<<< HEAD
+=======
+/// Per-language LSP server configuration supplied by the user in settings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LspServerConfig {
+    pub command: String,
+    pub args: Vec<String>,
+    pub enabled: bool,
+}
+
+>>>>>>> 1ff5617c (fix: sync all bug fixes to combined branch)
 /// API timeout and retry configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApiTimeoutConfig {
@@ -195,8 +206,10 @@ pub struct RuntimeFeatureConfig {
     rules_import: RulesImportConfig,
     provider: RuntimeProviderConfig,
     lsp: BTreeMap<String, LspServerConfig>,
+    api_timeout: ApiTimeoutConfig,
 }
 
+<<<<<<< HEAD
 /// Controls which external AI coding framework rules are imported into the system prompt.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum RulesImportConfig {
@@ -218,6 +231,26 @@ impl RulesImportConfig {
             Self::List(frameworks) => frameworks
                 .iter()
                 .any(|candidate| candidate.eq_ignore_ascii_case(framework)),
+=======
+impl Default for RuntimeFeatureConfig {
+    fn default() -> Self {
+        Self {
+            hooks: RuntimeHookConfig::default(),
+            plugins: RuntimePluginConfig::default(),
+            mcp: McpConfigCollection::default(),
+            oauth: None,
+            model: None,
+            lsp_auto_start: true,
+            aliases: BTreeMap::new(),
+            permission_mode: None,
+            permission_rules: RuntimePermissionRuleConfig::default(),
+            sandbox: SandboxConfig::default(),
+            provider_fallbacks: ProviderFallbackConfig::default(),
+            trusted_roots: Vec::new(),
+            provider: RuntimeProviderConfig::default(),
+            lsp: BTreeMap::new(),
+            api_timeout: ApiTimeoutConfig::default(),
+>>>>>>> 1ff5617c (fix: sync all bug fixes to combined branch)
         }
     }
 }
@@ -255,7 +288,6 @@ impl RuntimeProviderConfig {
     pub fn model(&self) -> Option<&str> {
         self.model.as_deref()
     }
-    api_timeout: ApiTimeoutConfig,
 }
 
 /// Ordered chain of fallback model identifiers used when the primary

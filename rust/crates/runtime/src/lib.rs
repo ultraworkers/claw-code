@@ -70,6 +70,7 @@ pub use compact::{
 };
 pub use config::{
 <<<<<<< HEAD
+<<<<<<< HEAD
     clear_user_provider_settings, default_config_home, save_user_provider_settings,
     suppress_config_warnings_for_json_mode, ApiTimeoutConfig, ConfigEntry, ConfigError,
     ConfigFileReport, ConfigFileStatus, ConfigInspection, ConfigLoader, ConfigSource,
@@ -85,6 +86,10 @@ pub use config::{
     McpOAuthConfig, McpRemoteServerConfig, McpSdkServerConfig, McpServerConfig,
     McpStdioServerConfig, McpTransport, McpWebSocketServerConfig, OAuthConfig,
     ApiTimeoutConfig, ConfigEntry, ConfigError, ConfigLoader, ConfigSource, McpConfigCollection,
+=======
+    ApiTimeoutConfig, clear_user_provider_settings, save_user_provider_settings, ConfigEntry,
+    ConfigError, ConfigLoader, ConfigSource, LspServerConfig, McpConfigCollection,
+>>>>>>> 1ff5617c (fix: sync all bug fixes to combined branch)
     McpManagedProxyServerConfig, McpOAuthConfig, McpRemoteServerConfig, McpSdkServerConfig,
     McpServerConfig, McpStdioServerConfig, McpTransport, McpWebSocketServerConfig, OAuthConfig,
     ProviderFallbackConfig, ResolvedPermissionMode, RuntimeConfig, RuntimeFeatureConfig,
