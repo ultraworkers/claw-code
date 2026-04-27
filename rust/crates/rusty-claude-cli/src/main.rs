@@ -6925,12 +6925,18 @@ fn run_resume_command(
         | SlashCommand::Ide { .. }
         | SlashCommand::Tag { .. }
         | SlashCommand::OutputStyle { .. }
+<<<<<<< HEAD
         | SlashCommand::AddDir { .. }
 <<<<<<< HEAD
         | SlashCommand::Team { .. }
 =======
         | SlashCommand::Lsp { .. }
 >>>>>>> 856409d3 (feat: full LSP (Language Server Protocol) integration)
+=======
+        | SlashCommand::AddDir { .. } => Err("unsupported resumed slash command".into()),
+        | SlashCommand::AddDir { .. }
+        | SlashCommand::Lsp { .. }
+>>>>>>> e9582034 (feat: full LSP (Language Server Protocol) integration)
         | SlashCommand::Setup => Err("unsupported resumed slash command".into()),
     }
 }
@@ -7092,6 +7098,7 @@ fn run_repl(
                 server.clone(),
             );
         }
+<<<<<<< HEAD
         // Auto-start all discovered servers if enabled
         if cli.lsp_auto_start {
             let registry = tools::global_lsp_registry();
@@ -7102,6 +7109,8 @@ fn run_repl(
                 }
             }
         }
+=======
+>>>>>>> e9582034 (feat: full LSP (Language Server Protocol) integration)
     }
 
     loop {
@@ -8386,7 +8395,11 @@ impl LiveCli {
         })
     }
 
+<<<<<<< HEAD
     fn handle_lsp_command(&mut self, action: Option<&str>, target: Option<&str>) {
+=======
+    fn handle_lsp_command(&self, action: Option<&str>, target: Option<&str>) {
+>>>>>>> e9582034 (feat: full LSP (Language Server Protocol) integration)
         let registry = tools::global_lsp_registry();
         match action {
             Some("start") => {
@@ -8411,6 +8424,7 @@ impl LiveCli {
                     Err(e) => eprintln!("Failed to restart LSP server '{lang}': {e}"),
                 }
             }
+<<<<<<< HEAD
             Some("toggle") => {
                 self.lsp_auto_start = !self.lsp_auto_start;
                 let state = if self.lsp_auto_start { "on" } else { "off" };
@@ -8420,6 +8434,10 @@ impl LiveCli {
                 let servers = registry.list_servers();
                 let auto_state = if self.lsp_auto_start { "on" } else { "off" };
                 eprintln!("LSP auto-start: {auto_state}");
+=======
+            _ => {
+                let servers = registry.list_servers();
+>>>>>>> e9582034 (feat: full LSP (Language Server Protocol) integration)
                 if servers.is_empty() {
                     eprintln!("No LSP servers registered.");
                 } else {

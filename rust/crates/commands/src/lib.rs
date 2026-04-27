@@ -1302,10 +1302,14 @@ impl SlashCommand {
             Self::OutputStyle { .. } => "/output-style",
             Self::AddDir { .. } => "/add-dir",
 <<<<<<< HEAD
+<<<<<<< HEAD
             Self::Team { .. } => "/team",
 =======
             Self::Lsp { .. } => "/lsp",
 >>>>>>> 856409d3 (feat: full LSP (Language Server Protocol) integration)
+=======
+            Self::Lsp { .. } => "/lsp",
+>>>>>>> e9582034 (feat: full LSP (Language Server Protocol) integration)
             Self::Sandbox => "/sandbox",
             Self::Mcp { .. } => "/mcp",
             Self::Export { .. } => "/export",
@@ -5413,11 +5417,17 @@ pub fn handle_slash_command(
         | SlashCommand::AddDir { .. }
         | SlashCommand::History { .. }
 <<<<<<< HEAD
+<<<<<<< HEAD
         | SlashCommand::Team { .. }
 =======
         | SlashCommand::Lsp { .. }
 >>>>>>> 856409d3 (feat: full LSP (Language Server Protocol) integration)
         | SlashCommand::Setup
+=======
+        | SlashCommand::Lsp { .. }
+        | SlashCommand::Setup
+        | SlashCommand::Unknown(_) => None,
+>>>>>>> e9582034 (feat: full LSP (Language Server Protocol) integration)
         | SlashCommand::Unknown(_) => None,
     }
 }
@@ -6035,11 +6045,15 @@ mod tests {
         assert!(!help.contains("/login"));
         assert!(!help.contains("/logout"));
 <<<<<<< HEAD
+<<<<<<< HEAD
         assert!(help.contains("/setup"));
         assert_eq!(slash_command_specs().len(), 140);
 =======
         assert_eq!(slash_command_specs().len(), 141);
 >>>>>>> 856409d3 (feat: full LSP (Language Server Protocol) integration)
+=======
+        assert_eq!(slash_command_specs().len(), 141);
+>>>>>>> e9582034 (feat: full LSP (Language Server Protocol) integration)
         assert!(resume_supported_slash_commands().len() >= 39);
     }
 

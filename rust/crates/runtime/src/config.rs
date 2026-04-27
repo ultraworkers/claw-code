@@ -127,7 +127,10 @@ pub struct RuntimePluginConfig {
 
 <<<<<<< HEAD
 <<<<<<< HEAD
+<<<<<<< HEAD
 =======
+=======
+>>>>>>> e9582034 (feat: full LSP (Language Server Protocol) integration)
 /// Per-language LSP server configuration supplied by the user in settings.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LspServerConfig {
@@ -136,6 +139,7 @@ pub struct LspServerConfig {
     pub enabled: bool,
 }
 
+<<<<<<< HEAD
 >>>>>>> 1ff5617c (fix: sync all bug fixes to combined branch)
 /// API timeout and retry configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -188,6 +192,8 @@ impl Default for ApiTimeoutConfig {
 >>>>>>> 07ce5aee (feat: API timeout config, Retry-After header support, and configurable retry)
 }
 
+=======
+>>>>>>> e9582034 (feat: full LSP (Language Server Protocol) integration)
 /// Structured feature configuration consumed by runtime subsystems.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RuntimeFeatureConfig {
@@ -202,6 +208,7 @@ pub struct RuntimeFeatureConfig {
     sandbox: SandboxConfig,
     provider_fallbacks: ProviderFallbackConfig,
     trusted_roots: Vec<String>,
+<<<<<<< HEAD
     api_timeout: ApiTimeoutConfig,
     rules_import: RulesImportConfig,
     provider: RuntimeProviderConfig,
@@ -260,6 +267,13 @@ impl Default for RuntimeFeatureConfig {
 /// Represents the `provider` section in `~/.claw/settings.json`, used as a
 /// fallback when environment variables are absent (3-tier resolution:
 /// env var > .env file > stored config).
+=======
+    provider: RuntimeProviderConfig,
+    lsp: BTreeMap<String, LspServerConfig>,
+}
+
+/// Stored provider configuration from the setup wizard.
+>>>>>>> e9582034 (feat: full LSP (Language Server Protocol) integration)
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RuntimeProviderConfig {
     kind: Option<String>,
@@ -736,6 +750,7 @@ impl ConfigLoader {
             provider: parse_optional_provider_config(&merged_value)?,
             lsp: parse_optional_lsp_config(&merged_value)?,
 <<<<<<< HEAD
+<<<<<<< HEAD
 >>>>>>> 856409d3 (feat: full LSP (Language Server Protocol) integration)
 =======
             lsp_auto_start: merged_value
@@ -745,6 +760,8 @@ impl ConfigLoader {
                 .unwrap_or(true),
             api_timeout: parse_optional_api_timeout_config(&merged_value)?,
 >>>>>>> 07ce5aee (feat: API timeout config, Retry-After header support, and configurable retry)
+=======
+>>>>>>> e9582034 (feat: full LSP (Language Server Protocol) integration)
         };
 
         ConfigInspection {
@@ -1004,15 +1021,19 @@ impl RuntimeConfig {
     }
 
     #[must_use]
+<<<<<<< HEAD
     pub fn rules_import(&self) -> &RulesImportConfig {
         &self.feature_config.rules_import
     }
 
     #[must_use]
+=======
+>>>>>>> e9582034 (feat: full LSP (Language Server Protocol) integration)
     pub fn provider(&self) -> &RuntimeProviderConfig {
         &self.feature_config.provider
     }
 
+<<<<<<< HEAD
 <<<<<<< HEAD
     /// Merge config-level default trusted roots with per-call roots.
     ///
@@ -1028,6 +1049,11 @@ impl RuntimeConfig {
     pub fn lsp(&self) -> &BTreeMap<String, LspServerConfig> {
         &self.feature_config.lsp
 >>>>>>> 856409d3 (feat: full LSP (Language Server Protocol) integration)
+=======
+    #[must_use]
+    pub fn lsp(&self) -> &BTreeMap<String, LspServerConfig> {
+        &self.feature_config.lsp
+>>>>>>> e9582034 (feat: full LSP (Language Server Protocol) integration)
     }
 }
 
@@ -1107,6 +1133,7 @@ impl RuntimeFeatureConfig {
     }
 
     #[must_use]
+<<<<<<< HEAD
     pub fn rules_import(&self) -> &RulesImportConfig {
         &self.rules_import
     }
@@ -1128,11 +1155,20 @@ fn merge_trusted_roots(config_roots: &[String], per_call_roots: &[String]) -> Ve
     }
     merged
 =======
+=======
+    pub fn provider(&self) -> &RuntimeProviderConfig {
+        &self.provider
+    }
+
+>>>>>>> e9582034 (feat: full LSP (Language Server Protocol) integration)
     #[must_use]
     pub fn lsp(&self) -> &BTreeMap<String, LspServerConfig> {
         &self.lsp
     }
+<<<<<<< HEAD
 >>>>>>> 856409d3 (feat: full LSP (Language Server Protocol) integration)
+=======
+>>>>>>> e9582034 (feat: full LSP (Language Server Protocol) integration)
 }
 
 impl ProviderFallbackConfig {
@@ -2321,6 +2357,7 @@ fn parse_optional_oauth_config(
     }))
 }
 
+<<<<<<< HEAD
 /// #92: expand `${VAR}` environment variable references and `~/` home directory
 /// prefix in a config string value. Returns the expanded string.
 fn expand_config_value(value: &str) -> String {
@@ -2358,6 +2395,25 @@ fn expand_config_value(value: &str) -> String {
         }
     }
     result
+=======
+fn parse_optional_provider_config(root: &JsonValue) -> Result<RuntimeProviderConfig, ConfigError> {
+    let Some(provider_value) = root.as_object().and_then(|object| object.get("provider")) else {
+        return Ok(RuntimeProviderConfig::default());
+    };
+    let Some(object) = provider_value.as_object() else {
+        return Ok(RuntimeProviderConfig::default());
+    };
+    let kind = optional_string(object, "kind", "provider")?.map(str::to_string);
+    let api_key = optional_string(object, "apiKey", "provider")?.map(str::to_string);
+    let base_url = optional_string(object, "baseUrl", "provider")?.map(str::to_string);
+    let model = optional_string(object, "model", "provider")?.map(str::to_string);
+    Ok(RuntimeProviderConfig {
+        kind,
+        api_key,
+        base_url,
+        model,
+    })
+>>>>>>> e9582034 (feat: full LSP (Language Server Protocol) integration)
 }
 
 fn parse_optional_lsp_config(

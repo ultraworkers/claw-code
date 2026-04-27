@@ -214,6 +214,7 @@ const TOP_LEVEL_FIELDS: &[FieldSpec] = &[
     },
     FieldSpec {
 <<<<<<< HEAD
+<<<<<<< HEAD
         name: "rulesImport",
         expected: FieldType::RulesImport,
     },
@@ -228,6 +229,10 @@ const TOP_LEVEL_FIELDS: &[FieldSpec] = &[
     FieldSpec {
         name: "lspAutoStart",
         expected: FieldType::Bool,
+=======
+        name: "lsp",
+        expected: FieldType::Object,
+>>>>>>> e9582034 (feat: full LSP (Language Server Protocol) integration)
     },
 ];
 
@@ -578,6 +583,31 @@ pub fn validate_config_file(
             source,
             &path_display,
         ));
+    }
+
+    // Validate lsp map: each value must be an object with LSP_FIELDS.
+    if let Some(lsp) = object.get("lsp").and_then(JsonValue::as_object) {
+        for (server_name, server_value) in lsp {
+            if let Some(server_obj) = server_value.as_object() {
+                result.merge(validate_object_keys(
+                    server_obj,
+                    LSP_FIELDS,
+                    &format!("lsp.{server_name}"),
+                    source,
+                    &path_display,
+                ));
+            } else {
+                result.errors.push(ConfigDiagnostic {
+                    path: path_display.clone(),
+                    field: format!("lsp.{server_name}"),
+                    line: find_key_line(source, server_name),
+                    kind: DiagnosticKind::WrongType {
+                        expected: "an object",
+                        got: json_type_label(server_value),
+                    },
+                });
+            }
+        }
     }
 
     // Validate lsp map: each value must be an object with LSP_FIELDS.

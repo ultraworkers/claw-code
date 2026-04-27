@@ -71,6 +71,7 @@ pub use compact::{
 pub use config::{
 <<<<<<< HEAD
 <<<<<<< HEAD
+<<<<<<< HEAD
     clear_user_provider_settings, default_config_home, save_user_provider_settings,
     suppress_config_warnings_for_json_mode, ApiTimeoutConfig, ConfigEntry, ConfigError,
     ConfigFileReport, ConfigFileStatus, ConfigInspection, ConfigLoader, ConfigSource,
@@ -81,10 +82,13 @@ pub use config::{
     RuntimeInvalidHookConfig, RuntimePermissionRuleConfig, RuntimePluginConfig,
     RuntimeProviderConfig, ScopedMcpServerConfig, CLAW_SETTINGS_SCHEMA_NAME,
 =======
+=======
+>>>>>>> e9582034 (feat: full LSP (Language Server Protocol) integration)
     clear_user_provider_settings, save_user_provider_settings, ConfigEntry, ConfigError,
     ConfigLoader, ConfigSource, LspServerConfig, McpConfigCollection, McpManagedProxyServerConfig,
     McpOAuthConfig, McpRemoteServerConfig, McpSdkServerConfig, McpServerConfig,
     McpStdioServerConfig, McpTransport, McpWebSocketServerConfig, OAuthConfig,
+<<<<<<< HEAD
     ApiTimeoutConfig, ConfigEntry, ConfigError, ConfigLoader, ConfigSource, McpConfigCollection,
 =======
     ApiTimeoutConfig, clear_user_provider_settings, save_user_provider_settings, ConfigEntry,
@@ -92,6 +96,8 @@ pub use config::{
 >>>>>>> 1ff5617c (fix: sync all bug fixes to combined branch)
     McpManagedProxyServerConfig, McpOAuthConfig, McpRemoteServerConfig, McpSdkServerConfig,
     McpServerConfig, McpStdioServerConfig, McpTransport, McpWebSocketServerConfig, OAuthConfig,
+=======
+>>>>>>> e9582034 (feat: full LSP (Language Server Protocol) integration)
     ProviderFallbackConfig, ResolvedPermissionMode, RuntimeConfig, RuntimeFeatureConfig,
     RuntimeHookConfig, RuntimePermissionRuleConfig, RuntimePluginConfig, RuntimeProviderConfig,
     ScopedMcpServerConfig, CLAW_SETTINGS_SCHEMA_NAME,
