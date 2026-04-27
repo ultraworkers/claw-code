@@ -20,6 +20,7 @@ const CONTEXT_WINDOW_ERROR_MARKERS: &[&str] = &[
     "completion tokens",
     "prompt tokens",
     "request is too large",
+    "no parseable body",
 ];
 
 #[derive(Debug)]
