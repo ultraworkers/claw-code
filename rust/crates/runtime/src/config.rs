@@ -81,13 +81,14 @@ pub struct LspServerConfig {
 }
 
 /// Structured feature configuration consumed by runtime subsystems.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeFeatureConfig {
     hooks: RuntimeHookConfig,
     plugins: RuntimePluginConfig,
     mcp: McpConfigCollection,
     oauth: Option<OAuthConfig>,
     model: Option<String>,
+    lsp_auto_start: bool,
     aliases: BTreeMap<String, String>,
     permission_mode: Option<ResolvedPermissionMode>,
     permission_rules: RuntimePermissionRuleConfig,
@@ -109,6 +110,29 @@ pub struct ModelProviderConfig {
     api_key: Option<String>,
     models: Vec<String>,
     default_model: Option<String>,
+}
+
+impl Default for RuntimeFeatureConfig {
+    fn default() -> Self {
+        Self {
+            hooks: RuntimeHookConfig::default(),
+            plugins: RuntimePluginConfig::default(),
+            mcp: McpConfigCollection::default(),
+            oauth: None,
+            model: None,
+            lsp_auto_start: true,
+            aliases: BTreeMap::new(),
+            permission_mode: None,
+            permission_rules: RuntimePermissionRuleConfig::default(),
+            sandbox: SandboxConfig::default(),
+            provider_fallbacks: ProviderFallbackConfig::default(),
+            model_providers: BTreeMap::new(),
+            trusted_roots: Vec::new(),
+            api_timeout: ApiTimeoutConfig::default(),
+            provider: RuntimeProviderConfig::default(),
+            lsp: BTreeMap::new(),
+        }
+    }
 }
 
 /// Stored provider configuration from the setup wizard.
@@ -394,6 +418,11 @@ impl ConfigLoader {
             api_timeout: parse_optional_api_timeout_config(&merged_value)?,
             provider: parse_optional_provider_config(&merged_value)?,
             lsp: parse_optional_lsp_config(&merged_value)?,
+            lsp_auto_start: merged_value
+                .as_object()
+                .and_then(|o| o.get("lspAutoStart"))
+                .and_then(JsonValue::as_bool)
+                .unwrap_or(true),
         };
 
         Ok(RuntimeConfig {
@@ -508,6 +537,11 @@ impl RuntimeConfig {
     pub fn lsp(&self) -> &BTreeMap<String, LspServerConfig> {
         &self.feature_config.lsp
     }
+
+    #[must_use]
+    pub fn lsp_auto_start(&self) -> bool {
+        self.feature_config.lsp_auto_start
+    }
 }
 
 impl RuntimeFeatureConfig {
@@ -591,6 +625,11 @@ impl RuntimeFeatureConfig {
     #[must_use]
     pub fn lsp(&self) -> &BTreeMap<String, LspServerConfig> {
         &self.lsp
+    }
+
+    #[must_use]
+    pub fn lsp_auto_start(&self) -> bool {
+        self.lsp_auto_start
     }
 }
 
