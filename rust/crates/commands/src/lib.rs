@@ -4315,8 +4315,6 @@ pub fn handle_slash_command(
         | SlashCommand::AddDir { .. }
         | SlashCommand::History { .. }
         | SlashCommand::Lsp { .. }
-        | SlashCommand::Setup
-        | SlashCommand::Unknown(_) => None,
         | SlashCommand::Unknown(_) => None,
     }
 }
