@@ -15,9 +15,15 @@ use api::{
 use plugins::PluginTool;
 use reqwest::blocking::Client;
 use runtime::{
+<<<<<<< HEAD
     check_freshness, dedupe_superseded_commit_events, edit_file_in_workspace, execute_bash,
     glob_search_in_workspace, grep_search_in_workspace, load_system_prompt,
     lsp_client::LspRegistry,
+=======
+    check_freshness, dedupe_superseded_commit_events, edit_file, execute_bash, glob_search,
+    grep_search, load_system_prompt,
+    lsp_client::{LspDiagnostic, LspRegistry},
+>>>>>>> 73cc8277 (feat: auto-LSP integration with didOpen/didChange and diagnostic enrichment)
     mcp_tool_bridge::McpToolRegistry,
     permission_enforcer::{EnforcementResult, PermissionEnforcer},
     read_file_in_workspace,
@@ -2448,23 +2454,48 @@ fn branch_divergence_output(
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_read_file(input: ReadFileInput) -> Result<String, String> {
+<<<<<<< HEAD
     let workspace = std::env::current_dir().map_err(|error| error.to_string())?;
     to_pretty_json(
         read_file_in_workspace(&input.path, input.offset, input.limit, &workspace)
             .map_err(io_to_string)?,
     )
+=======
+    let result = read_file(&input.path, input.offset, input.limit).map_err(io_to_string)?;
+    let mut output = to_pretty_json(result)?;
+
+    // LSP enrichment: notify the server that the file was opened and append diagnostics
+    if let Some(diags) = lsp_enrichment_for_path(&input.path, &LspEvent::Open) {
+        output.push_str(&format_diagnostic_appendix(&diags));
+    }
+
+    Ok(output)
+>>>>>>> 73cc8277 (feat: auto-LSP integration with didOpen/didChange and diagnostic enrichment)
 }
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_write_file(input: WriteFileInput) -> Result<String, String> {
+<<<<<<< HEAD
     let workspace = std::env::current_dir().map_err(|error| error.to_string())?;
     to_pretty_json(
         write_file_in_workspace(&input.path, &input.content, &workspace).map_err(io_to_string)?,
     )
+=======
+    let result = write_file(&input.path, &input.content).map_err(io_to_string)?;
+    let mut output = to_pretty_json(result)?;
+
+    // LSP enrichment: notify the server that the file changed and append diagnostics
+    if let Some(diags) = lsp_enrichment_for_path(&input.path, &LspEvent::Change) {
+        output.push_str(&format_diagnostic_appendix(&diags));
+    }
+
+    Ok(output)
+>>>>>>> 73cc8277 (feat: auto-LSP integration with didOpen/didChange and diagnostic enrichment)
 }
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_edit_file(input: EditFileInput) -> Result<String, String> {
+<<<<<<< HEAD
     let workspace = std::env::current_dir().map_err(|error| error.to_string())?;
     to_pretty_json(
         edit_file_in_workspace(
@@ -2475,7 +2506,74 @@ fn run_edit_file(input: EditFileInput) -> Result<String, String> {
             &workspace,
         )
         .map_err(io_to_string)?,
+=======
+    let result = edit_file(
+        &input.path,
+        &input.old_string,
+        &input.new_string,
+        input.replace_all.unwrap_or(false),
+>>>>>>> 73cc8277 (feat: auto-LSP integration with didOpen/didChange and diagnostic enrichment)
     )
+    .map_err(io_to_string)?;
+
+    let mut output = to_pretty_json(result)?;
+
+    // LSP enrichment: notify the server that the file changed and append diagnostics
+    let full_content = std::fs::read_to_string(&input.path).unwrap_or_default();
+    if let Some(diags) =
+        lsp_enrichment_for_path_with_content(&input.path, &full_content, &LspEvent::Change)
+    {
+        output.push_str(&format_diagnostic_appendix(&diags));
+    }
+
+    Ok(output)
+}
+
+enum LspEvent {
+    Open,
+    Change,
+}
+
+fn lsp_enrichment_for_path(path: &str, event: &LspEvent) -> Option<Vec<LspDiagnostic>> {
+    let content = std::fs::read_to_string(path).ok()?;
+    lsp_enrichment_for_path_with_content(path, &content, event)
+}
+
+fn lsp_enrichment_for_path_with_content(
+    path: &str,
+    content: &str,
+    event: &LspEvent,
+) -> Option<Vec<LspDiagnostic>> {
+    let registry = global_lsp_registry();
+
+    registry.find_server_for_path(path)?;
+
+    let diags = match event {
+        LspEvent::Open => registry.notify_file_open(path, content),
+        LspEvent::Change => registry.notify_file_change(path, content),
+    };
+
+    if diags.is_empty() {
+        None
+    } else {
+        Some(diags)
+    }
+}
+
+fn format_diagnostic_appendix(diagnostics: &[LspDiagnostic]) -> String {
+    let mut lines = vec![String::from("\n--- LSP Diagnostics ---")];
+    for d in diagnostics {
+        let source = d.source.as_deref().unwrap_or("lsp");
+        lines.push(format!(
+            "[{}:{}] {} ({}): {}",
+            d.line + 1,
+            d.character + 1,
+            d.severity,
+            source,
+            d.message
+        ));
+    }
+    lines.join("\n")
 }
 
 #[allow(clippy::needless_pass_by_value)]

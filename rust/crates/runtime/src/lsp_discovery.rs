@@ -113,6 +113,7 @@ pub fn command_exists_on_path(command: &str) -> bool {
         .arg("--version")
         .output()
 <<<<<<< HEAD
+<<<<<<< HEAD
         .is_ok()
 }
 
@@ -141,6 +142,9 @@ fn rustup_component_works(component: &str) -> bool {
         .map(|output| output.status.success())
         .unwrap_or(false)
 >>>>>>> e9582034 (feat: full LSP (Language Server Protocol) integration)
+=======
+        .is_ok()
+>>>>>>> 73cc8277 (feat: auto-LSP integration with didOpen/didChange and diagnostic enrichment)
 }
 
 /// Discover LSP servers that are actually installed on the current system.

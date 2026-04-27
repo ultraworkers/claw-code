@@ -1,11 +1,12 @@
 //! LSP process manager: spawns language servers and drives the LSP lifecycle.
 
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use serde_json::Value as JsonValue;
 
 use crate::lsp_client::{
-    LspCompletionItem, LspHoverResult, LspLocation, LspServerStatus, LspSymbol,
+    LspCompletionItem, LspDiagnostic, LspHoverResult, LspLocation, LspServerStatus, LspSymbol,
 };
 use crate::lsp_transport::{LspTransport, LspTransportError};
 
@@ -16,6 +17,8 @@ pub struct LspProcess {
     root_uri: String,
     capabilities: Option<JsonValue>,
     status: LspServerStatus,
+    open_files: HashSet<String>,
+    version_counter: HashMap<String, u32>,
 }
 
 #[allow(clippy::cast_possible_truncation)]
@@ -38,6 +41,8 @@ impl LspProcess {
             root_uri: root_uri.clone(),
             capabilities: None,
             status: LspServerStatus::Starting,
+            open_files: HashSet::new(),
+            version_counter: HashMap::new(),
         };
 
         process.initialize(&canonical).await?;
@@ -279,6 +284,103 @@ impl LspProcess {
         }
     }
 
+    /// Notify the server that a file was opened. Sends `textDocument/didOpen`.
+    /// No-op if the file is already tracked as open.
+    pub async fn did_open(&mut self, path: &str, content: &str) -> Result<(), LspProcessError> {
+        if self.open_files.contains(path) {
+            return Ok(());
+        }
+
+        let uri = path_to_uri(path);
+        let language_id = language_id_for_path(path);
+        let params = serde_json::json!({
+            "textDocument": {
+                "uri": uri,
+                "languageId": language_id,
+                "version": 0,
+                "text": content
+            }
+        });
+
+        self.transport
+            .send_notification("textDocument/didOpen", Some(params))
+            .await
+            .map_err(LspProcessError::Transport)?;
+
+        self.open_files.insert(path.to_owned());
+        self.version_counter.insert(path.to_owned(), 0);
+        Ok(())
+    }
+
+    /// Notify the server that a file's content changed. Sends `textDocument/didChange`.
+    pub async fn did_change(&mut self, path: &str, content: &str) -> Result<(), LspProcessError> {
+        let version = self.version_counter.get(path).map_or(1, |v| v + 1);
+
+        let uri = path_to_uri(path);
+        let params = serde_json::json!({
+            "textDocument": { "uri": uri, "version": version },
+            "contentChanges": [{ "text": content }]
+        });
+
+        self.transport
+            .send_notification("textDocument/didChange", Some(params))
+            .await
+            .map_err(LspProcessError::Transport)?;
+
+        self.version_counter.insert(path.to_owned(), version);
+        Ok(())
+    }
+
+    /// Drain queued server notifications and extract `publishDiagnostics`.
+    #[allow(clippy::redundant_closure_for_method_calls)]
+    pub fn drain_diagnostics(&mut self) -> Vec<LspDiagnostic> {
+        let notifications = self.transport.drain_notifications();
+        let mut diagnostics = Vec::new();
+        for n in &notifications {
+            if n.method == "textDocument/publishDiagnostics" {
+                if let Some(params) = &n.params {
+                    if let Some(uri) = params.get("uri").and_then(|v| v.as_str()) {
+                        let path = uri_to_path(uri);
+                        if let Some(diags) = params.get("diagnostics").and_then(|v| v.as_array())
+                        {
+                            for d in diags {
+                                diagnostics.push(LspDiagnostic {
+                                    path: path.clone(),
+                                    line: d
+                                        .get("range")
+                                        .and_then(|r| r.get("start"))
+                                        .and_then(|s| s.get("line"))
+                                        .and_then(|v| v.as_u64())
+                                        .map_or(0, |v| v as u32),
+                                    character: d
+                                        .get("range")
+                                        .and_then(|r| r.get("start"))
+                                        .and_then(|s| s.get("character"))
+                                        .and_then(|v| v.as_u64())
+                                        .map_or(0, |v| v as u32),
+                                    severity: d
+                                        .get("severity")
+                                        .and_then(|v| v.as_u64())
+                                        .map_or_else(|| "error".to_owned(), severity_name),
+                                    message: d
+                                        .get("message")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("")
+                                        .to_owned(),
+                                    source: d
+                                        .get("source")
+                                        .and_then(|v| v.as_str())
+                                        .map(str::to_owned),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        diagnostics
+    }
+
     #[must_use]
     pub fn status(&self) -> LspServerStatus {
         self.status
@@ -358,6 +460,39 @@ fn text_document_position_params(uri: &str, line: u32, character: u32) -> JsonVa
 
 fn uri_to_path(uri: &str) -> String {
     uri.strip_prefix("file://").unwrap_or(uri).to_owned()
+}
+
+fn language_id_for_path(path: &str) -> String {
+    let ext = std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+    match ext {
+        "rs" => "rust",
+        "ts" => "typescript",
+        "tsx" => "typescriptreact",
+        "js" => "javascript",
+        "jsx" => "javascriptreact",
+        "py" => "python",
+        "go" => "go",
+        "java" => "java",
+        "c" | "h" => "c",
+        "cpp" | "hpp" | "cc" => "cpp",
+        "rb" => "ruby",
+        "lua" => "lua",
+        _ => ext,
+    }
+    .to_owned()
+}
+
+fn severity_name(code: u64) -> String {
+    match code {
+        1 => "error".to_owned(),
+        2 => "warning".to_owned(),
+        3 => "info".to_owned(),
+        4 => "hint".to_owned(),
+        _ => format!("unknown({code})"),
+    }
 }
 
 fn parse_hover(value: &JsonValue) -> Option<LspHoverResult> {
