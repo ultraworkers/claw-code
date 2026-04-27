@@ -225,6 +225,10 @@ const TOP_LEVEL_FIELDS: &[FieldSpec] = &[
         expected: FieldType::Object,
 >>>>>>> 856409d3 (feat: full LSP (Language Server Protocol) integration)
     },
+    FieldSpec {
+        name: "lspAutoStart",
+        expected: FieldType::Bool,
+    },
 ];
 
 const HOOKS_FIELDS: &[FieldSpec] = &[
