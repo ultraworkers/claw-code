@@ -74,6 +74,18 @@ US-007 COMPLETE (Phase 5 - Plugin/MCP lifecycle maturity)
 - DegradedMode behavior
 - Tests: 11 unit tests passing
 
+
+Iteration 2026-04-27 - ROADMAP #200 COMPLETED
+------------------------------------------------
+- Selected next actionable backlog item because no active task was in progress.
+- ROADMAP #200: Interactive MCP/tool permission prompts are invisible blockers.
+- Files: rust/crates/runtime/src/worker_boot.rs, rust/crates/runtime/src/recovery_recipes.rs, ROADMAP.md, progress.txt.
+- Added tool_permission_required worker status and event classification for interactive MCP/tool permission gates.
+- Added structured ToolPermissionPrompt payload with server/tool identity and prompt preview.
+- Startup evidence now records tool_permission_prompt_detected and classifies timeout evidence as tool_permission_required.
+- Readiness snapshots now mark tool-permission-gated workers as blocked, not ready/idle.
+- Tests: targeted tool_permission regressions, full runtime test/clippy/fmt pending in Ralph verification loop.
+
 VERIFICATION STATUS:
 ------------------
 - cargo build --workspace: PASSED
