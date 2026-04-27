@@ -138,6 +138,7 @@ fn rustup_component_works(component: &str) -> bool {
         .args(["run", "stable", component, "--version"])
         .output()
         .is_ok_and(|o| o.status.success())
+<<<<<<< HEAD
 =======
         .map(|output| output.status.success())
         .unwrap_or(false)
@@ -145,26 +146,37 @@ fn rustup_component_works(component: &str) -> bool {
 =======
         .is_ok()
 >>>>>>> 73cc8277 (feat: auto-LSP integration with didOpen/didChange and diagnostic enrichment)
+=======
+>>>>>>> ab3550e5 (feat(lsp): add lspAutoStart config, remove unused LSP client/process/transport modules)
 }
 
 /// Discover LSP servers that are actually installed on the current system.
 ///
 /// Iterates over the known server table and returns only those whose command
 <<<<<<< HEAD
+<<<<<<< HEAD
+=======
+>>>>>>> ab3550e5 (feat(lsp): add lspAutoStart config, remove unused LSP client/process/transport modules)
 /// is found on `PATH` **and** is actually functional. For `rust-analyzer`,
 /// rustup ships a stub proxy that always exists on PATH but prints
 /// "Unknown binary" when the component isn't installed. We detect that
 /// case and either rewrite to `rustup run stable rust-analyzer` (when the
 /// component is installed) or skip the server entirely (when it's not).
+<<<<<<< HEAD
 =======
 /// is found on `PATH`.
 >>>>>>> e9582034 (feat: full LSP (Language Server Protocol) integration)
+=======
+>>>>>>> ab3550e5 (feat(lsp): add lspAutoStart config, remove unused LSP client/process/transport modules)
 #[must_use]
 pub fn discover_available_servers() -> Vec<LspServerDescriptor> {
     KNOWN_LSP_SERVERS_TABLE
         .iter()
         .filter(|desc| command_exists_on_path(desc.command))
 <<<<<<< HEAD
+<<<<<<< HEAD
+=======
+>>>>>>> ab3550e5 (feat(lsp): add lspAutoStart config, remove unused LSP client/process/transport modules)
         .filter_map(|desc| {
             let mut server = desc.to_descriptor();
             // rustup ships a proxy `rust-analyzer` that exists on PATH but
@@ -187,9 +199,12 @@ pub fn discover_available_servers() -> Vec<LspServerDescriptor> {
             }
             Some(server)
         })
+<<<<<<< HEAD
 =======
         .map(StaticLspServerDescriptor::to_descriptor)
 >>>>>>> e9582034 (feat: full LSP (Language Server Protocol) integration)
+=======
+>>>>>>> ab3550e5 (feat(lsp): add lspAutoStart config, remove unused LSP client/process/transport modules)
         .collect()
 }
 

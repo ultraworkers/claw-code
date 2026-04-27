@@ -7099,6 +7099,9 @@ fn run_repl(
             );
         }
 <<<<<<< HEAD
+<<<<<<< HEAD
+=======
+>>>>>>> ab3550e5 (feat(lsp): add lspAutoStart config, remove unused LSP client/process/transport modules)
         // Auto-start all discovered servers if enabled
         if cli.lsp_auto_start {
             let registry = tools::global_lsp_registry();
@@ -7109,8 +7112,11 @@ fn run_repl(
                 }
             }
         }
+<<<<<<< HEAD
 =======
 >>>>>>> e9582034 (feat: full LSP (Language Server Protocol) integration)
+=======
+>>>>>>> ab3550e5 (feat(lsp): add lspAutoStart config, remove unused LSP client/process/transport modules)
     }
 
     loop {
@@ -8396,10 +8402,14 @@ impl LiveCli {
     }
 
 <<<<<<< HEAD
+<<<<<<< HEAD
     fn handle_lsp_command(&mut self, action: Option<&str>, target: Option<&str>) {
 =======
     fn handle_lsp_command(&self, action: Option<&str>, target: Option<&str>) {
 >>>>>>> e9582034 (feat: full LSP (Language Server Protocol) integration)
+=======
+    fn handle_lsp_command(&mut self, action: Option<&str>, target: Option<&str>) {
+>>>>>>> ab3550e5 (feat(lsp): add lspAutoStart config, remove unused LSP client/process/transport modules)
         let registry = tools::global_lsp_registry();
         match action {
             Some("start") => {
@@ -8425,6 +8435,9 @@ impl LiveCli {
                 }
             }
 <<<<<<< HEAD
+<<<<<<< HEAD
+=======
+>>>>>>> ab3550e5 (feat(lsp): add lspAutoStart config, remove unused LSP client/process/transport modules)
             Some("toggle") => {
                 self.lsp_auto_start = !self.lsp_auto_start;
                 let state = if self.lsp_auto_start { "on" } else { "off" };
@@ -8434,10 +8447,13 @@ impl LiveCli {
                 let servers = registry.list_servers();
                 let auto_state = if self.lsp_auto_start { "on" } else { "off" };
                 eprintln!("LSP auto-start: {auto_state}");
+<<<<<<< HEAD
 =======
             _ => {
                 let servers = registry.list_servers();
 >>>>>>> e9582034 (feat: full LSP (Language Server Protocol) integration)
+=======
+>>>>>>> ab3550e5 (feat(lsp): add lspAutoStart config, remove unused LSP client/process/transport modules)
                 if servers.is_empty() {
                     eprintln!("No LSP servers registered.");
                 } else {

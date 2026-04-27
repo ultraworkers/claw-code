@@ -195,13 +195,14 @@ impl Default for ApiTimeoutConfig {
 =======
 >>>>>>> e9582034 (feat: full LSP (Language Server Protocol) integration)
 /// Structured feature configuration consumed by runtime subsystems.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeFeatureConfig {
     hooks: RuntimeHookConfig,
     plugins: RuntimePluginConfig,
     mcp: McpConfigCollection,
     oauth: Option<OAuthConfig>,
     model: Option<String>,
+    lsp_auto_start: bool,
     aliases: BTreeMap<String, String>,
     permission_mode: Option<ResolvedPermissionMode>,
     permission_rules: RuntimePermissionRuleConfig,
@@ -270,6 +271,27 @@ impl Default for RuntimeFeatureConfig {
 =======
     provider: RuntimeProviderConfig,
     lsp: BTreeMap<String, LspServerConfig>,
+}
+
+impl Default for RuntimeFeatureConfig {
+    fn default() -> Self {
+        Self {
+            hooks: RuntimeHookConfig::default(),
+            plugins: RuntimePluginConfig::default(),
+            mcp: McpConfigCollection::default(),
+            oauth: None,
+            model: None,
+            lsp_auto_start: true,
+            aliases: BTreeMap::new(),
+            permission_mode: None,
+            permission_rules: RuntimePermissionRuleConfig::default(),
+            sandbox: SandboxConfig::default(),
+            provider_fallbacks: ProviderFallbackConfig::default(),
+            trusted_roots: Vec::new(),
+            provider: RuntimeProviderConfig::default(),
+            lsp: BTreeMap::new(),
+        }
+    }
 }
 
 /// Stored provider configuration from the setup wizard.
@@ -751,17 +773,23 @@ impl ConfigLoader {
             lsp: parse_optional_lsp_config(&merged_value)?,
 <<<<<<< HEAD
 <<<<<<< HEAD
+<<<<<<< HEAD
 >>>>>>> 856409d3 (feat: full LSP (Language Server Protocol) integration)
 =======
+=======
+>>>>>>> ab3550e5 (feat(lsp): add lspAutoStart config, remove unused LSP client/process/transport modules)
             lsp_auto_start: merged_value
                 .as_object()
                 .and_then(|o| o.get("lspAutoStart"))
                 .and_then(JsonValue::as_bool)
                 .unwrap_or(true),
+<<<<<<< HEAD
             api_timeout: parse_optional_api_timeout_config(&merged_value)?,
 >>>>>>> 07ce5aee (feat: API timeout config, Retry-After header support, and configurable retry)
 =======
 >>>>>>> e9582034 (feat: full LSP (Language Server Protocol) integration)
+=======
+>>>>>>> ab3550e5 (feat(lsp): add lspAutoStart config, remove unused LSP client/process/transport modules)
         };
 
         ConfigInspection {
@@ -1055,6 +1083,11 @@ impl RuntimeConfig {
         &self.feature_config.lsp
 >>>>>>> e9582034 (feat: full LSP (Language Server Protocol) integration)
     }
+
+    #[must_use]
+    pub fn lsp_auto_start(&self) -> bool {
+        self.feature_config.lsp_auto_start
+    }
 }
 
 impl RuntimeFeatureConfig {
@@ -1166,9 +1199,17 @@ fn merge_trusted_roots(config_roots: &[String], per_call_roots: &[String]) -> Ve
         &self.lsp
     }
 <<<<<<< HEAD
+<<<<<<< HEAD
 >>>>>>> 856409d3 (feat: full LSP (Language Server Protocol) integration)
 =======
 >>>>>>> e9582034 (feat: full LSP (Language Server Protocol) integration)
+=======
+
+    #[must_use]
+    pub fn lsp_auto_start(&self) -> bool {
+        self.lsp_auto_start
+    }
+>>>>>>> ab3550e5 (feat(lsp): add lspAutoStart config, remove unused LSP client/process/transport modules)
 }
 
 impl ProviderFallbackConfig {
