@@ -1764,10 +1764,14 @@ async fn expect_success(response: reqwest::Response) -> Result<reqwest::Response
     })
 }
 
+<<<<<<< HEAD
 fn parse_retry_after(
     headers: &reqwest::header::HeaderMap,
     status: reqwest::StatusCode,
 ) -> Option<std::time::Duration> {
+=======
+fn parse_retry_after(headers: &reqwest::header::HeaderMap, status: reqwest::StatusCode) -> Option<std::time::Duration> {
+>>>>>>> 07ce5aee (feat: API timeout config, Retry-After header support, and configurable retry)
     if status != reqwest::StatusCode::TOO_MANY_REQUESTS {
         return None;
     }

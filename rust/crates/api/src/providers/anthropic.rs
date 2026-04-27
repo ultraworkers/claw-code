@@ -467,8 +467,12 @@ impl AnthropicClient {
                 break;
             }
 
+<<<<<<< HEAD
             let delay = if let Some(retry_after) = last_error.as_ref().and_then(|e| e.retry_after())
             {
+=======
+            let delay = if let Some(retry_after) = last_error.as_ref().and_then(|e| e.retry_after()) {
+>>>>>>> 07ce5aee (feat: API timeout config, Retry-After header support, and configurable retry)
                 retry_after
             } else {
                 self.jittered_backoff_for_attempt(attempts)?
@@ -907,10 +911,14 @@ async fn expect_success(response: reqwest::Response) -> Result<reqwest::Response
     })
 }
 
+<<<<<<< HEAD
 fn parse_retry_after(
     headers: &reqwest::header::HeaderMap,
     status: reqwest::StatusCode,
 ) -> Option<std::time::Duration> {
+=======
+fn parse_retry_after(headers: &reqwest::header::HeaderMap, status: reqwest::StatusCode) -> Option<std::time::Duration> {
+>>>>>>> 07ce5aee (feat: API timeout config, Retry-After header support, and configurable retry)
     if status != reqwest::StatusCode::TOO_MANY_REQUESTS {
         return None;
     }

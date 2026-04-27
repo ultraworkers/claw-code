@@ -135,6 +135,10 @@ impl ApiError {
     /// Return the `Retry-After` delay if this error came from a 429 response
     /// that included a `retry-after` header. Callers should prefer this value
     /// over the computed backoff delay when it exists.
+<<<<<<< HEAD
+=======
+    #[must_use]
+>>>>>>> 07ce5aee (feat: API timeout config, Retry-After header support, and configurable retry)
     pub fn retry_after(&self) -> Option<Duration> {
         match self {
             Self::Api { retry_after, .. } => *retry_after,

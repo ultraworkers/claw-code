@@ -152,7 +152,29 @@ pub struct LspServerConfig {
     pub command: String,
     pub args: Vec<String>,
     pub enabled: bool,
+<<<<<<< HEAD
 >>>>>>> 856409d3 (feat: full LSP (Language Server Protocol) integration)
+=======
+/// API timeout and retry configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApiTimeoutConfig {
+    /// Connect timeout in seconds. Defaults to 30.
+    pub connect_timeout_secs: u64,
+    /// Request timeout in seconds. Defaults to 300 (5 minutes).
+    pub request_timeout_secs: u64,
+    /// Maximum retry attempts on transient failures. Defaults to 8.
+    pub max_retries: u32,
+}
+
+impl Default for ApiTimeoutConfig {
+    fn default() -> Self {
+        Self {
+            connect_timeout_secs: 30,
+            request_timeout_secs: 300,
+            max_retries: 8,
+        }
+    }
+>>>>>>> 07ce5aee (feat: API timeout config, Retry-After header support, and configurable retry)
 }
 
 /// Structured feature configuration consumed by runtime subsystems.
@@ -233,6 +255,7 @@ impl RuntimeProviderConfig {
     pub fn model(&self) -> Option<&str> {
         self.model.as_deref()
     }
+    api_timeout: ApiTimeoutConfig,
 }
 
 /// Ordered chain of fallback model identifiers used when the primary
@@ -680,7 +703,16 @@ impl ConfigLoader {
             trusted_roots: parse_optional_trusted_roots(&merged_value)?,
             provider: parse_optional_provider_config(&merged_value)?,
             lsp: parse_optional_lsp_config(&merged_value)?,
+<<<<<<< HEAD
 >>>>>>> 856409d3 (feat: full LSP (Language Server Protocol) integration)
+=======
+            lsp_auto_start: merged_value
+                .as_object()
+                .and_then(|o| o.get("lspAutoStart"))
+                .and_then(JsonValue::as_bool)
+                .unwrap_or(true),
+            api_timeout: parse_optional_api_timeout_config(&merged_value)?,
+>>>>>>> 07ce5aee (feat: API timeout config, Retry-After header support, and configurable retry)
         };
 
         ConfigInspection {
@@ -2142,8 +2174,15 @@ fn parse_optional_api_timeout_config(root: &JsonValue) -> Result<ApiTimeoutConfi
         return Ok(ApiTimeoutConfig::default());
     };
     let context = "merged settings.apiTimeout";
+<<<<<<< HEAD
     let connect_timeout_secs = optional_u64(obj, "connectTimeout", context)?.unwrap_or(30);
     let request_timeout_secs = optional_u64(obj, "requestTimeout", context)?.unwrap_or(300);
+=======
+    let connect_timeout_secs = optional_u64(obj, "connectTimeout", context)?
+        .unwrap_or(30);
+    let request_timeout_secs = optional_u64(obj, "requestTimeout", context)?
+        .unwrap_or(300);
+>>>>>>> 07ce5aee (feat: API timeout config, Retry-After header support, and configurable retry)
     let max_retries = optional_u64(obj, "maxRetries", context)?
         .map(|v| v as u32)
         .unwrap_or(8);

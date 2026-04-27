@@ -14648,7 +14648,11 @@ mod tests {
                 retryable: false,
                 suggested_action: None,
                 retry_after: None,
+<<<<<<< HEAD
             }),
+=======
+}),
+>>>>>>> 07ce5aee (feat: API timeout config, Retry-After header support, and configurable retry)
         };
 
         let rendered = format_user_visible_api_error("session-issue-32", &error);

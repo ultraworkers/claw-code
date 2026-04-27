@@ -132,20 +132,20 @@ pub fn build_http_client() -> Result<reqwest::Client, ApiError> {
 #[must_use]
 pub fn build_http_client_or_default() -> reqwest::Client {
     build_http_client_with_opts(&ProxyConfig::from_env(), &TimeoutConfig::from_env())
+<<<<<<< HEAD
         .unwrap_or_else(|_| {
             reqwest::Client::builder()
                 .user_agent("clawd-rust-tools/0.1")
                 .build()
                 .expect("default client with user_agent should always succeed")
         })
+=======
+        .unwrap_or_else(|_| reqwest::Client::new())
+>>>>>>> 07ce5aee (feat: API timeout config, Retry-After header support, and configurable retry)
 }
 
 /// Build a `reqwest::Client` from an explicit [`ProxyConfig`]. Used by tests
 /// and by callers that want to override process-level environment lookups.
-///
-/// When `config.proxy_url` is set it overrides the per-scheme `http_proxy`
-/// and `https_proxy` fields and is registered as both an HTTP and HTTPS
-/// proxy so a single value can route every outbound request.
 pub fn build_http_client_with(config: &ProxyConfig) -> Result<reqwest::Client, ApiError> {
     build_http_client_with_opts(config, &TimeoutConfig::from_env())
 }
@@ -158,7 +158,10 @@ pub fn build_http_client_with_opts(
 ) -> Result<reqwest::Client, ApiError> {
     let mut builder = reqwest::Client::builder()
         .no_proxy()
+<<<<<<< HEAD
         .user_agent("clawd-rust-tools/0.1")
+=======
+>>>>>>> 07ce5aee (feat: API timeout config, Retry-After header support, and configurable retry)
         .connect_timeout(timeout.connect_timeout)
         .timeout(timeout.request_timeout);
 
