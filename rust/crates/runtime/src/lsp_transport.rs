@@ -89,6 +89,14 @@ impl LspResponse {
     }
 }
 
+/// A message received from an LSP server — either a response to a request
+/// or a server-initiated notification (e.g. `textDocument/publishDiagnostics`).
+#[derive(Debug, Clone)]
+pub enum LspServerMessage {
+    Response(LspResponse),
+    Notification(LspNotification),
+}
+
 #[derive(Debug)]
 pub enum LspTransportError {
     Io(io::Error),
@@ -138,6 +146,7 @@ pub struct LspTransport {
     stdout: BufReader<ChildStdout>,
     next_id: u64,
     request_timeout: Duration,
+    pending_notifications: Vec<LspNotification>,
 }
 
 impl LspTransport {
@@ -172,6 +181,7 @@ impl LspTransport {
             stdout: BufReader::new(stdout),
             next_id: 1,
             request_timeout,
+            pending_notifications: Vec::new(),
         })
     }
 
@@ -193,6 +203,7 @@ impl LspTransport {
             stdout: BufReader::new(stdout),
             next_id: 1,
             request_timeout,
+            pending_notifications: Vec::new(),
         }
     }
 
@@ -235,12 +246,27 @@ impl LspTransport {
 
         let method_owned = method.to_string();
         let timeout_duration = self.request_timeout;
-        let response = timeout(timeout_duration, self.read_response())
-            .await
-            .map_err(|_| LspTransportError::Timeout {
-                method: method_owned,
-                timeout: timeout_duration,
-            })??;
+        let response = match timeout(timeout_duration, async {
+            loop {
+                match self.read_message().await {
+                    Ok(LspServerMessage::Response(r)) => break Ok(r),
+                    Ok(LspServerMessage::Notification(n)) => {
+                        self.pending_notifications.push(n);
+                    }
+                    Err(e) => break Err(e),
+                }
+            }
+        })
+        .await
+        {
+            Ok(inner) => inner,
+            Err(_) => {
+                return Err(LspTransportError::Timeout {
+                    method: method_owned,
+                    timeout: timeout_duration,
+                })
+            }
+        }?;
 
         if response.jsonrpc != "2.0" {
             return Err(LspTransportError::InvalidResponse {
@@ -266,8 +292,57 @@ impl LspTransport {
         Ok(response)
     }
 
+    /// Read a single message from the server, returning either a response or
+    /// a server-initiated notification (e.g. `publishDiagnostics`).
+    pub async fn read_message(&mut self) -> Result<LspServerMessage, LspTransportError> {
+        let payload = self.read_frame().await?;
+        let value: JsonValue = serde_json::from_slice(&payload).map_err(|error| {
+            LspTransportError::InvalidResponse {
+                method: "unknown".to_string(),
+                details: error.to_string(),
+            }
+        })?;
+
+        // Responses have an "id" field; notifications have "method" but no "id"
+        if value.get("id").is_some() {
+            let response: LspResponse = serde_json::from_value(value).map_err(|error| {
+                LspTransportError::InvalidResponse {
+                    method: "unknown".to_string(),
+                    details: format!("failed to parse response: {error}"),
+                }
+            })?;
+            Ok(LspServerMessage::Response(response))
+        } else if value.get("method").is_some() {
+            let notification: LspNotification = serde_json::from_value(value).map_err(|error| {
+                LspTransportError::InvalidResponse {
+                    method: "unknown".to_string(),
+                    details: format!("failed to parse notification: {error}"),
+                }
+            })?;
+            Ok(LspServerMessage::Notification(notification))
+        } else {
+            Err(LspTransportError::InvalidResponse {
+                method: "unknown".to_string(),
+                details: "message has neither 'id' nor 'method'".to_string(),
+            })
+        }
+    }
+
+    /// Read a response from the server. Interleaved notifications are queued.
     pub async fn read_response(&mut self) -> Result<LspResponse, LspTransportError> {
-        self.read_jsonrpc_message().await
+        loop {
+            match self.read_message().await? {
+                LspServerMessage::Response(r) => return Ok(r),
+                LspServerMessage::Notification(n) => {
+                    self.pending_notifications.push(n);
+                }
+            }
+        }
+    }
+
+    /// Drain and return all queued server-initiated notifications.
+    pub fn drain_notifications(&mut self) -> Vec<LspNotification> {
+        std::mem::take(&mut self.pending_notifications)
     }
 
     pub async fn shutdown(&mut self) -> Result<(), LspTransportError> {
@@ -343,16 +418,6 @@ impl LspTransport {
         })?;
 
         Ok(payload)
-    }
-
-    async fn read_jsonrpc_message<T: serde::de::DeserializeOwned>(
-        &mut self,
-    ) -> Result<T, LspTransportError> {
-        let payload = self.read_frame().await?;
-        serde_json::from_slice(&payload).map_err(|error| LspTransportError::InvalidResponse {
-            method: "unknown".to_string(),
-            details: error.to_string(),
-        })
     }
 }
 
