@@ -109,7 +109,7 @@ pub fn command_exists_on_path(command: &str) -> bool {
     Command::new(command)
         .arg("--version")
         .output()
-        .map_or(false, |_| true)
+        .is_ok()
 }
 
 /// Discover LSP servers that are actually installed on the current system.
