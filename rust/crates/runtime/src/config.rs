@@ -51,6 +51,14 @@ pub struct RuntimePluginConfig {
     max_output_tokens: Option<u32>,
 }
 
+/// Per-language LSP server configuration supplied by the user in settings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LspServerConfig {
+    pub command: String,
+    pub args: Vec<String>,
+    pub enabled: bool,
+}
+
 /// Structured feature configuration consumed by runtime subsystems.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RuntimeFeatureConfig {
@@ -66,6 +74,7 @@ pub struct RuntimeFeatureConfig {
     provider_fallbacks: ProviderFallbackConfig,
     trusted_roots: Vec<String>,
     provider: RuntimeProviderConfig,
+    lsp: BTreeMap<String, LspServerConfig>,
 }
 
 /// Stored provider configuration from the setup wizard.
@@ -348,6 +357,7 @@ impl ConfigLoader {
             provider_fallbacks: parse_optional_provider_fallbacks(&merged_value)?,
             trusted_roots: parse_optional_trusted_roots(&merged_value)?,
             provider: parse_optional_provider_config(&merged_value)?,
+            lsp: parse_optional_lsp_config(&merged_value)?,
         };
 
         Ok(RuntimeConfig {
@@ -452,6 +462,11 @@ impl RuntimeConfig {
     pub fn provider(&self) -> &RuntimeProviderConfig {
         &self.feature_config.provider
     }
+
+    #[must_use]
+    pub fn lsp(&self) -> &BTreeMap<String, LspServerConfig> {
+        &self.feature_config.lsp
+    }
 }
 
 impl RuntimeFeatureConfig {
@@ -525,6 +540,11 @@ impl RuntimeFeatureConfig {
     #[must_use]
     pub fn provider(&self) -> &RuntimeProviderConfig {
         &self.provider
+    }
+
+    #[must_use]
+    pub fn lsp(&self) -> &BTreeMap<String, LspServerConfig> {
+        &self.lsp
     }
 }
 
@@ -1095,6 +1115,34 @@ fn parse_optional_provider_config(root: &JsonValue) -> Result<RuntimeProviderCon
         base_url,
         model,
     })
+}
+
+fn parse_optional_lsp_config(
+    root: &JsonValue,
+) -> Result<BTreeMap<String, LspServerConfig>, ConfigError> {
+    let Some(lsp_value) = root.as_object().and_then(|object| object.get("lsp")) else {
+        return Ok(BTreeMap::new());
+    };
+    let lsp_object = expect_object(lsp_value, "merged settings.lsp")?;
+    let mut result = BTreeMap::new();
+    for (language, value) in lsp_object {
+        let entry = expect_object(value, &format!("merged settings.lsp.{language}"))?;
+        let command = expect_string(entry, "command", &format!("merged settings.lsp.{language}"))?
+            .to_string();
+        let args = optional_string_array(entry, "args", &format!("merged settings.lsp.{language}"))?
+            .unwrap_or_default();
+        let enabled = optional_bool(entry, "enabled", &format!("merged settings.lsp.{language}"))?
+            .unwrap_or(true);
+        result.insert(
+            language.clone(),
+            LspServerConfig {
+                command,
+                args,
+                enabled,
+            },
+        );
+    }
+    Ok(result)
 }
 
 fn parse_mcp_server_config(
