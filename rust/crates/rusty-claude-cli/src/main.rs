@@ -4906,7 +4906,8 @@ impl LiveCli {
             return Ok(false);
         };
 
-        let (handle, session) = load_session_reference(&session_ref)?;
+        let (handle, session) =
+            load_session_reference_excluding(&session_ref, Some(&self.session.id))?;
         let message_count = session.messages.len();
         let session_id = session.session_id.clone();
         let runtime = build_runtime(
@@ -5396,16 +5397,17 @@ fn latest_managed_session() -> Result<ManagedSessionSummary, Box<dyn std::error:
 fn load_session_reference(
     reference: &str,
 ) -> Result<(SessionHandle, Session), Box<dyn std::error::Error>> {
+    load_session_reference_excluding(reference, None)
+}
+
+fn load_session_reference_excluding(
+    reference: &str,
+    exclude_id: Option<&str>,
+) -> Result<(SessionHandle, Session), Box<dyn std::error::Error>> {
     let store = current_session_store()?;
-    // For alias references ("latest", "last", "recent"), allow cross-workspace
-    // resume so /resume latest finds the most recent session globally.
-    // For explicit references, workspace validation is enforced.
-    let result = if runtime::session_control::is_session_reference_alias(reference) {
-        store.load_session_loose(reference)
-    } else {
-        store.load_session(reference)
-    };
-    let loaded = result.map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+    let loaded = store
+        .load_session_excluding(reference, exclude_id)
+        .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
     Ok((
         SessionHandle {
             id: loaded.handle.id,

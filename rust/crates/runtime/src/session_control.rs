@@ -93,8 +93,19 @@ impl SessionStore {
     }
 
     pub fn resolve_reference(&self, reference: &str) -> Result<SessionHandle, SessionControlError> {
+        self.resolve_reference_excluding(reference, None)
+    }
+
+    /// Resolve a session reference, optionally excluding a session by ID.
+    /// When the reference is an alias, the excluded session is skipped
+    /// so /resume latest returns the previous session, not the current one.
+    pub fn resolve_reference_excluding(
+        &self,
+        reference: &str,
+        exclude_id: Option<&str>,
+    ) -> Result<SessionHandle, SessionControlError> {
         if is_session_reference_alias(reference) {
-            let latest = self.latest_session()?;
+            let latest = self.latest_session_excluding(exclude_id)?;
             return Ok(SessionHandle {
                 id: latest.id,
                 path: latest.path,
@@ -158,13 +169,32 @@ impl SessionStore {
     }
 
     pub fn latest_session(&self) -> Result<ManagedSessionSummary, SessionControlError> {
+        self.latest_session_excluding(None)
+    }
+
+    /// Find the most recent session, optionally excluding a session by ID.
+    /// Used by /resume latest to skip the current empty session.
+    pub fn latest_session_excluding(
+        &self,
+        exclude_id: Option<&str>,
+    ) -> Result<ManagedSessionSummary, SessionControlError> {
+        let exclude = exclude_id.unwrap_or("");
         // First: look in the current workspace's session namespace
-        if let Some(latest) = self.list_sessions()?.into_iter().next() {
+        if let Some(latest) = self
+            .list_sessions()?
+            .into_iter()
+            .find(|s| s.id != exclude && s.message_count > 0)
+        {
             return Ok(latest);
         }
         // Fallback: scan all workspace namespaces under ~/.claw/sessions/
-        // so that /resume latest can find sessions from other workspaces
-        if let Some(latest) = self.scan_global_sessions()?.into_iter().next() {
+        // and project-local .claw/sessions/ so /resume latest finds sessions
+        // from other workspaces.
+        if let Some(latest) = self
+            .scan_global_sessions()?
+            .into_iter()
+            .find(|s| s.id != exclude && s.message_count > 0)
+        {
             return Ok(latest);
         }
         Err(SessionControlError::Format(format_no_managed_sessions(
@@ -196,28 +226,39 @@ impl SessionStore {
         &self,
         reference: &str,
     ) -> Result<LoadedManagedSession, SessionControlError> {
-        match self.load_session(reference) {
-            Ok(loaded) => Ok(loaded),
-            Err(SessionControlError::WorkspaceMismatch { expected, actual })
-                if is_session_reference_alias(reference) =>
+        self.load_session_excluding(reference, None)
+    }
+
+    /// Like `load_session_loose` but also excludes a session by ID.
+    /// Used by /resume latest to skip the current empty session and find
+    /// the previous session with actual conversation history.
+    pub fn load_session_excluding(
+        &self,
+        reference: &str,
+        exclude_id: Option<&str>,
+    ) -> Result<LoadedManagedSession, SessionControlError> {
+        let handle = self.resolve_reference_excluding(reference, exclude_id)?;
+        let session = Session::load_from_path(&handle.path)?;
+        // For alias references, allow cross-workspace resume
+        if is_session_reference_alias(reference) {
+            if let Err(SessionControlError::WorkspaceMismatch { expected: _, actual }) =
+                self.validate_loaded_session(&handle.path, &session)
             {
-                let handle = self.resolve_reference(reference)?;
-                let session = Session::load_from_path(&handle.path)?;
                 eprintln!(
                     "  Note: resuming session from a different workspace (origin: {})",
                     actual.display()
                 );
-                let _ = expected; // suppress unused warning
-                Ok(LoadedManagedSession {
-                    handle: SessionHandle {
-                        id: session.session_id.clone(),
-                        path: handle.path,
-                    },
-                    session,
-                })
             }
-            Err(other) => Err(other),
+        } else {
+            self.validate_loaded_session(&handle.path, &session)?;
         }
+        Ok(LoadedManagedSession {
+            handle: SessionHandle {
+                id: session.session_id.clone(),
+                path: handle.path,
+            },
+            session,
+        })
     }
 
     pub fn fork_session(
