@@ -1,7 +1,7 @@
 #![allow(clippy::should_implement_trait, clippy::must_use_candidate)]
 //! LSP (Language Server Protocol) client registry for tool dispatch.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -156,6 +156,7 @@ pub struct LspRegistry {
 #[derive(Debug, Default)]
 struct RegistryInner {
     servers: HashMap<String, LspServerEntry>,
+    open_files: HashSet<String>,
 }
 
 impl LspRegistry {
@@ -422,6 +423,139 @@ impl LspRegistry {
         }
 
         Ok(())
+    }
+
+    /// Notify the LSP server that a file was opened and collect any diagnostics.
+    /// Best-effort: returns empty vec if no server is available.
+    pub fn notify_file_open(&self, path: &str, content: &str) -> Vec<LspDiagnostic> {
+        let Some(language) = Self::language_for_path(path) else {
+            return Vec::new();
+        };
+
+        // Check if already open
+        {
+            let inner = self.inner.lock().expect("lsp registry lock poisoned");
+            if inner.open_files.contains(path) {
+                return Vec::new();
+            }
+        }
+
+        // Lazy-start the server
+        if self.start_server(&language).is_err() {
+            return Vec::new();
+        }
+
+        // Get the process handle and send didOpen
+        let process_arc = {
+            let inner = self.inner.lock().expect("lsp registry lock poisoned");
+            match inner.servers.get(&language).and_then(|e| e.process.clone()) {
+                Some(p) => p,
+                None => return Vec::new(),
+            }
+        };
+
+        let mut diagnostics = Vec::new();
+        if let Ok(mut process) = process_arc.lock() {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build();
+            if let Ok(rt) = rt {
+                let _ = rt.block_on(process.did_open(path, content));
+                diagnostics = process.drain_diagnostics();
+            }
+        }
+
+        // Cache diagnostics in registry state
+        if !diagnostics.is_empty() {
+            let diag_path = path.to_owned();
+            let diags = diagnostics.clone();
+            let mut inner = self.inner.lock().expect("lsp registry lock poisoned");
+            if let Some(entry) = inner.servers.get_mut(&language) {
+                // Replace diagnostics for this file (publishDiagnostics is full replacement)
+                entry.state.diagnostics.retain(|d| d.path != diag_path);
+                entry.state.diagnostics.extend(diags);
+            }
+        }
+
+        // Mark file as open
+        {
+            let mut inner = self.inner.lock().expect("lsp registry lock poisoned");
+            inner.open_files.insert(path.to_owned());
+        }
+
+        diagnostics
+    }
+
+    /// Notify the LSP server that a file changed and collect any diagnostics.
+    /// Best-effort: returns empty vec if no server is available.
+    pub fn notify_file_change(&self, path: &str, content: &str) -> Vec<LspDiagnostic> {
+        let Some(language) = Self::language_for_path(path) else {
+            return Vec::new();
+        };
+
+        // Get the process handle
+        let process_arc = {
+            let inner = self.inner.lock().expect("lsp registry lock poisoned");
+            match inner.servers.get(&language).and_then(|e| e.process.clone()) {
+                Some(p) => p,
+                None => return Vec::new(),
+            }
+        };
+
+        let mut diagnostics = Vec::new();
+        if let Ok(mut process) = process_arc.lock() {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build();
+            if let Ok(rt) = rt {
+                let _ = rt.block_on(process.did_change(path, content));
+                diagnostics = process.drain_diagnostics();
+            }
+        }
+
+        // Replace cached diagnostics for this file
+        if !diagnostics.is_empty() {
+            let diag_path = path.to_owned();
+            let diags = diagnostics.clone();
+            let mut inner = self.inner.lock().expect("lsp registry lock poisoned");
+            if let Some(entry) = inner.servers.get_mut(&language) {
+                entry.state.diagnostics.retain(|d| d.path != diag_path);
+                entry.state.diagnostics.extend(diags);
+            }
+        }
+
+        diagnostics
+    }
+
+    /// Fetch diagnostics for a file by draining pending server notifications
+    /// and returning cached diagnostics.
+    pub fn fetch_diagnostics_for_file(&self, path: &str) -> Vec<LspDiagnostic> {
+        let Some(language) = Self::language_for_path(path) else {
+            return Vec::new();
+        };
+
+        // Drain pending notifications from the transport
+        let process_arc = {
+            let inner = self.inner.lock().expect("lsp registry lock poisoned");
+            inner.servers.get(&language).and_then(|e| e.process.clone())
+        };
+
+        if let Some(process_arc) = process_arc {
+            if let Ok(mut process) = process_arc.lock() {
+                let new_diags = process.drain_diagnostics();
+                if !new_diags.is_empty() {
+                    let diag_path = path.to_owned();
+                    let mut inner =
+                        self.inner.lock().expect("lsp registry lock poisoned");
+                    if let Some(entry) = inner.servers.get_mut(&language) {
+                        entry.state.diagnostics.retain(|d| d.path != diag_path);
+                        entry.state.diagnostics.extend(new_diags);
+                    }
+                }
+            }
+        }
+
+        self.get_diagnostics(path)
     }
 
     /// Dispatch an LSP action and return a structured result.
