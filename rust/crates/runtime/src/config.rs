@@ -125,6 +125,7 @@ pub struct RuntimePluginConfig {
     max_output_tokens: Option<u32>,
 }
 
+<<<<<<< HEAD
 /// API timeout and retry configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApiTimeoutConfig {
@@ -144,6 +145,14 @@ impl Default for ApiTimeoutConfig {
             max_retries: 8,
         }
     }
+=======
+/// Per-language LSP server configuration supplied by the user in settings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LspServerConfig {
+    pub command: String,
+    pub args: Vec<String>,
+    pub enabled: bool,
+>>>>>>> 856409d3 (feat: full LSP (Language Server Protocol) integration)
 }
 
 /// Structured feature configuration consumed by runtime subsystems.
@@ -163,6 +172,7 @@ pub struct RuntimeFeatureConfig {
     api_timeout: ApiTimeoutConfig,
     rules_import: RulesImportConfig,
     provider: RuntimeProviderConfig,
+    lsp: BTreeMap<String, LspServerConfig>,
 }
 
 /// Controls which external AI coding framework rules are imported into the system prompt.
@@ -496,6 +506,7 @@ impl ConfigLoader {
         build_runtime_config(merged, loaded_entries, mcp)
     }
 
+<<<<<<< HEAD
     /// Like [`load`] but also returns the list of validation warnings collected during
     /// loading, without emitting them to stderr. Callers that want to surface warnings
     /// through a structured channel (e.g. the JSON config envelope) should use this.
@@ -652,6 +663,24 @@ impl ConfigLoader {
                 load_error.get_or_insert_with(|| error.to_string());
                 None
             }
+=======
+        let feature_config = RuntimeFeatureConfig {
+            hooks: parse_optional_hooks_config(&merged_value)?,
+            plugins: parse_optional_plugin_config(&merged_value)?,
+            mcp: McpConfigCollection {
+                servers: mcp_servers,
+            },
+            oauth: parse_optional_oauth_config(&merged_value, "merged settings.oauth")?,
+            model: parse_optional_model(&merged_value),
+            aliases: parse_optional_aliases(&merged_value)?,
+            permission_mode: parse_optional_permission_mode(&merged_value)?,
+            permission_rules: parse_optional_permission_rules(&merged_value)?,
+            sandbox: parse_optional_sandbox_config(&merged_value)?,
+            provider_fallbacks: parse_optional_provider_fallbacks(&merged_value)?,
+            trusted_roots: parse_optional_trusted_roots(&merged_value)?,
+            provider: parse_optional_provider_config(&merged_value)?,
+            lsp: parse_optional_lsp_config(&merged_value)?,
+>>>>>>> 856409d3 (feat: full LSP (Language Server Protocol) integration)
         };
 
         ConfigInspection {
@@ -920,6 +949,7 @@ impl RuntimeConfig {
         &self.feature_config.provider
     }
 
+<<<<<<< HEAD
     /// Merge config-level default trusted roots with per-call roots.
     ///
     /// Config roots are defaults and are kept first; per-call roots extend the
@@ -929,6 +959,11 @@ impl RuntimeConfig {
     #[must_use]
     pub fn trusted_roots_with_overrides(&self, per_call_roots: &[String]) -> Vec<String> {
         merge_trusted_roots(self.trusted_roots(), per_call_roots)
+=======
+    #[must_use]
+    pub fn lsp(&self) -> &BTreeMap<String, LspServerConfig> {
+        &self.feature_config.lsp
+>>>>>>> 856409d3 (feat: full LSP (Language Server Protocol) integration)
     }
 }
 
@@ -1012,6 +1047,7 @@ impl RuntimeFeatureConfig {
         &self.rules_import
     }
 
+<<<<<<< HEAD
     /// Merge this config's default trusted roots with per-call roots.
     #[must_use]
     pub fn trusted_roots_with_overrides(&self, per_call_roots: &[String]) -> Vec<String> {
@@ -1027,6 +1063,12 @@ fn merge_trusted_roots(config_roots: &[String], per_call_roots: &[String]) -> Ve
         }
     }
     merged
+=======
+    #[must_use]
+    pub fn lsp(&self) -> &BTreeMap<String, LspServerConfig> {
+        &self.lsp
+    }
+>>>>>>> 856409d3 (feat: full LSP (Language Server Protocol) integration)
 }
 
 impl ProviderFallbackConfig {
@@ -2245,6 +2287,34 @@ fn expand_config_value(value: &str) -> String {
         }
     }
     result
+}
+
+fn parse_optional_lsp_config(
+    root: &JsonValue,
+) -> Result<BTreeMap<String, LspServerConfig>, ConfigError> {
+    let Some(lsp_value) = root.as_object().and_then(|object| object.get("lsp")) else {
+        return Ok(BTreeMap::new());
+    };
+    let lsp_object = expect_object(lsp_value, "merged settings.lsp")?;
+    let mut result = BTreeMap::new();
+    for (language, value) in lsp_object {
+        let entry = expect_object(value, &format!("merged settings.lsp.{language}"))?;
+        let command = expect_string(entry, "command", &format!("merged settings.lsp.{language}"))?
+            .to_string();
+        let args = optional_string_array(entry, "args", &format!("merged settings.lsp.{language}"))?
+            .unwrap_or_default();
+        let enabled = optional_bool(entry, "enabled", &format!("merged settings.lsp.{language}"))?
+            .unwrap_or(true);
+        result.insert(
+            language.clone(),
+            LspServerConfig {
+                command,
+                args,
+                enabled,
+            },
+        );
+    }
+    Ok(result)
 }
 
 fn parse_mcp_server_config(
