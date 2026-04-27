@@ -40,10 +40,33 @@ The canonical implementation lives in [`rust/`](./rust), and the current source 
 >
 > **ACP / Zed status:** `claw-code` does not ship an ACP/Zed daemon entrypoint yet. Run `claw acp` (or `claw --acp`) for the current status instead of guessing from source layout; `claw acp serve` is currently a discoverability alias only, and real ACP support remains tracked separately in `ROADMAP.md`.
 
+## Documentation Overview
+
+| Document | What it covers |
+|---|---|
+| [`USAGE.md`](./USAGE.md) | Build, auth, CLI reference, sessions, parity-harness workflows |
+| [`docs/CONFIGURATION.md`](./docs/CONFIGURATION.md) | All env vars, `settings.json` keys, validation, and migration notes |
+| [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md) | High-level crate/subsystem map and design rationale |
+| [`docs/API_REFERENCE.md`](./docs/API_REFERENCE.md) | JSON protocol, output envelopes, exit codes |
+| [`docs/SUPPORTED_PROVIDERS.md`](./docs/SUPPORTED_PROVIDERS.md) | Provider selection, auth, and model compatibility |
+| [`docs/MODEL_COMPATIBILITY.md`](./docs/MODEL_COMPATIBILITY.md) | Per-model capability matrix |
+| [`docs/container.md`](./docs/container.md) | Container-first workflow and Docker setup |
+| [`ERROR_HANDLING.md`](./ERROR_HANDLING.md) | Unified error-handling pattern for orchestration code |
+| [`TROUBLESHOOTING.md`](./TROUBLESHOOTING.md) | Common failures and recovery steps |
+| [`PARITY.md`](./PARITY.md) | Rust-port parity status and migration notes |
+| [`ROADMAP.md`](./ROADMAP.md) | Active roadmap, pinpoints #241–#311, and cleanup backlog |
+| [`CONTRIBUTING.md`](./CONTRIBUTING.md) | Contribution guidelines and PR workflow |
+| [`CHANGELOG.md`](./CHANGELOG.md) | Release history |
+| [`PHILOSOPHY.md`](./PHILOSOPHY.md) | Project intent and system-design framing |
+| [`SCHEMAS.md`](./SCHEMAS.md) | JSON protocol contract (Python harness reference) |
+
+> **New users:** start with [`USAGE.md`](./USAGE.md) → run `claw doctor` → check [`docs/CONFIGURATION.md`](./docs/CONFIGURATION.md) for settings → [`TROUBLESHOOTING.md`](./TROUBLESHOOTING.md) if stuck.
+
 ## Current repository shape
 
 - **`rust/`** — canonical Rust workspace and the `claw` CLI binary
 - **`USAGE.md`** — task-oriented usage guide for the current product surface
+- **`docs/`** — full documentation suite (configuration, architecture, API reference, providers, container workflow)
 - **`ERROR_HANDLING.md`** — unified error-handling pattern for orchestration code
 - **`PARITY.md`** — Rust-port parity status and migration notes
 - **`ROADMAP.md`** — active roadmap and cleanup backlog
