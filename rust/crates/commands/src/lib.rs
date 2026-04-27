@@ -2709,6 +2709,7 @@ fn render_mcp_report_for(
     }
 }
 
+<<<<<<< HEAD
 fn render_mcp_unsupported_action_text(action: &str, hint: &str) -> String {
     format!(
         "MCP\n  Error            unsupported action '{action}'\n  Hint             {hint}\n  Usage            /mcp [list|show <server>|help]"
@@ -2730,6 +2731,8 @@ fn render_mcp_unsupported_action_json(action: &str, hint: &str) -> Value {
     })
 }
 
+=======
+>>>>>>> 9b1593c (fix: /resume latest finds sessions across all workspaces)
 #[allow(clippy::unnecessary_wraps)]
 fn render_mcp_report_json_for(
     loader: &ConfigLoader,
