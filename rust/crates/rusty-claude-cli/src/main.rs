@@ -7865,6 +7865,7 @@ impl LiveCli {
                 // ============================================================================
 
                 let error_str = error.to_string();
+<<<<<<< HEAD
                 // Detect context window overflow. Some providers (e.g. OpenAI-compat backends)
                 // return 400 with "no parseable body" instead of a proper context_length_exceeded
                 // error when the request is too large to even parse — treat that as context overflow too.
@@ -7931,6 +7932,32 @@ impl LiveCli {
                             // No more messages to compact — further rounds won't help
                             println!("  No further compaction possible.");
                             break;
+=======
+                let is_context_window = error_str.contains("context_window") || error_str.contains("Context window");
+                
+                if is_context_window {
+                    println!("  Auto-compacting session and retrying...");
+                    
+                    // Step 1: Compact the session to free up context space
+                    // Run the Trident compaction pipeline (supersede + collapse + cluster)
+                    // then apply summary-based compaction for maximum context reduction
+                    let result = runtime::trident::trident_compact_session(
+                        runtime.session(),
+                        CompactionConfig {
+                            max_estimated_tokens: 0,
+                            ..CompactionConfig::default()
+                        },
+                        &runtime::trident::TridentConfig::default(),
+                    );
+                    let removed = result.removed_message_count;
+                    
+                    // Only proceed if compaction actually happened (messages were removed)
+                    // or there's still a session to work with
+                    if removed > 0 || result.compacted_session.messages.len() > 0 {
+                        if removed > 0 {
+                            // Report compaction results to user
+                            println!("{}", format_compact_report(removed, result.compacted_session.messages.len(), false));
+>>>>>>> 5e19cf1c (feat: Trident compaction pipeline (supersede + collapse + cluster))
                         }
 
                         if removed > 0 {
