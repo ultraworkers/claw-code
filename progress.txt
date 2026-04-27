@@ -365,14 +365,3 @@ US-021 COMPLETED (Request body size pre-flight check - from dogfood findings)
 - Tests: 5 new tests for size estimation and limit checking
 
 PROJECT STATUS: COMPLETE (21/21 stories)
-
-Iteration 2026-04-29 - ROADMAP #96 COMPLETED
-------------------------------------------------
-- Pulled origin/main: already up to date.
-- Selected ROADMAP #96 as a small repo-local Immediate Backlog item: the `claw --help` Resume-safe command summary leaked slash-command stubs despite the main Interactive command listing filtering them.
-- Files: rust/crates/rusty-claude-cli/src/main.rs, ROADMAP.md, progress.txt.
-- Changed help rendering to filter `resume_supported_slash_commands()` through `STUB_COMMANDS` before building the Resume-safe one-liner.
-- Added `stub_commands_absent_from_resume_safe_help` regression coverage so future stub additions cannot leak into the Resume-safe summary.
-- Targeted verification: `cargo test -p rusty-claude-cli stub_commands_absent_from_resume_safe_help -- --nocapture` passed; `cargo test -p rusty-claude-cli parses_direct_cli_actions -- --nocapture` passed.
-- Format/check verification: `cargo fmt --all --check`, `git diff --check`, and `cargo check -p rusty-claude-cli` passed.
-- Broader clippy note: `cargo clippy -p rusty-claude-cli --all-targets -- -D warnings` is blocked by pre-existing `clippy::unnecessary_wraps` failures in `rust/crates/commands/src/lib.rs` (`render_mcp_report_for`, `render_mcp_report_json_for`), outside this diff.
