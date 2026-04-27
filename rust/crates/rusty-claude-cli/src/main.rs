@@ -2,6 +2,13 @@
     dead_code,
     unused_imports,
     unused_variables,
+    clippy::doc_markdown,
+    clippy::len_zero,
+    clippy::manual_string_new,
+    clippy::match_same_arms,
+    clippy::result_large_err,
+    clippy::too_many_lines,
+    clippy::uninlined_format_args,
     clippy::unneeded_struct_pattern,
     clippy::unnecessary_wraps,
     clippy::unused_self
@@ -9,6 +16,7 @@
 mod init;
 mod input;
 mod render;
+mod setup_wizard;
 
 use std::collections::BTreeSet;
 use std::env;
@@ -406,6 +414,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         CliAction::Acp { output_format } => print_acp_status(output_format)?,
         CliAction::State { output_format } => run_worker_state(output_format)?,
         CliAction::Init { output_format } => run_init(output_format)?,
+        CliAction::Setup { .. } => setup_wizard::run_setup_wizard()?,
         // #146: dispatch pure-local introspection. Text mode uses existing
         // render_config_report/render_diff_report; JSON mode uses the
         // corresponding _json helpers already exposed for resume sessions.
@@ -562,6 +571,9 @@ enum CliAction {
     HelpTopic(LocalHelpTopic),
     // prompt-mode formatting is only supported for non-interactive runs
     Help {
+        output_format: CliOutputFormat,
+    },
+    Setup {
         output_format: CliOutputFormat,
     },
 }
@@ -1099,6 +1111,7 @@ fn parse_single_word_command_alias(
         "sandbox" => Some(Ok(CliAction::Sandbox { output_format })),
         "doctor" => Some(Ok(CliAction::Doctor { output_format })),
         "state" => Some(Ok(CliAction::State { output_format })),
+        "setup" => Some(Ok(CliAction::Setup { output_format })),
         // #146: let `config` and `diff` fall through to parse_subcommand
         // where they are wired as pure-local introspection, instead of
         // producing the "is a slash command" guidance. Zero-arg cases
@@ -1120,6 +1133,7 @@ fn bare_slash_command_guidance(command_name: &str) -> Option<String> {
             | "init"
             | "prompt"
             | "export"
+            | "setup"
     ) {
         return None;
     }
@@ -1572,7 +1586,8 @@ fn config_permission_mode_for_current_dir() -> Option<PermissionMode> {
 fn config_model_for_current_dir() -> Option<String> {
     let cwd = env::current_dir().ok()?;
     let loader = ConfigLoader::default_for(&cwd);
-    loader.load().ok()?.model().map(ToOwned::to_owned)
+    let config = loader.load().ok()?;
+    config.model().map(ToOwned::to_owned).or_else(|| config.provider().model().map(ToOwned::to_owned))
 }
 
 fn resolve_repl_model(cli_model: String) -> String {
@@ -3463,7 +3478,8 @@ fn run_resume_command(
         | SlashCommand::Ide { .. }
         | SlashCommand::Tag { .. }
         | SlashCommand::OutputStyle { .. }
-        | SlashCommand::AddDir { .. } => Err("unsupported resumed slash command".into()),
+        | SlashCommand::AddDir { .. }
+        | SlashCommand::Setup => Err("unsupported resumed slash command".into()),
     }
 }
 
@@ -3614,6 +3630,16 @@ fn run_repl(
                 editor.push_history(input);
                 cli.record_prompt_history(&trimmed);
                 cli.run_turn(&trimmed)?;
+            }
+            input::ReadOutcome::ProviderSwap => {
+                // Ctrl+P triggered — launch setup wizard and hot-swap model
+                setup_wizard::run_setup_wizard()?;
+                let cwd = std::env::current_dir().unwrap_or_default();
+                let config = runtime::ConfigLoader::default_for(&cwd).load().ok();
+                if let Some(new_model) = config.as_ref().and_then(|c| c.provider().model().map(str::to_string)) {
+                    cli.set_model(Some(new_model))?;
+                }
+                println!("{}", format_connected_line(&cli.model));
             }
             input::ReadOutcome::Cancel => {}
             input::ReadOutcome::Exit => {
@@ -4290,6 +4316,85 @@ impl LiveCli {
                     TerminalRenderer::new().color_theme(),
                     &mut stdout,
                 )?;
+                
+                // ============================================================================
+                // Auto-compact retry on context window errors
+                // ============================================================================
+                // When the model API returns a context_window_blocked error (because the request
+                // exceeds the model's context window), we automatically:
+                // 1. Compact the session (remove old messages to free up space)
+                // 2. Retry the original request with the compacted session
+                // 3. Report results to the user
+                //
+                // This eliminates the need for users to manually run /compact when they
+                // hit context limits - the recovery happens automatically.
+                //
+                // Detection: We look for "context_window" or "Context window" in the error
+                // message, which covers error types like:
+                // - "context_window_blocked"
+                // - "Context window blocked"
+                // - "This model's maximum context length is X tokens..."
+                // ============================================================================
+                
+                let error_str = error.to_string();
+                let is_context_window = error_str.contains("context_window") || error_str.contains("Context window");
+                
+                if is_context_window {
+                    println!("  Auto-compacting session and retrying...");
+                    
+                    // Step 1: Compact the session to free up context space
+                    // We set max_estimated_tokens to 0 to compact as aggressively as needed
+                    let result = runtime::compact_session(
+                        runtime.session(),
+                        CompactionConfig {
+                            max_estimated_tokens: 0,
+                            ..CompactionConfig::default()
+                        },
+                    );
+                    let removed = result.removed_message_count;
+                    
+                    // Only proceed if compaction actually happened (messages were removed)
+                    // or there's still a session to work with
+                    if removed > 0 || result.compacted_session.messages.len() > 0 {
+                        if removed > 0 {
+                            // Report compaction results to user
+                            println!("{}", format_compact_report(removed, result.compacted_session.messages.len(), false));
+                        }
+                        
+                        // Step 2: Build a new runtime with the compacted session and retry
+                        let (mut new_runtime, hook_abort_monitor) = self.prepare_turn_runtime(true)?;
+                        drop(hook_abort_monitor); // not needed for retry
+                        
+                        // Step 3: Run the turn again with the smaller session
+                        let mut rp = CliPermissionPrompter::new(self.permission_mode);
+                        match new_runtime.run_turn(input, Some(&mut rp)) {
+                            Ok(summary) => {
+                                // Success! Replace old runtime with the new compacted one
+                                self.replace_runtime(new_runtime)?;
+                                spinner.finish(
+                                    "✨ Done (after auto-compact)",
+                                    TerminalRenderer::new().color_theme(),
+                                    &mut stdout,
+                                )?;
+                                println!();
+                                // If additional auto-compaction happened during retry,
+                                // report that too
+                                if let Some(event) = summary.auto_compaction {
+                                    println!("{}", format_auto_compaction_notice(event.removed_message_count));
+                                }
+                                // Save the compacted session to disk
+                                self.persist_session()?;
+                                return Ok(());
+                            }
+                            // If retry also fails, propagate the new error
+                            Err(retry_error) => {
+                                return Err(Box::new(retry_error));
+                            }
+                        }
+                    }
+                }
+                
+                // If not a context window error, return original error
                 Err(Box::new(error))
             }
         }
@@ -4464,6 +4569,16 @@ impl LiveCli {
             }
             SlashCommand::Init => {
                 run_init(CliOutputFormat::Text)?;
+                false
+            }
+            SlashCommand::Setup => {
+                setup_wizard::run_setup_wizard()?;
+                // Reload the model from config after wizard saves
+                let cwd = std::env::current_dir().unwrap_or_default();
+                let config = runtime::ConfigLoader::default_for(&cwd).load().ok();
+                if let Some(new_model) = config.as_ref().and_then(|c| c.provider().model().map(str::to_string)) {
+                    self.set_model(Some(new_model))?;
+                }
                 false
             }
             SlashCommand::Diff => {
@@ -4791,7 +4906,8 @@ impl LiveCli {
             return Ok(false);
         };
 
-        let (handle, session) = load_session_reference(&session_ref)?;
+        let (handle, session) =
+            load_session_reference_excluding(&session_ref, Some(&self.session.id))?;
         let message_count = session.messages.len();
         let session_id = session.session_id.clone();
         let runtime = build_runtime(
@@ -5281,8 +5397,16 @@ fn latest_managed_session() -> Result<ManagedSessionSummary, Box<dyn std::error:
 fn load_session_reference(
     reference: &str,
 ) -> Result<(SessionHandle, Session), Box<dyn std::error::Error>> {
-    let loaded = current_session_store()?
-        .load_session(reference)
+    load_session_reference_excluding(reference, None)
+}
+
+fn load_session_reference_excluding(
+    reference: &str,
+    exclude_id: Option<&str>,
+) -> Result<(SessionHandle, Session), Box<dyn std::error::Error>> {
+    let store = current_session_store()?;
+    let loaded = store
+        .load_session_excluding(reference, exclude_id)
         .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
     Ok((
         SessionHandle {

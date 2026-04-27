@@ -314,6 +314,13 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         resume_supported: true,
     },
     SlashCommandSpec {
+        name: "setup",
+        aliases: &[],
+        summary: "Configure provider, API key, and model interactively",
+        argument_hint: None,
+        resume_supported: true,
+    },
+    SlashCommandSpec {
         name: "stats",
         aliases: &[],
         summary: "Show workspace and session statistics",
@@ -1140,6 +1147,7 @@ pub enum SlashCommand {
     Usage {
         scope: Option<String>,
     },
+    Setup,
     Rename {
         name: Option<String>,
     },
@@ -1265,6 +1273,7 @@ impl SlashCommand {
             Self::Theme { .. } => "/theme",
             Self::Voice { .. } => "/voice",
             Self::Usage { .. } => "/usage",
+            Self::Setup => "/setup",
             Self::Rename { .. } => "/rename",
             Self::Copy { .. } => "/copy",
             Self::Hooks { .. } => "/hooks",
@@ -1476,6 +1485,7 @@ pub fn validate_slash_command_input(
         "theme" => SlashCommand::Theme { name: remainder },
         "voice" => SlashCommand::Voice { mode: remainder },
         "usage" => SlashCommand::Usage { scope: remainder },
+        "setup" => SlashCommand::Setup,
         "rename" => SlashCommand::Rename { name: remainder },
         "copy" => SlashCommand::Copy { target: remainder },
         "hooks" => SlashCommand::Hooks { args: remainder },
@@ -2537,6 +2547,7 @@ pub fn resolve_skill_path(cwd: &Path, skill: &str) -> std::io::Result<PathBuf> {
     ))
 }
 
+#[allow(clippy::unnecessary_wraps)]
 fn render_mcp_report_for(
     loader: &ConfigLoader,
     cwd: &Path,
@@ -2600,6 +2611,7 @@ fn render_mcp_report_for(
     }
 }
 
+#[allow(clippy::unnecessary_wraps)]
 fn render_mcp_report_json_for(
     loader: &ConfigLoader,
     cwd: &Path,
@@ -4169,6 +4181,7 @@ pub fn handle_slash_command(
         | SlashCommand::OutputStyle { .. }
         | SlashCommand::AddDir { .. }
         | SlashCommand::History { .. }
+        | SlashCommand::Setup
         | SlashCommand::Unknown(_) => None,
     }
 }
@@ -4706,7 +4719,7 @@ mod tests {
         assert!(help.contains("aliases: /skill"));
         assert!(!help.contains("/login"));
         assert!(!help.contains("/logout"));
-        assert_eq!(slash_command_specs().len(), 139);
+        assert_eq!(slash_command_specs().len(), 140);
         assert!(resume_supported_slash_commands().len() >= 39);
     }
 
