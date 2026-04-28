@@ -100,12 +100,18 @@ pub use config::{
 >>>>>>> 1ff5617c (fix: sync all bug fixes to combined branch)
     McpManagedProxyServerConfig, McpOAuthConfig, McpRemoteServerConfig, McpSdkServerConfig,
     McpServerConfig, McpStdioServerConfig, McpTransport, McpWebSocketServerConfig, OAuthConfig,
+<<<<<<< HEAD
 =======
 >>>>>>> e9582034 (feat: full LSP (Language Server Protocol) integration)
     ProviderFallbackConfig, ResolvedPermissionMode, RuntimeConfig, RuntimeFeatureConfig,
     RuntimeHookConfig, RuntimePermissionRuleConfig, RuntimePluginConfig, RuntimeProviderConfig,
     ScopedMcpServerConfig, CLAW_SETTINGS_SCHEMA_NAME,
 >>>>>>> 856409d3 (feat: full LSP (Language Server Protocol) integration)
+=======
+    ProviderFallbackConfig, ResolvedPermissionMode, RulesImportConfig, RuntimeConfig,
+    RuntimeFeatureConfig, RuntimeHookConfig, RuntimePermissionRuleConfig, RuntimePluginConfig,
+    ScopedMcpServerConfig, CLAW_SETTINGS_SCHEMA_NAME,
+>>>>>>> 22f948b7 (feat: project rules with .claw/rules/ and multi-framework auto-import)
 };
 pub use config_validate::{
     check_unsupported_format, format_diagnostics, validate_config_file, ConfigDiagnostic,

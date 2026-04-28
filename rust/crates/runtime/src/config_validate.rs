@@ -209,6 +209,7 @@ const TOP_LEVEL_FIELDS: &[FieldSpec] = &[
         expected: FieldType::StringArray,
     },
     FieldSpec {
+<<<<<<< HEAD
         name: "provider",
         expected: FieldType::Object,
     },
@@ -237,6 +238,10 @@ const TOP_LEVEL_FIELDS: &[FieldSpec] = &[
     FieldSpec {
         name: "lspAutoStart",
         expected: FieldType::Bool,
+=======
+        name: "rulesImport",
+        expected: FieldType::String,
+>>>>>>> 22f948b7 (feat: project rules with .claw/rules/ and multi-framework auto-import)
     },
 ];
 
