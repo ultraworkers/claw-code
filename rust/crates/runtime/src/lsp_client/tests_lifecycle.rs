@@ -188,6 +188,7 @@ fn register_with_descriptor_stores_entry() {
         command: "rust-analyzer".into(),
         args: vec![],
         extensions: vec!["rs".into()],
+        install_hint: vec![],
     };
     registry.register_with_descriptor(
         "rust",
@@ -249,6 +250,7 @@ fn dispatch_hover_lazy_starts_server() {
         command: "rust-analyzer".into(),
         args: vec![],
         extensions: vec!["rs".into()],
+        install_hint: vec![],
     };
     registry.register_with_descriptor("rust", LspServerStatus::Starting, None, vec![], descriptor);
     // dispatch should trigger start_server because process is None
@@ -276,6 +278,7 @@ fn start_and_stop_server() {
         command: "rust-analyzer".into(),
         args: vec![],
         extensions: vec!["rs".into()],
+        install_hint: vec![],
     };
     registry.register_with_descriptor("rust", LspServerStatus::Starting, None, vec![], descriptor);
 

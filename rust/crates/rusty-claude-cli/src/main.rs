@@ -4316,6 +4316,15 @@ fn run_repl(
         }
     }
 
+    // Show install suggestions for missing LSP servers
+    {
+        let availability = runtime::lsp_discovery::check_lsp_availability();
+        let prompt = runtime::lsp_discovery::format_install_prompt(&availability);
+        if !prompt.is_empty() {
+            eprintln!("{prompt}");
+        }
+    }
+
     loop {
         editor.set_completions(cli.repl_completion_candidates().unwrap_or_default());
         match editor.read_line()? {
