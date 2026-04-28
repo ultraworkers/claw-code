@@ -210,6 +210,7 @@ const TOP_LEVEL_FIELDS: &[FieldSpec] = &[
     },
     FieldSpec {
 <<<<<<< HEAD
+<<<<<<< HEAD
         name: "provider",
         expected: FieldType::Object,
     },
@@ -242,6 +243,10 @@ const TOP_LEVEL_FIELDS: &[FieldSpec] = &[
         name: "rulesImport",
         expected: FieldType::String,
 >>>>>>> 22f948b7 (feat: project rules with .claw/rules/ and multi-framework auto-import)
+=======
+        name: "subagentModel",
+        expected: FieldType::String,
+>>>>>>> 7e7baeaa (feat: SubAgent tool for fast sub-agent delegation)
     },
 ];
 

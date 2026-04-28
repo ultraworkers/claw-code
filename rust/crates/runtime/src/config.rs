@@ -211,6 +211,7 @@ pub struct RuntimeFeatureConfig {
     trusted_roots: Vec<String>,
 <<<<<<< HEAD
 <<<<<<< HEAD
+<<<<<<< HEAD
     api_timeout: ApiTimeoutConfig,
     rules_import: RulesImportConfig,
     provider: RuntimeProviderConfig,
@@ -353,6 +354,9 @@ impl RulesImportConfig {
         }
     }
 >>>>>>> 22f948b7 (feat: project rules with .claw/rules/ and multi-framework auto-import)
+=======
+    subagent_model: Option<String>,
+>>>>>>> 7e7baeaa (feat: SubAgent tool for fast sub-agent delegation)
 }
 
 /// Ordered chain of fallback model identifiers used when the primary
@@ -799,6 +803,7 @@ impl ConfigLoader {
             provider_fallbacks: parse_optional_provider_fallbacks(&merged_value)?,
             trusted_roots: parse_optional_trusted_roots(&merged_value)?,
 <<<<<<< HEAD
+<<<<<<< HEAD
             provider: parse_optional_provider_config(&merged_value)?,
             lsp: parse_optional_lsp_config(&merged_value)?,
 <<<<<<< HEAD
@@ -823,6 +828,9 @@ impl ConfigLoader {
 =======
             rules_import: parse_optional_rules_import(&merged_value)?,
 >>>>>>> 22f948b7 (feat: project rules with .claw/rules/ and multi-framework auto-import)
+=======
+            subagent_model: parse_optional_subagent_model(&merged_value),
+>>>>>>> 7e7baeaa (feat: SubAgent tool for fast sub-agent delegation)
         };
 
         ConfigInspection {
@@ -1082,6 +1090,7 @@ impl RuntimeConfig {
     }
 
 <<<<<<< HEAD
+<<<<<<< HEAD
     #[must_use]
 <<<<<<< HEAD
     pub fn rules_import(&self) -> &RulesImportConfig {
@@ -1127,6 +1136,12 @@ impl RuntimeConfig {
         &self.feature_config.rules_import
     }
 >>>>>>> 22f948b7 (feat: project rules with .claw/rules/ and multi-framework auto-import)
+=======
+    #[must_use]
+    pub fn subagent_model(&self) -> Option<&str> {
+        self.feature_config.subagent_model.as_deref()
+    }
+>>>>>>> 7e7baeaa (feat: SubAgent tool for fast sub-agent delegation)
 }
 
 impl RuntimeFeatureConfig {
@@ -1937,6 +1952,19 @@ fn parse_optional_model(root: &JsonValue) -> Option<String> {
         .and_then(|object| object.get("model"))
         .and_then(JsonValue::as_str)
         .map(ToOwned::to_owned)
+}
+
+fn parse_optional_subagent_model(value: &JsonValue) -> Option<String> {
+    value
+        .as_object()
+        .and_then(|object| {
+            object
+                .get("subagentModel")
+                .or_else(|| object.get("subagent_model"))
+        })
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.trim().to_string())
 }
 
 fn parse_optional_aliases(root: &JsonValue) -> Result<BTreeMap<String, String>, ConfigError> {
