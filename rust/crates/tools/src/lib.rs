@@ -1497,6 +1497,7 @@ fn execute_tool_with_enforcer(
             .and_then(run_worker_observe_completion),
         "TeamCreate" => from_value::<TeamCreateInput>(input).and_then(run_team_create),
         "TeamDelete" => from_value::<TeamDeleteInput>(input).and_then(run_team_delete),
+        "AgentMessage" => from_value::<AgentMessageInput>(input).and_then(run_agent_message),
         "CronCreate" => from_value::<CronCreateInput>(input).and_then(run_cron_create),
         "CronDelete" => from_value::<CronDeleteInput>(input).and_then(run_cron_delete),
         "CronList" => run_cron_list(input.clone()),
@@ -4481,11 +4482,21 @@ fn build_agent_system_prompt(subagent_type: &str, model: &str) -> Result<Vec<Str
 }
 
 fn resolve_agent_model(model: Option<&str>) -> String {
-    model
-        .map(str::trim)
-        .filter(|model| !model.is_empty())
-        .unwrap_or(DEFAULT_AGENT_MODEL)
-        .to_string()
+    if let Some(m) = model.map(str::trim).filter(|m| !m.is_empty()) {
+        return m.to_string();
+    }
+    if let Some(fast) = load_subagent_model_from_config() {
+        return fast;
+    }
+    DEFAULT_AGENT_MODEL.to_string()
+}
+
+/// Read the `subagentModel` setting from merged config so the Agent tool
+/// honors it even when the caller didn't pass an explicit model.
+fn load_subagent_model_from_config() -> Option<String> {
+    let cwd = std::env::current_dir().ok()?;
+    let config = ConfigLoader::default_for(&cwd).load().ok()?;
+    config.subagent_model().map(str::to_string)
 }
 
 fn allowed_tools_for_subagent(subagent_type: &str) -> BTreeSet<String> {
@@ -4498,6 +4509,7 @@ fn allowed_tools_for_subagent(subagent_type: &str) -> BTreeSet<String> {
             "WebSearch",
             "ToolSearch",
             "Skill",
+            "AgentMessage",
             "StructuredOutput",
         ],
         "Plan" => vec![
@@ -4509,6 +4521,7 @@ fn allowed_tools_for_subagent(subagent_type: &str) -> BTreeSet<String> {
             "ToolSearch",
             "Skill",
             "TodoWrite",
+            "AgentMessage",
             "StructuredOutput",
             "SendUserMessage",
         ],
@@ -4521,6 +4534,7 @@ fn allowed_tools_for_subagent(subagent_type: &str) -> BTreeSet<String> {
             "WebSearch",
             "ToolSearch",
             "TodoWrite",
+            "AgentMessage",
             "StructuredOutput",
             "SendUserMessage",
             "PowerShell",
@@ -4559,6 +4573,7 @@ fn allowed_tools_for_subagent(subagent_type: &str) -> BTreeSet<String> {
             "ToolSearch",
             "NotebookEdit",
             "Sleep",
+            "AgentMessage",
             "SendUserMessage",
             "Config",
             "StructuredOutput",
