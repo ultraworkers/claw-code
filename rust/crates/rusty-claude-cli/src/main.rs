@@ -10843,23 +10843,15 @@ mod tests {
             json.get("model").and_then(|v| v.as_str()),
             Some("test-model")
         );
-        assert!(
-            json.get("workspace").is_some(),
-            "workspace field still reported"
-        );
-        assert!(
-            json.get("sandbox").is_some(),
-            "sandbox field still reported"
-        );
+        assert!(json.get("workspace").is_some(), "workspace field still reported");
+        assert!(json.get("sandbox").is_some(), "sandbox field still reported");
         assert_eq!(
-            json.pointer("/allowed_tools/source")
-                .and_then(|v| v.as_str()),
+            json.pointer("/allowed_tools/source").and_then(|v| v.as_str()),
             Some("default"),
             "default status should expose unrestricted tool source: {json}"
         );
         assert_eq!(
-            json.pointer("/allowed_tools/restricted")
-                .and_then(|v| v.as_bool()),
+            json.pointer("/allowed_tools/restricted").and_then(|v| v.as_bool()),
             Some(false),
             "default status should expose unrestricted tool state: {json}"
         );
