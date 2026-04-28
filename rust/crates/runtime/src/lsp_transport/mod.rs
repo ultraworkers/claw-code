@@ -168,6 +168,7 @@ impl LspTransport {
     ) -> io::Result<Self> {
         let mut cmd = Command::new(command);
         cmd.args(args)
+            .env("NODE_NO_WARNINGS", "1")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
@@ -454,7 +455,8 @@ impl LspTransport {
             c
         };
 
-        cmd.stdin(Stdio::piped())
+        cmd.env("NODE_NO_WARNINGS", "1")
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
 
