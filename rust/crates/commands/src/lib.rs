@@ -6049,6 +6049,7 @@ mod tests {
         assert!(!help.contains("/logout"));
 <<<<<<< HEAD
 <<<<<<< HEAD
+<<<<<<< HEAD
         assert!(help.contains("/setup"));
         assert_eq!(slash_command_specs().len(), 140);
 =======
@@ -6057,6 +6058,9 @@ mod tests {
 =======
         assert_eq!(slash_command_specs().len(), 141);
 >>>>>>> e9582034 (feat: full LSP (Language Server Protocol) integration)
+=======
+        assert_eq!(slash_command_specs().len(), 140);
+>>>>>>> 353da088 (feat(lsp): install prompts, new servers, and advanced LSP features)
         assert!(resume_supported_slash_commands().len() >= 39);
     }
 

@@ -7124,6 +7124,15 @@ fn run_repl(
 >>>>>>> ab3550e5 (feat(lsp): add lspAutoStart config, remove unused LSP client/process/transport modules)
     }
 
+    // Show install suggestions for missing LSP servers
+    {
+        let availability = runtime::lsp_discovery::check_lsp_availability();
+        let prompt = runtime::lsp_discovery::format_install_prompt(&availability);
+        if !prompt.is_empty() {
+            eprintln!("{prompt}");
+        }
+    }
+
     loop {
         editor.set_completions(cli.repl_completion_candidates().unwrap_or_default());
         match editor.read_line()? {
