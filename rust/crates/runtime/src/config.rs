@@ -1131,17 +1131,24 @@ impl RuntimeConfig {
     pub fn lsp_auto_start(&self) -> bool {
         self.feature_config.lsp_auto_start
     }
+<<<<<<< HEAD
 =======
     pub fn rules_import(&self) -> &RulesImportConfig {
         &self.feature_config.rules_import
     }
 >>>>>>> 22f948b7 (feat: project rules with .claw/rules/ and multi-framework auto-import)
 =======
+=======
+
+>>>>>>> 6b0af2bc (refactor: remove SubAgent tool, make Agent use subagentModel config)
     #[must_use]
     pub fn subagent_model(&self) -> Option<&str> {
         self.feature_config.subagent_model.as_deref()
     }
+<<<<<<< HEAD
 >>>>>>> 7e7baeaa (feat: SubAgent tool for fast sub-agent delegation)
+=======
+>>>>>>> 6b0af2bc (refactor: remove SubAgent tool, make Agent use subagentModel config)
 }
 
 impl RuntimeFeatureConfig {

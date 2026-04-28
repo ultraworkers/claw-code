@@ -233,7 +233,11 @@ fn prompt_fast_model(
     main_model: Option<&str>,
 ) -> Result<Option<String>, Box<dyn std::error::Error>> {
     println!();
+<<<<<<< HEAD
     println!("  \x1b[1mFast Model (for Agent subtasks)\x1b[0m");
+=======
+    println!("  [1mFast Model (for Agent subtasks)[0m");
+>>>>>>> 6b0af2bc (refactor: remove SubAgent tool, make Agent use subagentModel config)
     println!("    A smaller/cheaper model used by the Agent tool when spawning");
     println!("    Explore, Plan, or Verification sub-agents. This saves tokens");
     println!("    by using a fast model for information-gathering tasks.");
