@@ -1071,6 +1071,24 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             required_permission: PermissionMode::ReadOnly,
         },
         ToolSpec {
+            name: "TeamStatus",
+            description: "Check the progress of a team of agents. Returns structured status: which agents are running, completed, or failed, with their results. Use action=status for a snapshot, action=summary for final results when all agents are done, or action=events for a timeline of team events.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "team_id": { "type": "string", "description": "Team ID to check" },
+                    "action": {
+                        "type": "string",
+                        "enum": ["status", "summary", "events"],
+                        "description": "status=live snapshot, summary=final results, events=timeline"
+                    }
+                },
+                "required": ["team_id"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
             name: "CronCreate",
             description: "Create a scheduled recurring task.",
             input_schema: json!({
@@ -1389,6 +1407,7 @@ fn execute_tool_with_enforcer(
         "TeamCreate" => from_value::<TeamCreateInput>(input).and_then(run_team_create),
         "TeamDelete" => from_value::<TeamDeleteInput>(input).and_then(run_team_delete),
         "AgentMessage" => from_value::<AgentMessageInput>(input).and_then(run_agent_message),
+        "TeamStatus" => from_value::<TeamStatusInput>(input).and_then(run_team_status),
         "CronCreate" => from_value::<CronCreateInput>(input).and_then(run_cron_create),
         "CronDelete" => from_value::<CronDeleteInput>(input).and_then(run_cron_delete),
         "CronList" => run_cron_list(input.clone()),
@@ -1767,6 +1786,9 @@ fn run_team_create(input: TeamCreateInput) -> Result<String, String> {
     // Register in global registry
     let team = global_team_registry().create(&input.name, agent_ids.clone());
 
+    // Spawn background watcher that prints progress to stderr
+    spawn_team_watcher(&team_id, &agent_ids);
+
     to_pretty_json(json!({
         "team_id": team_id,
         "name": input.name,
@@ -1774,11 +1796,257 @@ fn run_team_create(input: TeamCreateInput) -> Result<String, String> {
         "agents": agent_outputs,
         "status": "running",
         "created_at": team.created_at,
-        "message": format!("Team created with {} agents. Use AgentMessage to coordinate. Poll agent .json files for results.", agent_ids.len()),
+        "message": format!("Team created with {} agents. Use AgentMessage to coordinate. TeamStatus shows live progress.", agent_ids.len()),
     }))
 }
 
 #[allow(clippy::needless_pass_by_value)]
+fn run_team_status(input: TeamStatusInput) -> Result<String, String> {
+    let action = input.action.as_deref().unwrap_or("status");
+    let team_dir = agent_store_dir()?.join("teams");
+    let manifest_path = team_dir.join(format!("{}.json", input.team_id));
+    if !manifest_path.exists() {
+        return Err(format!("team {} not found", input.team_id));
+    }
+    let team_data: Value = serde_json::from_str(
+        &std::fs::read_to_string(&manifest_path).map_err(|e| e.to_string())?
+    ).map_err(|e| e.to_string())?;
+    let agent_ids = team_data.get("agent_ids")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    let store_dir = agent_store_dir()?;
+    let mut agents_detail: Vec<Value> = Vec::new();
+    let mut running_count = 0usize;
+    let mut completed_count = 0usize;
+    let mut failed_count = 0usize;
+
+    for id_val in &agent_ids {
+        if let Some(id) = id_val.as_str() {
+            let agent_json = store_dir.join(format!("{id}.json"));
+            let agent_md = store_dir.join(format!("{id}.md"));
+            let mut detail = json!({ "agent_id": id });
+
+            if agent_json.exists() {
+                if let Ok(data) = std::fs::read_to_string(&agent_json) {
+                    if let Ok(parsed) = serde_json::from_str::<Value>(&data) {
+                        detail["status"] = parsed.get("status").cloned().unwrap_or(json!("unknown"));
+                        detail["name"] = parsed.get("name").cloned().unwrap_or(json!(null));
+                        detail["subagent_type"] = parsed.get("subagent_type").cloned().unwrap_or(json!(null));
+                        if let Some(completed) = parsed.get("completed_at") {
+                            detail["completed_at"] = completed.clone();
+                        }
+                    }
+                }
+            } else {
+                detail["status"] = json!("running");
+            }
+
+            if agent_md.exists() {
+                if let Ok(md_content) = std::fs::read_to_string(&agent_md) {
+                    let summary = md_content.lines()
+                        .skip_while(|line| !line.starts_with("## Result"))
+                        .skip(1)
+                        .take(10)
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    if !summary.is_empty() {
+                        detail["result_preview"] = json!(summary);
+                    }
+                }
+            }
+
+            match detail.get("status").and_then(|v| v.as_str()).unwrap_or("unknown") {
+                "completed" => completed_count += 1,
+                "failed" => failed_count += 1,
+                _ => running_count += 1,
+            }
+            agents_detail.push(detail);
+        }
+    }
+
+    match action {
+        "status" => {
+            to_pretty_json(json!({
+                "team_id": input.team_id,
+                "team_name": team_data.get("name"),
+                "status": if running_count > 0 { "running" } else if failed_count > 0 { "completed_with_failures" } else { "completed" },
+                "progress": {
+                    "total": agent_ids.len(),
+                    "running": running_count,
+                    "completed": completed_count,
+                    "failed": failed_count,
+                },
+                "agents": agents_detail,
+            }))
+        }
+        "summary" => {
+            let mut results: Vec<Value> = Vec::new();
+            for id_val in &agent_ids {
+                if let Some(id) = id_val.as_str() {
+                    let agent_md = store_dir.join(format!("{id}.md"));
+                    let agent_json = store_dir.join(format!("{id}.json"));
+                    let mut entry = json!({ "agent_id": id });
+
+                    if let Ok(data) = std::fs::read_to_string(&agent_json) {
+                        if let Ok(parsed) = serde_json::from_str::<Value>(&data) {
+                            entry["status"] = parsed.get("status").cloned().unwrap_or(json!("unknown"));
+                            entry["name"] = parsed.get("name").cloned().unwrap_or(json!(null));
+                            entry["subagent_type"] = parsed.get("subagent_type").cloned().unwrap_or(json!(null));
+                        }
+                    }
+                    if let Ok(md_content) = std::fs::read_to_string(&agent_md) {
+                        entry["result"] = json!(md_content);
+                    }
+                    results.push(entry);
+                }
+            }
+            to_pretty_json(json!({
+                "team_id": input.team_id,
+                "team_name": team_data.get("name"),
+                "status": if running_count > 0 { "still_running" } else if failed_count > 0 { "completed_with_failures" } else { "completed" },
+                "progress": {
+                    "total": agent_ids.len(),
+                    "running": running_count,
+                    "completed": completed_count,
+                    "failed": failed_count,
+                },
+                "results": results,
+            }))
+        }
+        "events" => {
+            let events_path = team_dir.join(format!("{}-events.jsonl", input.team_id));
+            let mut events: Vec<Value> = Vec::new();
+            if events_path.exists() {
+                if let Ok(content) = std::fs::read_to_string(&events_path) {
+                    for line in content.lines() {
+                        if let Ok(event) = serde_json::from_str::<Value>(line) {
+                            events.push(event);
+                        }
+                    }
+                }
+            }
+            to_pretty_json(json!({
+                "team_id": input.team_id,
+                "event_count": events.len(),
+                "events": events,
+            }))
+        }
+        other => Err(format!("unknown TeamStatus action: {other}. Use status, summary, or events")),
+    }
+}
+
+/// Spawn a background thread that watches a team's agents and prints progress.
+/// Prints agent completion/failure events to stderr. Exits when all agents are done.
+fn spawn_team_watcher(team_id: &str, agent_ids: &[String]) {
+    let team_id = team_id.to_string();
+    let agent_ids = agent_ids.to_vec();
+    let thread_name = format!("claw-team-watch-{team_id}");
+
+    std::thread::Builder::new()
+        .name(thread_name)
+        .spawn(move || {
+            let store_dir = match agent_store_dir() {
+                Ok(d) => d,
+                Err(_) => return,
+            };
+            let team_dir = store_dir.join("teams");
+            let events_path = team_dir.join(format!("{team_id}-events.jsonl"));
+
+            let mut completed: BTreeSet<String> = BTreeSet::new();
+            let mut failed: BTreeSet<String> = BTreeSet::new();
+            let total = agent_ids.len();
+
+            eprintln!("[team] {team_id}: watching {total} agents...");
+
+            loop {
+                let mut all_done = true;
+                for id in &agent_ids {
+                    if completed.contains(id) || failed.contains(id) {
+                        continue;
+                    }
+                    let agent_json = store_dir.join(format!("{id}.json"));
+                    if let Ok(data) = std::fs::read_to_string(&agent_json) {
+                        if let Ok(parsed) = serde_json::from_str::<Value>(&data) {
+                            let status = parsed.get("status").and_then(|v| v.as_str()).unwrap_or("unknown");
+                            match status {
+                                "completed" => {
+                                    completed.insert(id.clone());
+                                    let name = parsed.get("name").and_then(|v| v.as_str()).unwrap_or(id);
+                                    let subagent_type = parsed.get("subagent_type").and_then(|v| v.as_str()).unwrap_or("unknown");
+                                    let result_preview = get_agent_result_preview(&store_dir, id);
+                                    eprintln!("[team] {team_id}: done {name} ({subagent_type}) completed - {}/{total}{}", completed.len() + failed.len(), if result_preview.is_empty() { String::new() } else { format!(" - {}", &result_preview[..result_preview.len().min(120)]) });
+                                    append_team_event(&events_path, &team_id, id, "completed", &name, Some(&result_preview));
+                                }
+                                "failed" => {
+                                    failed.insert(id.clone());
+                                    let name = parsed.get("name").and_then(|v| v.as_str()).unwrap_or(id);
+                                    let error = parsed.get("error").and_then(|v| v.as_str()).unwrap_or("unknown error");
+                                    eprintln!("[team] {team_id}: FAIL {name} failed - {error}");
+                                    append_team_event(&events_path, &team_id, id, "failed", &name, Some(error));
+                                }
+                                _ => {
+                                    all_done = false;
+                                }
+                            }
+                        }
+                    } else {
+                        all_done = false;
+                    }
+                }
+
+                if all_done {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_secs(2));
+            }
+
+            eprintln!("[team] {team_id}: all agents finished - {}/{} completed, {}/{} failed", completed.len(), total, failed.len(), total);
+            append_team_event(&events_path, &team_id, "team", "finished", &team_id, Some(&format!("{}/{} completed", completed.len(), total)));
+
+            let manifest_path = team_dir.join(format!("{team_id}.json"));
+            if let Ok(data) = std::fs::read_to_string(&manifest_path) {
+                if let Ok(mut parsed) = serde_json::from_str::<Value>(&data) {
+                    if let Some(obj) = parsed.as_object_mut() {
+                        obj.insert("status".to_string(), json!(if failed.is_empty() { "completed" } else { "completed_with_failures" }));
+                        let _ = std::fs::write(&manifest_path, serde_json::to_string_pretty(&parsed).unwrap_or_default());
+                    }
+                }
+            }
+        })
+        .ok();
+}
+
+fn get_agent_result_preview(store_dir: &std::path::Path, agent_id: &str) -> String {
+    let md_path = store_dir.join(format!("{agent_id}.md"));
+    if let Ok(content) = std::fs::read_to_string(&md_path) {
+        let lines: Vec<&str> = content.lines().collect();
+        let start = lines.iter().position(|l| l.starts_with("## Result")).map(|i| i + 1).unwrap_or(0);
+        lines[start..].iter().take(5).cloned().collect::<Vec<&str>>().join(" ").chars().take(200).collect()
+    } else {
+        String::new()
+    }
+}
+
+fn append_team_event(events_path: &std::path::Path, team_id: &str, agent_id: &str, event_type: &str, name: &str, detail: Option<&str>) {
+    let entry = json!({
+        "timestamp": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis(),
+        "team_id": team_id,
+        "agent_id": agent_id,
+        "event": event_type,
+        "name": name,
+        "detail": detail,
+    });
+    if let Ok(line) = serde_json::to_string(&entry) {
+        use std::io::Write;
+        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(events_path) {
+            let _ = writeln!(file, "{line}");
+        }
+    }
+}
+
+
 fn run_team_delete(input: TeamDeleteInput) -> Result<String, String> {
     match global_team_registry().delete(&input.team_id) {
         Ok(team) => to_pretty_json(json!({
@@ -3047,6 +3315,13 @@ struct AgentMessageInput {
     message: Option<String>,
     #[serde(default)]
     mark_read: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TeamStatusInput {
+    team_id: String,
+    #[serde(default)]
+    action: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -4333,6 +4608,7 @@ fn allowed_tools_for_subagent(subagent_type: &str) -> BTreeSet<String> {
             "ToolSearch",
             "Skill",
             "AgentMessage",
+            "TeamStatus",
             "StructuredOutput",
         ],
         "Plan" => vec![
@@ -4345,6 +4621,7 @@ fn allowed_tools_for_subagent(subagent_type: &str) -> BTreeSet<String> {
             "Skill",
             "TodoWrite",
             "AgentMessage",
+            "TeamStatus",
             "StructuredOutput",
             "SendUserMessage",
         ],
@@ -4358,6 +4635,7 @@ fn allowed_tools_for_subagent(subagent_type: &str) -> BTreeSet<String> {
             "ToolSearch",
             "TodoWrite",
             "AgentMessage",
+            "TeamStatus",
             "StructuredOutput",
             "SendUserMessage",
             "PowerShell",
@@ -4397,6 +4675,7 @@ fn allowed_tools_for_subagent(subagent_type: &str) -> BTreeSet<String> {
             "NotebookEdit",
             "Sleep",
             "AgentMessage",
+            "TeamStatus",
             "SendUserMessage",
             "Config",
             "StructuredOutput",
