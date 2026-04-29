@@ -6962,6 +6962,7 @@ fn run_resume_command(
         | SlashCommand::Tag { .. }
         | SlashCommand::OutputStyle { .. }
         | SlashCommand::AddDir { .. }
+        | SlashCommand::Lsp { .. }
         | SlashCommand::Team { .. }
         | SlashCommand::Setup => Err("unsupported resumed slash command".into()),
     }
@@ -7144,6 +7145,17 @@ fn run_repl(
                 editor.push_history(input);
                 cli.record_prompt_history(&trimmed);
                 cli.run_turn(&trimmed)?;
+            }
+            input::ReadOutcome::TeamToggle => {
+                // Ctrl+T toggles agent teams mode
+                let current = std::env::var("CLAWD_AGENT_TEAMS").unwrap_or_default();
+                if current == "1" {
+                    std::env::set_var("CLAWD_AGENT_TEAMS", "0");
+                    eprintln!("[team] Agent teams disabled");
+                } else {
+                    std::env::set_var("CLAWD_AGENT_TEAMS", "1");
+                    eprintln!("[team] Agent teams enabled (TeamCreate now available)");
+                }
             }
             input::ReadOutcome::Cancel => {}
             input::ReadOutcome::Exit => {
@@ -8614,6 +8626,49 @@ impl LiveCli {
                 run_init(CliOutputFormat::Text)?;
                 false
             }
+            SlashCommand::Team { action } => {
+                match action.as_deref().unwrap_or("") {
+                    "on" | "enable" => {
+                        std::env::set_var("CLAWD_AGENT_TEAMS", "1");
+                        eprintln!("[team] Agent teams enabled (TeamCreate now available)");
+                    }
+                    "off" | "disable" => {
+                        std::env::set_var("CLAWD_AGENT_TEAMS", "0");
+                        eprintln!("[team] Agent teams disabled");
+                    }
+                    "status" => {
+                        let current = std::env::var("CLAWD_AGENT_TEAMS").unwrap_or_default();
+                        if current == "1" {
+                            eprintln!("[team] Agent teams: ENABLED");
+                        } else {
+                            eprintln!("[team] Agent teams: DISABLED (use /team on or Ctrl+T to enable)");
+                        }
+                    }
+                    "" => {
+                        // Toggle
+                        let current = std::env::var("CLAWD_AGENT_TEAMS").unwrap_or_default();
+                        if current == "1" {
+                            std::env::set_var("CLAWD_AGENT_TEAMS", "0");
+                            eprintln!("[team] Agent teams disabled");
+                        } else {
+                            std::env::set_var("CLAWD_AGENT_TEAMS", "1");
+                            eprintln!("[team] Agent teams enabled (TeamCreate now available)");
+                        }
+                    }
+                    other => eprintln!("[team] unknown action: {other}. Use: /team [on|off|status]"),
+                }
+                false
+            }
+            SlashCommand::Setup => {
+                setup_wizard::run_setup_wizard()?;
+                // Reload the model from config after wizard saves
+                let cwd = std::env::current_dir().unwrap_or_default();
+                let config = runtime::ConfigLoader::default_for(&cwd).load().ok();
+                if let Some(new_model) = config.as_ref().and_then(|c| c.provider().model().map(str::to_string)) {
+                    self.set_model(Some(new_model))?;
+                }
+                false
+            }
             SlashCommand::Diff => {
                 Self::print_diff()?;
                 false
@@ -8662,12 +8717,6 @@ impl LiveCli {
                 );
                 false
             }
-            SlashCommand::Setup => {
-                if let Err(e) = setup_wizard::run_setup_wizard() {
-                    eprintln!("Setup wizard failed: {e}");
-                }
-                false
-            }
             SlashCommand::History { count } => {
                 self.print_prompt_history(count.as_deref());
                 false
@@ -8714,13 +8763,10 @@ impl LiveCli {
             | SlashCommand::Ide { .. }
             | SlashCommand::Tag { .. }
             | SlashCommand::OutputStyle { .. }
-            | SlashCommand::AddDir { .. } => {
+            | SlashCommand::AddDir { .. }
+            | SlashCommand::Lsp { .. } => {
                 let cmd_name = command.slash_name();
                 eprintln!("{cmd_name} is not yet implemented in this build.");
-                false
-            }
-            SlashCommand::Team { action } => {
-                self.print_team_command(action.as_deref());
                 false
             }
             SlashCommand::Unknown(name) => {
@@ -8733,48 +8779,6 @@ impl LiveCli {
     fn persist_session(&self) -> Result<(), Box<dyn std::error::Error>> {
         self.runtime.session().save_to_path(&self.session.path)?;
         Ok(())
-    }
-
-    /// `/team` — user-facing manager for agent teams.
-    ///
-    /// The team registry and the `TeamCreate` / `TeamDelete` / `Cron*` tools live
-    /// inside the tool executor, so the model invokes them directly during a
-    /// turn. This slash command surfaces a readable view of the same teams and
-    /// is the user's way to take action without driving the model.
-    fn print_team_command(&self, action: Option<&str>) {
-        match action.map(str::to_ascii_lowercase).as_deref() {
-            None | Some("help") => {
-                println!("Agent teams — the model creates and manages teams via its tools.");
-                println!();
-                println!("Available team tools the model can call:");
-                println!("  TeamCreate   create a team from a set of tasks");
-                println!("  TeamDelete   mark a team deleted by team_id");
-                println!("  CronCreate   schedule a recurring prompt (cron)");
-                println!("  CronDelete   remove a scheduled cron by cron_id");
-                println!("  CronList     list scheduled crons");
-                println!();
-                println!("Slash commands:");
-                println!("  /team list   show teams in this session registry");
-                println!("  /team help   this message");
-                println!();
-                println!("Teams are held in-process for the lifetime of this claw session.");
-            }
-            Some("list") => {
-                // The team registry is owned by the in-process tool executor
-                // (tools::global_team_registry) and is not currently exposed to
-                // the CLI layer, so we can't enumerate live teams from here.
-                // Listing will arrive with tool-registry introspection.
-                println!("Live team listing isn't wired into the CLI yet.");
-                println!(
-                    "Teams are created/managed by the model via the TeamCreate and TeamDelete"
-                );
-                println!("tools during a turn. Ask the model to report on its teams.");
-            }
-            Some(other) => {
-                println!("Unknown /team action: {other}");
-                println!("Available: list, help");
-            }
-        }
     }
 
     fn print_status(&self) {
@@ -14569,8 +14573,10 @@ impl ToolExecutor for CliToolExecutor {
             "LSP",
             "Agent",
             "AgentMessage",
-            "TeamStatus",
-            "TaskGet",
+                        "TeamStatus",
+            "TaskClaim",
+            "AgentSuggestion",
+            "ContextRequest", "TaskGet",
             "TaskList",
             "TaskOutput",
             "GitStatus",

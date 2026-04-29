@@ -1195,10 +1195,14 @@ pub enum SlashCommand {
     History {
         count: Option<String>,
     },
-    Unknown(String),
+    Lsp {
+        action: Option<String>,
+        target: Option<String>,
+    },
     Team {
         action: Option<String>,
     },
+    Unknown(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5403,6 +5407,7 @@ pub fn handle_slash_command(
         | SlashCommand::OutputStyle { .. }
         | SlashCommand::AddDir { .. }
         | SlashCommand::History { .. }
+        | SlashCommand::Lsp { .. }
         | SlashCommand::Team { .. }
         | SlashCommand::Setup
         | SlashCommand::Unknown(_) => None,

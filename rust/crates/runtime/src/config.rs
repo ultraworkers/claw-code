@@ -163,6 +163,10 @@ pub struct RuntimeFeatureConfig {
     api_timeout: ApiTimeoutConfig,
     rules_import: RulesImportConfig,
     provider: RuntimeProviderConfig,
+    /// Model override used when spawning sub-agents via the Agent tool.
+    /// Read from `subagentModel` (or `subagent_model`) in settings; falls
+    /// back to the default model when unset.
+    subagent_model: Option<String>,
 }
 
 /// Controls which external AI coding framework rules are imported into the system prompt.
@@ -801,6 +805,7 @@ fn build_runtime_config(
         api_timeout: parse_optional_api_timeout_config(&merged_value)?,
         rules_import: parse_optional_rules_import(&merged_value)?,
         provider: parse_optional_provider_config(&merged_value)?,
+        subagent_model: parse_optional_subagent_model(&merged_value),
     };
 
     Ok(RuntimeConfig {
@@ -878,6 +883,13 @@ impl RuntimeConfig {
     #[must_use]
     pub fn model(&self) -> Option<&str> {
         self.feature_config.model.as_deref()
+    }
+
+    /// Model override used when spawning sub-agents via the Agent tool.
+    /// Read from `subagentModel` in settings; `None` means "use default model".
+    #[must_use]
+    pub fn subagent_model(&self) -> Option<&str> {
+        self.feature_config.subagent_model.as_deref()
     }
 
     #[must_use]
@@ -1715,6 +1727,17 @@ fn parse_optional_model(root: &JsonValue) -> Option<String> {
         .and_then(|object| object.get("model"))
         .and_then(JsonValue::as_str)
         .map(ToOwned::to_owned)
+}
+
+/// Reads `subagentModel` (or the snake_case `subagent_model` alias) from
+/// merged settings. Returns `None` when absent or blank so the Agent tool
+/// falls back to the default model.
+fn parse_optional_subagent_model(root: &JsonValue) -> Option<String> {
+    root.as_object()
+        .and_then(|object| object.get("subagentModel").or_else(|| object.get("subagent_model")))
+        .and_then(JsonValue::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.trim().to_string())
 }
 
 fn parse_optional_aliases(root: &JsonValue) -> Result<BTreeMap<String, String>, ConfigError> {
