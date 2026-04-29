@@ -117,6 +117,7 @@ mod tests {
             derived_state: "working".to_string(),
             current_blocker: None,
             error: None,
+            team_id: None,
         }
     }
 
