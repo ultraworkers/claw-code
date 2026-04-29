@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+.venv/
+
+# claw-web local data (registry, logs)
+*.sqlite
+*.sqlite-journal
+
+# OS / editor noise
+.DS_Store
+*.swp

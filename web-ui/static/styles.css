@@ -1,0 +1,410 @@
+/*
+ * claw-web styles. Single-file, no framework, dark-first with a light
+ * fallback via prefers-color-scheme. Goal: feel native on iPad / laptop
+ * without looking like a terminal. NOT xterm.js — see PLAN.md.
+ */
+
+:root {
+  --bg: #0f172a;
+  --bg-elev: #1e293b;
+  --bg-sidebar: #0b1322;
+  --fg: #e2e8f0;
+  --fg-muted: #94a3b8;
+  --accent: #60a5fa;
+  --accent-strong: #3b82f6;
+  --danger: #f87171;
+  --warn: #fbbf24;
+  --ok: #34d399;
+  --border: #334155;
+  --radius: 10px;
+  --mono: ui-monospace, SFMono-Regular, "Menlo", monospace;
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #f8fafc;
+    --bg-elev: #ffffff;
+    --bg-sidebar: #f1f5f9;
+    --fg: #0f172a;
+    --fg-muted: #64748b;
+    --border: #e2e8f0;
+  }
+}
+
+* { box-sizing: border-box; }
+
+/* Respect the `hidden` HTML attribute even when our component CSS sets
+   a different `display` (.conversation/.composer use `display: flex`,
+   which would otherwise mask `[hidden]`'s `display: none`). */
+[hidden] { display: none !important; }
+
+html, body {
+  margin: 0; padding: 0;
+  height: 100%;
+  font-family: var(--sans);
+  background: var(--bg);
+  color: var(--fg);
+  -webkit-font-smoothing: antialiased;
+}
+
+#app {
+  display: grid;
+  grid-template-columns: 280px 1fr;
+  height: 100vh;
+  height: 100dvh;
+}
+
+@media (max-width: 720px) {
+  #app { grid-template-columns: 1fr; }
+  .sidebar { display: none; }
+  /* phase 2: hamburger toggle */
+}
+
+/* ── Sidebar ────────────────────────────────────────────────────────── */
+.sidebar {
+  background: var(--bg-sidebar);
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.sidebar-head {
+  padding: 14px 16px 8px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.sidebar-head h1 {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 600;
+  letter-spacing: 0.5px;
+}
+
+.sidebar-section {
+  padding: 12px 8px;
+  border-top: 1px solid var(--border);
+  flex: 0 0 auto;
+}
+
+.sidebar-section .list {
+  max-height: 38vh;
+  overflow-y: auto;
+}
+
+.section-head {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 0 8px 6px;
+}
+
+.section-head h2 {
+  margin: 0;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  color: var(--fg-muted);
+}
+
+.list { list-style: none; padding: 0; margin: 0; }
+
+.list li {
+  padding: 8px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  transition: background 100ms ease;
+}
+.list li:hover { background: var(--bg-elev); }
+.list li.active { background: var(--bg-elev); outline: 1px solid var(--accent); }
+.list li .meta { font-size: 11px; color: var(--fg-muted); font-family: var(--mono); }
+
+.sidebar-foot {
+  margin-top: auto;
+  padding: 12px 16px;
+  border-top: 1px solid var(--border);
+}
+
+/* ── Main ───────────────────────────────────────────────────────────── */
+.main {
+  display: grid;
+  grid-template-rows: auto 1fr auto;
+  min-height: 0;
+  min-width: 0;
+}
+
+.main-head {
+  padding: 12px 18px;
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  background: var(--bg);
+}
+
+.crumbs { display: flex; gap: 8px; align-items: center; min-width: 0; }
+.crumb {
+  font-size: 14px;
+  font-weight: 500;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.crumb-empty { color: var(--fg-muted); font-style: italic; }
+.crumb-sep { color: var(--fg-muted); }
+
+.main-controls {
+  display: flex; align-items: center; gap: 8px;
+  flex: 0 0 auto;
+}
+
+#model-select {
+  background: var(--bg-elev);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 4px 8px;
+  font-size: 13px;
+}
+
+.badge {
+  font-size: 11px;
+  padding: 3px 8px;
+  border-radius: 999px;
+  background: var(--bg-elev);
+  color: var(--fg-muted);
+  font-family: var(--mono);
+  letter-spacing: 0.5px;
+}
+
+/* ── Conversation ───────────────────────────────────────────────────── */
+.conversation {
+  overflow-y: auto;
+  padding: 16px 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  min-height: 0;
+}
+
+.empty-state {
+  margin: auto;
+  text-align: center;
+  color: var(--fg-muted);
+  max-width: 420px;
+}
+.empty-state code {
+  font-family: var(--mono);
+  background: var(--bg-elev);
+  padding: 1px 5px;
+  border-radius: 4px;
+  font-size: 90%;
+}
+
+.turn { display: flex; flex-direction: column; gap: 4px; }
+.turn .role {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  color: var(--fg-muted);
+  font-weight: 600;
+}
+.turn .body {
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 10px 14px;
+  font-size: 14px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-wrap: break-word;
+}
+.turn.user .body { border-color: color-mix(in srgb, var(--accent) 35%, var(--border)); }
+.turn.error .body { border-color: var(--danger); color: var(--danger); }
+.turn .status-line {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--fg-muted);
+}
+
+/* ── Composer ───────────────────────────────────────────────────────── */
+.composer {
+  border-top: 1px solid var(--border);
+  padding: 10px 14px 14px;
+  background: var(--bg);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+#prompt-input {
+  width: 100%;
+  resize: vertical;
+  background: var(--bg-elev);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 10px 12px;
+  font: inherit;
+  font-size: 14px;
+  line-height: 1.5;
+}
+#prompt-input:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 25%, transparent);
+}
+
+.composer-bar {
+  display: flex; align-items: center; justify-content: space-between;
+}
+.composer-actions { display: flex; gap: 6px; }
+
+/* ── Buttons ────────────────────────────────────────────────────────── */
+.btn-primary, .btn-ghost {
+  font: inherit;
+  cursor: pointer;
+  border-radius: 6px;
+  padding: 6px 12px;
+  border: 1px solid transparent;
+  font-size: 13px;
+}
+
+.btn-primary {
+  background: var(--accent-strong);
+  color: white;
+}
+.btn-primary:hover { background: var(--accent); }
+.btn-primary:disabled { opacity: 0.5; cursor: not-allowed; }
+
+.btn-ghost {
+  background: transparent;
+  color: var(--fg-muted);
+  border-color: var(--border);
+}
+.btn-ghost:hover { color: var(--fg); border-color: var(--accent); }
+
+/* ── Dialogs ────────────────────────────────────────────────────────── */
+dialog {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-elev);
+  color: var(--fg);
+  padding: 18px 22px;
+  max-width: 420px;
+  box-shadow: 0 20px 50px rgba(0,0,0,0.4);
+}
+dialog::backdrop { background: rgba(0,0,0,0.4); backdrop-filter: blur(2px); }
+dialog h3 { margin: 0 0 12px; font-size: 16px; }
+dialog label {
+  display: flex; flex-direction: column; gap: 4px;
+  font-size: 13px;
+  color: var(--fg-muted);
+  margin-bottom: 12px;
+}
+dialog input {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  color: var(--fg);
+  border-radius: 6px;
+  padding: 8px 10px;
+  font: inherit;
+}
+dialog input:focus { outline: none; border-color: var(--accent); }
+dialog menu {
+  display: flex; gap: 8px; justify-content: flex-end;
+  padding: 0; margin: 8px 0 0;
+}
+
+.muted { color: var(--fg-muted); }
+
+/* ── Terminal panel ─────────────────────────────────────────────────── */
+.terminal-panel {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  padding: 0;
+  background: #000;
+}
+.terminal-panel .empty-state {
+  margin: auto;
+  padding: 24px;
+  text-align: center;
+  color: var(--fg-muted);
+}
+.terminal {
+  flex: 1 1 auto;
+  min-height: 0;
+  padding: 6px 8px 0;
+}
+/* xterm renders absolutely; the host needs a real sized frame. */
+.terminal .xterm {
+  height: 100%;
+  width: 100%;
+}
+.terminal-bar {
+  flex: 0 0 auto;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 6px 12px;
+  border-top: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--fg-muted);
+  font-size: 12px;
+}
+
+/* ── Approval dialog ────────────────────────────────────────────────── */
+dialog.approval { max-width: 540px; }
+dialog.approval h3 { color: var(--warn); }
+dialog.approval .approval-reason { margin: 0 0 14px; }
+
+.approval-grid {
+  display: grid;
+  grid-template-columns: 110px 1fr;
+  gap: 6px 12px;
+  margin: 0 0 12px;
+  font-size: 13px;
+}
+.approval-grid dt {
+  color: var(--fg-muted);
+  font-weight: 500;
+}
+.approval-grid dd {
+  margin: 0;
+  font-family: var(--mono);
+  word-break: break-word;
+}
+
+.approval-input {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 10px;
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.4;
+  margin: 0 0 12px;
+  max-height: 200px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* Pending-approval pulse on the in-progress turn. */
+.turn.pending-approval .body {
+  border-color: var(--warn);
+  animation: pulse-warn 1.5s ease-in-out infinite;
+}
+@keyframes pulse-warn {
+  0%, 100% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--warn) 40%, transparent); }
+  50%      { box-shadow: 0 0 0 6px color-mix(in srgb, var(--warn) 0%, transparent); }
+}

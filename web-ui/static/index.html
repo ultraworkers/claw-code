@@ -1,0 +1,170 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#0f172a" />
+  <title>claw-web · mock</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+  <link rel="manifest" href="/manifest.json" />
+  <link rel="icon" href="/static/icons/icon-192.png" />
+  <link rel="apple-touch-icon" href="/static/icons/icon-192.png" />
+  <!-- xterm.js for the terminal panel. Pinned to known-good versions. -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.min.css" />
+  <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.min.js" defer></script>
+  <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.min.js" defer></script>
+</head>
+<body>
+  <div id="app">
+    <aside class="sidebar">
+      <header class="sidebar-head">
+        <h1>claw <span class="muted">web</span></h1>
+        <span id="mode-badge" class="badge">…</span>
+      </header>
+
+      <section class="sidebar-section">
+        <div class="section-head">
+          <h2>Projects</h2>
+          <button id="new-project-btn" class="btn-ghost" title="New project">＋</button>
+        </div>
+        <ul id="project-list" class="list"></ul>
+      </section>
+
+      <section class="sidebar-section" id="sessions-section" hidden>
+        <div class="section-head">
+          <h2 id="sessions-heading">Sessions</h2>
+          <button id="new-session-btn" class="btn-ghost" title="New session">＋</button>
+        </div>
+        <ul id="session-list" class="list"></ul>
+      </section>
+
+      <footer class="sidebar-foot">
+        <small class="muted" id="health-line">connecting…</small>
+      </footer>
+    </aside>
+
+    <main class="main">
+      <header class="main-head">
+        <div class="crumbs">
+          <span id="crumb-project" class="crumb crumb-empty">No project</span>
+          <span class="crumb-sep">›</span>
+          <span id="crumb-session" class="crumb crumb-empty">No session</span>
+        </div>
+        <div class="main-controls">
+          <select id="model-select" disabled title="Model picker — phase 2">
+            <option>(model — phase 2)</option>
+          </select>
+          <span id="perm-badge" class="badge">read-only</span>
+        </div>
+      </header>
+
+      <section id="conversation" class="conversation" hidden>
+        <div class="empty-state" id="empty-state">
+          <h3>Pick a project to start.</h3>
+          <p class="muted">Legacy structured view (subprocess-per-turn).</p>
+        </div>
+      </section>
+
+      <section id="terminal-panel" class="terminal-panel">
+        <div class="empty-state" id="terminal-empty">
+          <h3>Pick a project to start.</h3>
+          <p class="muted">
+            Each session opens a long-lived <code>claw</code> REPL inside
+            tmux. Multi-turn, approval prompts, and disconnect resilience
+            all happen in the terminal directly.
+          </p>
+        </div>
+        <div id="terminal" class="terminal" hidden></div>
+        <div class="terminal-bar" id="terminal-bar" hidden>
+          <span id="term-status" class="muted">disconnected</span>
+          <span class="composer-actions">
+            <button id="kill-term-btn" type="button" class="btn-ghost"
+                    title="Destroys the tmux session (kills claw).">
+              Kill session
+            </button>
+          </span>
+        </div>
+      </section>
+
+      <form id="composer" class="composer" hidden>
+        <textarea
+          id="prompt-input"
+          placeholder="Type a prompt — ⏎ to send, ⇧⏎ for newline."
+          rows="3"
+          autocomplete="off"
+        ></textarea>
+        <div class="composer-bar">
+          <span id="ws-status" class="muted">disconnected</span>
+          <span class="composer-actions">
+            <button id="abort-btn" type="button" class="btn-ghost" hidden>
+              Abort turn
+            </button>
+            <button id="send-btn" type="submit" class="btn-primary" disabled>
+              Send
+            </button>
+          </span>
+        </div>
+      </form>
+    </main>
+  </div>
+
+  <dialog id="new-project-dialog">
+    <form method="dialog" id="new-project-form">
+      <h3>New project</h3>
+      <label>
+        Name
+        <input name="name" required maxlength="200" autofocus />
+      </label>
+      <label>
+        Path
+        <input name="path" required placeholder="/absolute/path/to/project" />
+        <small class="muted">
+          The directory should already exist. Phase 2 will offer scaffolding.
+        </small>
+      </label>
+      <menu>
+        <button value="cancel" class="btn-ghost">Cancel</button>
+        <button value="create" class="btn-primary">Create</button>
+      </menu>
+    </form>
+  </dialog>
+
+  <dialog id="new-session-dialog">
+    <form method="dialog" id="new-session-form">
+      <h3>New session</h3>
+      <label>
+        Title
+        <input name="title" required maxlength="300" placeholder="What are you working on?" autofocus />
+      </label>
+      <menu>
+        <button value="cancel" class="btn-ghost">Cancel</button>
+        <button value="create" class="btn-primary">Create</button>
+      </menu>
+    </form>
+  </dialog>
+
+  <dialog id="approval-dialog" class="approval">
+    <form method="dialog" id="approval-form">
+      <h3>claw wants permission</h3>
+      <p class="muted approval-reason" id="approval-reason"></p>
+      <dl class="approval-grid">
+        <dt>Tool</dt>          <dd id="approval-tool"></dd>
+        <dt>Current mode</dt>  <dd id="approval-current"></dd>
+        <dt>Required mode</dt> <dd id="approval-required"></dd>
+      </dl>
+      <pre class="approval-input" id="approval-input"></pre>
+      <menu>
+        <button value="deny" class="btn-ghost">Deny</button>
+        <button value="allow" class="btn-primary">Allow once</button>
+      </menu>
+    </form>
+  </dialog>
+
+  <script src="/static/app.js" type="module"></script>
+  <script>
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker.register('/sw.js').catch(() => {});
+    }
+  </script>
+</body>
+</html>
