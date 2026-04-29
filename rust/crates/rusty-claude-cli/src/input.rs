@@ -19,6 +19,7 @@ pub enum ReadOutcome {
     Cancel,
     Exit,
     ProviderSwap,
+    TeamToggle,
 }
 
 struct SlashCommandHelper {
@@ -130,6 +131,11 @@ impl LineEditor {
             KeyEvent(KeyCode::Char('P'), Modifiers::CTRL),
             Cmd::SelfInsert(1, '\x01'),
         );
+        // Ctrl+T inserts a sentinel character that toggles agent teams mode.
+        editor.bind_sequence(
+            KeyEvent(KeyCode::Char('T'), Modifiers::CTRL),
+            Cmd::SelfInsert(1, '\x02'),
+        );
 
         Self {
             prompt: prompt.into(),
@@ -167,6 +173,10 @@ impl LineEditor {
                 // The sentinel is stripped and we return ProviderSwap to the REPL loop.
                 if line.contains('\x01') {
                     return Ok(ReadOutcome::ProviderSwap);
+                }
+                // Ctrl+T inserts \x02 sentinel — toggles team mode.
+                if line.contains('\x02') {
+                    return Ok(ReadOutcome::TeamToggle);
                 }
                 Ok(ReadOutcome::Submit(line))
             }

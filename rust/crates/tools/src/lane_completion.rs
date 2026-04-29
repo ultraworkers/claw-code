@@ -116,8 +116,9 @@ mod tests {
             lane_events: vec![],
             derived_state: "working".to_string(),
             current_blocker: None,
-            error: None,
             team_id: None,
+            task_id: None,
+            error: None,
         }
     }
 

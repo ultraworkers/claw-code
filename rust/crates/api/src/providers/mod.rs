@@ -722,6 +722,7 @@ pub fn model_token_limit(model: &str) -> Option<ModelTokenLimit> {
             max_output_tokens: 16_384,
             context_window_tokens: 256_000,
         }),
+<<<<<<< HEAD
         "qwen-max" => Some(ModelTokenLimit {
             max_output_tokens: 8_192,
             context_window_tokens: 131_072,
@@ -731,6 +732,23 @@ pub fn model_token_limit(model: &str) -> Option<ModelTokenLimit> {
             context_window_tokens: 131_072,
         }),
         _ => None,
+=======
+        // Qwen models via DashScope / OpenAI-compat
+        "qwen3.6-35b-fast" | "qwen3-235b-a22b" | "qwen-max" | "qwen-plus" | "qwen-turbo" | "qwen-qwq" => Some(ModelTokenLimit {
+            max_output_tokens: 16_384,
+            context_window_tokens: 131_072,
+        }),
+        "glm-5.1-fast" => Some(ModelTokenLimit {
+            max_output_tokens: 16_384,
+            context_window_tokens: 200_000,
+        }),
+        // Generic fallback for any model: assume 128K context, 8K output
+        // This prevents the "unknown model → no limit check → context overflow" bug
+        _ => Some(ModelTokenLimit {
+            max_output_tokens: 8_192,
+            context_window_tokens: 131_072,
+        }),
+>>>>>>> 7ab899c0 (feat: agent teams with task claiming, context management, and team monitoring)
     }
 }
 

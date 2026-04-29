@@ -1199,6 +1199,9 @@ pub enum SlashCommand {
         action: Option<String>,
         target: Option<String>,
     },
+    Team {
+        action: Option<String>,
+    },
     Unknown(String),
     Team {
         action: Option<String>,
@@ -1289,6 +1292,11 @@ impl SlashCommand {
             Self::Theme { .. } => "/theme",
             Self::Voice { .. } => "/voice",
             Self::Usage { .. } => "/usage",
+<<<<<<< HEAD
+=======
+            Self::Team { .. } => "/team",
+            Self::Setup => "/setup",
+>>>>>>> 7ab899c0 (feat: agent teams with task claiming, context management, and team monitoring)
             Self::Rename { .. } => "/rename",
             Self::Copy { .. } => "/copy",
             Self::Hooks { .. } => "/hooks",
@@ -1513,6 +1521,11 @@ pub fn validate_slash_command_input(
         "theme" => SlashCommand::Theme { name: remainder },
         "voice" => SlashCommand::Voice { mode: remainder },
         "usage" => SlashCommand::Usage { scope: remainder },
+<<<<<<< HEAD
+=======
+        "team" => SlashCommand::Team { action: remainder },
+        "setup" => SlashCommand::Setup,
+>>>>>>> 7ab899c0 (feat: agent teams with task claiming, context management, and team monitoring)
         "rename" => SlashCommand::Rename { name: remainder },
         "copy" => SlashCommand::Copy { target: remainder },
         "hooks" => SlashCommand::Hooks { args: remainder },
@@ -5421,6 +5434,7 @@ pub fn handle_slash_command(
         | SlashCommand::Team { .. }
 =======
         | SlashCommand::Lsp { .. }
+<<<<<<< HEAD
 >>>>>>> 856409d3 (feat: full LSP (Language Server Protocol) integration)
         | SlashCommand::Setup
 =======
@@ -5432,6 +5446,10 @@ pub fn handle_slash_command(
 =======
 >>>>>>> 0b227b62 (fix: resolve cherry-pick conflicts and remove non-LSP artifacts)
         | SlashCommand::Unknown(_) => None,
+=======
+        | SlashCommand::Team { .. }
+        | SlashCommand::Setup        | SlashCommand::Unknown(_) => None,
+>>>>>>> 7ab899c0 (feat: agent teams with task claiming, context management, and team monitoring)
     }
 }
 

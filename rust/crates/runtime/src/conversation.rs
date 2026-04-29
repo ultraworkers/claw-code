@@ -120,6 +120,22 @@ impl Display for ToolError {
 
 impl std::error::Error for ToolError {}
 
+/// Callback trait for reporting tool execution progress during a turn.
+/// Implementations can post progress to a team inbox, log to stderr, etc.
+/// Called after each tool call completes (success or failure).
+pub trait TurnProgressReporter: Send + Sync {
+    /// Called after a tool execution completes.
+    /// `iteration` is 1-based index of the tool call within this turn.
+    fn on_tool_result(
+        &self,
+        iteration: usize,
+        max_iterations: usize,
+        tool_name: &str,
+        input: &str,
+        result: Result<&str, &str>,
+    );
+}
+
 /// Error returned when a conversation turn cannot be completed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeError {
@@ -174,6 +190,7 @@ pub struct ConversationRuntime<C, T> {
     hook_abort_signal: HookAbortSignal,
     hook_progress_reporter: Option<Box<dyn HookProgressReporter>>,
     session_tracer: Option<SessionTracer>,
+    turn_progress_reporter: Option<Box<dyn TurnProgressReporter>>,
 }
 
 impl<C, T> ConversationRuntime<C, T>
@@ -223,6 +240,7 @@ where
             hook_abort_signal: HookAbortSignal::default(),
             hook_progress_reporter: None,
             session_tracer: None,
+            turn_progress_reporter: None,
         }
     }
 
@@ -263,6 +281,14 @@ where
     #[must_use]
     pub fn with_session_tracer(mut self, session_tracer: SessionTracer) -> Self {
         self.session_tracer = Some(session_tracer);
+        self
+    }
+
+    pub fn with_turn_progress_reporter(
+        mut self,
+        reporter: Box<dyn TurnProgressReporter>,
+    ) -> Self {
+        self.turn_progress_reporter = Some(reporter);
         self
     }
 
@@ -551,7 +577,8 @@ where
 
             // Phase 3: Post-hooks and session updates (sequential, original order).
             for p in &pending {
-                let result_message = if p.allowed {
+                // Capture progress data for the reporter.
+                let (progress_tool_name, progress_input, progress_output, progress_is_error, result_message) = if p.allowed {
                     let batch_result = &batch_results[batch_index];
                     batch_index += 1;
                     let (mut output, mut is_error) = match &batch_result.result {
@@ -587,25 +614,36 @@ where
                             || post_hook_result.is_failed()
                             || post_hook_result.is_cancelled(),
                     );
-
-                    ConversationMessage::tool_result(
+                    let progress_output = output.clone();
+                    let result_message = ConversationMessage::tool_result(
                         p.tool_use_id.clone(),
                         p.tool_name.clone(),
                         output,
                         is_error,
-                    )
+                    );
+                    (p.tool_name.clone(), p.effective_input.clone(), progress_output, is_error, result_message)
                 } else {
-                    ConversationMessage::tool_result(
+                    let denied_output = merge_hook_feedback(&p.pre_hook_messages, p.deny_reason.clone().unwrap_or_default(), true);
+                    let result_message = ConversationMessage::tool_result(
                         p.tool_use_id.clone(),
                         p.tool_name.clone(),
-                        merge_hook_feedback(&p.pre_hook_messages, p.deny_reason.clone().unwrap_or_default(), true),
+                        denied_output,
                         true,
-                    )
+                    );
+                    (p.tool_name.clone(), String::new(), String::new(), true, result_message)
                 };
                 self.session
                     .push_message(result_message.clone())
                     .map_err(|error| RuntimeError::new(error.to_string()))?;
                 self.record_tool_finished(iterations, &result_message);
+                if let Some(ref reporter) = self.turn_progress_reporter {
+                    let report_result = if progress_is_error {
+                        Err(progress_output.as_str())
+                    } else {
+                        Ok(progress_output.as_str())
+                    };
+                    reporter.on_tool_result(iterations, self.max_iterations, &progress_tool_name, &progress_input, report_result);
+                }
                 tool_results.push(result_message);
             }
         }

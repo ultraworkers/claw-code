@@ -6937,6 +6937,7 @@ fn run_resume_command(
         | SlashCommand::AddDir { .. } => Err("unsupported resumed slash command".into()),
         | SlashCommand::AddDir { .. }
         | SlashCommand::Lsp { .. }
+<<<<<<< HEAD
 >>>>>>> e9582034 (feat: full LSP (Language Server Protocol) integration)
         | SlashCommand::Setup => Err("unsupported resumed slash command".into()),
 =======
@@ -6944,6 +6945,10 @@ fn run_resume_command(
         | SlashCommand::Lsp { .. } => Err("unsupported resumed slash command".into()),
 >>>>>>> 0b227b62 (fix: resolve cherry-pick conflicts and remove non-LSP artifacts)
     }
+=======
+        | SlashCommand::Team { .. }
+        | SlashCommand::Setup => Err("unsupported resumed slash command".into()),    }
+>>>>>>> 7ab899c0 (feat: agent teams with task claiming, context management, and team monitoring)
 }
 
 /// Detect if the current working directory is "broad" (home directory or
@@ -7206,6 +7211,17 @@ fn run_repl(
                     cli.set_model(Some(new_model))?;
                 }
                 println!("{}", format_connected_line(&cli.model));
+            }
+            input::ReadOutcome::TeamToggle => {
+                // Ctrl+T toggles agent teams mode
+                let current = std::env::var("CLAWD_AGENT_TEAMS").unwrap_or_default();
+                if current == "1" {
+                    std::env::set_var("CLAWD_AGENT_TEAMS", "0");
+                    eprintln!("[team] Agent teams disabled");
+                } else {
+                    std::env::set_var("CLAWD_AGENT_TEAMS", "1");
+                    eprintln!("[team] Agent teams enabled (TeamCreate now available)");
+                }
             }
             input::ReadOutcome::Cancel => {}
             input::ReadOutcome::Exit => {
@@ -8322,6 +8338,52 @@ impl LiveCli {
                 run_init(CliOutputFormat::Text)?;
                 false
             }
+<<<<<<< HEAD
+=======
+            SlashCommand::Team { action } => {
+                match action.as_deref().unwrap_or("") {
+                    "on" | "enable" => {
+                        std::env::set_var("CLAWD_AGENT_TEAMS", "1");
+                        eprintln!("[team] Agent teams enabled (TeamCreate now available)");
+                    }
+                    "off" | "disable" => {
+                        std::env::set_var("CLAWD_AGENT_TEAMS", "0");
+                        eprintln!("[team] Agent teams disabled");
+                    }
+                    "status" => {
+                        let current = std::env::var("CLAWD_AGENT_TEAMS").unwrap_or_default();
+                        if current == "1" {
+                            eprintln!("[team] Agent teams: ENABLED");
+                        } else {
+                            eprintln!("[team] Agent teams: DISABLED (use /team on or Ctrl+T to enable)");
+                        }
+                    }
+                    "" => {
+                        // Toggle
+                        let current = std::env::var("CLAWD_AGENT_TEAMS").unwrap_or_default();
+                        if current == "1" {
+                            std::env::set_var("CLAWD_AGENT_TEAMS", "0");
+                            eprintln!("[team] Agent teams disabled");
+                        } else {
+                            std::env::set_var("CLAWD_AGENT_TEAMS", "1");
+                            eprintln!("[team] Agent teams enabled (TeamCreate now available)");
+                        }
+                    }
+                    other => eprintln!("[team] unknown action: {other}. Use: /team [on|off|status]"),
+                }
+                false
+            }
+            SlashCommand::Setup => {
+                setup_wizard::run_setup_wizard()?;
+                // Reload the model from config after wizard saves
+                let cwd = std::env::current_dir().unwrap_or_default();
+                let config = runtime::ConfigLoader::default_for(&cwd).load().ok();
+                if let Some(new_model) = config.as_ref().and_then(|c| c.provider().model().map(str::to_string)) {
+                    self.set_model(Some(new_model))?;
+                }
+                false
+            }
+>>>>>>> 7ab899c0 (feat: agent teams with task claiming, context management, and team monitoring)
             SlashCommand::Diff => {
                 Self::print_diff()?;
                 false
@@ -14270,8 +14332,10 @@ impl ToolExecutor for CliToolExecutor {
             "LSP",
             "Agent",
             "AgentMessage",
-            "TeamStatus",
-            "TaskGet",
+                        "TeamStatus",
+            "TaskClaim",
+            "AgentSuggestion",
+            "ContextRequest", "TaskGet",
             "TaskList",
             "TaskOutput",
             "GitStatus",
