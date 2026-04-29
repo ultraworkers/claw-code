@@ -14,7 +14,9 @@ api = { path = "../api" }
 commands = { path = "../commands" }
 crossterm = "0.28"
 pulldown-cmark = "0.13"
+ratatui = "0.29"
 rustyline = "15"
+tui-textarea = "0.7"
 runtime = { path = "../runtime" }
 plugins = { path = "../plugins" }
 serde = { version = "1", features = ["derive"] }

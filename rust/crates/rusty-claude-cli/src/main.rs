@@ -16,6 +16,7 @@
 )]
 mod init;
 mod input;
+mod tui;
 mod render;
 mod setup_wizard;
 
@@ -7066,6 +7067,254 @@ fn run_stale_base_preflight(flag_value: Option<&str>) {
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_repl(
+    model: String,
+    allowed_tools: Option<AllowedToolSet>,
+    permission_mode: PermissionMode,
+    base_commit: Option<String>,
+    reasoning_effort: Option<String>,
+    allow_broad_cwd: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if io::stdout().is_terminal() {
+        return run_repl_tui(model, allowed_tools, permission_mode, base_commit, reasoning_effort, allow_broad_cwd);
+    }
+    run_repl_classic(model, allowed_tools, permission_mode, base_commit, reasoning_effort, allow_broad_cwd)
+}
+
+#[allow(clippy::too_many_lines)]
+fn run_repl_tui(
+    model: String,
+    allowed_tools: Option<AllowedToolSet>,
+    permission_mode: PermissionMode,
+    base_commit: Option<String>,
+    reasoning_effort: Option<String>,
+    allow_broad_cwd: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    enforce_broad_cwd_policy(allow_broad_cwd, CliOutputFormat::Text)?;
+    run_stale_base_preflight(base_commit.as_deref());
+    let resolved_model = resolve_repl_model(model.clone());
+    let reasoning_effort_clone = reasoning_effort.clone();
+
+    let mut cli = LiveCli::new(resolved_model.clone(), true, allowed_tools.clone(), permission_mode)?;
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let lsp_auto = runtime::ConfigLoader::default_for(&cwd)
+        .load()
+        .map(|c| c.lsp_auto_start())
+        .unwrap_or(true);
+    cli.lsp_auto_start = lsp_auto;
+    cli.set_reasoning_effort(reasoning_effort_clone);
+
+    // Build shared dashboard state
+    let dashboard_state = tui::SharedDashboardState::new(std::sync::RwLock::new({
+        let mut ds = tui::DashboardState::new();
+        ds.model = cli.model.clone();
+        ds.permission_mode = permission_mode.as_str().to_string();
+        ds.session_id = Some(cli.session.id.clone());
+        if let Ok(config) = runtime::ConfigLoader::default_for(&cwd).load() {
+            if let Some(base_url) = config.provider().base_url() {
+                ds.provider_url = base_url.to_string();
+            }
+        }
+        ds
+    }));
+
+    // Discover and register LSP servers (before TUI takes over the terminal)
+    let lsp_servers = runtime::lsp_discovery::discover_available_servers();
+    if !lsp_servers.is_empty() {
+        for server in &lsp_servers {
+            tools::global_lsp_registry().register_with_descriptor(
+                &server.language,
+                runtime::lsp_client::LspServerStatus::Starting,
+                None,
+                vec![],
+                server.clone(),
+            );
+        }
+        if cli.lsp_auto_start {
+            let registry = tools::global_lsp_registry();
+            for server in &lsp_servers {
+                let _ = registry.start_server(&server.language);
+            }
+        }
+    }
+    update_dashboard_lsp(&dashboard_state);
+
+    // Initialize TUI
+    let mut app = match tui::TuiApp::init(dashboard_state.clone()) {
+        Ok(app) => app,
+        Err(e) => {
+            eprintln!("TUI init failed, falling back to classic mode: {e}");
+            return run_repl_classic(model, allowed_tools, permission_mode, base_commit, reasoning_effort, allow_broad_cwd);
+        }
+    };
+    // TUI banner — styled ASCII art with info lines
+    {
+        let status = status_context(None).ok();
+        let git_branch = status
+            .as_ref()
+            .and_then(|ctx| ctx.git_branch.as_deref())
+            .unwrap_or("unknown");
+        let workspace = status.as_ref().map_or_else(
+            || "unknown".to_string(),
+            |ctx| ctx.git_summary.headline(),
+        );
+        let banner_lines = vec![
+            tui::BannerLine { text: " ██████╗██╗      █████╗ ██╗    ██╗".to_string(), color: ratatui::style::Color::Red },
+            tui::BannerLine { text: "██╔════╝██║     ██╔══██╗██║    ██║".to_string(), color: ratatui::style::Color::Red },
+            tui::BannerLine { text: "██║     ██║     ███████║██║ █╗ ██║".to_string(), color: ratatui::style::Color::Red },
+            tui::BannerLine { text: "██║     ██║     ██╔══██║██║███╗██║".to_string(), color: ratatui::style::Color::Red },
+            tui::BannerLine { text: "╚██████╗███████╗██║  ██║╚███╔███╔╝".to_string(), color: ratatui::style::Color::Red },
+            tui::BannerLine { text: " ╚═════╝╚══════╝╚═╝  ╚═╝ ╚══╝╚══╝ Code".to_string(), color: ratatui::style::Color::Red },
+            tui::BannerLine { text: String::new(), color: ratatui::style::Color::White },
+            tui::BannerLine { text: format!("  Model       {}", cli.model), color: ratatui::style::Color::White },
+            tui::BannerLine { text: format!("  Mode        {}", permission_mode.as_str()), color: ratatui::style::Color::White },
+            tui::BannerLine { text: format!("  Branch      {}", git_branch), color: ratatui::style::Color::Green },
+            tui::BannerLine { text: format!("  Workspace   {}", workspace), color: ratatui::style::Color::White },
+            tui::BannerLine { text: format!("  Session     {}", cli.session.id), color: ratatui::style::Color::Gray },
+            tui::BannerLine { text: String::new(), color: ratatui::style::Color::White },
+        ];
+        app.push_banner(banner_lines);
+    }
+
+    // Main TUI event loop
+    loop {
+        app.set_slash_completions(cli.repl_completion_candidates().unwrap_or_default());
+        match app.read_line()? {
+            tui::TuiReadOutcome::Pending => continue,
+            tui::TuiReadOutcome::Submit(input) => {
+                let trimmed = input.trim().to_string();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if matches!(trimmed.as_str(), "/exit" | "/quit") {
+                    let _ = app.restore_terminal();
+                    cli.shutdown_lsp_servers();
+                    cli.persist_session()?;
+                    break;
+                }
+                match SlashCommand::parse(&trimmed) {
+                    Ok(Some(command)) => {
+                        app.suspend()?;
+                        let cmd_result = cli.handle_repl_command(command);
+                        if let Ok(true) = cmd_result {
+                            cli.persist_session()?;
+                        }
+                        if let Err(e) = app.resume() {
+                            eprintln!("TUI resume failed: {e}");
+                            let _ = app.restore_terminal();
+                            return Err(e);
+                        }
+                        continue;
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        app.push_system_message(&error.to_string());
+                        continue;
+                    }
+                }
+                let cwd_check = std::env::current_dir().unwrap_or_default();
+                let prompt = if let Some(p) = try_resolve_bare_skill_prompt(&cwd_check, &trimmed) {
+                    p
+                } else {
+                    trimmed.clone()
+                };
+                app.push_user_input(&input);
+                cli.record_prompt_history(&trimmed);
+                update_dashboard(&dashboard_state, &cli);
+                app.set_status("Thinking...");
+
+                // Suspend TUI, run turn with normal stdout, then resume
+                app.suspend()?;
+                let result = cli.run_turn(&prompt);
+                if let Err(e) = app.resume() {
+                    eprintln!("TUI resume failed: {e}, restoring terminal...");
+                    let _ = app.restore_terminal();
+                    return Err(e);
+                }
+
+                match result {
+                    Ok(()) => {
+                        app.set_status("Done");
+                        if let Ok(mut ds) = dashboard_state.write() {
+                            ds.status_message.clear();
+                        }
+                    }
+                    Err(e) => {
+                        app.push_system_message(&format!("Error: {e}"));
+                        app.set_status("");
+                    }
+                }
+                update_dashboard(&dashboard_state, &cli);
+            }
+            tui::TuiReadOutcome::ProviderSwap => {
+                app.suspend()?;
+                setup_wizard::run_setup_wizard()?;
+                let cwd = std::env::current_dir().unwrap_or_default();
+                let config = runtime::ConfigLoader::default_for(&cwd).load().ok();
+                if let Some(new_model) = config.as_ref().and_then(|c| c.provider().model().map(str::to_string)) {
+                    cli.set_model(Some(new_model))?;
+                }
+                if let Err(e) = app.resume() {
+                    eprintln!("TUI resume failed: {e}");
+                    let _ = app.restore_terminal();
+                    return Err(e);
+                }
+                update_dashboard(&dashboard_state, &cli);
+            }
+            tui::TuiReadOutcome::TeamToggle => {
+                let current = std::env::var("CLAWD_AGENT_TEAMS").unwrap_or_default();
+                if current == "1" {
+                    std::env::set_var("CLAWD_AGENT_TEAMS", "0");
+                    app.push_system_message("[team] Agent teams disabled");
+                } else {
+                    std::env::set_var("CLAWD_AGENT_TEAMS", "1");
+                    app.push_system_message("[team] Agent teams enabled");
+                }
+            }
+            tui::TuiReadOutcome::Cancel => {
+                // Ctrl+C clears input (handled in TUI), just continue
+            }
+            tui::TuiReadOutcome::Exit => {
+                let _ = app.restore_terminal();
+                cli.shutdown_lsp_servers();
+                cli.persist_session()?;
+                break;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn update_dashboard(state: &tui::SharedDashboardState, cli: &LiveCli) {
+    if let Ok(mut ds) = state.write() {
+        ds.model = cli.model.clone();
+        ds.turn_count = cli.runtime.usage().turns();
+        let usage = cli.runtime.usage().cumulative_usage();
+        ds.input_tokens = usage.input_tokens;
+        ds.output_tokens = usage.output_tokens;
+        ds.cache_read_tokens = usage.cache_read_input_tokens;
+        ds.cache_creation_tokens = usage.cache_creation_input_tokens;
+        ds.cost_usd = usage.estimate_cost_usd().total_cost_usd();
+        ds.session_id = Some(cli.session.id.clone());
+    }
+    update_dashboard_lsp(state);
+}
+
+fn update_dashboard_lsp(state: &tui::SharedDashboardState) {
+    if let Ok(mut ds) = state.write() {
+        ds.lsp_servers = tools::global_lsp_registry()
+            .list_servers()
+            .into_iter()
+            .map(|s| tui::LspInfo {
+                language: s.language,
+                status: s.status.to_string(),
+            })
+            .collect();
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn run_repl_classic(
     model: String,
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
