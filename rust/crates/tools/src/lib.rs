@@ -1177,8 +1177,8 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                     "team_id": { "type": "string", "description": "Team ID to check" },
                     "action": {
                         "type": "string",
-                        "enum": ["status", "summary", "events"],
-                        "description": "status=live snapshot, summary=final results, events=timeline"
+                        "enum": ["status", "summary", "events", "inbox"],
+                        "description": "status=live snapshot, summary=final results, events=timeline, inbox=team messages from agents"
                     }
                 },
                 "required": ["team_id"],
@@ -1887,6 +1887,7 @@ fn run_team_create(input: TeamCreateInput) -> Result<String, String> {
             subagent_type: subagent_type.map(|s| s.to_string()),
             name: Some(format!("{}-agent-{}", slugify_agent_name(&input.name), i + 1)),
             model: model_override.map(|s| s.to_string()),
+            team_id: Some(team_id.clone()),
         };
 
         match execute_agent_with_spawn(agent_input, spawn_agent_job) {
@@ -2073,7 +2074,30 @@ fn run_team_status(input: TeamStatusInput) -> Result<String, String> {
                 "events": events,
             }))
         }
-        other => Err(format!("unknown TeamStatus action: {other}. Use status, summary, or events")),
+        "inbox" => {
+            let inbox_dir = agent_mailbox_dir().join("team").join(&input.team_id);
+            let mut messages: Vec<Value> = Vec::new();
+            if inbox_dir.exists() {
+                if let Ok(entries) = std::fs::read_dir(&inbox_dir) {
+                    for entry in entries.filter_map(|e| e.ok()) {
+                        let path = entry.path();
+                        if path.extension().is_some_and(|ext| ext == "json") {
+                            if let Ok(data) = std::fs::read_to_string(&path) {
+                                if let Ok(msg) = serde_json::from_str::<Value>(&data) {
+                                    messages.push(msg);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            to_pretty_json(json!({
+                "team_id": input.team_id,
+                "inbox_count": messages.len(),
+                "messages": messages,
+            }))
+        }
+        other => Err(format!("unknown TeamStatus action: {other}. Use status, summary, events, or inbox")),
     }
 }
 
@@ -2081,65 +2105,71 @@ fn run_team_status(input: TeamStatusInput) -> Result<String, String> {
 /// Prints agent completion/failure events to stderr. Exits when all agents are done.
 fn spawn_team_watcher(team_id: &str, agent_ids: &[String]) {
     let team_id = team_id.to_string();
-    let agent_ids = agent_ids.to_vec();
+    let total = agent_ids.len();
     let thread_name = format!("claw-team-watch-{team_id}");
 
     std::thread::Builder::new()
         .name(thread_name)
         .spawn(move || {
-            let store_dir = match agent_store_dir() {
-                Ok(d) => d,
-                Err(_) => return,
-            };
-            let team_dir = store_dir.join("teams");
+            let inbox_dir = agent_mailbox_dir().join("team").join(&team_id);
+            let _ = std::fs::create_dir_all(&inbox_dir);
+
+            let team_dir = agent_store_dir().map(|d| d.join("teams")).unwrap_or_default();
             let events_path = team_dir.join(format!("{team_id}-events.jsonl"));
 
             let mut completed: BTreeSet<String> = BTreeSet::new();
             let mut failed: BTreeSet<String> = BTreeSet::new();
-            let total = agent_ids.len();
+            let mut seen: BTreeSet<String> = BTreeSet::new();
 
-            eprintln!("[team] {team_id}: watching {total} agents...");
+            eprintln!("[team] {team_id}: watching {total} agents via inbox...");
 
             loop {
-                let mut all_done = true;
-                for id in &agent_ids {
-                    if completed.contains(id) || failed.contains(id) {
-                        continue;
-                    }
-                    let agent_json = store_dir.join(format!("{id}.json"));
-                    if let Ok(data) = std::fs::read_to_string(&agent_json) {
-                        if let Ok(parsed) = serde_json::from_str::<Value>(&data) {
-                            let status = parsed.get("status").and_then(|v| v.as_str()).unwrap_or("unknown");
-                            match status {
-                                "completed" => {
-                                    completed.insert(id.clone());
-                                    let name = parsed.get("name").and_then(|v| v.as_str()).unwrap_or(id);
-                                    let subagent_type = parsed.get("subagent_type").and_then(|v| v.as_str()).unwrap_or("unknown");
-                                    let result_preview = get_agent_result_preview(&store_dir, id);
-                                    eprintln!("[team] {team_id}: done {name} ({subagent_type}) completed - {}/{total}{}", completed.len() + failed.len(), if result_preview.is_empty() { String::new() } else { format!(" - {}", &result_preview[..result_preview.len().min(120)]) });
-                                    append_team_event(&events_path, &team_id, id, "completed", &name, Some(&result_preview));
-                                }
-                                "failed" => {
-                                    failed.insert(id.clone());
-                                    let name = parsed.get("name").and_then(|v| v.as_str()).unwrap_or(id);
-                                    let error = parsed.get("error").and_then(|v| v.as_str()).unwrap_or("unknown error");
-                                    eprintln!("[team] {team_id}: FAIL {name} failed - {error}");
-                                    append_team_event(&events_path, &team_id, id, "failed", &name, Some(error));
-                                }
-                                _ => {
-                                    all_done = false;
+                let mut new_events = false;
+                if let Ok(entries) = std::fs::read_dir(&inbox_dir) {
+                    for entry in entries.filter_map(|e| e.ok()) {
+                        let path = entry.path();
+                        let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                        if seen.contains(&name) {
+                            continue;
+                        }
+                        if !path.extension().is_some_and(|ext| ext == "json") {
+                            continue;
+                        }
+                        if let Ok(data) = std::fs::read_to_string(&path) {
+                            if let Ok(parsed) = serde_json::from_str::<Value>(&data) {
+                                seen.insert(name);
+                                new_events = true;
+                                let agent_id = parsed.get("agent_id").and_then(|v| v.as_str()).unwrap_or("unknown");
+                                let event = parsed.get("event").and_then(|v| v.as_str()).unwrap_or("unknown");
+                                let agent_name = parsed.get("name").and_then(|v| v.as_str()).unwrap_or(agent_id);
+                                let subagent_type = parsed.get("subagent_type").and_then(|v| v.as_str()).unwrap_or("unknown");
+                                let result_preview = parsed.get("result_preview").and_then(|v| v.as_str()).unwrap_or("");
+
+                                match event {
+                                    "agent_completed" => {
+                                        completed.insert(agent_id.to_string());
+                                        let done_count = completed.len() + failed.len();
+                                        eprintln!("[team] {team_id}: done {agent_name} ({subagent_type}) completed - {done_count}/{total}{}", if result_preview.is_empty() { String::new() } else { format!(" - {}", &result_preview[..result_preview.len().min(120)]) });
+                                        append_team_event(&events_path, &team_id, agent_id, "completed", agent_name, Some(result_preview));
+                                    }
+                                    "agent_failed" => {
+                                        failed.insert(agent_id.to_string());
+                                        let error = parsed.get("error").and_then(|v| v.as_str()).unwrap_or("unknown error");
+                                        eprintln!("[team] {team_id}: FAIL {agent_name} failed - {error}");
+                                        append_team_event(&events_path, &team_id, agent_id, "failed", agent_name, Some(error));
+                                    }
+                                    _ => {}
                                 }
                             }
                         }
-                    } else {
-                        all_done = false;
                     }
                 }
 
+                let all_done = completed.len() + failed.len() >= total;
                 if all_done {
                     break;
                 }
-                std::thread::sleep(std::time::Duration::from_secs(2));
+                std::thread::sleep(std::time::Duration::from_secs(1));
             }
 
             eprintln!("[team] {team_id}: all agents finished - {}/{} completed, {}/{} failed", completed.len(), total, failed.len(), total);
@@ -2154,6 +2184,9 @@ fn spawn_team_watcher(team_id: &str, agent_ids: &[String]) {
                     }
                 }
             }
+
+            // Clean up inbox
+            let _ = std::fs::remove_dir_all(&inbox_dir);
         })
         .ok();
 }
@@ -3600,6 +3633,8 @@ struct AgentInput {
     subagent_type: Option<String>,
     name: Option<String>,
     model: Option<String>,
+    #[serde(default)]
+    team_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -4019,6 +4054,8 @@ struct AgentOutput {
     derived_state: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    #[serde(rename = "teamId", skip_serializing_if = "Option::is_none")]
+    team_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -4027,6 +4064,7 @@ struct AgentJob {
     prompt: String,
     system_prompt: Vec<String>,
     allowed_tools: BTreeSet<String>,
+    team_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -4923,6 +4961,7 @@ where
     let created_at = iso8601_now();
     let system_prompt = build_agent_system_prompt(&normalized_subagent_type, &model)?;
     let allowed_tools = allowed_tools_for_subagent(&normalized_subagent_type);
+    let team_id = input.team_id.clone();
 
     let output_contents = format!(
         "# Agent Task
@@ -4957,6 +4996,7 @@ where
         current_blocker: None,
         derived_state: String::from("working"),
         error: None,
+        team_id: input.team_id.clone(),
     };
     write_agent_manifest(&manifest)?;
 
@@ -4966,6 +5006,7 @@ where
         prompt: input.prompt,
         system_prompt,
         allowed_tools,
+        team_id: input.team_id.clone(),
     };
     if let Err(error) = spawn_fn(job) {
         let error = format!("failed to spawn sub-agent: {error}");
@@ -5235,7 +5276,40 @@ fn persist_agent_terminal_state(
             ));
         }
     }
-    write_agent_manifest(&next_manifest)
+    write_agent_manifest(&next_manifest)?;
+
+    // If this agent belongs to a team, post completion to the team inbox
+    if let Some(ref tid) = next_manifest.team_id {
+        let _ = post_agent_completion_to_team_inbox(&next_manifest, tid, status, result);
+    }
+
+    Ok(())
+}
+
+fn post_agent_completion_to_team_inbox(
+    manifest: &AgentOutput,
+    team_id: &str,
+    status: &str,
+    result: Option<&str>,
+) -> Result<(), String> {
+    let mailbox_dir = agent_mailbox_dir().join("team").join(team_id);
+    std::fs::create_dir_all(&mailbox_dir).map_err(|e| e.to_string())?;
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let entry = json!({
+        "event": format!("agent_{status}"),
+        "agent_id": manifest.agent_id,
+        "name": manifest.name,
+        "subagent_type": manifest.subagent_type,
+        "status": status,
+        "result_preview": result.map(|r| r.chars().take(2000).collect::<String>()),
+        "timestamp": ts,
+    });
+    let msg_file = mailbox_dir.join(format!("{}-{ts}.json", manifest.agent_id));
+    std::fs::write(&msg_file, serde_json::to_string_pretty(&entry).map_err(|e| e.to_string())?)
+        .map_err(|e| e.to_string())
 }
 
 const MIN_LANE_SUMMARY_WORDS: usize = 7;
@@ -9539,6 +9613,7 @@ mod tests {
                 subagent_type: Some("Explore".to_string()),
                 name: Some("ship-audit".to_string()),
                 model: None,
+            team_id: None,
             },
             move |job| {
                 *captured_for_spawn
@@ -9620,6 +9695,7 @@ mod tests {
                 subagent_type: Some("Explore".to_string()),
                 name: Some("complete-task".to_string()),
                 model: Some("claude-sonnet-4-6".to_string()),
+            team_id: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -9677,6 +9753,7 @@ mod tests {
                 subagent_type: Some("Verification".to_string()),
                 name: Some("fail-task".to_string()),
                 model: None,
+            team_id: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -9724,6 +9801,7 @@ mod tests {
                 subagent_type: Some("Explore".to_string()),
                 name: Some("summary-floor".to_string()),
                 model: None,
+            team_id: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -9769,6 +9847,7 @@ mod tests {
                 subagent_type: Some("Explore".to_string()),
                 name: Some("recovery-lane".to_string()),
                 model: None,
+            team_id: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -9817,6 +9896,7 @@ mod tests {
                 subagent_type: Some("Verification".to_string()),
                 name: Some("review-lane".to_string()),
                 model: None,
+            team_id: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -9857,6 +9937,7 @@ mod tests {
                 subagent_type: Some("Explore".to_string()),
                 name: Some("backlog-scan".to_string()),
                 model: None,
+            team_id: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -9903,6 +9984,7 @@ mod tests {
                 subagent_type: Some("Explore".to_string()),
                 name: Some("artifact-lane".to_string()),
                 model: None,
+            team_id: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -9973,6 +10055,7 @@ mod tests {
                 subagent_type: Some("Explore".to_string()),
                 name: Some("cron-closeout".to_string()),
                 model: None,
+            team_id: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -10014,6 +10097,7 @@ mod tests {
                 subagent_type: None,
                 name: Some("spawn-error".to_string()),
                 model: None,
+            team_id: None,
             },
             |_| Err(String::from("thread creation failed")),
         )
