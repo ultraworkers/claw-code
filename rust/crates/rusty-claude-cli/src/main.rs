@@ -14604,6 +14604,7 @@ mod doctor_broad_cwd_tests {
     use std::path::PathBuf;
 
     fn make_ctx(cwd: PathBuf, project_root: Option<PathBuf>) -> StatusContext {
+        use super::{SessionLifecycleKind, SessionLifecycleSummary};
         use runtime::SandboxStatus;
         StatusContext {
             cwd,
@@ -14616,6 +14617,14 @@ mod doctor_broad_cwd_tests {
             git_summary: super::parse_git_workspace_summary(None),
             sandbox_status: SandboxStatus::default(),
             config_load_error: None,
+            session_lifecycle: SessionLifecycleSummary {
+                kind: SessionLifecycleKind::SavedOnly,
+                pane_id: None,
+                pane_command: None,
+                pane_path: None,
+                workspace_dirty: false,
+                abandoned: false,
+            },
         }
     }
 
