@@ -14247,6 +14247,7 @@ impl ToolExecutor for CliToolExecutor {
             "LSP",
             "Agent",
             "AgentMessage",
+            "TeamStatus",
             "TaskGet",
             "TaskList",
             "TaskOutput",
