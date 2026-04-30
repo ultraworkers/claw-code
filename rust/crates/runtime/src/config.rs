@@ -1,22 +1,7 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
-
-/// Process-lifetime set of already-emitted config deprecation warning strings.
-/// Prevents duplicate warnings when `ConfigLoader::load()` is called multiple
-/// times within a single CLI invocation. (ROADMAP #698)
-static EMITTED_CONFIG_WARNINGS: std::sync::OnceLock<Mutex<HashSet<String>>> =
-    std::sync::OnceLock::new();
-
-fn emit_config_warning_once(warning: &str) {
-    let set = EMITTED_CONFIG_WARNINGS.get_or_init(|| Mutex::new(HashSet::new()));
-    let mut guard = set.lock().unwrap_or_else(|e| e.into_inner());
-    if guard.insert(warning.to_string()) {
-        eprintln!("warning: {warning}");
-    }
-}
 
 use crate::json::JsonValue;
 use crate::sandbox::{FilesystemIsolationMode, SandboxConfig};
@@ -53,6 +38,45 @@ pub struct RuntimeConfig {
     merged: BTreeMap<String, JsonValue>,
     loaded_entries: Vec<ConfigEntry>,
     feature_config: RuntimeFeatureConfig,
+}
+
+/// Machine-readable load state for a discovered config file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigFileStatus {
+    Loaded,
+    NotFound,
+    Skipped,
+    LoadError,
+}
+
+impl ConfigFileStatus {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Loaded => "loaded",
+            Self::NotFound => "not_found",
+            Self::Skipped => "skipped",
+            Self::LoadError => "load_error",
+        }
+    }
+}
+
+/// Structured status for a single discovered config file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigFileReport {
+    pub entry: ConfigEntry,
+    pub loaded: bool,
+    pub status: ConfigFileStatus,
+    pub reason: Option<String>,
+    pub detail: Option<String>,
+}
+
+/// Best-effort inspection of the full config discovery/load pipeline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigInspection {
+    pub files: Vec<ConfigFileReport>,
+    pub runtime_config: Option<RuntimeConfig>,
+    pub load_error: Option<String>,
 }
 
 /// Parsed plugin-related settings extracted from runtime config.
@@ -105,10 +129,6 @@ pub struct RuntimePermissionRuleConfig {
     allow: Vec<String>,
     deny: Vec<String>,
     ask: Vec<String>,
-    /// #159: simple tool-name denials parsed from the `deniedTools` config field.
-    /// Unlike the `deny` rules (pattern-based), `denied_tools` is a flat list of
-    /// tool names that are unconditionally denied regardless of permission mode.
-    denied_tools: Vec<String>,
 }
 
 /// Collection of configured MCP servers after scope-aware merging.
@@ -120,7 +140,6 @@ pub struct McpConfigCollection {
 /// MCP server config paired with the scope that defined it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScopedMcpServerConfig {
-    pub required: bool,
     pub scope: ConfigSource,
     pub config: McpServerConfig,
 }
@@ -296,7 +315,7 @@ impl ConfigLoader {
 
         for entry in self.discover() {
             crate::config_validate::check_unsupported_format(&entry.path)?;
-            let Some(parsed) = read_optional_json_object(&entry.path)? else {
+            let OptionalConfigFile::Loaded(parsed) = read_optional_json_object(&entry.path)? else {
                 continue;
             };
             let validation = crate::config_validate::validate_config_file(
@@ -316,33 +335,189 @@ impl ConfigLoader {
         }
 
         for warning in &all_warnings {
-            emit_config_warning_once(&warning.to_string());
+            eprintln!("warning: {warning}");
         }
 
-        let merged_value = JsonValue::Object(merged.clone());
-
-        let feature_config = RuntimeFeatureConfig {
-            hooks: parse_optional_hooks_config(&merged_value)?,
-            plugins: parse_optional_plugin_config(&merged_value)?,
-            mcp: McpConfigCollection {
-                servers: mcp_servers,
-            },
-            oauth: parse_optional_oauth_config(&merged_value, "merged settings.oauth")?,
-            model: parse_optional_model(&merged_value),
-            aliases: parse_optional_aliases(&merged_value)?,
-            permission_mode: parse_optional_permission_mode(&merged_value)?,
-            permission_rules: parse_optional_permission_rules(&merged_value)?,
-            sandbox: parse_optional_sandbox_config(&merged_value)?,
-            provider_fallbacks: parse_optional_provider_fallbacks(&merged_value)?,
-            trusted_roots: parse_optional_trusted_roots(&merged_value)?,
-        };
-
-        Ok(RuntimeConfig {
-            merged,
-            loaded_entries,
-            feature_config,
-        })
+        build_runtime_config(merged, loaded_entries, mcp_servers)
     }
+
+    /// Inspect discovered files and return per-file statuses without aborting
+    /// the whole report on the first missing/skipped/invalid file.
+    #[must_use]
+    pub fn inspect(&self) -> ConfigInspection {
+        let mut merged = BTreeMap::new();
+        let mut loaded_entries = Vec::new();
+        let mut mcp_servers = BTreeMap::new();
+        let mut all_warnings = Vec::new();
+        let mut files = Vec::new();
+        let mut first_error = None;
+
+        for entry in self.discover() {
+            if let Err(error) = crate::config_validate::check_unsupported_format(&entry.path) {
+                let detail = error.to_string();
+                first_error.get_or_insert_with(|| detail.clone());
+                files.push(ConfigFileReport {
+                    entry,
+                    loaded: false,
+                    status: ConfigFileStatus::LoadError,
+                    reason: Some("unsupported_format".to_string()),
+                    detail: Some(detail),
+                });
+                continue;
+            }
+
+            let parsed = match read_optional_json_object(&entry.path) {
+                Ok(OptionalConfigFile::Loaded(parsed)) => parsed,
+                Ok(OptionalConfigFile::NotFound) => {
+                    files.push(ConfigFileReport {
+                        entry,
+                        loaded: false,
+                        status: ConfigFileStatus::NotFound,
+                        reason: Some("not_found".to_string()),
+                        detail: None,
+                    });
+                    continue;
+                }
+                Ok(OptionalConfigFile::Skipped { reason, detail }) => {
+                    files.push(ConfigFileReport {
+                        entry,
+                        loaded: false,
+                        status: ConfigFileStatus::Skipped,
+                        reason: Some(reason),
+                        detail,
+                    });
+                    continue;
+                }
+                Err(error) => {
+                    let detail = error.to_string();
+                    first_error.get_or_insert_with(|| detail.clone());
+                    let reason = match &error {
+                        ConfigError::Io(io_error)
+                            if io_error.kind() == std::io::ErrorKind::PermissionDenied =>
+                        {
+                            "permission_denied"
+                        }
+                        ConfigError::Io(_) => "io_error",
+                        ConfigError::Parse(_) => "parse_error",
+                    };
+                    files.push(ConfigFileReport {
+                        entry,
+                        loaded: false,
+                        status: ConfigFileStatus::LoadError,
+                        reason: Some(reason.to_string()),
+                        detail: Some(detail),
+                    });
+                    continue;
+                }
+            };
+
+            let validation = crate::config_validate::validate_config_file(
+                &parsed.object,
+                &parsed.source,
+                &entry.path,
+            );
+            if !validation.is_ok() {
+                let detail = validation.errors[0].to_string();
+                first_error.get_or_insert_with(|| detail.clone());
+                files.push(ConfigFileReport {
+                    entry,
+                    loaded: false,
+                    status: ConfigFileStatus::LoadError,
+                    reason: Some("validation_error".to_string()),
+                    detail: Some(detail),
+                });
+                continue;
+            }
+            all_warnings.extend(validation.warnings);
+
+            if let Err(error) = validate_optional_hooks_config(&parsed.object, &entry.path) {
+                let detail = error.to_string();
+                first_error.get_or_insert_with(|| detail.clone());
+                files.push(ConfigFileReport {
+                    entry,
+                    loaded: false,
+                    status: ConfigFileStatus::LoadError,
+                    reason: Some("validation_error".to_string()),
+                    detail: Some(detail),
+                });
+                continue;
+            }
+
+            if let Err(error) =
+                merge_mcp_servers(&mut mcp_servers, entry.source, &parsed.object, &entry.path)
+            {
+                let detail = error.to_string();
+                first_error.get_or_insert_with(|| detail.clone());
+                files.push(ConfigFileReport {
+                    entry,
+                    loaded: false,
+                    status: ConfigFileStatus::LoadError,
+                    reason: Some("parse_error".to_string()),
+                    detail: Some(detail),
+                });
+                continue;
+            }
+
+            deep_merge_objects(&mut merged, &parsed.object);
+            loaded_entries.push(entry.clone());
+            files.push(ConfigFileReport {
+                entry,
+                loaded: true,
+                status: ConfigFileStatus::Loaded,
+                reason: None,
+                detail: None,
+            });
+        }
+
+        for warning in &all_warnings {
+            eprintln!("warning: {warning}");
+        }
+
+        match build_runtime_config(merged, loaded_entries, mcp_servers) {
+            Ok(runtime_config) => ConfigInspection {
+                files,
+                runtime_config: Some(runtime_config),
+                load_error: first_error,
+            },
+            Err(error) => {
+                first_error.get_or_insert_with(|| error.to_string());
+                ConfigInspection {
+                    files,
+                    runtime_config: None,
+                    load_error: first_error,
+                }
+            }
+        }
+    }
+}
+
+fn build_runtime_config(
+    merged: BTreeMap<String, JsonValue>,
+    loaded_entries: Vec<ConfigEntry>,
+    mcp_servers: BTreeMap<String, ScopedMcpServerConfig>,
+) -> Result<RuntimeConfig, ConfigError> {
+    let merged_value = JsonValue::Object(merged.clone());
+    let feature_config = RuntimeFeatureConfig {
+        hooks: parse_optional_hooks_config(&merged_value)?,
+        plugins: parse_optional_plugin_config(&merged_value)?,
+        mcp: McpConfigCollection {
+            servers: mcp_servers,
+        },
+        oauth: parse_optional_oauth_config(&merged_value, "merged settings.oauth")?,
+        model: parse_optional_model(&merged_value),
+        aliases: parse_optional_aliases(&merged_value)?,
+        permission_mode: parse_optional_permission_mode(&merged_value)?,
+        permission_rules: parse_optional_permission_rules(&merged_value)?,
+        sandbox: parse_optional_sandbox_config(&merged_value)?,
+        provider_fallbacks: parse_optional_provider_fallbacks(&merged_value)?,
+        trusted_roots: parse_optional_trusted_roots(&merged_value)?,
+    };
+
+    Ok(RuntimeConfig {
+        merged,
+        loaded_entries,
+        feature_config,
+    })
 }
 
 impl RuntimeConfig {
@@ -434,17 +609,6 @@ impl RuntimeConfig {
     pub fn trusted_roots(&self) -> &[String] {
         &self.feature_config.trusted_roots
     }
-
-    /// Merge config-level default trusted roots with per-call roots.
-    ///
-    /// Config roots are defaults and are kept first; per-call roots extend the
-    /// allowlist for a specific worker/session creation request. Duplicates are
-    /// removed without reordering the first occurrence so evidence remains
-    /// deterministic while avoiding repeated trust checks.
-    #[must_use]
-    pub fn trusted_roots_with_overrides(&self, per_call_roots: &[String]) -> Vec<String> {
-        merge_trusted_roots(self.trusted_roots(), per_call_roots)
-    }
 }
 
 impl RuntimeFeatureConfig {
@@ -514,22 +678,6 @@ impl RuntimeFeatureConfig {
     pub fn trusted_roots(&self) -> &[String] {
         &self.trusted_roots
     }
-
-    /// Merge this config's default trusted roots with per-call roots.
-    #[must_use]
-    pub fn trusted_roots_with_overrides(&self, per_call_roots: &[String]) -> Vec<String> {
-        merge_trusted_roots(self.trusted_roots(), per_call_roots)
-    }
-}
-
-fn merge_trusted_roots(config_roots: &[String], per_call_roots: &[String]) -> Vec<String> {
-    let mut merged = Vec::with_capacity(config_roots.len() + per_call_roots.len());
-    for root in config_roots.iter().chain(per_call_roots.iter()) {
-        if !merged.contains(root) {
-            merged.push(root.clone());
-        }
-    }
-    merged
 }
 
 impl ProviderFallbackConfig {
@@ -611,104 +759,6 @@ pub fn default_config_home() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(".claw"))
 }
 
-/// Save provider settings to the user-level `~/.claw/settings.json`.
-/// Creates the file and directory if they don't exist. Sets file permissions
-/// to `0o600` (owner read/write only) to protect stored API keys.
-pub fn save_user_provider_settings(
-    kind: &str,
-    api_key: &str,
-    base_url: Option<&str>,
-    model: Option<&str>,
-) -> Result<(), ConfigError> {
-    let config_home = default_config_home();
-    fs::create_dir_all(&config_home).map_err(ConfigError::Io)?;
-    let settings_path = config_home.join("settings.json");
-
-    let mut root = read_settings_root(&settings_path);
-
-    let mut provider = serde_json::Map::new();
-    provider.insert(
-        "kind".to_string(),
-        serde_json::Value::String(kind.to_string()),
-    );
-    provider.insert(
-        "apiKey".to_string(),
-        serde_json::Value::String(api_key.to_string()),
-    );
-    if let Some(base_url) = base_url {
-        provider.insert(
-            "baseUrl".to_string(),
-            serde_json::Value::String(base_url.to_string()),
-        );
-    } else {
-        provider.remove("baseUrl");
-    }
-    root.insert("provider".to_string(), serde_json::Value::Object(provider));
-    if let Some(model) = model {
-        root.insert(
-            "model".to_string(),
-            serde_json::Value::String(model.to_string()),
-        );
-    } else {
-        root.remove("model");
-    }
-
-    write_settings_root(&settings_path, &root)?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o600);
-        fs::set_permissions(&settings_path, perms).map_err(ConfigError::Io)?;
-    }
-
-    Ok(())
-}
-
-/// Remove the `provider` section from the user-level `~/.claw/settings.json`.
-pub fn clear_user_provider_settings() -> Result<(), ConfigError> {
-    let config_home = default_config_home();
-    let settings_path = config_home.join("settings.json");
-
-    if !settings_path.exists() {
-        return Ok(());
-    }
-
-    let mut root = read_settings_root(&settings_path);
-    if root.remove("provider").is_none() {
-        return Ok(());
-    }
-    root.remove("model");
-
-    write_settings_root(&settings_path, &root)?;
-
-    Ok(())
-}
-
-fn read_settings_root(path: &Path) -> serde_json::Map<String, serde_json::Value> {
-    match fs::read_to_string(path) {
-        Ok(contents) if !contents.trim().is_empty() => {
-            serde_json::from_str::<serde_json::Value>(&contents)
-                .ok()
-                .and_then(|v| v.as_object().cloned())
-                .unwrap_or_default()
-        }
-        _ => serde_json::Map::new(),
-    }
-}
-
-fn write_settings_root(
-    path: &Path,
-    root: &serde_json::Map<String, serde_json::Value>,
-) -> Result<(), ConfigError> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(ConfigError::Io)?;
-    }
-    let rendered = serde_json::to_string_pretty(&serde_json::Value::Object(root.clone()))
-        .map_err(|e| ConfigError::Parse(e.to_string()))?;
-    fs::write(path, format!("{rendered}\n")).map_err(ConfigError::Io)
-}
-
 impl RuntimeHookConfig {
     #[must_use]
     pub fn new(
@@ -757,18 +807,8 @@ impl RuntimeHookConfig {
 
 impl RuntimePermissionRuleConfig {
     #[must_use]
-    pub fn new(
-        allow: Vec<String>,
-        deny: Vec<String>,
-        ask: Vec<String>,
-        denied_tools: Vec<String>,
-    ) -> Self {
-        Self {
-            allow,
-            deny,
-            ask,
-            denied_tools,
-        }
+    pub fn new(allow: Vec<String>, deny: Vec<String>, ask: Vec<String>) -> Self {
+        Self { allow, deny, ask }
     }
 
     #[must_use]
@@ -784,11 +824,6 @@ impl RuntimePermissionRuleConfig {
     #[must_use]
     pub fn ask(&self) -> &[String] {
         &self.ask
-    }
-
-    #[must_use]
-    pub fn denied_tools(&self) -> &[String] {
-        &self.denied_tools
     }
 }
 
@@ -831,16 +866,27 @@ struct ParsedConfigFile {
     source: String,
 }
 
-fn read_optional_json_object(path: &Path) -> Result<Option<ParsedConfigFile>, ConfigError> {
+enum OptionalConfigFile {
+    Loaded(ParsedConfigFile),
+    NotFound,
+    Skipped {
+        reason: String,
+        detail: Option<String>,
+    },
+}
+
+fn read_optional_json_object(path: &Path) -> Result<OptionalConfigFile, ConfigError> {
     let is_legacy_config = path.file_name().and_then(|name| name.to_str()) == Some(".claw.json");
     let contents = match fs::read_to_string(path) {
         Ok(contents) => contents,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(OptionalConfigFile::NotFound);
+        }
         Err(error) => return Err(ConfigError::Io(error)),
     };
 
     if contents.trim().is_empty() {
-        return Ok(Some(ParsedConfigFile {
+        return Ok(OptionalConfigFile::Loaded(ParsedConfigFile {
             object: BTreeMap::new(),
             source: contents,
         }));
@@ -848,19 +894,30 @@ fn read_optional_json_object(path: &Path) -> Result<Option<ParsedConfigFile>, Co
 
     let parsed = match JsonValue::parse(&contents) {
         Ok(parsed) => parsed,
-        Err(_error) if is_legacy_config => return Ok(None),
+        Err(error) if is_legacy_config => {
+            return Ok(OptionalConfigFile::Skipped {
+                reason: "legacy_invalid_json".to_string(),
+                detail: Some(format!("{}: {error}", path.display())),
+            });
+        }
         Err(error) => return Err(ConfigError::Parse(format!("{}: {error}", path.display()))),
     };
     let Some(object) = parsed.as_object() else {
         if is_legacy_config {
-            return Ok(None);
+            return Ok(OptionalConfigFile::Skipped {
+                reason: "legacy_non_object".to_string(),
+                detail: Some(format!(
+                    "{}: top-level legacy settings value is not a JSON object",
+                    path.display()
+                )),
+            });
         }
         return Err(ConfigError::Parse(format!(
             "{}: top-level settings value must be a JSON object",
             path.display()
         )));
     };
-    Ok(Some(ParsedConfigFile {
+    Ok(OptionalConfigFile::Loaded(ParsedConfigFile {
         object: object.clone(),
         source: contents,
     }))
@@ -885,12 +942,6 @@ fn merge_mcp_servers(
         target.insert(
             name.clone(),
             ScopedMcpServerConfig {
-                required: optional_bool(
-                    expect_object(value, &format!("{}: mcpServers.{name}", path.display()))?,
-                    "required",
-                    &format!("{}: mcpServers.{name}", path.display()),
-                )?
-                .unwrap_or(false),
                 scope: source,
                 config: parsed,
             },
@@ -960,12 +1011,6 @@ fn parse_optional_permission_rules(
             .unwrap_or_default(),
         ask: optional_string_array(permissions, "ask", "merged settings.permissions")?
             .unwrap_or_default(),
-        denied_tools: optional_string_array(
-            permissions,
-            "deniedTools",
-            "merged settings.permissions",
-        )?
-        .unwrap_or_default(),
     })
 }
 
@@ -1416,9 +1461,9 @@ fn push_unique(target: &mut Vec<String>, value: String) {
 #[cfg(test)]
 mod tests {
     use super::{
-        deep_merge_objects, parse_permission_mode_label, ConfigLoader, ConfigSource,
-        McpServerConfig, McpTransport, ResolvedPermissionMode, RuntimeFeatureConfig,
-        RuntimeHookConfig, RuntimePluginConfig, CLAW_SETTINGS_SCHEMA_NAME,
+        deep_merge_objects, parse_permission_mode_label, ConfigFileStatus, ConfigLoader,
+        ConfigSource, McpServerConfig, McpTransport, ResolvedPermissionMode, RuntimeHookConfig,
+        RuntimePluginConfig, CLAW_SETTINGS_SCHEMA_NAME,
     };
     use crate::json::JsonValue;
     use crate::sandbox::FilesystemIsolationMode;
@@ -1675,51 +1720,6 @@ mod tests {
     }
 
     #[test]
-    fn trusted_roots_with_overrides_preserves_config_defaults_and_adds_per_call_roots() {
-        // given
-        let root = temp_dir();
-        let cwd = root.join("project");
-        let home = root.join("home").join(".claw");
-        fs::create_dir_all(&home).expect("home config dir");
-        fs::create_dir_all(&cwd).expect("project dir");
-        fs::write(
-            home.join("settings.json"),
-            r#"{"trustedRoots": ["/tmp/config-default", "/tmp/shared"]}"#,
-        )
-        .expect("write settings");
-
-        // when
-        let loaded = ConfigLoader::new(&cwd, &home)
-            .load()
-            .expect("config should load");
-        let merged = loaded.trusted_roots_with_overrides(&[
-            "/tmp/per-call".to_string(),
-            "/tmp/shared".to_string(),
-        ]);
-
-        // then
-        assert_eq!(
-            merged,
-            ["/tmp/config-default", "/tmp/shared", "/tmp/per-call"]
-        );
-
-        fs::remove_dir_all(root).expect("cleanup temp dir");
-    }
-
-    #[test]
-    fn runtime_feature_trusted_roots_with_overrides_matches_runtime_config_merge() {
-        let config = RuntimeFeatureConfig {
-            trusted_roots: vec!["/tmp/config".to_string()],
-            ..RuntimeFeatureConfig::default()
-        };
-
-        assert_eq!(
-            config.trusted_roots_with_overrides(&["/tmp/per-call".to_string()]),
-            ["/tmp/config", "/tmp/per-call"]
-        );
-    }
-
-    #[test]
     fn trusted_roots_default_is_empty_when_unset() {
         // given
         let root = temp_dir();
@@ -1755,8 +1755,7 @@ mod tests {
                 "stdio-server": {
                   "command": "uvx",
                   "args": ["mcp-server"],
-                  "env": {"TOKEN": "secret"},
-                  "required": true
+                  "env": {"TOKEN": "secret"}
                 },
                 "remote-server": {
                   "type": "http",
@@ -1805,7 +1804,6 @@ mod tests {
             .get("stdio-server")
             .expect("stdio server should exist");
         assert_eq!(stdio_server.scope, ConfigSource::User);
-        assert!(stdio_server.required);
         assert_eq!(stdio_server.transport(), McpTransport::Stdio);
 
         let remote_server = loaded
@@ -1813,7 +1811,6 @@ mod tests {
             .get("remote-server")
             .expect("remote server should exist");
         assert_eq!(remote_server.scope, ConfigSource::Local);
-        assert!(!remote_server.required);
         assert_eq!(remote_server.transport(), McpTransport::Ws);
         match &remote_server.config {
             McpServerConfig::Ws(config) => {
@@ -2051,6 +2048,47 @@ mod tests {
         assert_eq!(loaded.loaded_entries().len(), 1);
         assert_eq!(loaded.permission_mode(), None);
         assert_eq!(loaded.plugins().enabled_plugins().len(), 0);
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn inspect_classifies_missing_loaded_and_legacy_skipped_files() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        fs::create_dir_all(cwd.join(".claw")).expect("project claw dir");
+        fs::create_dir_all(&home).expect("home dir");
+        fs::write(cwd.join(".claw.json"), "{not json").expect("legacy config");
+        fs::write(cwd.join(".claw/settings.json"), r#"{"model":"opus"}"#)
+            .expect("project settings");
+
+        let inspection = ConfigLoader::new(&cwd, &home).inspect();
+        assert!(inspection.load_error.is_none());
+        assert!(inspection.runtime_config.is_some());
+
+        let loaded = inspection
+            .files
+            .iter()
+            .find(|file| file.loaded)
+            .expect("loaded file");
+        assert_eq!(loaded.status, ConfigFileStatus::Loaded);
+        assert_eq!(loaded.reason, None);
+
+        let missing = inspection
+            .files
+            .iter()
+            .find(|file| file.status == ConfigFileStatus::NotFound)
+            .expect("missing file");
+        assert_eq!(missing.reason.as_deref(), Some("not_found"));
+
+        let skipped = inspection
+            .files
+            .iter()
+            .find(|file| file.status == ConfigFileStatus::Skipped)
+            .expect("skipped legacy file");
+        assert_eq!(skipped.reason.as_deref(), Some("legacy_invalid_json"));
+        assert!(!skipped.loaded);
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
