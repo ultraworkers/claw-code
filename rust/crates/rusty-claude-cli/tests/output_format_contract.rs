@@ -360,6 +360,34 @@ fn resumed_inventory_commands_emit_structured_json_when_requested() {
     assert_eq!(skills["action"], "list");
     assert!(skills["summary"]["total"].is_number());
     assert!(skills["skills"].is_array());
+
+    let plugins = assert_json_command_with_env(
+        &root,
+        &[
+            "--output-format",
+            "json",
+            "--resume",
+            session_path.to_str().expect("utf8 session path"),
+            "/plugins",
+        ],
+        &[
+            (
+                "CLAW_CONFIG_HOME",
+                config_home.to_str().expect("utf8 config home"),
+            ),
+            ("HOME", home.to_str().expect("utf8 home")),
+        ],
+    );
+    assert_eq!(plugins["kind"], "plugin");
+    assert_eq!(plugins["action"], "list");
+    assert!(
+        plugins["reload_runtime"].is_boolean(),
+        "plugins reload_runtime should be a boolean"
+    );
+    assert!(
+        plugins["target"].is_null(),
+        "plugins target should be null when no plugin is targeted"
+    );
 }
 
 #[test]
