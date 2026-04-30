@@ -3542,6 +3542,37 @@ fn run_resume_command(
                 json: Some(handle_skills_slash_command_json(args.as_deref(), &cwd)?),
             })
         }
+        SlashCommand::Plugins { action, target } => {
+            // Only list is supported in resume mode (no runtime to reload)
+            match action.as_deref() {
+                Some("install") | Some("uninstall") | Some("enable") | Some("disable")
+                | Some("update") => {
+                    return Err(
+                        "resumed /plugins mutations are interactive-only; start `claw` and run `/plugins` in the REPL".into(),
+                    );
+                }
+                _ => {}
+            }
+            let cwd = env::current_dir()?;
+            let loader = ConfigLoader::default_for(&cwd);
+            let runtime_config = loader.load()?;
+            let mut manager = build_plugin_manager(&cwd, &loader, &runtime_config);
+            let result =
+                handle_plugins_slash_command(action.as_deref(), target.as_deref(), &mut manager)?;
+            let action_str = action.as_deref().unwrap_or("list");
+            let json = serde_json::json!({
+                "kind": "plugin",
+                "action": action_str,
+                "target": target,
+                "message": &result.message,
+                "reload_runtime": result.reload_runtime,
+            });
+            Ok(ResumeCommandOutcome {
+                session: session.clone(),
+                message: Some(result.message),
+                json: Some(json),
+            })
+        }
         SlashCommand::Doctor => {
             let report = render_doctor_report()?;
             Ok(ResumeCommandOutcome {
@@ -3628,7 +3659,6 @@ fn run_resume_command(
         | SlashCommand::Model { .. }
         | SlashCommand::Permissions { .. }
         | SlashCommand::Session { .. }
-        | SlashCommand::Plugins { .. }
         | SlashCommand::Login
         | SlashCommand::Logout
         | SlashCommand::Vim
