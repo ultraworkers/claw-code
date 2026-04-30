@@ -12146,11 +12146,27 @@ mod tests {
 
     #[test]
     fn config_report_supports_section_views() {
-        let report = render_config_report(Some("env")).expect("config report should render");
+        let _guard = env_lock();
+        let root = temp_dir();
+        let workspace = root.join("workspace");
+        let config_home = root.join("home").join(".claw");
+        fs::create_dir_all(&workspace).expect("workspace dir");
+        fs::create_dir_all(&config_home).expect("config home dir");
+
+        let report = with_config_home(&config_home, || {
+            with_current_dir(&workspace, || {
+                render_config_report(Some("env")).expect("config report should render")
+            })
+        });
         assert!(report.contains("Merged section: env"));
-        let plugins_report =
-            render_config_report(Some("plugins")).expect("plugins config report should render");
+        let plugins_report = with_config_home(&config_home, || {
+            with_current_dir(&workspace, || {
+                render_config_report(Some("plugins")).expect("plugins config report should render")
+            })
+        });
         assert!(plugins_report.contains("Merged section: plugins"));
+
+        fs::remove_dir_all(root).expect("cleanup temp root");
     }
 
     #[test]
@@ -12164,10 +12180,23 @@ mod tests {
 
     #[test]
     fn config_report_uses_sectioned_layout() {
-        let report = render_config_report(None).expect("config report should render");
+        let _guard = env_lock();
+        let root = temp_dir();
+        let workspace = root.join("workspace");
+        let config_home = root.join("home").join(".claw");
+        fs::create_dir_all(&workspace).expect("workspace dir");
+        fs::create_dir_all(&config_home).expect("config home dir");
+
+        let report = with_config_home(&config_home, || {
+            with_current_dir(&workspace, || {
+                render_config_report(None).expect("config report should render")
+            })
+        });
         assert!(report.contains("Config"));
         assert!(report.contains("Discovered files"));
         assert!(report.contains("Merged JSON"));
+
+        fs::remove_dir_all(root).expect("cleanup temp root");
     }
 
     #[test]
