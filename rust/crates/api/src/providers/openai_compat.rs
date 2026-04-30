@@ -728,6 +728,7 @@ impl ToolCallState {
 
 #[derive(Debug, Deserialize)]
 struct ChatCompletionResponse {
+    #[serde(default)]
     id: String,
     model: String,
     choices: Vec<ChatChoice>,
@@ -775,6 +776,7 @@ struct OpenAiUsage {
 
 #[derive(Debug, Deserialize)]
 struct ChatCompletionChunk {
+    #[serde(default)]
     id: String,
     #[serde(default)]
     model: Option<String>,
