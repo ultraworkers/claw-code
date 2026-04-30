@@ -497,10 +497,12 @@ impl StreamState {
         }
 
         for choice in chunk.choices {
+            // Handle reasoning/thinking from various provider fields
             if let Some(reasoning) = choice
                 .delta
                 .reasoning_content
                 .filter(|value| !value.is_empty())
+                .or(choice.delta.thinking.and_then(|t| t.content).filter(|value| !value.is_empty()))
             {
                 if !self.thinking_started {
                     self.thinking_started = true;
@@ -796,10 +798,19 @@ struct ChunkChoice {
 struct ChunkDelta {
     #[serde(default)]
     content: Option<String>,
+    /// Some providers (GLM, DeepSeek) emit reasoning in `reasoning_content`
     #[serde(default)]
     reasoning_content: Option<String>,
+    #[serde(default)]
+    thinking: Option<ThinkingDelta>,
     #[serde(default, deserialize_with = "deserialize_null_as_empty_vec")]
     tool_calls: Vec<DeltaToolCall>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ThinkingDelta {
+    #[serde(default)]
+    content: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
