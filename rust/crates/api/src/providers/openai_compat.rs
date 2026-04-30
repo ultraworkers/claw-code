@@ -1521,6 +1521,7 @@ fn parse_sse_frame(
                     body: trimmed.chars().take(500).collect(),
                     retryable: false,
                     suggested_action: suggested_action_for_status(status),
+                    retry_after: None,
                 });
             }
         }
@@ -1536,6 +1537,7 @@ fn parse_sse_frame(
                 body: trimmed.chars().take(200).collect(),
                 retryable: false,
                 suggested_action: Some("verify the API endpoint URL is correct".to_string()),
+                retry_after: None,
             });
         }
         return Ok(None);
@@ -1574,22 +1576,6 @@ fn parse_sse_frame(
                 retry_after: None,
             });
         }
-    }
-    // Detect HTML or other non-JSON responses early for better error messages
-    let trimmed_payload = payload.trim();
-    if trimmed_payload.starts_with('<') || trimmed_payload.starts_with("<!") {
-        return Err(ApiError::Api {
-            status: reqwest::StatusCode::BAD_REQUEST,
-            error_type: Some("invalid_response".to_string()),
-            message: Some(
-                "provider returned HTML instead of JSON (check endpoint URL)".to_string(),
-            ),
-            request_id: None,
-            body: payload.chars().take(200).collect(),
-            retryable: false,
-            suggested_action: Some("verify the API endpoint URL is correct".to_string()),
-            retry_after: None,
-        });
     }
     serde_json::from_str::<ChatCompletionChunk>(&payload)
         .map(Some)
