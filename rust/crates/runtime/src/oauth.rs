@@ -405,107 +405,90 @@ pub fn run_oauth_callback_server(
 ) -> io::Result<OAuthCallbackResult> {
     use std::io::{BufRead, BufReader, Write};
     use std::net::{SocketAddr, TcpListener};
+    use std::sync::mpsc;
 
     let addr: SocketAddr = format!("127.0.0.1:{port}").parse().map_err(|e| {
         io::Error::new(io::ErrorKind::InvalidInput, format!("invalid address: {e}"))
     })?;
     let listener = TcpListener::bind(addr)?;
-    listener.set_nonblocking(false)?;
 
-    let start = std::time::Instant::now();
+    let (tx, rx) = mpsc::channel::<std::net::TcpStream>();
 
-    loop {
-        if start.elapsed() > timeout {
+    std::thread::spawn(move || {
+        if let Ok((stream, _)) = listener.accept() {
+            let _ = tx.send(stream);
+        }
+    });
+
+    let mut stream = match rx.recv_timeout(timeout) {
+        Ok(stream) => stream,
+        Err(mpsc::RecvTimeoutError::Timeout) => {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "OAuth callback timed out waiting for browser redirect",
             ));
         }
-
-        let (mut stream, _) = match listener.accept() {
-            Ok(conn) => conn,
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                std::thread::sleep(std::time::Duration::from_millis(100));
-                continue;
-            }
-            Err(e) => return Err(e),
-        };
-
-        let mut reader = BufReader::new(&mut stream);
-        let mut first_line = String::new();
-        reader.read_line(&mut first_line)?;
-
-        // Parse "GET /callback?code=...&state=... HTTP/1.1"
-        let target = first_line
-            .split_whitespace()
-            .nth(1)
-            .unwrap_or("");
-
-        // Consume remaining headers so browser doesn't reset connection
-        loop {
-            let mut line = String::new();
-            if reader.read_line(&mut line)? == 0 {
-                break;
-            }
-            if line == "\r\n" || line == "\n" {
-                break;
-            }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "callback server thread disconnected",
+            ));
         }
+    };
 
-        match parse_oauth_callback_request_target(target) {
-            Ok(params) => {
-                if let (Some(code), Some(state)) = (&params.code, &params.state) {
-                    // Success page
-                    let body = r#"<!DOCTYPE html>
+    let mut reader = BufReader::new(&mut stream);
+    let mut first_line = String::new();
+    reader.read_line(&mut first_line)?;
+
+    // Parse "GET /callback?code=...&state=... HTTP/1.1"
+    let target = first_line
+        .split_whitespace()
+        .nth(1)
+        .unwrap_or("");
+
+    // Consume remaining headers so browser doesn't reset connection
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line)? == 0 {
+            break;
+        }
+        if line == "\r\n" || line == "\n" {
+            break;
+        }
+    }
+
+    match parse_oauth_callback_request_target(target) {
+        Ok(params) => {
+            if let (Some(code), Some(state)) = (&params.code, &params.state) {
+                // Success page
+                let body = r#"<!DOCTYPE html>
 <html><head><title>Authentication Successful</title></head>
 <body style="font-family:sans-serif;text-align:center;padding:40px;">
 <h1>✅ Authentication Successful</h1>
 <p>You can close this tab and return to the terminal.</p>
 </body></html>"#;
-                    let response = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                        body.len(),
-                        body
-                    );
-                    stream.write_all(response.as_bytes())?;
-                    return Ok(OAuthCallbackResult {
-                        code: code.clone(),
-                        state: state.clone(),
-                    });
-                }
-                if let Some(error) = &params.error {
-                    let err_desc = params.error_description.as_deref().unwrap_or(error);
-                    let body = format!(
-                        r#"<!DOCTYPE html>
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(response.as_bytes())?;
+                return Ok(OAuthCallbackResult {
+                    code: code.clone(),
+                    state: state.clone(),
+                });
+            }
+            if let Some(error) = &params.error {
+                let err_desc = params.error_description.as_deref().unwrap_or(error);
+                let body = format!(
+                    r#"<!DOCTYPE html>
 <html><head><title>Authentication Failed</title></head>
 <body style="font-family:sans-serif;text-align:center;padding:40px;">
 <h1>❌ Authentication Failed</h1>
 <p>{}</p>
 <p>You can close this tab and return to the terminal.</p>
 </body></html>"#,
-                        html_escape(err_desc)
-                    );
-                    let response = format!(
-                        "HTTP/1.1 400 Bad Request\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                        body.len(),
-                        body
-                    );
-                    stream.write_all(response.as_bytes())?;
-                    return Err(io::Error::new(
-                        io::ErrorKind::Other,
-                        format!("OAuth error: {error} - {err_desc}"),
-                    ));
-                }
-            }
-            Err(e) => {
-                let body = format!(
-                    r#"<!DOCTYPE html>
-<html><head><title>Authentication Failed</title></head>
-<body style="font-family:sans-serif;text-align:center;padding:40px;">
-<h1>❌ Invalid Callback</h1>
-<p>{}</p>
-</body></html>"#,
-                    html_escape(&e)
+                    html_escape(err_desc)
                 );
                 let response = format!(
                     "HTTP/1.1 400 Bad Request\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -513,8 +496,33 @@ pub fn run_oauth_callback_server(
                     body
                 );
                 stream.write_all(response.as_bytes())?;
-                return Err(io::Error::new(io::ErrorKind::Other, e));
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("OAuth error: {error} - {err_desc}"),
+                ));
             }
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "callback received neither code nor error",
+            ))
+        }
+        Err(e) => {
+            let body = format!(
+                r#"<!DOCTYPE html>
+<html><head><title>Authentication Failed</title></head>
+<body style="font-family:sans-serif;text-align:center;padding:40px;">
+<h1>❌ Invalid Callback</h1>
+<p>{}</p>
+</body></html>"#,
+                html_escape(&e)
+            );
+            let response = format!(
+                "HTTP/1.1 400 Bad Request\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes())?;
+            Err(io::Error::new(io::ErrorKind::Other, e))
         }
     }
 }
@@ -802,10 +810,12 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        clear_oauth_credentials, code_challenge_s256, credentials_path, generate_pkce_pair,
-        generate_state, load_oauth_credentials, loopback_redirect_uri, parse_oauth_callback_query,
-        parse_oauth_callback_request_target, save_oauth_credentials, OAuthAuthorizationRequest,
-        OAuthConfig, OAuthRefreshRequest, OAuthTokenExchangeRequest, OAuthTokenSet,
+        clear_oauth_credentials, clear_provider_oauth, code_challenge_s256, credentials_path,
+        generate_pkce_pair, generate_state, load_oauth_credentials, load_provider_oauth,
+        loopback_redirect_uri, parse_oauth_callback_query, parse_oauth_callback_request_target,
+        run_oauth_callback_server, save_oauth_credentials, save_provider_oauth, html_escape,
+        OAuthAuthorizationRequest, OAuthConfig, OAuthRefreshRequest, OAuthTokenExchangeRequest,
+        OAuthTokenSet,
     };
 
     fn sample_config() -> OAuthConfig {
@@ -936,5 +946,175 @@ mod tests {
         assert_eq!(params.code.as_deref(), Some("abc"));
         assert_eq!(params.state.as_deref(), Some("xyz"));
         assert!(parse_oauth_callback_request_target("/wrong?code=abc").is_err());
+    }
+
+    #[test]
+    fn provider_oauth_credentials_round_trip_and_clear() {
+        let _guard = env_lock();
+        let config_home = temp_config_home();
+        std::env::set_var("CLAW_CONFIG_HOME", &config_home);
+        let path = credentials_path().expect("credentials path");
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("create parent");
+
+        let openai_tokens = OAuthTokenSet {
+            access_token: "openai-access".to_string(),
+            refresh_token: Some("openai-refresh".to_string()),
+            expires_at: Some(1000),
+            scopes: vec!["openid".to_string()],
+        };
+        let moonshot_tokens = OAuthTokenSet {
+            access_token: "moonshot-access".to_string(),
+            refresh_token: None,
+            expires_at: Some(2000),
+            scopes: vec!["profile".to_string()],
+        };
+
+        save_provider_oauth("openai", &openai_tokens).expect("save openai");
+        save_provider_oauth("moonshot", &moonshot_tokens).expect("save moonshot");
+
+        assert_eq!(
+            load_provider_oauth("openai").expect("load openai"),
+            Some(openai_tokens.clone())
+        );
+        assert_eq!(
+            load_provider_oauth("moonshot").expect("load moonshot"),
+            Some(moonshot_tokens.clone())
+        );
+        assert_eq!(
+            load_provider_oauth("unknown").expect("load unknown"),
+            None
+        );
+
+        let saved = std::fs::read_to_string(&path).expect("read saved file");
+        assert!(saved.contains("\"oauth_providers\""));
+        assert!(saved.contains("\"openai\""));
+        assert!(saved.contains("\"moonshot\""));
+
+        clear_provider_oauth("openai").expect("clear openai");
+        assert_eq!(load_provider_oauth("openai").expect("load cleared"), None);
+        assert_eq!(
+            load_provider_oauth("moonshot").expect("load moonshot after clear"),
+            Some(moonshot_tokens)
+        );
+
+        clear_provider_oauth("moonshot").expect("clear moonshot");
+        let cleared = std::fs::read_to_string(&path).expect("read cleared file");
+        assert!(!cleared.contains("\"oauth_providers\""));
+
+        std::env::remove_var("CLAW_CONFIG_HOME");
+        std::fs::remove_dir_all(config_home).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn provider_oauth_preserves_legacy_oauth_key() {
+        let _guard = env_lock();
+        let config_home = temp_config_home();
+        std::env::set_var("CLAW_CONFIG_HOME", &config_home);
+        let path = credentials_path().expect("credentials path");
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("create parent");
+
+        let legacy = OAuthTokenSet {
+            access_token: "legacy-access".to_string(),
+            refresh_token: Some("legacy-refresh".to_string()),
+            expires_at: Some(999),
+            scopes: vec!["org:read".to_string()],
+        };
+        save_oauth_credentials(&legacy).expect("save legacy");
+
+        let provider = OAuthTokenSet {
+            access_token: "provider-access".to_string(),
+            refresh_token: None,
+            expires_at: Some(888),
+            scopes: vec!["user:read".to_string()],
+        };
+        save_provider_oauth("openai", &provider).expect("save provider");
+
+        assert_eq!(
+            load_oauth_credentials().expect("load legacy"),
+            Some(legacy)
+        );
+        assert_eq!(
+            load_provider_oauth("openai").expect("load provider"),
+            Some(provider)
+        );
+
+        std::env::remove_var("CLAW_CONFIG_HOME");
+        std::fs::remove_dir_all(config_home).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn callback_server_returns_code_and_state() {
+        use std::io::{Read, Write};
+        use std::net::TcpStream;
+        use std::thread;
+
+        let port = 4547;
+        let server_thread = thread::spawn(move || {
+            run_oauth_callback_server(port, std::time::Duration::from_secs(5))
+        });
+
+        // Give the server a moment to bind
+        thread::sleep(std::time::Duration::from_millis(100));
+
+        // Simulate browser callback
+        let request = format!(
+            "GET /callback?code=test-code-123&state=test-state-456 HTTP/1.1\r\nHost: localhost:{port}\r\n\r\n"
+        );
+        let mut stream = TcpStream::connect(format!("127.0.0.1:{port}")).expect("connect to callback server");
+        stream.write_all(request.as_bytes()).expect("send request");
+        stream.flush().expect("flush");
+
+        // Read response (should be HTML success page)
+        let mut response = String::new();
+        stream.read_to_string(&mut response).expect("read response");
+        assert!(response.contains("200 OK"), "expected 200 OK, got: {response}");
+        assert!(response.contains("Authentication Successful"), "expected success page");
+
+        let result = server_thread.join().expect("server thread join");
+        let callback = result.expect("callback result");
+        assert_eq!(callback.code, "test-code-123");
+        assert_eq!(callback.state, "test-state-456");
+    }
+
+    #[test]
+    fn callback_server_returns_error_on_oauth_error() {
+        use std::io::{Read, Write};
+        use std::net::TcpStream;
+        use std::thread;
+
+        let port = 4548;
+        let server_thread = thread::spawn(move || {
+            run_oauth_callback_server(port, std::time::Duration::from_secs(5))
+        });
+
+        thread::sleep(std::time::Duration::from_millis(100));
+
+        let request = format!(
+            "GET /callback?error=access_denied&error_description=user%20denied HTTP/1.1\r\nHost: localhost:{port}\r\n\r\n"
+        );
+        let mut stream = TcpStream::connect(format!("127.0.0.1:{port}")).expect("connect");
+        stream.write_all(request.as_bytes()).expect("send");
+        stream.flush().expect("flush");
+
+        let mut response = String::new();
+        stream.read_to_string(&mut response).expect("read");
+        assert!(response.contains("400 Bad Request"), "expected 400, got: {response}");
+
+        let result = server_thread.join().expect("join");
+        assert!(result.is_err(), "expected error for OAuth error response");
+    }
+
+    #[test]
+    fn callback_server_times_out_when_no_request() {
+        let port = 4549;
+        let result = run_oauth_callback_server(port, std::time::Duration::from_millis(50));
+        assert!(result.is_err(), "expected timeout error");
+    }
+
+    #[test]
+    fn html_escape_works() {
+        assert_eq!(html_escape("<script>alert('xss')</script>"), "&lt;script&gt;alert('xss')&lt;/script&gt;");
+        assert_eq!(html_escape("foo & bar"), "foo &amp; bar");
+        assert_eq!(html_escape("\"quoted\""), "&quot;quoted&quot;");
     }
 }

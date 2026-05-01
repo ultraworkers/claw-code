@@ -14851,7 +14851,15 @@ mod dump_manifests_tests {
 
 #[cfg(test)]
 mod auth_tests {
-    use super::{parse_args, CliAction};
+    use std::sync::{Mutex, OnceLock};
+    use super::{parse_args, check_model_auth_available, BUILTIN_PROVIDERS, LOGIN_PROVIDER_TEMPLATES, CliAction};
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 
     #[test]
     fn parse_args_auth_without_provider() {
@@ -14871,5 +14879,94 @@ mod auth_tests {
             CliAction::Auth { provider } => assert_eq!(provider, Some("openai".to_string())),
             other => panic!("expected CliAction::Auth, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn openai_builtin_provider_has_oauth_config() {
+        let openai = BUILTIN_PROVIDERS
+            .iter()
+            .find(|p| p.id == "openai")
+            .expect("openai provider exists");
+        assert!(openai.oauth.is_some(), "openai should have OAuth config");
+        let oauth = openai.oauth.unwrap();
+        assert_eq!(oauth.client_id, "app_EMoamEEZ73f0CkXaXp7hrann");
+        assert_eq!(oauth.callback_port, 1455);
+    }
+
+    #[test]
+    fn anthropic_and_xai_have_no_oauth() {
+        for provider in BUILTIN_PROVIDERS.iter() {
+            if provider.id == "anthropic" || provider.id == "xai" {
+                assert!(provider.oauth.is_none(), "{} should not have OAuth", provider.id);
+            }
+        }
+    }
+
+    #[test]
+    fn moonshot_template_has_device_oauth() {
+        let moonshot = LOGIN_PROVIDER_TEMPLATES
+            .iter()
+            .find(|p| p.id == "moonshot")
+            .expect("moonshot template exists");
+        assert!(moonshot.oauth.is_some(), "moonshot should have OAuth config");
+        let oauth = moonshot.oauth.unwrap();
+        assert_eq!(oauth.client_id, "17e5f671-d194-4dfb-9706-5516cb48c098");
+    }
+
+    #[test]
+    fn zai_and_minimax_have_no_oauth() {
+        for template in LOGIN_PROVIDER_TEMPLATES.iter() {
+            if template.id == "zai" || template.id == "minimax-coding-plan" {
+                assert!(
+                    template.oauth.is_none(),
+                    "{} should not have OAuth",
+                    template.id
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn check_model_auth_available_detects_saved_oauth() {
+        let _guard = env_lock();
+        let config_home = std::env::temp_dir().join(format!(
+            "claw-oauth-auth-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::env::set_var("CLAW_CONFIG_HOME", &config_home);
+        std::fs::create_dir_all(&config_home).expect("create config home");
+
+        // Ensure no env var is set
+        std::env::remove_var("OPENAI_API_KEY");
+        std::env::remove_var("DASHSCOPE_API_KEY");
+
+        // Without saved OAuth, auth should not be available
+        assert!(
+            !check_model_auth_available("gpt-4o").expect("check auth"),
+            "auth should be unavailable without env or saved tokens"
+        );
+
+        // Save an OAuth token for openai
+        let token_set = runtime::OAuthTokenSet {
+            access_token: "test-access-token".to_string(),
+            refresh_token: Some("test-refresh".to_string()),
+            expires_at: Some(9999999999),
+            scopes: vec!["openid".to_string()],
+        };
+        runtime::save_provider_oauth("openai", &token_set).expect("save token");
+
+        // With saved OAuth, auth should be available
+        assert!(
+            check_model_auth_available("gpt-4o").expect("check auth with oauth"),
+            "auth should be available with saved OAuth token"
+        );
+
+        // Clean up
+        std::env::remove_var("CLAW_CONFIG_HOME");
+        std::fs::remove_dir_all(config_home).ok();
     }
 }
