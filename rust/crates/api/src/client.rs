@@ -128,6 +128,16 @@ impl ProviderClient {
         Self::Anthropic(AnthropicClient::new(api_key).with_base_url(base_url))
     }
 
+    /// Set a custom User-Agent header on the underlying OpenAI-compatible client.
+    /// No-op for Anthropic, xAI, or WHAM variants.
+    #[must_use]
+    pub fn with_user_agent(self, user_agent: impl Into<String>) -> Self {
+        match self {
+            Self::OpenAi(client) => Self::OpenAi(client.with_user_agent(user_agent)),
+            other => other,
+        }
+    }
+
     #[must_use]
     pub const fn provider_kind(&self) -> ProviderKind {
         match self {

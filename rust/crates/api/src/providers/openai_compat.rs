@@ -132,6 +132,8 @@ pub struct OpenAiCompatClient {
     initial_backoff: Duration,
     max_backoff: Duration,
     oauth_state: Option<std::sync::Arc<std::sync::Mutex<OpenAiCompatOAuthState>>>,
+    /// Custom User-Agent header for providers that gate access by client identity.
+    user_agent: Option<String>,
 }
 
 impl OpenAiCompatClient {
@@ -154,6 +156,7 @@ impl OpenAiCompatClient {
             initial_backoff: DEFAULT_INITIAL_BACKOFF,
             max_backoff: DEFAULT_MAX_BACKOFF,
             oauth_state: None,
+            user_agent: None,
         }
     }
 
@@ -202,6 +205,7 @@ impl OpenAiCompatClient {
                     provider_id: provider_id.into(),
                 },
             ))),
+            user_agent: None,
         }
     }
 
@@ -253,6 +257,12 @@ impl OpenAiCompatClient {
     #[must_use]
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into();
+        self
+    }
+
+    #[must_use]
+    pub fn with_user_agent(mut self, user_agent: impl Into<String>) -> Self {
+        self.user_agent = Some(user_agent.into());
         self
     }
 
@@ -457,14 +467,16 @@ impl OpenAiCompatClient {
         };
 
         let request_url = chat_completions_endpoint(&self.base_url);
-        self.http
+        let mut req = self
+            .http
             .post(&request_url)
             .header("content-type", "application/json")
             .bearer_auth(&access_token)
-            .json(&build_chat_completion_request(request, self.config()))
-            .send()
-            .await
-            .map_err(ApiError::from)
+            .json(&build_chat_completion_request(request, self.config()));
+        if let Some(ref ua) = self.user_agent {
+            req = req.header("user-agent", ua);
+        }
+        req.send().await.map_err(ApiError::from)
     }
 
     fn backoff_for_attempt(&self, attempt: u32) -> Result<Duration, ApiError> {

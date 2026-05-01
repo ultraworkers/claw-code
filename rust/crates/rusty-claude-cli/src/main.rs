@@ -8272,6 +8272,18 @@ impl AnthropicRuntimeClient {
                     .with_prompt_cache(PromptCache::new(session_id))
                 }
                 "openai-compatible" | "openai" => {
+                    // Kimi For Coding requires a whitelisted User-Agent.
+                    let user_agent = if provider.base_url.contains("api.kimi.com") {
+                        Some("claude-code/0.1.0")
+                    } else {
+                        None
+                    };
+                    let apply_ua = |client: ApiProviderClient| {
+                        match user_agent {
+                            Some(ua) => client.with_user_agent(ua),
+                            None => client,
+                        }
+                    };
                     // Route to WhamClient when using ChatGPT OAuth (WHAM backend).
                     if provider.base_url.contains("backend-api/wham") {
                         if let Ok(Some(token_set)) = runtime::load_provider_oauth("openai") {
@@ -8289,26 +8301,26 @@ impl AnthropicRuntimeClient {
                                 "app_EMoamEEZ73f0CkXaXp7hrann",
                             ))
                         } else {
-                            ApiProviderClient::from_openai_compatible_profile(
+                            apply_ua(ApiProviderClient::from_openai_compatible_profile(
                                 provider.api_key,
                                 provider.base_url,
-                            )
+                            ))
                         }
                     } else if let (Some(token_set), Some(token_url), Some(client_id)) =
                         (provider.oauth_token_set, provider.oauth_token_url, provider.oauth_client_id)
                     {
                         // Custom provider with OAuth: use auto-refreshing client.
-                        ApiProviderClient::from_openai_compatible_oauth(
+                        apply_ua(ApiProviderClient::from_openai_compatible_oauth(
                             provider.base_url,
                             token_set,
                             token_url,
                             client_id,
-                        )
+                        ))
                     } else {
-                        ApiProviderClient::from_openai_compatible_profile(
+                        apply_ua(ApiProviderClient::from_openai_compatible_profile(
                             provider.api_key,
                             provider.base_url,
-                        )
+                        ))
                     }
                 }
                 other => {
