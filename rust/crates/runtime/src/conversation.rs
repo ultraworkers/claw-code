@@ -17,6 +17,8 @@ use crate::usage::{TokenUsage, UsageTracker};
 
 const DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD: u32 = 100_000;
 const AUTO_COMPACTION_THRESHOLD_ENV_VAR: &str = "CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS";
+const DEFAULT_PREFLIGHT_COMPACTION_INPUT_TOKENS: usize = 80_000;
+const PREFLIGHT_COMPACTION_TOKENS_ENV_VAR: &str = "CLAUDE_CODE_PREFLIGHT_COMPACT_TOKENS";
 
 /// Fully assembled request payload sent to the upstream model client.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -114,6 +116,7 @@ pub struct TurnSummary {
     pub iterations: usize,
     pub usage: TokenUsage,
     pub auto_compaction: Option<AutoCompactionEvent>,
+    pub preflight_auto_compaction: Option<AutoCompactionEvent>,
 }
 
 /// Details about automatic session compaction applied during a turn.
@@ -133,6 +136,7 @@ pub struct ConversationRuntime<C, T> {
     usage_tracker: UsageTracker,
     hook_runner: HookRunner,
     auto_compaction_input_tokens_threshold: u32,
+    preflight_compaction_input_tokens_threshold: usize,
     hook_abort_signal: HookAbortSignal,
     hook_progress_reporter: Option<Box<dyn HookProgressReporter>>,
     session_tracer: Option<SessionTracer>,
@@ -182,6 +186,7 @@ where
             usage_tracker,
             hook_runner: HookRunner::from_feature_config(feature_config),
             auto_compaction_input_tokens_threshold: auto_compaction_threshold_from_env(),
+            preflight_compaction_input_tokens_threshold: preflight_compaction_threshold_from_env(),
             hook_abort_signal: HookAbortSignal::default(),
             hook_progress_reporter: None,
             session_tracer: None,
@@ -197,6 +202,12 @@ where
     #[must_use]
     pub fn with_auto_compaction_input_tokens_threshold(mut self, threshold: u32) -> Self {
         self.auto_compaction_input_tokens_threshold = threshold;
+        self
+    }
+
+    #[must_use]
+    pub fn with_preflight_compaction_input_tokens_threshold(mut self, threshold: usize) -> Self {
+        self.preflight_compaction_input_tokens_threshold = threshold;
         self
     }
 
@@ -338,6 +349,7 @@ where
         let mut tool_results = Vec::new();
         let mut prompt_cache_events = Vec::new();
         let mut iterations = 0;
+        let mut preflight_auto_compaction: Option<AutoCompactionEvent> = None;
 
         loop {
             iterations += 1;
@@ -348,6 +360,11 @@ where
                 self.record_turn_failed(iterations, &error);
                 return Err(error);
             }
+
+            // Preflight auto-compaction: compact before sending the request to prevent
+            // context overflow errors from the provider. This runs before every model
+            // request, unlike the post-turn compaction which only runs at turn end.
+            preflight_auto_compaction = self.maybe_preflight_compact();
 
             let request = ApiRequest {
                 system_prompt: self.system_prompt.clone(),
@@ -508,6 +525,7 @@ where
             iterations,
             usage: self.usage_tracker.cumulative_usage(),
             auto_compaction,
+            preflight_auto_compaction,
         };
         self.record_turn_completed(&summary);
 
@@ -556,6 +574,31 @@ where
         if self.usage_tracker.cumulative_usage().input_tokens
             < self.auto_compaction_input_tokens_threshold
         {
+            return None;
+        }
+
+        let result = compact_session(
+            &self.session,
+            CompactionConfig {
+                max_estimated_tokens: 0,
+                ..CompactionConfig::default()
+            },
+        );
+
+        if result.removed_message_count == 0 {
+            return None;
+        }
+
+        self.session = result.compacted_session;
+        Some(AutoCompactionEvent {
+            removed_message_count: result.removed_message_count,
+        })
+    }
+
+    fn maybe_preflight_compact(&mut self) -> Option<AutoCompactionEvent> {
+        let estimated_tokens = estimate_session_tokens(&self.session);
+
+        if estimated_tokens < self.preflight_compaction_input_tokens_threshold {
             return None;
         }
 
@@ -703,6 +746,16 @@ fn parse_auto_compaction_threshold(value: Option<&str>) -> u32 {
         .unwrap_or(DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD)
 }
 
+/// Reads the preflight compaction threshold from the environment.
+#[must_use]
+pub fn preflight_compaction_threshold_from_env() -> usize {
+    std::env::var(PREFLIGHT_COMPACTION_TOKENS_ENV_VAR)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .filter(|threshold| *threshold > 0)
+        .unwrap_or(DEFAULT_PREFLIGHT_COMPACTION_INPUT_TOKENS)
+}
+
 fn build_assistant_message(
     events: Vec<AssistantEvent>,
 ) -> Result<
@@ -822,9 +875,10 @@ impl ToolExecutor for StaticToolExecutor {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_assistant_message, parse_auto_compaction_threshold, ApiClient, ApiRequest,
-        AssistantEvent, AutoCompactionEvent, ConversationRuntime, PromptCacheEvent, RuntimeError,
-        StaticToolExecutor, ToolExecutor, DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD,
+        build_assistant_message, parse_auto_compaction_threshold, preflight_compaction_threshold_from_env,
+        ApiClient, ApiRequest, AssistantEvent, AutoCompactionEvent, ConversationRuntime,
+        PromptCacheEvent, RuntimeError, StaticToolExecutor, ToolExecutor,
+        DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD, DEFAULT_PREFLIGHT_COMPACTION_INPUT_TOKENS,
     };
     use crate::compact::CompactionConfig;
     use crate::config::{RuntimeFeatureConfig, RuntimeHookConfig};
@@ -1691,6 +1745,99 @@ mod tests {
             .expect("empty compacted session should not fail health probe");
         assert_eq!(summary.auto_compaction, None);
         assert_eq!(runtime.session().messages.len(), 2);
+    }
+
+    #[test]
+    fn preflight_skips_compaction_under_threshold() {
+        struct SimpleApi;
+        impl ApiClient for SimpleApi {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                Ok(vec![
+                    AssistantEvent::TextDelta("done".to_string()),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            SimpleApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_preflight_compaction_input_tokens_threshold(100_000);
+
+        let summary = runtime
+            .run_turn("small input", None)
+            .expect("turn should succeed");
+        assert_eq!(summary.preflight_auto_compaction, None);
+    }
+
+    #[test]
+    fn preflight_compacts_before_api_request() {
+        struct SimpleApi;
+        impl ApiClient for SimpleApi {
+            fn stream(
+                &mut self,
+                request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                // Request should have fewer messages after preflight compaction.
+                // A session with 100 tiny user messages should be well over the
+                // 100-token threshold and compacted before this API call.
+                assert!(
+                    request.messages.len() < 100,
+                    "Preflight compaction should reduce message count, got {}",
+                    request.messages.len()
+                );
+                Ok(vec![
+                    AssistantEvent::TextDelta("done".to_string()),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let mut session = Session::new();
+        // Add 100 user messages (well over 100 token threshold).
+        for i in 0..100 {
+            session
+                .messages
+                .push(crate::session::ConversationMessage::user_text(format!("message {i}")));
+        }
+
+        let mut runtime = ConversationRuntime::new(
+            session,
+            SimpleApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_preflight_compaction_input_tokens_threshold(100);
+
+        let summary = runtime
+            .run_turn("trigger", None)
+            .expect("turn should succeed");
+
+        assert!(summary.preflight_auto_compaction.is_some());
+        // With 101 messages (1 system + 100 user) and preserve_recent_messages=4,
+        // at least 95 messages should be removed.
+        assert!(
+            summary.preflight_auto_compaction.unwrap().removed_message_count >= 95,
+            "Should remove most messages during preflight compaction, got {}",
+            summary.preflight_auto_compaction.unwrap().removed_message_count
+        );
+    }
+
+    #[test]
+    fn preflight_compaction_threshold_comes_from_env() {
+        // Default is 80_000 when env var is not set.
+        assert_eq!(
+            preflight_compaction_threshold_from_env(),
+            DEFAULT_PREFLIGHT_COMPACTION_INPUT_TOKENS
+        );
     }
 
     #[test]
