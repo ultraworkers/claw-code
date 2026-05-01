@@ -42,7 +42,10 @@ impl ProviderClient {
                     Some(meta) if meta.auth_env == "MOONSHOT_API_KEY" => {
                         (OpenAiCompatConfig::moonshot(), Some("moonshot"))
                     }
-                    _ => (OpenAiCompatConfig::openai(), Some("openai")),
+                    // OpenAI Platform API requires API keys, not OAuth tokens.
+                    // OAuth tokens from auth.openai.com are WHAM-backend tokens
+                    // (for chatgpt.com/backend-api) and return 401 on api.openai.com.
+                    _ => (OpenAiCompatConfig::openai(), None),
                 };
                 // Try OAuth if the provider supports it and env var is not set
                 if let Some(provider_id) = oauth_provider_id {

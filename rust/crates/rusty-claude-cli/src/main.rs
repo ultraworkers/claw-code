@@ -1557,9 +1557,19 @@ fn configured_provider_for_model(
     } else if let Some(env_name) = provider.api_key_env() {
         if let Ok(key) = env::var(env_name) {
             key
-        } else if let Ok(Some(token_set)) = runtime::load_provider_oauth(provider_name) {
-            // Fall back to saved OAuth bearer token when env var is unset
-            token_set.access_token
+        } else if provider_name != "openai" {
+            // Fall back to saved OAuth bearer token when env var is unset.
+            // Skip for "openai": OAuth tokens from auth.openai.com are
+            // ChatGPT/WHAM-backend tokens, NOT Platform API tokens. They
+            // return 401 Unauthorized on api.openai.com/v1.
+            if let Ok(Some(token_set)) = runtime::load_provider_oauth(provider_name) {
+                token_set.access_token
+            } else {
+                return Err(format!(
+                    "model provider '{provider_name}' requires env var {env_name}"
+                )
+                .into());
+            }
         } else {
             return Err(format!(
                 "model provider '{provider_name}' requires env var {env_name}"
@@ -8300,16 +8310,13 @@ const BUILTIN_PROVIDERS: &[BuiltinProvider] = &[
         label: "OpenAI",
         env_var: "OPENAI_API_KEY",
         default_model: "gpt-4o",
-        oauth: Some(ProviderOAuthConfig {
-            client_id: "app_EMoamEEZ73f0CkXaXp7hrann",
-            callback_port: 1455,
-            redirect_path: "/auth/callback",
-            flow: OAuthFlowType::Pkce {
-                authorize_url: "https://auth.openai.com/oauth/authorize",
-                token_url: "https://auth.openai.com/oauth/token",
-                scopes: &["openid", "profile", "email", "offline_access"],
-            },
-        }),
+        // NOTE: OpenAI's OAuth (auth.openai.com, Codex CLI client_id) produces
+        // ChatGPT/WHAM-backend tokens, NOT Platform API tokens. These tokens
+        // authenticate your ChatGPT account, not your OpenAI Platform account.
+        // They work with chatgpt.com/backend-api but return 401 Unauthorized
+        // (Missing scopes: model.request) on api.openai.com/v1.
+        // OpenAI Platform API requires API keys (sk-...) only.
+        oauth: None,
     },
     BuiltinProvider {
         id: "xai",
@@ -8326,8 +8333,12 @@ fn check_model_auth_available(model: &str) -> Result<bool, Box<dyn std::error::E
     // If model has a provider/ prefix, check auth for that specific provider.
     // This works for ANY provider (built-in, template, or custom from .claw.json).
     if let Some((provider_name, _)) = resolved.split_once('/') {
-        // Generic OAuth check: any provider may have a saved OAuth token
-        if runtime::load_provider_oauth(provider_name).ok().flatten().is_some() {
+        // Generic OAuth check: any provider may have a saved OAuth token.
+        // Skip for "openai": OAuth tokens from auth.openai.com are WHAM-backend
+        // tokens and do NOT work with api.openai.com/v1 Platform API.
+        if provider_name != "openai"
+            && runtime::load_provider_oauth(provider_name).ok().flatten().is_some()
+        {
             return Ok(true);
         }
         // Check the provider's config from .claw.json for env var or hardcoded key
@@ -8359,11 +8370,10 @@ fn check_model_auth_available(model: &str) -> Result<bool, Box<dyn std::error::E
     // No prefix - use metadata_for_model for built-in model detection
     if let Some(meta) = api::metadata_for_model(&resolved) {
         let has_env = has_api_key(meta.auth_env);
-        // Generic OAuth check based on auth_env mapping
+        // OAuth fallback: only for providers whose OAuth tokens work with
+        // their inference endpoint. OpenAI OAuth tokens (from auth.openai.com)
+        // are ChatGPT/WHAM-backend tokens and return 401 on api.openai.com.
         let has_oauth = match meta.auth_env {
-            "OPENAI_API_KEY" => {
-                runtime::load_provider_oauth("openai").ok().flatten().is_some()
-            }
             "MOONSHOT_API_KEY" => {
                 runtime::load_provider_oauth("moonshot").ok().flatten().is_some()
             }
@@ -8381,7 +8391,6 @@ fn check_model_auth_available(model: &str) -> Result<bool, Box<dyn std::error::E
             has_api_key("OPENAI_API_KEY")
                 || has_api_key("DASHSCOPE_API_KEY")
                 || has_api_key("MOONSHOT_API_KEY")
-                || runtime::load_provider_oauth("openai").ok().flatten().is_some()
                 || runtime::load_provider_oauth("moonshot").ok().flatten().is_some()
         }
     };
@@ -15041,15 +15050,16 @@ mod auth_tests {
     }
 
     #[test]
-    fn openai_builtin_provider_has_oauth_config() {
+    fn openai_builtin_provider_has_no_oauth() {
         let openai = BUILTIN_PROVIDERS
             .iter()
             .find(|p| p.id == "openai")
             .expect("openai provider exists");
-        assert!(openai.oauth.is_some(), "openai should have OAuth config");
-        let oauth = openai.oauth.unwrap();
-        assert_eq!(oauth.client_id, "app_EMoamEEZ73f0CkXaXp7hrann");
-        assert_eq!(oauth.callback_port, 1455);
+        assert!(
+            openai.oauth.is_none(),
+            "openai should NOT have OAuth config — Platform API requires API keys, \
+             not ChatGPT/WHAM-backend OAuth tokens"
+        );
     }
 
     #[test]
@@ -15086,7 +15096,7 @@ mod auth_tests {
     }
 
     #[test]
-    fn check_model_auth_available_detects_saved_oauth() {
+    fn check_model_auth_available_detects_saved_moonshot_oauth() {
         let _guard = env_lock();
         let config_home = std::env::temp_dir().join(format!(
             "claw-oauth-auth-test-{}-{}",
@@ -15100,27 +15110,27 @@ mod auth_tests {
         std::fs::create_dir_all(&config_home).expect("create config home");
 
         // Ensure no env var is set
-        std::env::remove_var("OPENAI_API_KEY");
+        std::env::remove_var("MOONSHOT_API_KEY");
         std::env::remove_var("DASHSCOPE_API_KEY");
 
         // Without saved OAuth, auth should not be available
         assert!(
-            !check_model_auth_available("gpt-4o").expect("check auth"),
+            !check_model_auth_available("moonshot/moonshot-v1-8k").expect("check auth"),
             "auth should be unavailable without env or saved tokens"
         );
 
-        // Save an OAuth token for openai
+        // Save an OAuth token for moonshot
         let token_set = runtime::OAuthTokenSet {
             access_token: "test-access-token".to_string(),
             refresh_token: Some("test-refresh".to_string()),
             expires_at: Some(9999999999),
             scopes: vec!["openid".to_string()],
         };
-        runtime::save_provider_oauth("openai", &token_set).expect("save token");
+        runtime::save_provider_oauth("moonshot", &token_set).expect("save token");
 
         // With saved OAuth, auth should be available
         assert!(
-            check_model_auth_available("gpt-4o").expect("check auth with oauth"),
+            check_model_auth_available("moonshot/moonshot-v1-8k").expect("check auth with oauth"),
             "auth should be available with saved OAuth token"
         );
 
