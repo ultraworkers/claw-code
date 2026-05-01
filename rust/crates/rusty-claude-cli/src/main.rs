@@ -8634,7 +8634,8 @@ fn run_pkce_oauth_flow(
     if provider_id == "openai" {
         auth_request = auth_request
             .with_extra_param("id_token_add_organizations", "true")
-            .with_extra_param("codex_cli_simplified_flow", "true");
+            .with_extra_param("codex_cli_simplified_flow", "true")
+            .with_extra_param("originator", "codex_cli_rs");
     }
 
     let auth_url = auth_request.build_url();
