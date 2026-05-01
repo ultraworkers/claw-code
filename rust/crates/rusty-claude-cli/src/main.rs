@@ -24,9 +24,10 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use api::{
-    detect_provider_kind, resolve_startup_auth_source, AnthropicClient, AuthSource,
-    ContentBlockDelta, InputContentBlock, InputMessage, MessageRequest, MessageResponse,
-    OutputContentBlock, PromptCache, ProviderClient as ApiProviderClient, ProviderKind,
+    anthropic_has_auth, detect_provider_kind, has_api_key, metadata_for_model,
+    resolve_startup_auth_source, AnthropicClient, AuthSource, ContentBlockDelta, InputContentBlock,
+    InputMessage, MessageRequest, MessageResponse, OutputContentBlock, PromptCache,
+    ProviderClient as ApiProviderClient, ProviderKind, ProviderMetadata,
     StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
 };
 
@@ -94,6 +95,21 @@ struct ModelProvenance {
     raw: Option<String>,
     /// Where the resolved model string originated.
     source: ModelSource,
+}
+
+#[derive(Debug, Clone)]
+struct ConfiguredModelProvider {
+    wire_model: String,
+    provider_type: String,
+    api_key: String,
+    base_url: String,
+    /// Full OAuth token set when auth came from saved OAuth credentials.
+    /// Enables automatic token refresh for custom providers.
+    oauth_token_set: Option<runtime::OAuthTokenSet>,
+    /// OAuth token URL for refreshing the access token.
+    oauth_token_url: Option<String>,
+    /// OAuth client ID for refreshing the access token.
+    oauth_client_id: Option<String>,
 }
 
 impl ModelProvenance {
@@ -364,6 +380,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             output_format,
         } => print_system_prompt(cwd, date, output_format)?,
         CliAction::Version { output_format } => print_version(output_format)?,
+        CliAction::Login => {
+            if let Some(model) = run_login_wizard()? {
+                println!("Configured provider. Use `claw --model {model}` or `/model {model}`.");
+            }
+        }
         CliAction::ResumeSession {
             session_path,
             commands,
@@ -407,7 +428,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 None
             };
             let effective_prompt = merge_prompt_with_stdin(&prompt, stdin_context.as_deref());
-            let mut cli = LiveCli::new(model, true, allowed_tools, permission_mode)?;
+            let resolved_model = resolve_model_alias_with_config(&model);
+            let final_model = if !check_model_auth_available(&resolved_model)? {
+                match run_provider_welcome(&resolved_model)? {
+                    Some(new_model) => new_model,
+                    None => return Ok(()),
+                }
+            } else {
+                resolved_model
+            };
+            let mut cli = LiveCli::new(final_model, true, allowed_tools, permission_mode)?;
             cli.set_reasoning_effort(reasoning_effort);
             cli.run_turn_with_output(&effective_prompt, output_format, compact)?;
         }
@@ -464,6 +494,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             reasoning_effort,
             allow_broad_cwd,
         )?,
+        CliAction::Auth { provider } => run_auth_command(provider.as_deref())?,
+        CliAction::Model { name } => run_model_command(name.as_deref())?,
         CliAction::HelpTopic(topic) => print_help_topic(topic),
         CliAction::Help { output_format } => print_help(output_format)?,
     }
@@ -504,6 +536,7 @@ enum CliAction {
     Version {
         output_format: CliOutputFormat,
     },
+    Login,
     ResumeSession {
         session_path: PathBuf,
         commands: Vec<String>,
@@ -566,6 +599,12 @@ enum CliAction {
         base_commit: Option<String>,
         reasoning_effort: Option<String>,
         allow_broad_cwd: bool,
+    },
+    Auth {
+        provider: Option<String>,
+    },
+    Model {
+        name: Option<String>,
     },
     HelpTopic(LocalHelpTopic),
     // prompt-mode formatting is only supported for non-interactive runs
@@ -948,7 +987,36 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         }
         "system-prompt" => parse_system_prompt_args(&rest[1..], output_format),
         "acp" => parse_acp_args(&rest[1..], output_format),
-        "login" | "logout" => Err(removed_auth_surface_error(rest[0].as_str())),
+        "login" => Ok(CliAction::Login),
+        "logout" => Err(removed_auth_surface_error(rest[0].as_str())),
+        "auth" => {
+            if rest.len() == 2 && is_help_flag(&rest[1]) {
+                return Ok(CliAction::Help { output_format });
+            }
+            let provider = rest.get(1).cloned();
+            if rest.len() > 2 {
+                return Err(format!(
+                    "unexpected extra arguments after `claw auth {}`: {}",
+                    provider.as_deref().unwrap_or(""),
+                    rest[2..].join(" ")
+                ));
+            }
+            Ok(CliAction::Auth { provider })
+        }
+        "model" | "models" => {
+            if rest.len() == 2 && is_help_flag(&rest[1]) {
+                return Ok(CliAction::Help { output_format });
+            }
+            let name = rest.get(1).cloned();
+            if rest.len() > 2 {
+                return Err(format!(
+                    "unexpected extra arguments after `claw model {}`: {}",
+                    name.as_deref().unwrap_or(""),
+                    rest[2..].join(" ")
+                ));
+            }
+            Ok(CliAction::Model { name })
+        }
         "init" => Ok(CliAction::Init { output_format }),
         "export" => parse_export_args(&rest[1..], output_format),
         "prompt" => {
@@ -1108,11 +1176,11 @@ fn parse_single_word_command_alias(
         "sandbox" => Some(Ok(CliAction::Sandbox { output_format })),
         "doctor" => Some(Ok(CliAction::Doctor { output_format })),
         "state" => Some(Ok(CliAction::State { output_format })),
-        // #146: let `config` and `diff` fall through to parse_subcommand
+        // #146: let `config`, `diff`, and `model` fall through to parse_subcommand
         // where they are wired as pure-local introspection, instead of
         // producing the "is a slash command" guidance. Zero-arg cases
         // reach parse_subcommand too via this None.
-        "config" | "diff" => None,
+        "config" | "diff" | "model" | "models" => None,
         other => bare_slash_command_guidance(other).map(Err),
     }
 }
@@ -1339,6 +1407,7 @@ fn suggest_similar_subcommand(input: &str) -> Option<Vec<String>> {
         "init",
         "export",
         "prompt",
+        "auth",
     ];
 
     let normalized_input = input.to_ascii_lowercase();
@@ -1443,7 +1512,480 @@ fn resolve_model_alias_with_config(model: &str) -> String {
     if let Some(resolved) = config_alias_for_current_dir(trimmed) {
         return resolve_model_alias(&resolved).to_string();
     }
+    if let Some(resolved) = config_provider_default_model_for_current_dir(trimmed) {
+        return resolved;
+    }
     resolve_model_alias(trimmed).to_string()
+}
+
+fn config_provider_default_model_for_current_dir(provider_name: &str) -> Option<String> {
+    if provider_name.is_empty() || provider_name.contains('/') {
+        return None;
+    }
+    let cwd = env::current_dir().ok()?;
+    let loader = ConfigLoader::default_for(&cwd);
+    let config = loader.load().ok()?;
+    let provider = config.model_providers().get(provider_name)?;
+    let model = provider
+        .default_model()
+        .or_else(|| provider.models().first().map(String::as_str))?;
+    Some(format!("{provider_name}/{model}"))
+}
+
+fn configured_provider_names_for_current_dir() -> Vec<String> {
+    let Ok(cwd) = env::current_dir() else {
+        return Vec::new();
+    };
+    let loader = ConfigLoader::default_for(&cwd);
+    loader
+        .load()
+        .map(|config| config.model_providers().keys().cloned().collect())
+        .unwrap_or_default()
+}
+
+fn configured_provider_for_model(
+    model: &str,
+) -> Result<Option<ConfiguredModelProvider>, Box<dyn std::error::Error>> {
+    let Some((provider_name, requested_model)) = model.split_once('/') else {
+        return Ok(None);
+    };
+    let cwd = env::current_dir()?;
+    let config = ConfigLoader::default_for(&cwd).load()?;
+    let Some(provider) = config.model_providers().get(provider_name) else {
+        return Ok(None);
+    };
+    if !matches!(
+        provider.provider_type(),
+        "openai-compatible" | "openai" | "anthropic-compatible" | "anthropic"
+    ) {
+        return Err(format!(
+            "model provider '{provider_name}' uses unsupported type '{}'",
+            provider.provider_type()
+        )
+        .into());
+    }
+    let wire_model = if requested_model.is_empty() {
+        provider.default_model().ok_or_else(|| {
+            format!("model provider '{provider_name}' does not define defaultModel")
+        })?
+    } else {
+        requested_model
+    };
+    if !provider.models().is_empty() && !provider.models().iter().any(|model| model == wire_model) {
+        return Err(format!(
+            "model '{wire_model}' is not listed in modelProviders.{provider_name}.models"
+        )
+        .into());
+    }
+    let (api_key, base_url, oauth_token_set, oauth_token_url, oauth_client_id) =
+        if let Some(api_key) = provider.api_key().filter(|value| !value.is_empty()) {
+            (
+                api_key.to_string(),
+                provider.base_url().to_string(),
+                None,
+                None,
+                None,
+            )
+        } else if let Some(env_name) = provider.api_key_env() {
+            if let Ok(key) = env::var(env_name) {
+                (
+                    key,
+                    provider.base_url().to_string(),
+                    None,
+                    None,
+                    None,
+                )
+            } else if let Ok(Some(token_set)) = runtime::load_provider_oauth(provider_name) {
+                // Fall back to saved OAuth bearer token when env var is unset.
+                // For OpenAI, OAuth tokens are WHAM-backend tokens, not Platform API tokens.
+                // Override the base URL to the WHAM backend.
+                let base_url = if provider_name == "openai" {
+                    api::DEFAULT_WHAM_BASE_URL.to_string()
+                } else {
+                    provider.base_url().to_string()
+                };
+                // Look up OAuth refresh config from login templates so custom
+                // providers that match built-in templates get automatic refresh.
+                let template_oauth = LOGIN_PROVIDER_TEMPLATES
+                    .iter()
+                    .find(|t| t.id == provider_name)
+                    .and_then(|t| t.oauth.as_ref())
+                    .or_else(|| {
+                        LOGIN_PROVIDER_TEMPLATES
+                            .iter()
+                            .find(|t| t.base_url == provider.base_url())
+                            .and_then(|t| t.oauth.as_ref())
+                    });
+                let (token_url, client_id) = match template_oauth {
+                    Some(oauth) => {
+                        let token_url = match oauth.flow {
+                            OAuthFlowType::Device { token_url, .. } => token_url,
+                            OAuthFlowType::Pkce { token_url, .. } => token_url,
+                        };
+                        (Some(token_url.to_string()), Some(oauth.client_id.to_string()))
+                    }
+                    None => (None, None),
+                };
+                (
+                    token_set.access_token.clone(),
+                    base_url,
+                    Some(token_set),
+                    token_url,
+                    client_id,
+                )
+            } else {
+                return Err(format!(
+                    "model provider '{provider_name}' requires env var {env_name}"
+                )
+                .into());
+            }
+        } else {
+            return Err(
+                format!("model provider '{provider_name}' requires apiKeyEnv or apiKey").into(),
+            );
+        };
+    Ok(Some(ConfiguredModelProvider {
+        wire_model: wire_model.to_string(),
+        provider_type: provider.provider_type().to_string(),
+        api_key,
+        base_url,
+        oauth_token_set,
+        oauth_token_url,
+        oauth_client_id,
+    }))
+}
+
+struct LoginProviderTemplate {
+    id: &'static str,
+    label: &'static str,
+    provider_type: &'static str,
+    base_url: &'static str,
+    api_key_env: &'static str,
+    models: &'static [&'static str],
+    default_model: &'static str,
+    oauth: Option<ProviderOAuthConfig>,
+}
+
+const LOGIN_PROVIDER_TEMPLATES: &[LoginProviderTemplate] = &[
+    LoginProviderTemplate {
+        id: "zai",
+        label: "Z.AI",
+        provider_type: "openai-compatible",
+        base_url: "https://api.z.ai/api/paas/v4",
+        api_key_env: "Z_AI_API_KEY",
+        models: &[
+            "glm-5.1",
+            "glm-5",
+            "glm-5-turbo",
+            "glm-4.7",
+            "glm-4.7-flashx",
+            "glm-4.7-flash",
+            "glm-4.6",
+            "glm-4.5",
+            "glm-4.5-x",
+            "glm-4.5-air",
+            "glm-4.5-airx",
+            "glm-4.5-flash",
+            "glm-4-32b-0414-128k",
+        ],
+        default_model: "glm-5.1",
+        oauth: None,
+    },
+    LoginProviderTemplate {
+        id: "zai-coding-plan",
+        label: "Z.AI Coding Plan",
+        provider_type: "openai-compatible",
+        base_url: "https://api.z.ai/api/coding/paas/v4",
+        api_key_env: "Z_AI_API_KEY",
+        models: &[
+            "glm-4.5-air",
+            "glm-4.7",
+            "glm-5-turbo",
+            "glm-5.1",
+            "glm-5v-turbo",
+        ],
+        default_model: "glm-5.1",
+        oauth: None,
+    },
+    LoginProviderTemplate {
+        id: "minimax-coding-plan",
+        label: "MiniMax Coding Plan",
+        provider_type: "anthropic-compatible",
+        base_url: "https://api.minimax.io/anthropic/v1",
+        api_key_env: "MINIMAX_API_KEY",
+        models: &[
+            "MiniMax-M2",
+            "MiniMax-M2.1",
+            "MiniMax-M2.5",
+            "MiniMax-M2.5-highspeed",
+            "MiniMax-M2.7",
+            "MiniMax-M2.7-highspeed",
+        ],
+        default_model: "MiniMax-M2.7-highspeed",
+        oauth: None,
+    },
+    LoginProviderTemplate {
+        id: "kimi-for-coding",
+        label: "Kimi For Coding",
+        provider_type: "anthropic-compatible",
+        base_url: "https://api.kimi.com/coding/v1",
+        api_key_env: "KIMI_API_KEY",
+        models: &["k2p5", "k2p6", "kimi-k2-thinking"],
+        default_model: "k2p6",
+        oauth: None,
+    },
+    LoginProviderTemplate {
+        id: "moonshot",
+        label: "Moonshot / Kimi",
+        provider_type: "openai-compatible",
+        base_url: "https://api.moonshot.ai/v1",
+        api_key_env: "MOONSHOT_API_KEY",
+        models: &[
+            "kimi-k2.6",
+            "kimi-k2.5",
+            "kimi-k2-0905-preview",
+            "kimi-k2-0711-preview",
+            "kimi-k2-turbo-preview",
+            "kimi-k2-thinking",
+            "kimi-k2-thinking-turbo",
+            "moonshot-v1-8k",
+            "moonshot-v1-32k",
+            "moonshot-v1-128k",
+            "moonshot-v1-8k-vision-preview",
+            "moonshot-v1-32k-vision-preview",
+            "moonshot-v1-128k-vision-preview",
+        ],
+        default_model: "kimi-k2.6",
+        oauth: Some(ProviderOAuthConfig {
+            client_id: "17e5f671-d194-4dfb-9706-5516cb48c098",
+            callback_port: 4546,
+            redirect_path: "/callback",
+            flow: OAuthFlowType::Device {
+                device_auth_url: "https://auth.kimi.com/api/oauth/device_authorization",
+                token_url: "https://auth.kimi.com/api/oauth/token",
+                scopes: &["openid", "profile", "email"],
+            },
+        }),
+    },
+];
+
+fn run_login_wizard() -> Result<Option<String>, Box<dyn std::error::Error>> {
+    if !io::stdin().is_terminal() {
+        return Err("login requires an interactive terminal".into());
+    }
+
+    println!();
+    println!("Claw provider login");
+    println!("Configure a model provider profile.");
+    println!("Press Enter to accept defaults.");
+    println!();
+
+    for (index, provider) in LOGIN_PROVIDER_TEMPLATES.iter().enumerate() {
+        println!("  [{}] {}", index + 1, provider.label);
+    }
+    println!(
+        "  [{}] Custom compatible endpoint",
+        LOGIN_PROVIDER_TEMPLATES.len() + 1
+    );
+
+    let choice = read_prompt("Select provider [1]: ")?;
+    let choice = if choice.trim().is_empty() {
+        1
+    } else {
+        choice.trim().parse::<usize>()?
+    };
+
+    let (
+        provider_id,
+        label,
+        provider_type,
+        default_base_url,
+        default_api_key_env,
+        default_models,
+        default_model,
+    ) = if choice == LOGIN_PROVIDER_TEMPLATES.len() + 1 {
+        let id = read_required_prompt("Provider id (e.g. openrouter): ")?;
+        let provider_type = read_prompt(
+            "Provider type [openai-compatible, anthropic-compatible] [openai-compatible]: ",
+        )?;
+        let provider_type = if provider_type.trim().is_empty() {
+            "openai-compatible".to_string()
+        } else {
+            provider_type.trim().to_string()
+        };
+        if !matches!(
+            provider_type.as_str(),
+            "openai-compatible" | "openai" | "anthropic-compatible" | "anthropic"
+        ) {
+            return Err(format!("unsupported provider type: {provider_type}").into());
+        }
+        let base_url = read_required_prompt("Base URL: ")?;
+        let api_key_env = read_prompt("API key env var [OPENAI_API_KEY]: ")?;
+        let model = read_required_prompt("Default model: ")?;
+        (
+            id,
+            "Custom".to_string(),
+            provider_type,
+            base_url,
+            if api_key_env.trim().is_empty() {
+                "OPENAI_API_KEY".to_string()
+            } else {
+                api_key_env.trim().to_string()
+            },
+            vec![model.clone()],
+            model,
+        )
+    } else {
+        let template = LOGIN_PROVIDER_TEMPLATES
+            .get(choice.saturating_sub(1))
+            .ok_or_else(|| format!("invalid provider choice: {choice}"))?;
+        (
+            template.id.to_string(),
+            template.label.to_string(),
+            template.provider_type.to_string(),
+            template.base_url.to_string(),
+            template.api_key_env.to_string(),
+            template
+                .models
+                .iter()
+                .map(|model| (*model).to_string())
+                .collect::<Vec<_>>(),
+            template.default_model.to_string(),
+        )
+    };
+
+    println!();
+    println!("{label}");
+    println!("Provider type: {provider_type}");
+    let base_url = read_prompt(&format!("Base URL [{default_base_url}]: "))?;
+    let base_url = if base_url.trim().is_empty() {
+        default_base_url
+    } else {
+        base_url.trim().to_string()
+    };
+    let api_key_env = read_prompt(&format!("API key env var [{default_api_key_env}]: "))?;
+    let api_key_env = if api_key_env.trim().is_empty() {
+        default_api_key_env
+    } else {
+        api_key_env.trim().to_string()
+    };
+
+    let token = read_prompt("Paste API key / bearer token now, or press Enter to use env var: ")?;
+    let api_key = (!token.trim().is_empty()).then(|| token.trim().to_string());
+
+    println!("Available models: {}", default_models.join(", "));
+    let model = read_prompt(&format!("Default model [{default_model}]: "))?;
+    let model = if model.trim().is_empty() {
+        default_model
+    } else {
+        model.trim().to_string()
+    };
+    let mut models = default_models;
+    if !models.iter().any(|known| known == &model) {
+        models.push(model.clone());
+    }
+
+    save_model_provider_profile(
+        &provider_id,
+        &provider_type,
+        &base_url,
+        &api_key_env,
+        api_key.as_deref(),
+        &models,
+        &model,
+    )?;
+    Ok(Some(format!("{provider_id}/{model}")))
+}
+
+fn read_prompt(prompt: &str) -> Result<String, Box<dyn std::error::Error>> {
+    print!("{prompt}");
+    io::stdout().flush()?;
+    let mut buffer = String::new();
+    io::stdin().read_line(&mut buffer)?;
+    Ok(buffer)
+}
+
+fn read_required_prompt(prompt: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let value = read_prompt(prompt)?;
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(format!("{prompt} is required").into());
+    }
+    Ok(value.to_string())
+}
+
+fn save_model_provider_profile(
+    provider_id: &str,
+    provider_type: &str,
+    base_url: &str,
+    api_key_env: &str,
+    api_key: Option<&str>,
+    models: &[String],
+    default_model: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let cwd = env::current_dir()?;
+    let config_home = ConfigLoader::default_for(&cwd).config_home().to_path_buf();
+    fs::create_dir_all(&config_home)?;
+    let settings_path = config_home.join("settings.json");
+    let mut root = match fs::read_to_string(&settings_path) {
+        Ok(contents) if !contents.trim().is_empty() => serde_json::from_str::<Value>(&contents)?,
+        Ok(_) => Value::Object(Map::new()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Value::Object(Map::new()),
+        Err(error) => return Err(error.into()),
+    };
+    if !root.is_object() {
+        root = Value::Object(Map::new());
+    }
+    let root_object = root.as_object_mut().expect("root object initialized");
+    let providers = root_object
+        .entry("modelProviders")
+        .or_insert_with(|| Value::Object(Map::new()));
+    if !providers.is_object() {
+        *providers = Value::Object(Map::new());
+    }
+    let provider_map = providers
+        .as_object_mut()
+        .expect("modelProviders object initialized");
+
+    let mut provider = Map::new();
+    provider.insert("type".to_string(), Value::String(provider_type.to_string()));
+    provider.insert("baseUrl".to_string(), Value::String(base_url.to_string()));
+    provider.insert(
+        "apiKeyEnv".to_string(),
+        Value::String(api_key_env.to_string()),
+    );
+    if let Some(api_key) = api_key {
+        provider.insert("apiKey".to_string(), Value::String(api_key.to_string()));
+    }
+    provider.insert(
+        "models".to_string(),
+        Value::Array(
+            models
+                .iter()
+                .map(|model| Value::String(model.clone()))
+                .collect(),
+        ),
+    );
+    provider.insert(
+        "defaultModel".to_string(),
+        Value::String(default_model.to_string()),
+    );
+    provider_map.insert(provider_id.to_string(), Value::Object(provider));
+    root_object.insert(
+        "model".to_string(),
+        Value::String(format!("{provider_id}/{default_model}")),
+    );
+
+    let serialized = format!("{}\n", serde_json::to_string_pretty(&root)?);
+    fs::write(&settings_path, serialized)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = fs::metadata(&settings_path)?.permissions();
+        permissions.set_mode(0o600);
+        fs::set_permissions(&settings_path, permissions)?;
+    }
+    Ok(())
 }
 
 /// Validate model syntax at parse time.
@@ -1458,6 +2000,12 @@ fn validate_model_syntax(model: &str) -> Result<(), String> {
     match trimmed {
         "opus" | "sonnet" | "haiku" => return Ok(()),
         _ => {}
+    }
+    if configured_provider_names_for_current_dir()
+        .iter()
+        .any(|name| name == trimmed)
+    {
+        return Ok(());
     }
     // Check for spaces (malformed)
     if trimmed.contains(' ') {
@@ -2117,7 +2665,7 @@ fn check_auth_health() -> DiagnosticCheck {
                     token_set.scopes.join(",")
                 }
             ),
-            "Suggested action  set ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN; `claw login` is removed"
+            "Suggested action  set ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN for Anthropic, or run `claw login` to configure a compatible provider"
                 .to_string(),
         ])
         .with_data(Map::from_iter([
@@ -3772,6 +4320,21 @@ fn run_repl(
     enforce_broad_cwd_policy(allow_broad_cwd, CliOutputFormat::Text)?;
     run_stale_base_preflight(base_commit.as_deref());
     let resolved_model = resolve_repl_model(model);
+    if !check_model_auth_available(&resolved_model)? {
+        match run_provider_welcome(&resolved_model)? {
+            Some(new_model) => {
+                return run_repl(
+                    new_model,
+                    allowed_tools,
+                    permission_mode,
+                    base_commit,
+                    reasoning_effort,
+                    allow_broad_cwd,
+                );
+            }
+            None => return Ok(()),
+        }
+    }
     let mut cli = LiveCli::new(resolved_model, true, allowed_tools, permission_mode)?;
     cli.set_reasoning_effort(reasoning_effort);
     let mut editor =
@@ -4713,8 +5276,13 @@ impl LiveCli {
                 println!("{}", format_cost_report(usage));
                 false
             }
-            SlashCommand::Login
-            | SlashCommand::Logout
+            SlashCommand::Login => {
+                if let Some(model) = run_login_wizard()? {
+                    self.set_model(Some(model))?;
+                }
+                false
+            }
+            SlashCommand::Logout
             | SlashCommand::Vim
             | SlashCommand::Upgrade
             | SlashCommand::Share
@@ -7527,6 +8095,10 @@ fn build_runtime_with_plugin_state(
         plugin_registry,
         mcp_state,
     } = runtime_plugin_state;
+    let configured_provider = configured_provider_for_model(&model)?;
+    let request_model = configured_provider
+        .as_ref()
+        .map_or_else(|| model.clone(), |provider| provider.wire_model.clone());
     plugin_registry.initialize()?;
     let policy = permission_policy(permission_mode, &feature_config, &tool_registry)
         .map_err(std::io::Error::other)?;
@@ -7534,7 +8106,8 @@ fn build_runtime_with_plugin_state(
         session,
         AnthropicRuntimeClient::new(
             session_id,
-            model,
+            request_model,
+            configured_provider,
             enable_tools,
             emit_output,
             allowed_tools.clone(),
@@ -7662,6 +8235,7 @@ impl AnthropicRuntimeClient {
     fn new(
         session_id: &str,
         model: String,
+        configured_provider: Option<ConfiguredModelProvider>,
         enable_tools: bool,
         emit_output: bool,
         allowed_tools: Option<AllowedToolSet>,
@@ -7688,26 +8262,93 @@ impl AnthropicRuntimeClient {
         // prompt cache is Anthropic-only so non-Anthropic variants
         // skip it.
         let resolved_model = api::resolve_model_alias(&model);
-        let client = match detect_provider_kind(&resolved_model) {
-            ProviderKind::Anthropic => {
-                let auth = resolve_cli_auth_source()?;
-                let inner = AnthropicClient::from_auth(auth)
-                    .with_base_url(api::read_base_url())
-                    .with_prompt_cache(PromptCache::new(session_id));
-                ApiProviderClient::Anthropic(inner)
+        let client = if let Some(provider) = configured_provider {
+            match provider.provider_type.as_str() {
+                "anthropic-compatible" | "anthropic" => {
+                    ApiProviderClient::from_anthropic_compatible_profile(
+                        provider.api_key,
+                        provider.base_url,
+                    )
+                    .with_prompt_cache(PromptCache::new(session_id))
+                }
+                "openai-compatible" | "openai" => {
+                    // Kimi For Coding requires a whitelisted User-Agent.
+                    let user_agent = if provider.base_url.contains("api.kimi.com") {
+                        Some("claude-code/0.1.0")
+                    } else {
+                        None
+                    };
+                    let apply_ua = |client: ApiProviderClient| {
+                        match user_agent {
+                            Some(ua) => client.with_user_agent(ua),
+                            None => client,
+                        }
+                    };
+                    // Route to WhamClient when using ChatGPT OAuth (WHAM backend).
+                    if provider.base_url.contains("backend-api/wham") {
+                        if let Ok(Some(token_set)) = runtime::load_provider_oauth("openai") {
+                            let account_id = token_set
+                                .id_token
+                                .as_deref()
+                                .and_then(runtime::extract_chatgpt_account_id)
+                                .or_else(|| {
+                                    runtime::extract_chatgpt_account_id(&token_set.access_token)
+                                });
+                            ApiProviderClient::Wham(api::WhamClient::from_oauth_token_set(
+                                token_set,
+                                account_id,
+                                "https://auth.openai.com/oauth/token",
+                                "app_EMoamEEZ73f0CkXaXp7hrann",
+                            ))
+                        } else {
+                            apply_ua(ApiProviderClient::from_openai_compatible_profile(
+                                provider.api_key,
+                                provider.base_url,
+                            ))
+                        }
+                    } else if let (Some(token_set), Some(token_url), Some(client_id)) =
+                        (provider.oauth_token_set, provider.oauth_token_url, provider.oauth_client_id)
+                    {
+                        // Custom provider with OAuth: use auto-refreshing client.
+                        apply_ua(ApiProviderClient::from_openai_compatible_oauth(
+                            provider.base_url,
+                            token_set,
+                            token_url,
+                            client_id,
+                        ))
+                    } else {
+                        apply_ua(ApiProviderClient::from_openai_compatible_profile(
+                            provider.api_key,
+                            provider.base_url,
+                        ))
+                    }
+                }
+                other => {
+                    return Err(format!("unsupported provider type: {other}").into());
+                }
             }
-            ProviderKind::Xai | ProviderKind::OpenAi => {
-                // The api crate's `ProviderClient::from_model_with_anthropic_auth`
-                // with `None` for the anthropic auth routes via
-                // `detect_provider_kind` and builds an
-                // `OpenAiCompatClient::from_env` with the matching
-                // `OpenAiCompatConfig` (openai / xai / dashscope).
-                // That reads the correct API-key env var and BASE_URL
-                // override internally, so this one call covers OpenAI,
-                // OpenRouter, xAI, DashScope, Ollama, and any other
-                // OpenAI-compat endpoint users configure via
-                // `OPENAI_BASE_URL` / `XAI_BASE_URL` / `DASHSCOPE_BASE_URL`.
-                ApiProviderClient::from_model_with_anthropic_auth(&resolved_model, None)?
+        } else {
+            match detect_provider_kind(&resolved_model) {
+                ProviderKind::Anthropic => {
+                    let auth = resolve_cli_auth_source()?;
+                    let inner = AnthropicClient::from_auth(auth)
+                        .with_base_url(api::read_base_url())
+                        .with_prompt_cache(PromptCache::new(session_id));
+                    ApiProviderClient::Anthropic(inner)
+                }
+                ProviderKind::Xai | ProviderKind::OpenAi => {
+                    // The api crate's `ProviderClient::from_model_with_anthropic_auth`
+                    // with `None` for the anthropic auth routes via
+                    // `detect_provider_kind` and builds an
+                    // `OpenAiCompatClient::from_env` with the matching
+                    // `OpenAiCompatConfig` (openai / xai / dashscope).
+                    // That reads the correct API-key env var and BASE_URL
+                    // override internally, so this one call covers OpenAI,
+                    // OpenRouter, xAI, DashScope, Ollama, and any other
+                    // OpenAI-compat endpoint users configure via
+                    // `OPENAI_BASE_URL` / `XAI_BASE_URL` / `DASHSCOPE_BASE_URL`.
+                    ApiProviderClient::from_model_with_anthropic_auth(&resolved_model, None)?
+                }
             }
         };
         Ok(Self {
@@ -7735,6 +8376,778 @@ fn resolve_cli_auth_source() -> Result<AuthSource, Box<dyn std::error::Error>> {
 
 fn resolve_cli_auth_source_for_cwd() -> Result<AuthSource, api::ApiError> {
     resolve_startup_auth_source(|| Ok(None))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OAuthFlowType {
+    Pkce {
+        authorize_url: &'static str,
+        token_url: &'static str,
+        scopes: &'static [&'static str],
+    },
+    Device {
+        device_auth_url: &'static str,
+        token_url: &'static str,
+        scopes: &'static [&'static str],
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProviderOAuthConfig {
+    client_id: &'static str,
+    callback_port: u16,
+    redirect_path: &'static str,
+    flow: OAuthFlowType,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BuiltinProvider {
+    id: &'static str,
+    label: &'static str,
+    env_var: &'static str,
+    default_model: &'static str,
+    oauth: Option<ProviderOAuthConfig>,
+}
+
+const BUILTIN_PROVIDERS: &[BuiltinProvider] = &[
+    BuiltinProvider {
+        id: "anthropic",
+        label: "Anthropic (Claude)",
+        env_var: "ANTHROPIC_API_KEY",
+        default_model: "claude-opus-4-6",
+        oauth: None,
+    },
+    BuiltinProvider {
+        id: "openai",
+        label: "OpenAI",
+        env_var: "OPENAI_API_KEY",
+        default_model: "gpt-4o",
+        oauth: Some(ProviderOAuthConfig {
+            client_id: "app_EMoamEEZ73f0CkXaXp7hrann",
+            callback_port: 1455,
+            redirect_path: "/auth/callback",
+            flow: OAuthFlowType::Pkce {
+                authorize_url: "https://auth.openai.com/oauth/authorize",
+                token_url: "https://auth.openai.com/oauth/token",
+                scopes: &["openid", "profile", "email", "offline_access"],
+            },
+        }),
+    },
+    BuiltinProvider {
+        id: "xai",
+        label: "xAI (Grok)",
+        env_var: "XAI_API_KEY",
+        default_model: "grok-3",
+        oauth: None,
+    },
+];
+
+fn check_model_auth_available(model: &str) -> Result<bool, Box<dyn std::error::Error>> {
+    let resolved = api::resolve_model_alias(model);
+
+    // If model has a provider/ prefix, check auth for that specific provider.
+    // This works for ANY provider (built-in, template, or custom from .claw.json).
+    if let Some((provider_name, _)) = resolved.split_once('/') {
+        // Generic OAuth check: any provider may have a saved OAuth token.
+        if runtime::load_provider_oauth(provider_name).ok().flatten().is_some() {
+            return Ok(true);
+        }
+        // Check the provider's config from .claw.json for env var or hardcoded key
+        if let Ok(cwd) = env::current_dir() {
+            if let Ok(config) = ConfigLoader::default_for(&cwd).load() {
+                if let Some(provider) = config.model_providers().get(provider_name) {
+                    if provider.api_key().filter(|k| !k.is_empty()).is_some() {
+                        return Ok(true);
+                    }
+                    if let Some(env_name) = provider.api_key_env() {
+                        if has_api_key(env_name) {
+                            return Ok(true);
+                        }
+                    }
+                    // Configured but no auth available
+                    return Ok(false);
+                }
+            }
+        }
+        // Not configured in .claw.json - check built-in provider env vars
+        return Ok(match provider_name {
+            "openai" => has_api_key("OPENAI_API_KEY"),
+            "xai" => has_api_key("XAI_API_KEY"),
+            "anthropic" => anthropic_has_auth().unwrap_or(false),
+            _ => false,
+        });
+    }
+
+    // No prefix - use metadata_for_model for built-in model detection
+    if let Some(meta) = api::metadata_for_model(&resolved) {
+        let has_env = has_api_key(meta.auth_env);
+        // OAuth fallback for bare model names.
+        let has_oauth = match meta.auth_env {
+            "OPENAI_API_KEY" => {
+                runtime::load_provider_oauth("openai").ok().flatten().is_some()
+            }
+            "MOONSHOT_API_KEY" => {
+                runtime::load_provider_oauth("moonshot").ok().flatten().is_some()
+            }
+            _ => false,
+        };
+        return Ok(has_env || has_oauth);
+    }
+
+    // Bare model name without recognized prefix - fall back to env sniffing
+    let provider = detect_provider_kind(&resolved);
+    let available = match provider {
+        ProviderKind::Anthropic => anthropic_has_auth().unwrap_or(false),
+        ProviderKind::Xai => has_api_key("XAI_API_KEY"),
+        ProviderKind::OpenAi => {
+            has_api_key("OPENAI_API_KEY")
+                || has_api_key("DASHSCOPE_API_KEY")
+                || has_api_key("MOONSHOT_API_KEY")
+                || runtime::load_provider_oauth("openai").ok().flatten().is_some()
+                || runtime::load_provider_oauth("moonshot").ok().flatten().is_some()
+        }
+    };
+    Ok(available)
+}
+
+fn run_provider_welcome(
+    default_model: &str,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        return Err(
+            "Authentication required. Set one of these environment variables:\n\
+             \n\
+             ANTHROPIC_API_KEY=<key>     # For Anthropic (Claude)\n\
+             OPENAI_API_KEY=<key>        # For OpenAI\n\
+             XAI_API_KEY=<key>           # For xAI (Grok)\n\
+             DASHSCOPE_API_KEY=<key>     # For DashScope/Qwen"
+                .into(),
+        );
+    }
+
+    println!(
+        "\n\x1b[1mWelcome to Claw Code\x1b[0m\n\n\
+         No API key detected for the selected model.\n\
+         Choose a provider to authenticate with:\n"
+    );
+
+    let builtin_count = BUILTIN_PROVIDERS.len();
+    let template_count = LOGIN_PROVIDER_TEMPLATES.len();
+    let total = builtin_count + template_count;
+
+    println!("  Built-in:");
+    for (i, provider) in BUILTIN_PROVIDERS.iter().enumerate() {
+        let oauth_tag = if provider.oauth.is_some() { " [OAuth]" } else { "" };
+        println!("  {}. {}{}", i + 1, provider.label, oauth_tag);
+    }
+
+    println!("\n  Additional providers:");
+    for (i, template) in LOGIN_PROVIDER_TEMPLATES.iter().enumerate() {
+        let oauth_tag = if template.oauth.is_some() { " [OAuth]" } else { "" };
+        println!(
+            "  {}. {}{}",
+            builtin_count + i + 1,
+            template.label,
+            oauth_tag
+        );
+    }
+
+    let total = builtin_count + template_count;
+
+    print!("\nEnter number (1-{total}): ");
+    std::io::stdout().flush()?;
+    let mut choice = String::new();
+    std::io::stdin().read_line(&mut choice)?;
+    let choice = choice.trim();
+
+    let index: usize = choice.parse().map_err(|_| "invalid selection")?;
+    if index == 0 || index > total {
+        return Err("invalid selection".into());
+    }
+
+    // Built-in provider selected
+    if index <= builtin_count {
+        let provider = BUILTIN_PROVIDERS.get(index - 1).expect("valid builtin index");
+
+        // Offer OAuth if available
+        if let Some(ref oauth) = provider.oauth {
+            if prompt_oauth_or_api_key(provider.label, true)? {
+                run_pkce_oauth_flow(provider.id, oauth)?;
+                return Ok(Some(format!("{}/{}", provider.id, provider.default_model)));
+            }
+        }
+
+        print!("Enter {} (or press Enter to cancel): ", provider.env_var);
+        std::io::stdout().flush()?;
+        let mut key = String::new();
+        std::io::stdin().read_line(&mut key)?;
+        let key = key.trim();
+
+        if key.is_empty() {
+            println!("Cancelled.");
+            return Ok(None);
+        }
+
+        std::env::set_var(provider.env_var, key);
+
+        // Optionally save to ~/.claw/settings.json as a simple model config.
+        if let Some(home) = std::env::var_os("HOME") {
+            let claw_dir = std::path::PathBuf::from(home).join(".claw");
+            if claw_dir.exists() || std::fs::create_dir_all(&claw_dir).is_ok() {
+                let settings_path = claw_dir.join("settings.json");
+                let model_str = format!("{}/{}", provider.id, provider.default_model);
+                let content = format!("{{\"model\": \"{model_str}\"}}");
+                let _ = std::fs::write(&settings_path, content);
+            }
+        }
+
+        return Ok(Some(format!("{}/{}", provider.id, provider.default_model)));
+    }
+
+    // Template provider selected
+    let template = LOGIN_PROVIDER_TEMPLATES
+        .get(index - builtin_count - 1)
+        .expect("valid template index");
+
+    // Offer OAuth if available
+    if let Some(ref oauth) = template.oauth {
+        if prompt_oauth_or_api_key(template.label, true)? {
+            match oauth.flow {
+                OAuthFlowType::Pkce { .. } => {
+                    run_pkce_oauth_flow(template.id, oauth)?;
+                }
+                OAuthFlowType::Device { .. } => {
+                    run_device_oauth_flow(template.id, oauth)?;
+                }
+            }
+            return Ok(Some(format!("{}/{}", template.id, template.default_model)));
+        }
+    }
+
+    print!(
+        "Enter {} (or press Enter to cancel): ",
+        template.api_key_env
+    );
+    std::io::stdout().flush()?;
+    let mut key = String::new();
+    std::io::stdin().read_line(&mut key)?;
+    let key = key.trim();
+
+    if key.is_empty() {
+        println!("Cancelled.");
+        return Ok(None);
+    }
+
+    std::env::set_var(template.api_key_env, key);
+    save_model_provider_profile(
+        template.id,
+        template.provider_type,
+        template.base_url,
+        template.api_key_env,
+        Some(key),
+        &template.models.iter().map(|m| (*m).to_string()).collect::<Vec<_>>(),
+        template.default_model,
+    )?;
+
+    // No custom providers in welcome — only built-in and templates.
+    Err("Invalid selection".into())
+}
+
+fn run_model_command(name: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+    let cwd = env::current_dir()?;
+    let loader = ConfigLoader::default_for(&cwd);
+    let config = loader.load()?;
+
+    if let Some(name) = name {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            return Err("model name cannot be empty".into());
+        }
+        validate_model_syntax(trimmed)?;
+        let resolved = resolve_model_alias_with_config(trimmed);
+
+        // Write to user settings.json
+        let settings_path = loader.config_home().join("settings.json");
+        let mut settings: serde_json::Value = if settings_path.exists() {
+            let contents = fs::read_to_string(&settings_path)?;
+            serde_json::from_str(&contents).unwrap_or_else(|_| serde_json::json!({}))
+        } else {
+            serde_json::json!({})
+        };
+        if let Some(obj) = settings.as_object_mut() {
+            obj.insert("model".to_string(), serde_json::Value::String(resolved.clone()));
+        }
+        fs::create_dir_all(loader.config_home())?;
+        fs::write(&settings_path, serde_json::to_string_pretty(&settings)?)?;
+
+        println!("Default model set to: {}", resolved);
+        return Ok(());
+    }
+
+    // No name provided: show current model and list available models
+    let env_model = env::var("ANTHROPIC_MODEL").ok();
+    let current_model = config.model()
+        .or_else(|| env_model.as_deref())
+        .unwrap_or(DEFAULT_MODEL);
+
+    println!("Current model: {}", current_model);
+    println!();
+    println!("Available models:");
+
+    // Built-in providers
+    println!("  Built-in:");
+    for builtin in BUILTIN_PROVIDERS {
+        let label = match builtin.id {
+            "anthropic" => "Anthropic (Claude)",
+            "openai" => "OpenAI",
+            "xai" => "xAI (Grok)",
+            other => other,
+        };
+        println!("    {}:", label);
+        println!("      {}/{}", builtin.id, builtin.default_model);
+    }
+
+    // Login templates
+    println!("  Additional providers:");
+    for template in LOGIN_PROVIDER_TEMPLATES {
+        println!("    {}:", template.label);
+        for model in template.models {
+            println!("      {}/{}", template.id, model);
+        }
+    }
+
+    // Custom providers from config
+    let custom_providers = config.model_providers();
+    if !custom_providers.is_empty() {
+        println!("  Custom providers:");
+        for (name, provider) in custom_providers {
+            println!("    {}:", name);
+            if !provider.models().is_empty() {
+                for model in provider.models() {
+                    println!("      {}/{}", name, model);
+                }
+            } else if let Some(default) = provider.default_model() {
+                println!("      {}/{}", name, default);
+            }
+        }
+    }
+
+    println!();
+    println!("Usage:");
+    println!("  claw model <provider/model>    Set default model");
+    println!("  claw --model <model> prompt    Use model for one prompt");
+
+    Ok(())
+}
+
+fn run_auth_command(provider: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(provider_id) = provider {
+        // Try built-in provider first
+        if let Some(builtin) = BUILTIN_PROVIDERS.iter().find(|p| p.id == provider_id) {
+            if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+                return Err(format!(
+                    "Authentication requires a terminal. Set the environment variable instead:\n\
+                     \n\
+                     export {}=<key>",
+                    builtin.env_var
+                )
+                .into());
+            }
+
+            // Offer OAuth if available
+            if let Some(ref oauth) = builtin.oauth {
+                if prompt_oauth_or_api_key(builtin.label, true)? {
+                    run_pkce_oauth_flow(builtin.id, oauth)?;
+                    println!("Authenticated with {} via OAuth.", builtin.label);
+                    return Ok(());
+                }
+            }
+
+            print!("Enter {} (or press Enter to cancel): ", builtin.env_var);
+            std::io::stdout().flush()?;
+            let mut key = String::new();
+            std::io::stdin().read_line(&mut key)?;
+            let key = key.trim();
+
+            if key.is_empty() {
+                println!("Cancelled.");
+                return Ok(());
+            }
+
+            std::env::set_var(builtin.env_var, key);
+            println!("Authentication set for {}.", builtin.label);
+            return Ok(());
+        }
+
+        // Try template provider
+        if let Some(template) = LOGIN_PROVIDER_TEMPLATES.iter().find(|p| p.id == provider_id) {
+            if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+                return Err(format!(
+                    "Authentication requires a terminal. Set the environment variable instead:\n\
+                     \n\
+                     export {}=<key>",
+                    template.api_key_env
+                )
+                .into());
+            }
+
+            // Offer OAuth if available
+            if let Some(ref oauth) = template.oauth {
+                if prompt_oauth_or_api_key(template.label, true)? {
+                    match oauth.flow {
+                        OAuthFlowType::Pkce { .. } => {
+                            run_pkce_oauth_flow(template.id, oauth)?;
+                        }
+                        OAuthFlowType::Device { .. } => {
+                            run_device_oauth_flow(template.id, oauth)?;
+                        }
+                    }
+                    println!(
+                        "Authenticated with {label} via OAuth. Model: {id}/{model}",
+                        label = template.label,
+                        id = template.id,
+                        model = template.default_model
+                    );
+                    return Ok(());
+                }
+            }
+
+            print!(
+                "Enter {} (or press Enter to cancel): ",
+                template.api_key_env
+            );
+            std::io::stdout().flush()?;
+            let mut key = String::new();
+            std::io::stdin().read_line(&mut key)?;
+            let key = key.trim();
+
+            if key.is_empty() {
+                println!("Cancelled.");
+                return Ok(());
+            }
+
+            std::env::set_var(template.api_key_env, key);
+            save_model_provider_profile(
+                template.id,
+                template.provider_type,
+                template.base_url,
+                template.api_key_env,
+                Some(key),
+                &template.models.iter().map(|m| (*m).to_string()).collect::<Vec<_>>(),
+                template.default_model,
+            )?;
+            println!(
+                "Authenticated with {label}. Model: {id}/{model}",
+                label = template.label,
+                id = template.id,
+                model = template.default_model
+            );
+            return Ok(());
+        }
+
+        // Try custom provider from .claw.json / settings.json
+        if let Ok(cwd) = env::current_dir() {
+            if let Ok(config) = ConfigLoader::default_for(&cwd).load() {
+                if let Some(provider) = config.model_providers().get(provider_id) {
+                    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+                        return Err(format!(
+                            "Authentication requires a terminal. Set the environment variable instead:\n\
+                             \n\
+                             export {}=<key>",
+                            provider.api_key_env().unwrap_or("API_KEY")
+                        )
+                        .into());
+                    }
+                    if let Some(env_name) = provider.api_key_env() {
+                        print!("Enter {} (or press Enter to cancel): ", env_name);
+                        std::io::stdout().flush()?;
+                        let mut key = String::new();
+                        std::io::stdin().read_line(&mut key)?;
+                        let key = key.trim();
+                        if key.is_empty() {
+                            println!("Cancelled.");
+                            return Ok(());
+                        }
+                        std::env::set_var(env_name, key);
+                        println!("Authentication set for {provider_id}.");
+                        return Ok(());
+                    }
+                    return Err(format!(
+                        "provider '{provider_id}' has no apiKeyEnv configured. Add it to your .claw.json."
+                    )
+                    .into());
+                }
+            }
+        }
+
+        return Err(format!(
+            "unknown provider: '{provider_id}'. Run `claw auth` to see available providers."
+        )
+        .into());
+    }
+
+    match run_provider_welcome(DEFAULT_MODEL)? {
+        Some(model) => {
+            println!("Authentication configured. Model set to {model}.");
+            Ok(())
+        }
+        None => {
+            println!("Cancelled.");
+            Ok(())
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// OAuth flow implementations
+// ---------------------------------------------------------------------------
+
+fn run_pkce_oauth_flow(
+    provider_id: &str,
+    oauth: &ProviderOAuthConfig,
+) -> Result<runtime::OAuthTokenSet, Box<dyn std::error::Error>> {
+    use runtime::{
+        generate_pkce_pair, generate_state, loopback_redirect_uri_with_path, open_browser,
+        run_oauth_callback_server, OAuthAuthorizationRequest, OAuthTokenExchangeRequest,
+    };
+
+    let pkce = generate_pkce_pair()?;
+    let state = generate_state()?;
+
+    let (authorize_url, token_url, scopes) = match oauth.flow {
+        OAuthFlowType::Pkce {
+            authorize_url,
+            token_url,
+            scopes,
+        } => (authorize_url, token_url, scopes),
+        _ => return Err("Expected PKCE flow".into()),
+    };
+
+    let config = runtime::OAuthConfig {
+        client_id: oauth.client_id.to_string(),
+        authorize_url: authorize_url.to_string(),
+        token_url: token_url.to_string(),
+        callback_port: Some(oauth.callback_port),
+        manual_redirect_url: None,
+        scopes: scopes.iter().map(|s| (*s).to_string()).collect(),
+    };
+
+    let redirect_uri = loopback_redirect_uri_with_path(oauth.callback_port, oauth.redirect_path);
+
+    let mut auth_request =
+        OAuthAuthorizationRequest::from_config(&config, &redirect_uri, &state, &pkce);
+
+    // OpenAI-specific parameters required for drop-in Codex CLI compatibility
+    if provider_id == "openai" {
+        auth_request = auth_request
+            .with_extra_param("id_token_add_organizations", "true")
+            .with_extra_param("codex_cli_simplified_flow", "true")
+            .with_extra_param("originator", "codex_cli_rs");
+    }
+
+    let auth_url = auth_request.build_url();
+
+    println!("Opening browser for OAuth authentication...");
+    println!("If the browser doesn't open automatically, visit:");
+    println!("  {auth_url}");
+    open_browser(&auth_url)?;
+
+    println!("Waiting for authentication...");
+    let callback = run_oauth_callback_server(
+        oauth.callback_port,
+        std::time::Duration::from_secs(300),
+        oauth.redirect_path,
+    )?;
+
+    if callback.state != state {
+        return Err("OAuth state mismatch. Possible CSRF attack.".into());
+    }
+
+    println!("Exchanging authorization code for tokens...");
+
+    let rt = tokio::runtime::Runtime::new()?;
+    let token_set = rt.block_on(async {
+        let client = reqwest::Client::new();
+        let exchange = OAuthTokenExchangeRequest::from_config(
+            &config,
+            &callback.code,
+            &state,
+            &pkce.verifier,
+            &redirect_uri,
+        );
+
+        let response = client
+            .post(&config.token_url)
+            .form(&exchange.form_params())
+            .send()
+            .await
+            .map_err(|e| format!("Token exchange request failed: {e}"))?;
+
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .map_err(|e| format!("Failed to read token response: {e}"))?;
+
+        if !status.is_success() {
+            return Err(format!("Token exchange failed ({status}): {body}").into());
+        }
+
+        let json: serde_json::Value = serde_json::from_str(&body)
+            .map_err(|e| format!("Invalid token response JSON: {e}"))?;
+
+        let access_token = json["access_token"]
+            .as_str()
+            .ok_or("access_token missing from response")?
+            .to_string();
+        let refresh_token = json["refresh_token"].as_str().map(String::from);
+        let id_token = json["id_token"].as_str().map(String::from);
+        let expires_at = json["expires_in"].as_u64().map(|secs| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+                + secs
+        });
+        let scopes = json["scope"]
+            .as_str()
+            .map(|s| s.split(' ').map(String::from).collect())
+            .unwrap_or_default();
+
+        Ok::<_, Box<dyn std::error::Error>>(runtime::OAuthTokenSet {
+            access_token,
+            refresh_token,
+            expires_at,
+            scopes,
+            id_token,
+        })
+    })?;
+
+    runtime::save_provider_oauth(provider_id, &token_set)?;
+    println!("✓ OAuth authentication successful. Tokens saved.");
+
+    Ok(token_set)
+}
+
+fn run_device_oauth_flow(
+    provider_id: &str,
+    oauth: &ProviderOAuthConfig,
+) -> Result<runtime::OAuthTokenSet, Box<dyn std::error::Error>> {
+    use runtime::{open_browser, poll_device_token, DeviceAuthRequest};
+
+    let (device_auth_url, token_url, scopes) = match oauth.flow {
+        OAuthFlowType::Device {
+            device_auth_url,
+            token_url,
+            scopes,
+        } => (device_auth_url, token_url, scopes),
+        _ => return Err("Expected Device flow".into()),
+    };
+
+    let rt = tokio::runtime::Runtime::new()?;
+
+    // Step 1: Request device code
+    let device_response = rt.block_on(async {
+        let client = reqwest::Client::new();
+        let scope_str = scopes.join(" ");
+        let params = [
+            ("client_id", oauth.client_id),
+            ("scope", scope_str.as_str()),
+        ];
+        let response = client
+            .post(device_auth_url)
+            .form(&params)
+            .send()
+            .await
+            .map_err(|e| format!("Device auth request failed: {e}"))?;
+
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .map_err(|e| format!("Failed to read device auth response: {e}"))?;
+
+        if !status.is_success() {
+            return Err(format!("Device auth failed ({status}): {body}").into());
+        }
+
+        let resp: runtime::DeviceAuthResponse = serde_json::from_str(&body)
+            .map_err(|e| format!("Invalid device auth response: {e}"))?;
+        Ok::<_, Box<dyn std::error::Error>>(resp)
+    })?;
+
+    println!("\nDevice authentication started.");
+    println!("User code: {}", device_response.user_code);
+    println!(
+        "Please visit: {}",
+        device_response
+            .verification_uri_complete
+            .as_deref()
+            .unwrap_or(&device_response.verification_uri)
+    );
+
+    if let Some(ref complete_uri) = device_response.verification_uri_complete {
+        open_browser(complete_uri)?;
+    } else {
+        open_browser(&device_response.verification_uri)?;
+    }
+
+    // Step 2: Poll for token
+    let start = std::time::Instant::now();
+    let expires_in = std::time::Duration::from_secs(device_response.expires_in);
+    let interval = std::time::Duration::from_secs(device_response.interval);
+
+    let token_set = rt.block_on(async {
+        let client = reqwest::Client::new();
+        loop {
+            if start.elapsed() > expires_in {
+                return Err::<_, Box<dyn std::error::Error>>(
+                    "Device authorization expired. Please try again.".into(),
+                );
+            }
+
+            tokio::time::sleep(interval).await;
+
+            match poll_device_token(
+                &client,
+                &device_response.device_code,
+                oauth.client_id,
+                token_url,
+            )
+            .await
+            {
+                Ok(Some(token_set)) => return Ok(token_set),
+                Ok(None) => {
+                    println!("Waiting for authorization...");
+                    continue;
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+    })?;
+
+    runtime::save_provider_oauth(provider_id, &token_set)?;
+    println!("✓ OAuth authentication successful. Tokens saved.");
+
+    Ok(token_set)
+}
+
+fn prompt_oauth_or_api_key(provider_label: &str, has_oauth: bool) -> Result<bool, Box<dyn std::error::Error>> {
+    if !has_oauth {
+        return Ok(false);
+    }
+
+    println!("\nChoose authentication method for {provider_label}:");
+    println!("  1. Sign in with {provider_label} account (OAuth) — recommended");
+    println!("  2. Enter API key manually");
+    print!("Select [1]: ");
+    std::io::stdout().flush()?;
+
+    let mut choice = String::new();
+    std::io::stdin().read_line(&mut choice)?;
+    let choice = choice.trim();
+
+    Ok(choice.is_empty() || choice == "1")
 }
 
 impl ApiClient for AnthropicRuntimeClient {
@@ -8134,7 +9547,6 @@ fn collect_prompt_cache_events(summary: &runtime::TurnSummary) -> Vec<serde_json
 /// in this build. Used to filter both REPL completions and help output so the
 /// discovery surface only shows commands that actually work (ROADMAP #39).
 const STUB_COMMANDS: &[&str] = &[
-    "login",
     "logout",
     "vim",
     "upgrade",
@@ -9104,6 +10516,11 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
         out,
         "      Diagnose local auth, config, workspace, and sandbox health"
     )?;
+    writeln!(out, "  claw login")?;
+    writeln!(
+        out,
+        "      Configure a compatible model provider in settings.json"
+    )?;
     writeln!(out, "  claw acp [serve]")?;
     writeln!(
         out,
@@ -9121,6 +10538,16 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(out, "  claw skills")?;
     writeln!(out, "  claw system-prompt [--cwd PATH] [--date YYYY-MM-DD]")?;
     writeln!(out, "  claw init")?;
+    writeln!(out, "  claw auth [PROVIDER]")?;
+    writeln!(
+        out,
+        "      Authenticate with a model provider (anthropic, openai, xai)"
+    )?;
+    writeln!(out, "  claw model [MODEL]")?;
+    writeln!(
+        out,
+        "      Show available models or set the default model"
+    )?;
     writeln!(
         out,
         "  claw export [PATH] [--session SESSION] [--output PATH]"
@@ -9261,6 +10688,7 @@ mod tests {
         SlashCommand, StatusUsage, TmuxPaneSnapshot, DEFAULT_MODEL, LATEST_SESSION_REFERENCE,
         STUB_COMMANDS,
     };
+    use crate::configured_provider_for_model;
     use api::{ApiError, MessageResponse, OutputContentBlock, Usage};
     use plugins::{
         PluginManager, PluginManagerConfig, PluginTool, PluginToolDefinition, PluginToolPermission,
@@ -9559,7 +10987,7 @@ mod tests {
     #[test]
     fn defaults_to_repl_when_no_args() {
         let _guard = env_lock();
-        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+        std::env::set_var("RUSTY_CLAUDE_PERMISSION_MODE", "danger-full-access");
         assert_eq!(
             parse_args(&[]).expect("args should parse"),
             CliAction::Repl {
@@ -9659,6 +11087,7 @@ mod tests {
             refresh_token: Some("refresh-token".to_string()),
             expires_at: Some(0),
             scopes: vec!["org:create_api_key".to_string(), "user:profile".to_string()],
+            id_token: None,
         })
         .expect("save expired oauth credentials");
 
@@ -9685,7 +11114,7 @@ mod tests {
     #[test]
     fn parses_prompt_subcommand() {
         let _guard = env_lock();
-        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+        std::env::set_var("RUSTY_CLAUDE_PERMISSION_MODE", "danger-full-access");
         let args = vec![
             "prompt".to_string(),
             "hello".to_string(),
@@ -9703,6 +11132,54 @@ mod tests {
                 base_commit: None,
                 reasoning_effort: None,
                 allow_broad_cwd: false,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_args_auth_without_provider() {
+        let _guard = env_lock();
+        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+        assert_eq!(
+            parse_args(&["auth".to_string()]).expect("args should parse"),
+            CliAction::Auth { provider: None }
+        );
+    }
+
+    #[test]
+    fn parse_args_auth_with_provider() {
+        let _guard = env_lock();
+        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+        assert_eq!(
+            parse_args(&["auth".to_string(), "openai".to_string()]).expect("args should parse"),
+            CliAction::Auth {
+                provider: Some("openai".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_args_model_without_name() {
+        let _guard = env_lock();
+        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+        assert_eq!(
+            parse_args(&["model".to_string()]).expect("args should parse"),
+            CliAction::Model { name: None }
+        );
+        assert_eq!(
+            parse_args(&["models".to_string()]).expect("args should parse"),
+            CliAction::Model { name: None }
+        );
+    }
+
+    #[test]
+    fn parse_args_model_with_name() {
+        let _guard = env_lock();
+        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+        assert_eq!(
+            parse_args(&["model".to_string(), "moonshot/kimi-k2.6".to_string()]).expect("args should parse"),
+            CliAction::Model {
+                name: Some("moonshot/kimi-k2.6".to_string()),
             }
         );
     }
@@ -9774,7 +11251,7 @@ mod tests {
     #[test]
     fn parses_bare_prompt_and_json_output_flag() {
         let _guard = env_lock();
-        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+        std::env::set_var("RUSTY_CLAUDE_PERMISSION_MODE", "danger-full-access");
         let args = vec![
             "--output-format=json".to_string(),
             "--model".to_string(),
@@ -9802,7 +11279,7 @@ mod tests {
     fn parses_compact_flag_for_prompt_mode() {
         // given a bare prompt invocation that includes the --compact flag
         let _guard = env_lock();
-        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+        std::env::set_var("RUSTY_CLAUDE_PERMISSION_MODE", "danger-full-access");
         let args = vec![
             "--compact".to_string(),
             "summarize".to_string(),
@@ -9849,7 +11326,7 @@ mod tests {
     #[test]
     fn resolves_model_aliases_in_args() {
         let _guard = env_lock();
-        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+        std::env::set_var("RUSTY_CLAUDE_PERMISSION_MODE", "danger-full-access");
         let args = vec![
             "--model".to_string(),
             "opus".to_string(),
@@ -9917,6 +11394,80 @@ mod tests {
         assert_eq!(cross_provider, "grok-3-mini");
         assert_eq!(unknown, "unknown-model");
         assert_eq!(builtin, "claude-haiku-4-5-20251213");
+    }
+
+    #[test]
+    fn configured_model_provider_default_resolves_to_provider_model_ref() {
+        // given
+        let _guard = env_lock();
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let config_home = root.join("config-home");
+        std::fs::create_dir_all(cwd.join(".claw")).expect("project config dir should exist");
+        std::fs::create_dir_all(&config_home).expect("config home should exist");
+        std::fs::write(
+            cwd.join(".claw").join("settings.json"),
+            r#"{"modelProviders":{"zai":{"type":"openai-compatible","baseUrl":"https://api.z.ai/api/paas/v4","apiKeyEnv":"Z_AI_API_KEY","models":["glm-5.1","glm-4.6"],"defaultModel":"glm-5.1"}}}"#,
+        )
+        .expect("project config should write");
+
+        let original_config_home = std::env::var("CLAW_CONFIG_HOME").ok();
+        std::env::set_var("CLAW_CONFIG_HOME", &config_home);
+
+        // when
+        let resolved = with_current_dir(&cwd, || resolve_model_alias_with_config("zai"));
+
+        match original_config_home {
+            Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
+            None => std::env::remove_var("CLAW_CONFIG_HOME"),
+        }
+        std::fs::remove_dir_all(root).expect("temp config root should clean up");
+
+        // then
+        assert_eq!(resolved, "zai/glm-5.1");
+    }
+
+    #[test]
+    fn configured_model_provider_resolves_runtime_connection_details() {
+        // given
+        let _guard = env_lock();
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let config_home = root.join("config-home");
+        std::fs::create_dir_all(cwd.join(".claw")).expect("project config dir should exist");
+        std::fs::create_dir_all(&config_home).expect("config home should exist");
+        std::fs::write(
+            cwd.join(".claw").join("settings.json"),
+            r#"{"modelProviders":{"minimax":{"baseUrl":"https://api.minimax.io/v1","apiKeyEnv":"MINIMAX_API_KEY","models":["MiniMax-M2.7-highspeed"]}}}"#,
+        )
+        .expect("project config should write");
+
+        let original_config_home = std::env::var("CLAW_CONFIG_HOME").ok();
+        let original_key = std::env::var("MINIMAX_API_KEY").ok();
+        std::env::set_var("CLAW_CONFIG_HOME", &config_home);
+        std::env::set_var("MINIMAX_API_KEY", "test-minimax-key");
+
+        // when
+        let provider = with_current_dir(&cwd, || {
+            configured_provider_for_model("minimax/MiniMax-M2.7-highspeed")
+        })
+        .expect("provider lookup should succeed")
+        .expect("provider should exist");
+
+        match original_config_home {
+            Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
+            None => std::env::remove_var("CLAW_CONFIG_HOME"),
+        }
+        match original_key {
+            Some(value) => std::env::set_var("MINIMAX_API_KEY", value),
+            None => std::env::remove_var("MINIMAX_API_KEY"),
+        }
+        std::fs::remove_dir_all(root).expect("temp config root should clean up");
+
+        // then
+        assert_eq!(provider.wire_model, "MiniMax-M2.7-highspeed");
+        assert_eq!(provider.api_key, "test-minimax-key");
+        assert_eq!(provider.base_url, "https://api.minimax.io/v1");
     }
 
     #[test]
@@ -10005,7 +11556,7 @@ mod tests {
     #[test]
     fn parses_allowed_tools_flags_with_aliases_and_lists() {
         let _guard = env_lock();
-        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+        std::env::set_var("RUSTY_CLAUDE_PERMISSION_MODE", "danger-full-access");
         let args = vec![
             "--allowedTools".to_string(),
             "read,glob".to_string(),
@@ -10068,9 +11619,11 @@ mod tests {
     }
 
     #[test]
-    fn removed_login_and_logout_subcommands_error_helpfully() {
-        let login = parse_args(&["login".to_string()]).expect_err("login should be removed");
-        assert!(login.contains("ANTHROPIC_API_KEY"));
+    fn login_subcommand_parses_and_logout_errors_helpfully() {
+        assert_eq!(
+            parse_args(&["login".to_string()]).expect("login should parse"),
+            CliAction::Login
+        );
         let logout = parse_args(&["logout".to_string()]).expect_err("logout should be removed");
         assert!(logout.contains("ANTHROPIC_AUTH_TOKEN"));
         assert_eq!(
@@ -10647,7 +12200,7 @@ mod tests {
     #[test]
     fn parses_single_word_command_aliases_without_falling_back_to_prompt_mode() {
         let _guard = env_lock();
-        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+        std::env::set_var("RUSTY_CLAUDE_PERMISSION_MODE", "danger-full-access");
         assert_eq!(
             parse_args(&["help".to_string()]).expect("help should parse"),
             CliAction::Help {
@@ -11313,6 +12866,8 @@ mod tests {
 
     #[test]
     fn prompt_subcommand_allows_literal_typo_word() {
+        let _guard = env_lock();
+        std::env::set_var("RUSTY_CLAUDE_PERMISSION_MODE", "danger-full-access");
         assert_eq!(
             parse_args(&["prompt".to_string(), "doctorr".to_string()])
                 .expect("explicit prompt subcommand should allow literal typo word"),
@@ -11336,6 +12891,7 @@ mod tests {
         // doesn't pick up a stale .claw/settings.json from other tests that
         // may have set `permissionMode: acceptEdits` in a shared cwd.
         let _guard = env_lock();
+        std::env::set_var("RUSTY_CLAUDE_PERMISSION_MODE", "danger-full-access");
         let root = temp_dir();
         let cwd = root.join("project");
         std::fs::create_dir_all(&cwd).expect("project dir should exist");
@@ -11790,7 +13346,7 @@ mod tests {
         assert!(help.contains("claw /skills"));
         assert!(help.contains("ultraworkers/claw-code"));
         assert!(help.contains("cargo install claw-code"));
-        assert!(!help.contains("claw login"));
+        assert!(help.contains("claw login"));
         assert!(!help.contains("claw logout"));
     }
 
@@ -13617,5 +15173,129 @@ mod dump_manifests_tests {
         );
 
         let _ = fs::remove_dir_all(&root);
+    }
+}
+
+
+#[cfg(test)]
+mod auth_tests {
+    use std::sync::{Mutex, OnceLock};
+    use super::{parse_args, check_model_auth_available, BUILTIN_PROVIDERS, LOGIN_PROVIDER_TEMPLATES, CliAction};
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    #[test]
+    fn parse_args_auth_without_provider() {
+        let args = vec!["auth".to_string()];
+        let action = parse_args(&args).expect("should parse");
+        match action {
+            CliAction::Auth { provider } => assert!(provider.is_none()),
+            other => panic!("expected CliAction::Auth, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_args_auth_with_provider() {
+        let args = vec!["auth".to_string(), "openai".to_string()];
+        let action = parse_args(&args).expect("should parse");
+        match action {
+            CliAction::Auth { provider } => assert_eq!(provider, Some("openai".to_string())),
+            other => panic!("expected CliAction::Auth, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn openai_builtin_provider_has_oauth_config() {
+        let openai = BUILTIN_PROVIDERS
+            .iter()
+            .find(|p| p.id == "openai")
+            .expect("openai provider exists");
+        assert!(openai.oauth.is_some(), "openai should have OAuth config");
+        let oauth = openai.oauth.unwrap();
+        assert_eq!(oauth.client_id, "app_EMoamEEZ73f0CkXaXp7hrann");
+        assert_eq!(oauth.callback_port, 1455);
+    }
+
+    #[test]
+    fn anthropic_and_xai_have_no_oauth() {
+        for provider in BUILTIN_PROVIDERS.iter() {
+            if provider.id == "anthropic" || provider.id == "xai" {
+                assert!(provider.oauth.is_none(), "{} should not have OAuth", provider.id);
+            }
+        }
+    }
+
+    #[test]
+    fn moonshot_template_has_device_oauth() {
+        let moonshot = LOGIN_PROVIDER_TEMPLATES
+            .iter()
+            .find(|p| p.id == "moonshot")
+            .expect("moonshot template exists");
+        assert!(moonshot.oauth.is_some(), "moonshot should have OAuth config");
+        let oauth = moonshot.oauth.unwrap();
+        assert_eq!(oauth.client_id, "17e5f671-d194-4dfb-9706-5516cb48c098");
+    }
+
+    #[test]
+    fn zai_and_minimax_have_no_oauth() {
+        for template in LOGIN_PROVIDER_TEMPLATES.iter() {
+            if template.id == "zai" || template.id == "minimax-coding-plan" {
+                assert!(
+                    template.oauth.is_none(),
+                    "{} should not have OAuth",
+                    template.id
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn check_model_auth_available_detects_saved_moonshot_oauth() {
+        let _guard = env_lock();
+        let config_home = std::env::temp_dir().join(format!(
+            "claw-oauth-auth-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::env::set_var("CLAW_CONFIG_HOME", &config_home);
+        std::fs::create_dir_all(&config_home).expect("create config home");
+
+        // Ensure no env var is set
+        std::env::remove_var("MOONSHOT_API_KEY");
+        std::env::remove_var("DASHSCOPE_API_KEY");
+
+        // Without saved OAuth, auth should not be available
+        assert!(
+            !check_model_auth_available("moonshot/moonshot-v1-8k").expect("check auth"),
+            "auth should be unavailable without env or saved tokens"
+        );
+
+        // Save an OAuth token for moonshot
+        let token_set = runtime::OAuthTokenSet {
+            access_token: "test-access-token".to_string(),
+            refresh_token: Some("test-refresh".to_string()),
+            expires_at: Some(9999999999),
+            scopes: vec!["openid".to_string()],
+            id_token: None,
+        };
+        runtime::save_provider_oauth("moonshot", &token_set).expect("save token");
+
+        // With saved OAuth, auth should be available
+        assert!(
+            check_model_auth_available("moonshot/moonshot-v1-8k").expect("check auth with oauth"),
+            "auth should be available with saved OAuth token"
+        );
+
+        // Clean up
+        std::env::remove_var("CLAW_CONFIG_HOME");
+        std::fs::remove_dir_all(config_home).ok();
     }
 }

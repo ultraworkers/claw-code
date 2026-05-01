@@ -1361,9 +1361,11 @@ dependencies = [
 name = "runtime"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "glob",
  "plugins",
  "regex",
+ "reqwest",
  "serde",
  "serde_json",
  "sha2",
@@ -1456,6 +1458,7 @@ dependencies = [
  "mock-anthropic-service",
  "plugins",
  "pulldown-cmark",
+ "reqwest",
  "runtime",
  "rustyline",
  "serde",

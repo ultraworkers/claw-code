@@ -18,14 +18,15 @@ pub use prompt_cache::{
     CacheBreakEvent, PromptCache, PromptCacheConfig, PromptCachePaths, PromptCacheRecord,
     PromptCacheStats,
 };
-pub use providers::anthropic::{AnthropicClient, AnthropicClient as ApiClient, AuthSource};
+pub use providers::anthropic::{has_auth_from_env_or_saved as anthropic_has_auth, AnthropicClient, AnthropicClient as ApiClient, AuthSource};
 pub use providers::openai_compat::{
-    build_chat_completion_request, flatten_tool_result_content, is_reasoning_model,
+    build_chat_completion_request, flatten_tool_result_content, has_api_key, is_reasoning_model,
     model_rejects_is_error_field, translate_message, OpenAiCompatClient, OpenAiCompatConfig,
 };
+pub use providers::wham::{WhamClient, DEFAULT_WHAM_BASE_URL};
 pub use providers::{
     detect_provider_kind, max_tokens_for_model, max_tokens_for_model_with_override,
-    resolve_model_alias, ProviderKind,
+    metadata_for_model, resolve_model_alias, ProviderKind, ProviderMetadata,
 };
 pub use sse::{parse_frame, SseParser};
 pub use types::{
