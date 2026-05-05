@@ -2,6 +2,7 @@ use crate::error::ApiError;
 use crate::prompt_cache::{PromptCache, PromptCacheRecord, PromptCacheStats};
 use crate::providers::anthropic::{self, AnthropicClient, AuthSource};
 use crate::providers::openai_compat::{self, OpenAiCompatClient, OpenAiCompatConfig};
+use crate::providers::wham::{self, WhamClient};
 use crate::providers::{self, ProviderKind};
 use crate::types::{MessageRequest, MessageResponse, StreamEvent};
 
@@ -11,6 +12,8 @@ pub enum ProviderClient {
     Anthropic(AnthropicClient),
     Xai(OpenAiCompatClient),
     OpenAi(OpenAiCompatClient),
+    /// OpenAI WHAM backend (chatgpt.com/backend-api/wham) using ChatGPT OAuth tokens.
+    Wham(WhamClient),
 }
 
 impl ProviderClient {
@@ -32,17 +35,106 @@ impl ProviderClient {
                 OpenAiCompatConfig::xai(),
             )?)),
             ProviderKind::OpenAi => {
-                // DashScope models (qwen-*) also return ProviderKind::OpenAi because they
-                // speak the OpenAI wire format, but they need the DashScope config which
-                // reads DASHSCOPE_API_KEY and points at dashscope.aliyuncs.com.
-                let config = match providers::metadata_for_model(&resolved_model) {
+                // Use metadata_for_model for prefix-aware config selection.
+                // DashScope models (qwen-*, kimi-*) and Moonshot models (moonshot/*)
+                // all speak the OpenAI wire format but need different configs.
+                let (config, oauth_provider_id) = match providers::metadata_for_model(&resolved_model) {
                     Some(meta) if meta.auth_env == "DASHSCOPE_API_KEY" => {
-                        OpenAiCompatConfig::dashscope()
+                        (OpenAiCompatConfig::dashscope(), None)
                     }
-                    _ => OpenAiCompatConfig::openai(),
+                    Some(meta) if meta.auth_env == "MOONSHOT_API_KEY" => {
+                        (OpenAiCompatConfig::moonshot(), Some("moonshot"))
+                    }
+                    _ => (OpenAiCompatConfig::openai(), Some("openai")),
                 };
-                Ok(Self::OpenAi(OpenAiCompatClient::from_env(config)?))
+                // Try OAuth if the provider supports it and env var is not set
+                if let Some(provider_id) = oauth_provider_id {
+                    if provider_id == "openai" {
+                        // OpenAI OAuth tokens are WHAM-backend tokens (chatgpt.com/backend-api/wham),
+                        // NOT Platform API tokens. Route to WhamClient when using OAuth.
+                        if let Ok(Some(token_set)) = runtime::load_provider_oauth(provider_id) {
+                            let account_id = token_set
+                                .id_token
+                                .as_deref()
+                                .and_then(runtime::extract_chatgpt_account_id)
+                                .or_else(|| {
+                                    runtime::extract_chatgpt_account_id(&token_set.access_token)
+                                });
+                            return Ok(Self::Wham(WhamClient::from_oauth_token_set(
+                                token_set,
+                                account_id,
+                                "https://auth.openai.com/oauth/token",
+                                "app_EMoamEEZ73f0CkXaXp7hrann",
+                            )));
+                        }
+                    }
+                    if provider_id == "moonshot" {
+                        Ok(Self::OpenAi(
+                            OpenAiCompatClient::from_env_or_oauth_with_refresh(
+                                config,
+                                provider_id,
+                                "https://auth.kimi.com/api/oauth/token",
+                                "17e5f671-d194-4dfb-9706-5516cb48c098",
+                            )?,
+                        ))
+                    } else {
+                        Ok(Self::OpenAi(OpenAiCompatClient::from_env_or_oauth(
+                            config, provider_id,
+                        )?))
+                    }
+                } else {
+                    Ok(Self::OpenAi(OpenAiCompatClient::from_env(config)?))
+                }
             }
+        }
+    }
+
+    #[must_use]
+    pub fn from_openai_compatible_profile(
+        api_key: impl Into<String>,
+        base_url: impl Into<String>,
+    ) -> Self {
+        Self::OpenAi(
+            OpenAiCompatClient::new(api_key, OpenAiCompatConfig::openai()).with_base_url(base_url),
+        )
+    }
+
+    /// Create an OpenAI-compatible client from an OAuth token set with automatic refresh.
+    /// Used for custom providers that authenticate via OAuth rather than API keys.
+    #[must_use]
+    pub fn from_openai_compatible_oauth(
+        base_url: impl Into<String>,
+        token_set: runtime::OAuthTokenSet,
+        token_url: impl Into<String>,
+        client_id: impl Into<String>,
+    ) -> Self {
+        Self::OpenAi(
+            OpenAiCompatClient::from_oauth_token_set(
+                token_set,
+                OpenAiCompatConfig::openai(),
+                token_url,
+                client_id,
+                "custom",
+            )
+            .with_base_url(base_url),
+        )
+    }
+
+    #[must_use]
+    pub fn from_anthropic_compatible_profile(
+        api_key: impl Into<String>,
+        base_url: impl Into<String>,
+    ) -> Self {
+        Self::Anthropic(AnthropicClient::new(api_key).with_base_url(base_url))
+    }
+
+    /// Set a custom User-Agent header on the underlying OpenAI-compatible client.
+    /// No-op for Anthropic, xAI, or WHAM variants.
+    #[must_use]
+    pub fn with_user_agent(self, user_agent: impl Into<String>) -> Self {
+        match self {
+            Self::OpenAi(client) => Self::OpenAi(client.with_user_agent(user_agent)),
+            other => other,
         }
     }
 
@@ -51,7 +143,7 @@ impl ProviderClient {
         match self {
             Self::Anthropic(_) => ProviderKind::Anthropic,
             Self::Xai(_) => ProviderKind::Xai,
-            Self::OpenAi(_) => ProviderKind::OpenAi,
+            Self::OpenAi(_) | Self::Wham(_) => ProviderKind::OpenAi,
         }
     }
 
@@ -67,7 +159,7 @@ impl ProviderClient {
     pub fn prompt_cache_stats(&self) -> Option<PromptCacheStats> {
         match self {
             Self::Anthropic(client) => client.prompt_cache_stats(),
-            Self::Xai(_) | Self::OpenAi(_) => None,
+            Self::Xai(_) | Self::OpenAi(_) | Self::Wham(_) => None,
         }
     }
 
@@ -75,7 +167,7 @@ impl ProviderClient {
     pub fn take_last_prompt_cache_record(&self) -> Option<PromptCacheRecord> {
         match self {
             Self::Anthropic(client) => client.take_last_prompt_cache_record(),
-            Self::Xai(_) | Self::OpenAi(_) => None,
+            Self::Xai(_) | Self::OpenAi(_) | Self::Wham(_) => None,
         }
     }
 
@@ -86,6 +178,7 @@ impl ProviderClient {
         match self {
             Self::Anthropic(client) => client.send_message(request).await,
             Self::Xai(client) | Self::OpenAi(client) => client.send_message(request).await,
+            Self::Wham(client) => client.send_message(request).await,
         }
     }
 
@@ -102,6 +195,10 @@ impl ProviderClient {
                 .stream_message(request)
                 .await
                 .map(MessageStream::OpenAiCompat),
+            Self::Wham(client) => client
+                .stream_message(request)
+                .await
+                .map(MessageStream::Wham),
         }
     }
 }
@@ -110,6 +207,7 @@ impl ProviderClient {
 pub enum MessageStream {
     Anthropic(anthropic::MessageStream),
     OpenAiCompat(openai_compat::MessageStream),
+    Wham(wham::WhamMessageStream),
 }
 
 impl MessageStream {
@@ -118,6 +216,7 @@ impl MessageStream {
         match self {
             Self::Anthropic(stream) => stream.request_id(),
             Self::OpenAiCompat(stream) => stream.request_id(),
+            Self::Wham(stream) => stream.request_id(),
         }
     }
 
@@ -125,6 +224,7 @@ impl MessageStream {
         match self {
             Self::Anthropic(stream) => stream.next_event().await,
             Self::OpenAiCompat(stream) => stream.next_event().await,
+            Self::Wham(stream) => stream.next_event().await,
         }
     }
 }

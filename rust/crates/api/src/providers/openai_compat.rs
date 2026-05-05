@@ -19,6 +19,7 @@ use super::{preflight_message_request, Provider, ProviderFuture};
 pub const DEFAULT_XAI_BASE_URL: &str = "https://api.x.ai/v1";
 pub const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 pub const DEFAULT_DASHSCOPE_BASE_URL: &str = "https://dashscope.aliyuncs.com/compatible-mode/v1";
+pub const DEFAULT_MOONSHOT_BASE_URL: &str = "https://api.moonshot.ai/v1";
 const REQUEST_ID_HEADER: &str = "request-id";
 const ALT_REQUEST_ID_HEADER: &str = "x-request-id";
 const DEFAULT_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
@@ -41,11 +42,13 @@ pub struct OpenAiCompatConfig {
 const XAI_ENV_VARS: &[&str] = &["XAI_API_KEY"];
 const OPENAI_ENV_VARS: &[&str] = &["OPENAI_API_KEY"];
 const DASHSCOPE_ENV_VARS: &[&str] = &["DASHSCOPE_API_KEY"];
+const MOONSHOT_ENV_VARS: &[&str] = &["MOONSHOT_API_KEY"];
 
 // Provider-specific request body size limits in bytes
 const XAI_MAX_REQUEST_BODY_BYTES: usize = 52_428_800; // 50MB
 const OPENAI_MAX_REQUEST_BODY_BYTES: usize = 104_857_600; // 100MB
 const DASHSCOPE_MAX_REQUEST_BODY_BYTES: usize = 6_291_456; // 6MB (observed limit in dogfood)
+const MOONSHOT_MAX_REQUEST_BODY_BYTES: usize = 52_428_800; // 50MB
 
 impl OpenAiCompatConfig {
     #[must_use]
@@ -85,15 +88,38 @@ impl OpenAiCompatConfig {
         }
     }
 
+    /// Moonshot AI native endpoint (Kimi family models).
+    #[must_use]
+    pub const fn moonshot() -> Self {
+        Self {
+            provider_name: "Moonshot",
+            api_key_env: "MOONSHOT_API_KEY",
+            base_url_env: "MOONSHOT_BASE_URL",
+            default_base_url: DEFAULT_MOONSHOT_BASE_URL,
+            max_request_body_bytes: MOONSHOT_MAX_REQUEST_BODY_BYTES,
+        }
+    }
+
     #[must_use]
     pub fn credential_env_vars(self) -> &'static [&'static str] {
         match self.provider_name {
             "xAI" => XAI_ENV_VARS,
             "OpenAI" => OPENAI_ENV_VARS,
             "DashScope" => DASHSCOPE_ENV_VARS,
+            "Moonshot" => MOONSHOT_ENV_VARS,
             _ => &[],
         }
     }
+}
+
+#[derive(Debug, Clone)]
+struct OpenAiCompatOAuthState {
+    access_token: String,
+    refresh_token: Option<String>,
+    expires_at: Option<u64>,
+    token_url: String,
+    client_id: String,
+    provider_id: String,
 }
 
 #[derive(Debug, Clone)]
@@ -105,6 +131,9 @@ pub struct OpenAiCompatClient {
     max_retries: u32,
     initial_backoff: Duration,
     max_backoff: Duration,
+    oauth_state: Option<std::sync::Arc<std::sync::Mutex<OpenAiCompatOAuthState>>>,
+    /// Custom User-Agent header for providers that gate access by client identity.
+    user_agent: Option<String>,
 }
 
 impl OpenAiCompatClient {
@@ -126,6 +155,8 @@ impl OpenAiCompatClient {
             max_retries: DEFAULT_MAX_RETRIES,
             initial_backoff: DEFAULT_INITIAL_BACKOFF,
             max_backoff: DEFAULT_MAX_BACKOFF,
+            oauth_state: None,
+            user_agent: None,
         }
     }
 
@@ -139,9 +170,99 @@ impl OpenAiCompatClient {
         Ok(Self::new(api_key, config))
     }
 
+    /// Create a client using an OAuth access token instead of an API key.
+    /// The token is sent as `Authorization: Bearer {token}`.
+    /// No automatic refresh is performed; use [`from_oauth_token_set`] for refresh support.
+    #[must_use]
+    pub fn from_oauth_token(token: impl Into<String>, config: OpenAiCompatConfig) -> Self {
+        Self::new(token, config)
+    }
+
+    /// Create a client from a full OAuth token set with automatic refresh support.
+    #[must_use]
+    pub fn from_oauth_token_set(
+        token_set: runtime::OAuthTokenSet,
+        config: OpenAiCompatConfig,
+        token_url: impl Into<String>,
+        client_id: impl Into<String>,
+        provider_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            http: build_http_client_or_default(),
+            api_key: token_set.access_token.clone(),
+            config,
+            base_url: read_base_url(config),
+            max_retries: DEFAULT_MAX_RETRIES,
+            initial_backoff: DEFAULT_INITIAL_BACKOFF,
+            max_backoff: DEFAULT_MAX_BACKOFF,
+            oauth_state: Some(std::sync::Arc::new(std::sync::Mutex::new(
+                OpenAiCompatOAuthState {
+                    access_token: token_set.access_token,
+                    refresh_token: token_set.refresh_token,
+                    expires_at: token_set.expires_at,
+                    token_url: token_url.into(),
+                    client_id: client_id.into(),
+                    provider_id: provider_id.into(),
+                },
+            ))),
+            user_agent: None,
+        }
+    }
+
+    /// Try env var first, then fall back to saved OAuth token for the provider.
+    /// `provider_id` is the key used in `~/.claw/credentials.json` under `oauth_providers`.
+    /// No automatic refresh is performed; use [`from_env_or_oauth_with_refresh`] for refresh support.
+    pub fn from_env_or_oauth(
+        config: OpenAiCompatConfig,
+        provider_id: &str,
+    ) -> Result<Self, ApiError> {
+        if let Some(api_key) = read_env_non_empty(config.api_key_env)? {
+            return Ok(Self::new(api_key, config));
+        }
+        if let Ok(Some(token_set)) = runtime::load_provider_oauth(provider_id) {
+            return Ok(Self::from_oauth_token(token_set.access_token, config));
+        }
+        Err(ApiError::missing_credentials(
+            config.provider_name,
+            config.credential_env_vars(),
+        ))
+    }
+
+    /// Try env var first, then fall back to saved OAuth token with automatic refresh.
+    /// `token_url` and `client_id` are used to refresh expired access tokens.
+    pub fn from_env_or_oauth_with_refresh(
+        config: OpenAiCompatConfig,
+        provider_id: &str,
+        token_url: &str,
+        client_id: &str,
+    ) -> Result<Self, ApiError> {
+        if let Some(api_key) = read_env_non_empty(config.api_key_env)? {
+            return Ok(Self::new(api_key, config));
+        }
+        if let Ok(Some(token_set)) = runtime::load_provider_oauth(provider_id) {
+            return Ok(Self::from_oauth_token_set(
+                token_set,
+                config,
+                token_url,
+                client_id,
+                provider_id,
+            ));
+        }
+        Err(ApiError::missing_credentials(
+            config.provider_name,
+            config.credential_env_vars(),
+        ))
+    }
+
     #[must_use]
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into();
+        self
+    }
+
+    #[must_use]
+    pub fn with_user_agent(mut self, user_agent: impl Into<String>) -> Self {
+        self.user_agent = Some(user_agent.into());
         self
     }
 
@@ -262,6 +383,69 @@ impl OpenAiCompatClient {
         })
     }
 
+    async fn ensure_token_valid(&self) -> Result<(), ApiError> {
+        let Some(oauth_state) = &self.oauth_state else {
+            return Ok(());
+        };
+
+        let needs_refresh = {
+            let state = oauth_state.lock().map_err(|e| {
+                ApiError::Auth(format!("OAuth state mutex poisoned: {e}"))
+            })?;
+            match state.expires_at {
+                None => false,
+                Some(expires_at) => {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    now + 60 >= expires_at
+                }
+            }
+        };
+
+        if !needs_refresh {
+            return Ok(());
+        }
+
+        let (refresh_token, token_url, client_id, provider_id) = {
+            let state = oauth_state.lock().map_err(|e| {
+                ApiError::Auth(format!("OAuth state mutex poisoned: {e}"))
+            })?;
+            let refresh = state.refresh_token.clone().ok_or_else(|| {
+                ApiError::Auth("OAuth token expired and no refresh token available".to_string())
+            })?;
+            (
+                refresh,
+                state.token_url.clone(),
+                state.client_id.clone(),
+                state.provider_id.clone(),
+            )
+        };
+
+        let new_token = runtime::refresh_oauth_token(
+            &self.http,
+            &token_url,
+            &client_id,
+            &refresh_token,
+        )
+        .await
+        .map_err(|e| ApiError::Auth(format!("OAuth token refresh failed: {e}")))?;
+
+        {
+            let mut state = oauth_state.lock().map_err(|e| {
+                ApiError::Auth(format!("OAuth state mutex poisoned: {e}"))
+            })?;
+            state.access_token = new_token.access_token.clone();
+            state.refresh_token = new_token.refresh_token.clone();
+            state.expires_at = new_token.expires_at;
+        }
+
+        let _ = runtime::save_provider_oauth(&provider_id, &new_token);
+
+        Ok(())
+    }
+
     async fn send_raw_request(
         &self,
         request: &MessageRequest,
@@ -269,15 +453,30 @@ impl OpenAiCompatClient {
         // Pre-flight check: verify request body size against provider limits
         check_request_body_size(request, self.config())?;
 
+        self.ensure_token_valid().await?;
+
+        let access_token = {
+            if let Some(oauth_state) = &self.oauth_state {
+                let state = oauth_state.lock().map_err(|e| {
+                    ApiError::Auth(format!("OAuth state mutex poisoned: {e}"))
+                })?;
+                state.access_token.clone()
+            } else {
+                self.api_key.clone()
+            }
+        };
+
         let request_url = chat_completions_endpoint(&self.base_url);
-        self.http
+        let mut req = self
+            .http
             .post(&request_url)
             .header("content-type", "application/json")
-            .bearer_auth(&self.api_key)
-            .json(&build_chat_completion_request(request, self.config()))
-            .send()
-            .await
-            .map_err(ApiError::from)
+            .bearer_auth(&access_token)
+            .json(&build_chat_completion_request(request, self.config()));
+        if let Some(ref ua) = self.user_agent {
+            req = req.header("user-agent", ua);
+        }
+        req.send().await.map_err(ApiError::from)
     }
 
     fn backoff_for_attempt(&self, attempt: u32) -> Result<Duration, ApiError> {
