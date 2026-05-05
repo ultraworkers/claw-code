@@ -719,26 +719,42 @@ fn optional_u16(
 fn optional_string_array(
     object: &BTreeMap<String, JsonValue>,
     key: &str,
-    context: &str,
+    _context: &str,
 ) -> Result<Option<Vec<String>>, ConfigError> {
     match object.get(key) {
         Some(value) => {
             let Some(array) = value.as_array() else {
-                return Err(ConfigError::Parse(format!(
-                    "{context}: field {key} must be an array"
-                )));
+                // Not an array — treat as absent (e.g. hooks in object format).
+                return Ok(None);
             };
-            array
+            let strings: Vec<String> = array
                 .iter()
-                .map(|item| {
-                    item.as_str().map(ToOwned::to_owned).ok_or_else(|| {
-                        ConfigError::Parse(format!(
-                            "{context}: field {key} must contain only strings"
-                        ))
-                    })
+                .filter_map(|item| {
+                    // Accept plain strings directly.
+                    if let Some(s) = item.as_str() {
+                        return Some(s.to_owned());
+                    }
+                    // Accept object-style hook entries: extract nested command strings.
+                    if let Some(obj) = item.as_object() {
+                        if let Some(hooks_arr) = obj.get("hooks").and_then(JsonValue::as_array) {
+                            for hook in hooks_arr {
+                                if let Some(cmd) =
+                                    hook.as_object().and_then(|h| h.get("command")).and_then(JsonValue::as_str)
+                                {
+                                    return Some(cmd.to_owned());
+                                }
+                            }
+                        }
+                    }
+                    // Skip unrecognized entries gracefully.
+                    None
                 })
-                .collect::<Result<Vec<_>, _>>()
-                .map(Some)
+                .collect();
+            if strings.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(strings))
+            }
         }
         None => Ok(None),
     }
