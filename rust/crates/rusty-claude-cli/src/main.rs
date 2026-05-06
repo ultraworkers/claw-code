@@ -7193,15 +7193,12 @@ fn run_repl_tui(
                 }
                 match SlashCommand::parse(&trimmed) {
                     Ok(Some(command)) => {
-                        app.suspend()?;
                         let cmd_result = cli.handle_repl_command(command);
                         if let Ok(true) = cmd_result {
                             cli.persist_session()?;
                         }
-                        if let Err(e) = app.resume() {
-                            eprintln!("TUI resume failed: {e}");
-                            let _ = app.restore_terminal();
-                            return Err(e);
+                        if let Err(e) = cmd_result {
+                            app.push_system_message(&format!("Command error: {e}"));
                         }
                         continue;
                     }
@@ -7222,13 +7219,23 @@ fn run_repl_tui(
                 update_dashboard(&dashboard_state, &cli);
                 app.set_status("Thinking...");
 
-                // Suspend TUI, run turn with normal stdout, then resume
-                app.suspend()?;
+                // Run turn in-place. Output goes to the alternate screen buffer
+                // which ratatui owns - it will be overwritten on next redraw.
+                // This avoids the fragile suspend/resume pattern.
                 let result = cli.run_turn(&prompt);
-                if let Err(e) = app.resume() {
-                    eprintln!("TUI resume failed: {e}, restoring terminal...");
-                    let _ = app.restore_terminal();
-                    return Err(e);
+
+                // Read the last assistant message from the session for the conversation pane
+                {
+                    let messages = &cli.runtime.session().messages;
+                    if let Some(msg) = messages.last() {
+                        if msg.role == runtime::MessageRole::Assistant {
+                            for block in &msg.blocks {
+                                if let runtime::ContentBlock::Text { text } = block {
+                                    app.push_output(text, false);
+                                }
+                            }
+                        }
+                    }
                 }
 
                 match result {
@@ -7246,18 +7253,16 @@ fn run_repl_tui(
                 update_dashboard(&dashboard_state, &cli);
             }
             tui::TuiReadOutcome::ProviderSwap => {
-                app.suspend()?;
+                // Provider swap wizard needs interactive terminal
+                let _ = app.restore_terminal();
+                println!();
                 setup_wizard::run_setup_wizard()?;
                 let cwd = std::env::current_dir().unwrap_or_default();
                 let config = runtime::ConfigLoader::default_for(&cwd).load().ok();
                 if let Some(new_model) = config.as_ref().and_then(|c| c.provider().model().map(str::to_string)) {
-                    cli.set_model(Some(new_model))?;
+                    let _ = cli.set_model(Some(new_model));
                 }
-                if let Err(e) = app.resume() {
-                    eprintln!("TUI resume failed: {e}");
-                    let _ = app.restore_terminal();
-                    return Err(e);
-                }
+                app.push_system_message("Provider updated - restart for full effect");
                 update_dashboard(&dashboard_state, &cli);
             }
             tui::TuiReadOutcome::TeamToggle => {
