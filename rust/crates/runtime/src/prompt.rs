@@ -236,7 +236,7 @@ fn discover_instruction_files(cwd: &Path) -> std::io::Result<Vec<ContextFile>> {
     directories.reverse();
 
     let mut files = Vec::new();
-    for dir in directories {
+    for dir in &directories {
         for candidate in [
             dir.join("CLAUDE.md"),
             dir.join("CLAUDE.local.md"),
@@ -246,7 +246,71 @@ fn discover_instruction_files(cwd: &Path) -> std::io::Result<Vec<ContextFile>> {
             push_context_file(&mut files, candidate)?;
         }
     }
+
+    // T2.4: Path-scoped rules — load every `.claude/rules/*.md` and
+    // `.claw/rules/*.md` file in the cwd ancestry. The frontmatter `paths:`
+    // glob filtering is intentionally deferred; rules currently load
+    // unconditionally. That's still useful for project-wide rules (the most
+    // common case) and avoids a half-implemented matcher. Rule files are
+    // sorted within each directory for deterministic ordering.
+    for dir in &directories {
+        for rules_dir in [dir.join(".claude").join("rules"), dir.join(".claw").join("rules")] {
+            if let Ok(entries) = fs::read_dir(&rules_dir) {
+                let mut rule_paths: Vec<PathBuf> = entries
+                    .flatten()
+                    .map(|e| e.path())
+                    .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("md"))
+                    .collect();
+                rule_paths.sort();
+                for path in rule_paths {
+                    push_context_file(&mut files, path)?;
+                }
+            }
+        }
+    }
+
+    // T1.3: Auto-memory discovery. Reads from
+    // ~/.claude/projects/<encoded-cwd>/memory/ matching Claude Code's path
+    // convention so memory files persist across CC↔claw and are auto-attached
+    // to the system prompt. MEMORY.md (the index) is loaded first, then each
+    // .md topic file in deterministic order.
+    if let Some(memory_dir) = memory_dir_for_cwd(cwd) {
+        push_context_file(&mut files, memory_dir.join("MEMORY.md"))?;
+        if let Ok(entries) = fs::read_dir(&memory_dir) {
+            let mut topic_paths: Vec<PathBuf> = entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.extension().and_then(|e| e.to_str()) == Some("md")
+                        && p.file_name().and_then(|n| n.to_str()) != Some("MEMORY.md")
+                })
+                .collect();
+            topic_paths.sort();
+            for path in topic_paths {
+                push_context_file(&mut files, path)?;
+            }
+        }
+    }
+
     Ok(dedupe_instruction_files(files))
+}
+
+/// Resolves the auto-memory directory for a given working directory, using
+/// Claude Code's `<HOME>/.claude/projects/<encoded-cwd>/memory/` convention
+/// (slashes in the absolute cwd path are replaced with dashes).
+fn memory_dir_for_cwd(cwd: &Path) -> Option<PathBuf> {
+    if !cwd.is_absolute() {
+        return None;
+    }
+    let home = std::env::var_os("HOME")?;
+    let encoded = cwd.to_string_lossy().replace('/', "-");
+    Some(
+        PathBuf::from(home)
+            .join(".claude")
+            .join("projects")
+            .join(encoded)
+            .join("memory"),
+    )
 }
 
 fn push_context_file(files: &mut Vec<ContextFile>, path: PathBuf) -> std::io::Result<()> {

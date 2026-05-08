@@ -395,6 +395,12 @@ fn parse_rule_matcher(content: &str) -> PermissionRuleMatcher {
     if unescaped.is_empty() || unescaped == "*" {
         PermissionRuleMatcher::Any
     } else if let Some(prefix) = unescaped.strip_suffix(":*") {
+        // Provider-specific colon-star form, e.g. WebFetch(domain:*).
+        PermissionRuleMatcher::Prefix(prefix.to_string())
+    } else if let Some(prefix) = unescaped.strip_suffix('*') {
+        // T2.5: General trailing-`*` glob — `Bash(npm run *)`, `Bash(git *)`,
+        // `WebFetch(https://example.com/*)`. Matches any input whose subject
+        // starts with the literal prefix (everything before the `*`).
         PermissionRuleMatcher::Prefix(prefix.to_string())
     } else {
         PermissionRuleMatcher::Exact(unescaped)

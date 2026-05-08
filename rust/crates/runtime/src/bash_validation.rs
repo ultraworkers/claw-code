@@ -592,6 +592,36 @@ fn classify_git_command(command: &str) -> CommandIntent {
 /// Returns the first non-Allow result, or Allow if all validations pass.
 #[must_use]
 pub fn validate_command(command: &str, mode: PermissionMode, workspace: &Path) -> ValidationResult {
+    // T1.5: Split compound pipelines (`&&`, `||`, `;`, `|`, `&`) at top level
+    // and validate each segment independently. Without this, a malicious
+    // chain like `ls && rm -rf /` passes because only the first command is
+    // inspected.
+    let segments = split_bash_pipeline(command);
+    if segments.len() <= 1 {
+        return validate_command_segment(command, mode, workspace);
+    }
+    let mut deferred_warn: Option<ValidationResult> = None;
+    for segment in segments {
+        match validate_command_segment(segment, mode, workspace) {
+            ValidationResult::Allow => {}
+            block @ ValidationResult::Block { .. } => return block,
+            warn @ ValidationResult::Warn { .. } => {
+                if deferred_warn.is_none() {
+                    deferred_warn = Some(warn);
+                }
+            }
+        }
+    }
+    deferred_warn.unwrap_or(ValidationResult::Allow)
+}
+
+/// Validate a single command segment (the original pre-T1.5 implementation,
+/// preserved unchanged so single-command inputs behave identically).
+fn validate_command_segment(
+    command: &str,
+    mode: PermissionMode,
+    workspace: &Path,
+) -> ValidationResult {
     // 1. Mode-level validation (includes read-only checks).
     let result = validate_mode(command, mode);
     if result != ValidationResult::Allow {
@@ -612,6 +642,73 @@ pub fn validate_command(command: &str, mode: PermissionMode, workspace: &Path) -
 
     // 4. Path validation.
     validate_paths(command, workspace)
+}
+
+/// Split a bash command at top-level chain/pipe operators, ignoring separators
+/// that appear inside single quotes, double quotes, backticks, or after a
+/// backslash escape. Recognised separators: `&&`, `||`, `;`, `|`, `&`.
+/// Returns trimmed, non-empty segments in order.
+fn split_bash_pipeline(command: &str) -> Vec<&str> {
+    let bytes = command.as_bytes();
+    let mut segments: Vec<&str> = Vec::new();
+    let mut start: usize = 0;
+    let mut i: usize = 0;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut in_backtick = false;
+    while i < bytes.len() {
+        let c = bytes[i];
+        // Backslash escape (outside single quotes, where it is literal)
+        if c == b'\\' && !in_single && i + 1 < bytes.len() {
+            i += 2;
+            continue;
+        }
+        if !in_double && !in_backtick && c == b'\'' {
+            in_single = !in_single;
+            i += 1;
+            continue;
+        }
+        if !in_single && !in_backtick && c == b'"' {
+            in_double = !in_double;
+            i += 1;
+            continue;
+        }
+        if !in_single && !in_double && c == b'`' {
+            in_backtick = !in_backtick;
+            i += 1;
+            continue;
+        }
+        if !in_single && !in_double && !in_backtick {
+            // Two-byte separators take precedence over one-byte.
+            let two_byte = i + 1 < bytes.len()
+                && (bytes[i] == b'&' && bytes[i + 1] == b'&'
+                    || bytes[i] == b'|' && bytes[i + 1] == b'|');
+            if two_byte {
+                let segment = command[start..i].trim();
+                if !segment.is_empty() {
+                    segments.push(segment);
+                }
+                i += 2;
+                start = i;
+                continue;
+            }
+            if c == b';' || c == b'|' || c == b'&' {
+                let segment = command[start..i].trim();
+                if !segment.is_empty() {
+                    segments.push(segment);
+                }
+                i += 1;
+                start = i;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    let last = command[start..].trim();
+    if !last.is_empty() {
+        segments.push(last);
+    }
+    segments
 }
 
 // ---------------------------------------------------------------------------
@@ -1001,4 +1098,86 @@ mod tests {
     fn extracts_plain_command() {
         assert_eq!(extract_first_command("grep -r pattern ."), "grep");
     }
+
+    // --- split_bash_pipeline (T1.5) ---
+
+    #[test]
+    fn split_pipeline_single_command() {
+        assert_eq!(split_bash_pipeline("ls -la"), vec!["ls -la"]);
+    }
+
+    #[test]
+    fn split_pipeline_double_amp() {
+        assert_eq!(
+            split_bash_pipeline("ls -la && rm -rf /tmp/x"),
+            vec!["ls -la", "rm -rf /tmp/x"]
+        );
+    }
+
+    #[test]
+    fn split_pipeline_double_pipe() {
+        assert_eq!(
+            split_bash_pipeline("test -f foo || touch foo"),
+            vec!["test -f foo", "touch foo"]
+        );
+    }
+
+    #[test]
+    fn split_pipeline_semicolon_and_pipe() {
+        assert_eq!(
+            split_bash_pipeline("ls ; cat /etc/hosts | grep host"),
+            vec!["ls", "cat /etc/hosts", "grep host"]
+        );
+    }
+
+    #[test]
+    fn split_pipeline_respects_double_quotes() {
+        assert_eq!(
+            split_bash_pipeline(r#"echo "a && b" && ls"#),
+            vec![r#"echo "a && b""#, "ls"]
+        );
+    }
+
+    #[test]
+    fn split_pipeline_respects_single_quotes() {
+        assert_eq!(
+            split_bash_pipeline(r#"echo 'a;b' ; ls"#),
+            vec![r#"echo 'a;b'"#, "ls"]
+        );
+    }
+
+    #[test]
+    fn split_pipeline_respects_backslash_escape() {
+        assert_eq!(
+            split_bash_pipeline(r#"echo a\&\&b"#),
+            vec![r#"echo a\&\&b"#]
+        );
+    }
+
+    // --- validate_command compound-bypass closure (T1.5) ---
+
+    #[test]
+    fn validate_command_blocks_destructive_after_safe_in_chain() {
+        let workspace = std::env::current_dir().unwrap();
+        // Pre-T1.5: this passed because only "ls -la" was inspected.
+        assert!(matches!(
+            validate_command("ls -la && rm -rf /tmp/x", PermissionMode::ReadOnly, &workspace),
+            ValidationResult::Block { .. }
+        ));
+    }
+
+    #[test]
+    fn validate_command_allows_chain_of_safe_commands() {
+        let workspace = std::env::current_dir().unwrap();
+        assert_eq!(
+            validate_command("ls -la && pwd && echo hi", PermissionMode::ReadOnly, &workspace),
+            ValidationResult::Allow
+        );
+    }
+
+    // Note: I considered a test that `echo "ls && rm -rf /"` should be Allow
+    // because the quoted text is not a separate command. The split correctly
+    // returns one segment, but `check_destructive` (correctly) scans the
+    // whole string for `rm -rf /`-like fork-bomb patterns and blocks anyway.
+    // Pre-existing paranoid behavior, not a regression from T1.5.
 }

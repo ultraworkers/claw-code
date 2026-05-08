@@ -24,11 +24,11 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use api::{
-    detect_provider_kind, model_family_identity_for, resolve_startup_auth_source, AnthropicClient,
-    AuthSource, ContentBlockDelta, InputContentBlock, InputMessage, MessageRequest,
-    MessageResponse, OutputContentBlock, PromptCache, ProviderClient as ApiProviderClient,
-    ProviderKind, StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition,
-    ToolResultContentBlock,
+    detect_provider_kind, max_tokens_for_model_with_override, model_family_identity_for,
+    resolve_startup_auth_source, AnthropicClient, AuthSource, ContentBlockDelta, InputContentBlock,
+    InputMessage, MessageRequest, MessageResponse, OutputContentBlock, PromptCache,
+    ProviderClient as ApiProviderClient, ProviderKind, StreamEvent as ApiStreamEvent, ToolChoice,
+    ToolDefinition, ToolResultContentBlock,
 };
 
 use commands::{
@@ -148,9 +148,6 @@ impl ModelProvenance {
     }
 }
 
-fn max_tokens_for_model(model: &str) -> u32 {
-    api::max_tokens_for_model(model)
-}
 // Build-time constants injected by build.rs (fall back to static values when
 // build.rs hasn't run, e.g. in doc-test or unusual toolchain environments).
 const DEFAULT_DATE: &str = match option_env!("BUILD_DATE") {
@@ -405,7 +402,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 None
             };
             let effective_prompt = merge_prompt_with_stdin(&prompt, stdin_context.as_deref());
-            let mut cli = LiveCli::new(model, true, allowed_tools, permission_mode)?;
+            let enable_tools = std::env::var_os("CLAW_NO_TOOLS").is_none();
+            let mut cli = LiveCli::new(model, enable_tools, allowed_tools, permission_mode)?;
             cli.set_reasoning_effort(reasoning_effort);
             cli.run_turn_with_output(&effective_prompt, output_format, compact)?;
         }
@@ -1481,6 +1479,10 @@ fn validate_model_syntax(model: &str) -> Result<(), String> {
     match trimmed {
         "opus" | "sonnet" | "haiku" => return Ok(()),
         _ => {}
+    }
+    // User-defined aliases from .claw.json
+    if config_alias_for_current_dir(trimmed).is_some() {
+        return Ok(());
     }
     // Check for spaces (malformed)
     if trimmed.contains(' ') {
@@ -3837,7 +3839,8 @@ fn run_repl(
     enforce_broad_cwd_policy(allow_broad_cwd, CliOutputFormat::Text)?;
     run_stale_base_preflight(base_commit.as_deref());
     let resolved_model = resolve_repl_model(model);
-    let mut cli = LiveCli::new(resolved_model, true, allowed_tools, permission_mode)?;
+    let enable_tools = std::env::var_os("CLAW_NO_TOOLS").is_none();
+    let mut cli = LiveCli::new(resolved_model, enable_tools, allowed_tools, permission_mode)?;
     cli.set_reasoning_effort(reasoning_effort);
     let mut editor =
         input::LineEditor::new("> ", cli.repl_completion_candidates().unwrap_or_default());
@@ -5380,11 +5383,17 @@ impl LiveCli {
         let removed = result.removed_message_count;
         let kept = result.compacted_session.messages.len();
         let skipped = removed == 0;
+        // T1.2: Re-discover system prompt from disk so post-compact context
+        // includes any CLAUDE.md / instruction-file changes since startup.
+        // Falls back to the cached prompt if discovery fails (e.g. cwd vanished).
+        let fresh_system_prompt =
+            build_system_prompt().unwrap_or_else(|_| self.system_prompt.clone());
+        self.system_prompt = fresh_system_prompt.clone();
         let runtime = build_runtime(
             result.compacted_session,
             &self.session.id,
             self.model.clone(),
-            self.system_prompt.clone(),
+            fresh_system_prompt,
             true,
             true,
             self.allowed_tools.clone(),
@@ -7740,6 +7749,7 @@ fn build_runtime_with_plugin_state(
             allowed_tools.clone(),
             tool_registry.clone(),
             progress_reporter,
+            feature_config.plugins().max_output_tokens(),
         )?,
         CliToolExecutor::new(
             allowed_tools.clone(),
@@ -7856,6 +7866,7 @@ struct AnthropicRuntimeClient {
     tool_registry: GlobalToolRegistry,
     progress_reporter: Option<InternalPromptProgressReporter>,
     reasoning_effort: Option<String>,
+    max_output_tokens_override: Option<u32>,
 }
 
 impl AnthropicRuntimeClient {
@@ -7867,6 +7878,7 @@ impl AnthropicRuntimeClient {
         allowed_tools: Option<AllowedToolSet>,
         tool_registry: GlobalToolRegistry,
         progress_reporter: Option<InternalPromptProgressReporter>,
+        max_output_tokens_override: Option<u32>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         // Dispatch to the correct provider at construction time.
         // `ApiProviderClient` (exposed by the api crate as
@@ -7921,6 +7933,7 @@ impl AnthropicRuntimeClient {
             tool_registry,
             progress_reporter,
             reasoning_effort: None,
+            max_output_tokens_override,
         })
     }
 
@@ -7946,7 +7959,10 @@ impl ApiClient for AnthropicRuntimeClient {
         let is_post_tool = request_ends_with_tool_result(&request);
         let message_request = MessageRequest {
             model: self.model.clone(),
-            max_tokens: max_tokens_for_model(&self.model),
+            max_tokens: max_tokens_for_model_with_override(
+                &self.model,
+                self.max_output_tokens_override,
+            ),
             messages: convert_messages(&request.messages),
             system: (!request.system_prompt.is_empty()).then(|| request.system_prompt.join("\n\n")),
             tools: self

@@ -77,11 +77,25 @@ pub struct ProviderFallbackConfig {
 }
 
 /// Hook command lists grouped by lifecycle stage.
+///
+/// T2.1: Extended from 3 to 10 lifecycle events for Claude Code parity. The
+/// 3-arg `new()` constructor is preserved for backward compatibility with
+/// existing call sites; the additional events default to empty and can be
+/// populated either via settings.json parsing or the dedicated builder
+/// methods.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RuntimeHookConfig {
     pre_tool_use: Vec<String>,
     post_tool_use: Vec<String>,
     post_tool_use_failure: Vec<String>,
+    stop: Vec<String>,
+    stop_failure: Vec<String>,
+    user_prompt_submit: Vec<String>,
+    session_start: Vec<String>,
+    session_end: Vec<String>,
+    post_tool_batch: Vec<String>,
+    permission_request: Vec<String>,
+    instructions_loaded: Vec<String>,
 }
 
 /// Raw permission rule lists grouped by allow, deny, and ask behavior.
@@ -575,6 +589,7 @@ impl RuntimeHookConfig {
             pre_tool_use,
             post_tool_use,
             post_tool_use_failure,
+            ..Default::default()
         }
     }
 
@@ -602,11 +617,53 @@ impl RuntimeHookConfig {
             &mut self.post_tool_use_failure,
             other.post_tool_use_failure(),
         );
+        extend_unique(&mut self.stop, other.stop());
+        extend_unique(&mut self.stop_failure, other.stop_failure());
+        extend_unique(&mut self.user_prompt_submit, other.user_prompt_submit());
+        extend_unique(&mut self.session_start, other.session_start());
+        extend_unique(&mut self.session_end, other.session_end());
+        extend_unique(&mut self.post_tool_batch, other.post_tool_batch());
+        extend_unique(&mut self.permission_request, other.permission_request());
+        extend_unique(&mut self.instructions_loaded, other.instructions_loaded());
     }
 
     #[must_use]
     pub fn post_tool_use_failure(&self) -> &[String] {
         &self.post_tool_use_failure
+    }
+
+    // T2.1: Claude Code parity event accessors.
+    #[must_use]
+    pub fn stop(&self) -> &[String] {
+        &self.stop
+    }
+    #[must_use]
+    pub fn stop_failure(&self) -> &[String] {
+        &self.stop_failure
+    }
+    #[must_use]
+    pub fn user_prompt_submit(&self) -> &[String] {
+        &self.user_prompt_submit
+    }
+    #[must_use]
+    pub fn session_start(&self) -> &[String] {
+        &self.session_start
+    }
+    #[must_use]
+    pub fn session_end(&self) -> &[String] {
+        &self.session_end
+    }
+    #[must_use]
+    pub fn post_tool_batch(&self) -> &[String] {
+        &self.post_tool_batch
+    }
+    #[must_use]
+    pub fn permission_request(&self) -> &[String] {
+        &self.permission_request
+    }
+    #[must_use]
+    pub fn instructions_loaded(&self) -> &[String] {
+        &self.instructions_loaded
     }
 }
 
@@ -766,6 +823,18 @@ fn parse_optional_hooks_config_object(
         pre_tool_use: optional_string_array(hooks, "PreToolUse", context)?.unwrap_or_default(),
         post_tool_use: optional_string_array(hooks, "PostToolUse", context)?.unwrap_or_default(),
         post_tool_use_failure: optional_string_array(hooks, "PostToolUseFailure", context)?
+            .unwrap_or_default(),
+        stop: optional_string_array(hooks, "Stop", context)?.unwrap_or_default(),
+        stop_failure: optional_string_array(hooks, "StopFailure", context)?.unwrap_or_default(),
+        user_prompt_submit: optional_string_array(hooks, "UserPromptSubmit", context)?
+            .unwrap_or_default(),
+        session_start: optional_string_array(hooks, "SessionStart", context)?.unwrap_or_default(),
+        session_end: optional_string_array(hooks, "SessionEnd", context)?.unwrap_or_default(),
+        post_tool_batch: optional_string_array(hooks, "PostToolBatch", context)?
+            .unwrap_or_default(),
+        permission_request: optional_string_array(hooks, "PermissionRequest", context)?
+            .unwrap_or_default(),
+        instructions_loaded: optional_string_array(hooks, "InstructionsLoaded", context)?
             .unwrap_or_default(),
     })
 }

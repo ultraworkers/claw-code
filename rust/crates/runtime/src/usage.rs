@@ -55,10 +55,23 @@ impl UsageCostEstimate {
 }
 
 /// Returns pricing metadata for a known model alias or family.
+///
+/// T1.4 update: extended beyond Anthropic-only with conservative public-tier
+/// estimates for OpenAI, xAI Grok, and Groq-hosted Llama, plus a zero-cost
+/// fallback for Ollama-style `name:tag` models (which only run locally).
+/// Cache-read/-write costs default to the input rate when the upstream
+/// provider doesn't support prompt caching.
 #[must_use]
 pub fn pricing_for_model(model: &str) -> Option<ModelPricing> {
     let normalized = model.to_ascii_lowercase();
-    if normalized.contains("haiku") {
+    // Strip any `xai/` / `openai/` / `qwen/` etc. routing prefix so the
+    // family match below works on the canonical model name.
+    let canonical = normalized
+        .rsplit_once('/')
+        .map_or(normalized.as_str(), |(_, rest)| rest);
+
+    // Anthropic family — original entries.
+    if canonical.contains("haiku") {
         return Some(ModelPricing {
             input_cost_per_million: 1.0,
             output_cost_per_million: 5.0,
@@ -66,7 +79,7 @@ pub fn pricing_for_model(model: &str) -> Option<ModelPricing> {
             cache_read_cost_per_million: 0.1,
         });
     }
-    if normalized.contains("opus") {
+    if canonical.contains("opus") {
         return Some(ModelPricing {
             input_cost_per_million: 15.0,
             output_cost_per_million: 75.0,
@@ -74,9 +87,92 @@ pub fn pricing_for_model(model: &str) -> Option<ModelPricing> {
             cache_read_cost_per_million: 1.5,
         });
     }
-    if normalized.contains("sonnet") {
+    if canonical.contains("sonnet") {
         return Some(ModelPricing::default_sonnet_tier());
     }
+
+    // Local Ollama models use `name:tag` syntax (e.g. `qwen2.5-coder:14b`),
+    // which never appears in cloud-API model identifiers. Treat as zero-cost.
+    if canonical.contains(':') {
+        return Some(ModelPricing {
+            input_cost_per_million: 0.0,
+            output_cost_per_million: 0.0,
+            cache_creation_cost_per_million: 0.0,
+            cache_read_cost_per_million: 0.0,
+        });
+    }
+
+    // OpenAI GPT-family (public API tier estimates as of 2026).
+    if canonical.starts_with("gpt-5") {
+        return Some(ModelPricing {
+            input_cost_per_million: 10.0,
+            output_cost_per_million: 30.0,
+            cache_creation_cost_per_million: 10.0,
+            cache_read_cost_per_million: 2.5,
+        });
+    }
+    if canonical.starts_with("gpt-4o") || canonical.starts_with("gpt-4.1") {
+        return Some(ModelPricing {
+            input_cost_per_million: 2.50,
+            output_cost_per_million: 10.0,
+            cache_creation_cost_per_million: 2.50,
+            cache_read_cost_per_million: 1.25,
+        });
+    }
+    if canonical.starts_with("o1") || canonical.starts_with("o3") || canonical.starts_with("o4") {
+        return Some(ModelPricing {
+            input_cost_per_million: 15.0,
+            output_cost_per_million: 60.0,
+            cache_creation_cost_per_million: 15.0,
+            cache_read_cost_per_million: 7.5,
+        });
+    }
+
+    // xAI Grok family.
+    if canonical.starts_with("grok-2") {
+        return Some(ModelPricing {
+            input_cost_per_million: 2.0,
+            output_cost_per_million: 10.0,
+            cache_creation_cost_per_million: 2.0,
+            cache_read_cost_per_million: 2.0,
+        });
+    }
+    if canonical.starts_with("grok-3-mini") {
+        return Some(ModelPricing {
+            input_cost_per_million: 0.30,
+            output_cost_per_million: 0.50,
+            cache_creation_cost_per_million: 0.30,
+            cache_read_cost_per_million: 0.30,
+        });
+    }
+    if canonical.starts_with("grok-3") || canonical == "grok" {
+        return Some(ModelPricing {
+            input_cost_per_million: 3.0,
+            output_cost_per_million: 15.0,
+            cache_creation_cost_per_million: 3.0,
+            cache_read_cost_per_million: 3.0,
+        });
+    }
+
+    // Groq-hosted Llama (paid tier; free tier reports same dollar cost but
+    // user pays $0 — accuracy is more important than zero-display here).
+    if canonical.starts_with("llama-3.3-70b") || canonical.starts_with("llama-3.1-70b") {
+        return Some(ModelPricing {
+            input_cost_per_million: 0.59,
+            output_cost_per_million: 0.79,
+            cache_creation_cost_per_million: 0.59,
+            cache_read_cost_per_million: 0.59,
+        });
+    }
+    if canonical.starts_with("llama-3.1-8b") || canonical.starts_with("llama-3.2") {
+        return Some(ModelPricing {
+            input_cost_per_million: 0.05,
+            output_cost_per_million: 0.08,
+            cache_creation_cost_per_million: 0.05,
+            cache_read_cost_per_million: 0.05,
+        });
+    }
+
     None
 }
 
@@ -309,5 +405,59 @@ mod tests {
         let tracker = UsageTracker::from_session(&session);
         assert_eq!(tracker.turns(), 1);
         assert_eq!(tracker.cumulative_usage().total_tokens(), 8);
+    }
+
+    // --- pricing_for_model extended families (T1.4) ---
+
+    #[test]
+    fn pricing_local_ollama_zero_cost() {
+        // `name:tag` syntax is Ollama-only; never appears in cloud APIs.
+        let p = pricing_for_model("llama3.2:3b").expect("local model has pricing");
+        assert_eq!(p.input_cost_per_million, 0.0);
+        assert_eq!(p.output_cost_per_million, 0.0);
+        let p2 = pricing_for_model("openai/qwen2.5-coder:14b").expect("prefixed local model");
+        assert_eq!(p2.output_cost_per_million, 0.0);
+    }
+
+    #[test]
+    fn pricing_groq_llama_70b() {
+        let p = pricing_for_model("llama-3.3-70b-versatile").expect("groq model has pricing");
+        assert!(p.output_cost_per_million > 0.0);
+        assert!(p.output_cost_per_million < 1.0);
+    }
+
+    #[test]
+    fn pricing_xai_grok_3() {
+        let p = pricing_for_model("xai/grok-3").expect("xai prefix routing");
+        assert!(p.output_cost_per_million >= 10.0);
+    }
+
+    #[test]
+    fn pricing_openai_gpt_5() {
+        let p = pricing_for_model("openai/gpt-5.2").expect("gpt-5 family");
+        assert!(p.output_cost_per_million >= 20.0);
+    }
+
+    #[test]
+    fn pricing_unknown_returns_none() {
+        // Random model name no longer silently defaults to sonnet pricing.
+        assert!(pricing_for_model("totally-made-up-model-2099").is_none());
+    }
+
+    #[test]
+    fn pricing_anthropic_unchanged() {
+        // Regression check that the original Anthropic entries still match.
+        assert_eq!(
+            pricing_for_model("claude-haiku-4-5-20251213")
+                .unwrap()
+                .input_cost_per_million,
+            1.0
+        );
+        assert_eq!(
+            pricing_for_model("claude-opus-4-6")
+                .unwrap()
+                .output_cost_per_million,
+            75.0
+        );
     }
 }

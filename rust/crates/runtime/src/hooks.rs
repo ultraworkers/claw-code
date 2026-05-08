@@ -23,6 +23,17 @@ pub enum HookEvent {
     PreToolUse,
     PostToolUse,
     PostToolUseFailure,
+    // T2.1: Claude Code parity events. Configurable from settings.json now;
+    // firing wired in stages — see conversation.rs lifecycle for which are
+    // currently emitted vs reserved for future PRs.
+    Stop,
+    StopFailure,
+    UserPromptSubmit,
+    SessionStart,
+    SessionEnd,
+    PostToolBatch,
+    PermissionRequest,
+    InstructionsLoaded,
 }
 
 impl HookEvent {
@@ -32,6 +43,14 @@ impl HookEvent {
             Self::PreToolUse => "PreToolUse",
             Self::PostToolUse => "PostToolUse",
             Self::PostToolUseFailure => "PostToolUseFailure",
+            Self::Stop => "Stop",
+            Self::StopFailure => "StopFailure",
+            Self::UserPromptSubmit => "UserPromptSubmit",
+            Self::SessionStart => "SessionStart",
+            Self::SessionEnd => "SessionEnd",
+            Self::PostToolBatch => "PostToolBatch",
+            Self::PermissionRequest => "PermissionRequest",
+            Self::InstructionsLoaded => "InstructionsLoaded",
         }
     }
 }

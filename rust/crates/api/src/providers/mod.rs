@@ -193,6 +193,17 @@ pub fn metadata_for_model(model: &str) -> Option<ProviderMetadata> {
             default_base_url: openai_compat::DEFAULT_OPENAI_BASE_URL,
         });
     }
+    // Explicit `xai/<model>` prefix routes to the XAI provider lane. This is
+    // useful for running a second OpenAI-compatible endpoint (e.g. Groq) in
+    // parallel with `OPENAI_BASE_URL`, since they have independent env vars.
+    if canonical.starts_with("xai/") {
+        return Some(ProviderMetadata {
+            provider: ProviderKind::Xai,
+            auth_env: "XAI_API_KEY",
+            base_url_env: "XAI_BASE_URL",
+            default_base_url: openai_compat::DEFAULT_XAI_BASE_URL,
+        });
+    }
     // Alibaba DashScope compatible-mode endpoint. Routes qwen/* and bare
     // qwen-* model names (qwen-max, qwen-plus, qwen-turbo, qwen-qwq, etc.)
     // to the OpenAI-compat client pointed at DashScope's /compatible-mode/v1.
