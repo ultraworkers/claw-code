@@ -242,7 +242,7 @@ fn prompt_fast_model(
 
     let input = read_line(&format!("  Fast model [{}]: ", if default_hint.is_empty() { "same as main" } else { default_hint }))?;
     if input.trim().is_empty() {
-        Ok(current_fast)
+        Ok(Some(default_hint.to_string()).filter(|s| !s.is_empty()))
     } else {
         Ok(Some(input.trim().to_string()))
     }
