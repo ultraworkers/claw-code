@@ -994,6 +994,12 @@ pub fn build_chat_completion_request(
         payload["reasoning_effort"] = json!(effort);
     }
 
+    // DeepSeek V4 Pro/Flash requires `thinking` extra_body for thinking mode.
+    // Per DeepSeek docs: `extra_body={"thinking": {"type": "enabled"}}`.
+    if model_requires_reasoning_content_in_history(wire_model) {
+        payload["thinking"] = json!({"type": "enabled"});
+    }
+
     payload
 }
 
@@ -1038,17 +1044,32 @@ pub fn translate_message(message: &InputMessage, model: &str) -> Vec<Value> {
                     InputContentBlock::ToolResult { .. } => {}
                 }
             }
-            let include_reasoning =
-                model_requires_reasoning_content_in_history(model) && !reasoning.is_empty();
-            if text.is_empty() && tool_calls.is_empty() && !include_reasoning {
+            let needs_reasoning = model_requires_reasoning_content_in_history(model);
+            let include_reasoning = needs_reasoning && !reasoning.is_empty();
+            if text.is_empty() && tool_calls.is_empty() && !include_reasoning && !needs_reasoning {
                 Vec::new()
             } else {
                 let mut msg = serde_json::json!({
                     "role": "assistant",
-                    "content": (!text.is_empty()).then_some(text),
                 });
+                // DeepSeek V4 thinking mode rejects "content": null on assistant messages.
+                // Omit the field entirely when there's no text content (DeepSeek V4).
+                // For other models keep "content": null (valid per OpenAI spec).
+                if !text.is_empty() {
+                    msg["content"] = json!(text);
+                }
+                // DeepSeek V4 Pro/Flash requires `reasoning_content` on ALL assistant
+                // messages when thinking mode is enabled and the conversation has
+                // involved tool calls. Per DeepSeek docs, once a tool-call turn has
+                // occurred, the `reasoning_content` from that turn must be echoed back
+                // in ALL subsequent requests. Include an empty string if there's no
+                // actual thinking content.
                 if include_reasoning {
                     msg["reasoning_content"] = json!(reasoning);
+                } else if needs_reasoning && !tool_calls.is_empty() {
+                    // When a tool-call turn had no Thinking block (edge case),
+                    // DeepSeek V4 still requires reasoning_content in history.
+                    msg["reasoning_content"] = json!("");
                 }
                 // Only include tool_calls when non-empty: some providers reject
                 // assistant messages with an explicit empty tool_calls array.
@@ -1623,6 +1644,45 @@ mod tests {
         // Then reasoning_content is included on the assistant message.
         let assistant = &payload["messages"][0];
         assert_eq!(assistant["reasoning_content"], json!("prior reasoning"));
+        assert_eq!(assistant["content"], json!("answer"));
+    }
+
+    #[test]
+    fn deepseek_v4_assistant_with_only_tool_calls_omits_content_and_includes_reasoning() {
+        // Given an assistant history turn with tool calls but NO thinking/text.
+        // DeepSeek V4 requires reasoning_content in history when tool calls occurred.
+        let request = MessageRequest {
+            model: "deepseek-v4-pro".to_string(),
+            max_tokens: 100,
+            messages: vec![InputMessage {
+                role: "assistant".to_string(),
+                content: vec![
+                    InputContentBlock::ToolUse {
+                        id: "call_1".to_string(),
+                        name: "get_weather".to_string(),
+                        input: json!({"city": "Paris"}),
+                    },
+                ],
+            }],
+            stream: false,
+            ..Default::default()
+        };
+
+        let payload = build_chat_completion_request(&request, OpenAiCompatConfig::openai());
+        let assistant = &payload["messages"][0];
+
+        // content field must be omitted (not null) when text is empty
+        assert!(
+            assistant.get("content").is_none(),
+            "content field should be omitted when empty for DeepSeek V4"
+        );
+        // reasoning_content must be present (even if empty) for DeepSeek V4 with tool_calls
+        assert_eq!(
+            assistant["reasoning_content"],
+            json!(""),
+            "DeepSeek V4 assistant with tool_calls must include reasoning_content"
+        );
+        assert_eq!(assistant["tool_calls"].as_array().unwrap().len(), 1);
     }
 
     #[test]
@@ -1778,6 +1838,40 @@ mod tests {
             schema3["additionalProperties"],
             json!(true),
             "must not overwrite existing"
+        );
+    }
+
+    #[test]
+    fn deepseek_v4_request_includes_thinking_parameter() {
+        // DeepSeek V4 models require `thinking: {type: enabled}` in the payload.
+        let payload = build_chat_completion_request(
+            &MessageRequest {
+                model: "deepseek-v4-pro".to_string(),
+                max_tokens: 1024,
+                messages: vec![InputMessage::user_text("hello")],
+                ..Default::default()
+            },
+            OpenAiCompatConfig::openai(),
+        );
+        assert_eq!(
+            payload["thinking"],
+            json!({"type": "enabled"}),
+            "DeepSeek V4 must include thinking: {type: enabled}"
+        );
+
+        // Non-DeepSeek models must NOT include the thinking parameter
+        let payload2 = build_chat_completion_request(
+            &MessageRequest {
+                model: "gpt-4o".to_string(),
+                max_tokens: 64,
+                messages: vec![InputMessage::user_text("hello")],
+                ..Default::default()
+            },
+            OpenAiCompatConfig::openai(),
+        );
+        assert!(
+            payload2.get("thinking").is_none(),
+            "Non-DeepSeek models must not include thinking parameter"
         );
     }
 

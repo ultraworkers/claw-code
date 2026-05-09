@@ -105,6 +105,14 @@ async fn send_message_preserves_deepseek_reasoning_content_before_text() {
             },
         ]
     );
+
+    // Verify the request includes the `thinking` extra_body parameter
+    // required by DeepSeek V4 thinking mode
+    let captured = state.lock().await;
+    let request = captured.first().expect("server should capture request");
+    let body: serde_json::Value = serde_json::from_str(&request.body).expect("json body");
+    assert_eq!(body["thinking"], json!({"type": "enabled"}),
+        "DeepSeek V4 requests must include thinking: {type: enabled} in the payload");
 }
 
 #[tokio::test]
