@@ -77,12 +77,12 @@ const DEFAULT_MODEL: &str = "anthropic/claude-opus-4-6";
 enum ModelSource {
     /// Explicit `--model` / `--model=` CLI flag.
     Flag,
-    /// ANTHROPIC_MODEL environment variable (when no flag was passed).
+    /// `ANTHROPIC_MODEL` environment variable (when no flag was passed).
     Env,
     /// `model` key in `.claw.json` / `.claw/settings.json` (when neither
     /// flag nor env set it).
     Config,
-    /// Compiled-in DEFAULT_MODEL fallback.
+    /// Compiled-in `DEFAULT_MODEL` fallback.
     Default,
 }
 
@@ -266,7 +266,7 @@ Run `claw --help` for usage."
 
 /// #77: Classify a stringified error message into a machine-readable kind.
 ///
-/// Returns a snake_case token that downstream consumers can switch on instead
+/// Returns a `snake_case` token that downstream consumers can switch on instead
 /// of regex-scraping the prose. The classification is best-effort prefix/keyword
 /// matching against the error messages produced throughout the CLI surface.
 fn classify_error_kind(message: &str) -> &'static str {
@@ -388,9 +388,9 @@ fn classify_error_kind(message: &str) -> &'static str {
     }
 }
 
-/// #77: Split a multi-line error message into (short_reason, optional_hint).
+/// #77: Split a multi-line error message into (`short_reason`, `optional_hint`).
 ///
-/// The short_reason is the first line (up to the first newline), and the hint
+/// The `short_reason` is the first line (up to the first newline), and the hint
 /// is the remaining text or `None` if there's no newline. This prevents the
 /// runbook prose from being stuffed into the `error` field that downstream
 /// parsers expect to be the short reason alone.
@@ -6444,8 +6444,8 @@ impl LiveCli {
                 // Propagate ok:false → non-zero exit so automation callers
                 // can rely on exit code instead of inspecting the envelope.
                 // (#68: mcp error envelopes previously always exited 0.)
-                let is_error = value.get("ok").and_then(|v| v.as_bool()) == Some(false)
-                    || value.get("status").and_then(|v| v.as_str()) == Some("error");
+                let is_error = value.get("ok").and_then(serde_json::Value::as_bool) == Some(false)
+                    || value.get("status").and_then(serde_json::Value::as_str) == Some("error");
                 println!("{}", serde_json::to_string_pretty(&value)?);
                 if is_error {
                     std::process::exit(1);
@@ -8487,8 +8487,7 @@ fn render_diff_report_for(cwd: &Path) -> Result<String, Box<dyn std::error::Erro
         .args(["rev-parse", "--is-inside-work-tree"])
         .current_dir(cwd)
         .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
+        .is_ok_and(|o| o.status.success());
     if !in_git_repo {
         return Ok(format!(
             "Diff\n  Result           no git repository\n  Detail           {} is not inside a git project",
@@ -8520,8 +8519,7 @@ fn render_diff_json_for(cwd: &Path) -> Result<serde_json::Value, Box<dyn std::er
         .args(["rev-parse", "--is-inside-work-tree"])
         .current_dir(cwd)
         .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
+        .is_ok_and(|o| o.status.success());
     if !in_git_repo {
         // #801: add error_kind, hint, message fields for envelope parity with other error paths
         return Ok(serde_json::json!({
@@ -8772,8 +8770,7 @@ fn command_exists(name: &str) -> bool {
     Command::new("which")
         .arg(name)
         .output()
-        .map(|output| output.status.success())
-        .unwrap_or(false)
+        .is_ok_and(|output| output.status.success())
 }
 
 fn write_temp_text_file(
