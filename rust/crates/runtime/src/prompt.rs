@@ -42,6 +42,7 @@ pub const SYSTEM_PROMPT_DYNAMIC_BOUNDARY: &str = "__SYSTEM_PROMPT_DYNAMIC_BOUNDA
 pub const FRONTIER_MODEL_NAME: &str = "Claude Opus 4.6";
 const MAX_INSTRUCTION_FILE_CHARS: usize = 4_000;
 const MAX_TOTAL_INSTRUCTION_CHARS: usize = 12_000;
+const MAX_GIT_DIFF_CHARS: usize = 50_000;
 
 /// Neutral identity for the model family line in generated prompts.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -295,7 +296,17 @@ fn read_git_diff(cwd: &Path) -> Option<String> {
     if sections.is_empty() {
         None
     } else {
-        Some(sections.join("\n\n"))
+        let mut combined = sections.join("\n\n");
+        if combined.len() > MAX_GIT_DIFF_CHARS {
+            // Truncate to a valid UTF-8 char boundary
+            let mut end = MAX_GIT_DIFF_CHARS;
+            while !combined.is_char_boundary(end) {
+                end -= 1;
+            }
+            combined.truncate(end);
+            combined.push_str("\n\n... [diff truncated — too large for system prompt]");
+        }
+        Some(combined)
     }
 }
 
