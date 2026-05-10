@@ -299,7 +299,7 @@ fn unshare_user_namespace_works() -> bool {
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
-            .is_ok_and(|status| status.success())
+            .is_ok_and(|s| s.success())
     })
 }
 
