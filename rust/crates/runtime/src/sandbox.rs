@@ -223,6 +223,7 @@ pub fn build_linux_sandbox_command(
     let mut args = vec![
         "--user".to_string(),
         "--map-root-user".to_string(),
+        "--map-auto".to_string(),
         "--mount".to_string(),
         "--ipc".to_string(),
         "--pid".to_string(),
@@ -293,7 +294,7 @@ fn unshare_user_namespace_works() -> bool {
             return false;
         }
         std::process::Command::new("unshare")
-            .args(["--user", "--map-root-user", "true"])
+            .args(["--user", "--map-root-user", "--map-auto", "true"])
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
