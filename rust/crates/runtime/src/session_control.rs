@@ -203,6 +203,47 @@ impl SessionStore {
         })
     }
 
+    /// Returns `true` if a session file with the given ID exists in this store.
+    ///
+    /// Checks the primary namespace first, then the legacy fallback root.
+    /// Accepts a bare session ID (not an alias like `"latest"`); use
+    /// [`SessionStore::resolve_reference`] first if you need alias resolution.
+    #[must_use]
+    pub fn session_exists(&self, session_id: &str) -> bool {
+        for extension in [PRIMARY_SESSION_EXTENSION, LEGACY_SESSION_EXTENSION] {
+            if self
+                .sessions_root
+                .join(format!("{session_id}.{extension}"))
+                .exists()
+            {
+                return true;
+            }
+        }
+        if let Some(legacy_root) = self.legacy_sessions_root() {
+            for extension in [PRIMARY_SESSION_EXTENSION, LEGACY_SESSION_EXTENSION] {
+                if legacy_root
+                    .join(format!("{session_id}.{extension}"))
+                    .exists()
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Delete the session identified by `reference` from disk.
+    ///
+    /// `reference` may be a session ID, an alias (`"latest"`, `"last"`,
+    /// `"recent"`), or a direct file path — anything accepted by
+    /// [`SessionStore::resolve_reference`].  Returns an error if the
+    /// reference cannot be resolved or the underlying file cannot be removed.
+    pub fn delete_session(&self, reference: &str) -> Result<(), SessionControlError> {
+        let handle = self.resolve_reference(reference)?;
+        fs::remove_file(&handle.path)?;
+        Ok(())
+    }
+
     fn legacy_sessions_root(&self) -> Option<PathBuf> {
         self.sessions_root
             .parent()
@@ -488,6 +529,30 @@ pub fn load_managed_session_for(
     store.load_session(reference)
 }
 
+pub fn managed_session_exists(session_id: &str) -> Result<bool, SessionControlError> {
+    managed_session_exists_for(env::current_dir()?, session_id)
+}
+
+pub fn managed_session_exists_for(
+    base_dir: impl AsRef<Path>,
+    session_id: &str,
+) -> Result<bool, SessionControlError> {
+    let store = SessionStore::from_cwd(base_dir)?;
+    Ok(store.session_exists(session_id))
+}
+
+pub fn delete_managed_session(reference: &str) -> Result<(), SessionControlError> {
+    delete_managed_session_for(env::current_dir()?, reference)
+}
+
+pub fn delete_managed_session_for(
+    base_dir: impl AsRef<Path>,
+    reference: &str,
+) -> Result<(), SessionControlError> {
+    let store = SessionStore::from_cwd(base_dir)?;
+    store.delete_session(reference)
+}
+
 pub fn fork_managed_session(
     session: &Session,
     branch_name: Option<String>,
@@ -569,10 +634,10 @@ fn path_is_within_workspace(path: &Path, workspace_root: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        create_managed_session_handle_for, fork_managed_session_for, is_session_reference_alias,
-        list_managed_sessions_for, load_managed_session_for, resolve_session_reference_for,
-        workspace_fingerprint, ManagedSessionSummary, SessionControlError, SessionStore,
-        LATEST_SESSION_REFERENCE,
+        create_managed_session_handle_for, delete_managed_session_for, fork_managed_session_for,
+        is_session_reference_alias, list_managed_sessions_for, load_managed_session_for,
+        managed_session_exists_for, resolve_session_reference_for, workspace_fingerprint,
+        ManagedSessionSummary, SessionControlError, SessionStore, LATEST_SESSION_REFERENCE,
     };
     use crate::session::Session;
     use std::fs;
@@ -993,6 +1058,140 @@ mod tests {
         // then
         assert_eq!(latest.id, newer.session_id);
         assert_eq!(handle.id, newer.session_id);
+        fs::remove_dir_all(base).expect("temp dir should clean up");
+    }
+
+    #[test]
+    fn session_exists_returns_true_for_persisted_session_and_false_otherwise() {
+        // given
+        let base = temp_dir();
+        fs::create_dir_all(&base).expect("base dir should exist");
+        let store = SessionStore::from_cwd(&base).expect("store should build");
+        let session = persist_session_via_store(&store, "existence check");
+
+        // when / then
+        assert!(
+            store.session_exists(&session.session_id),
+            "session_exists must return true for a persisted session"
+        );
+        assert!(
+            !store.session_exists("session-does-not-exist"),
+            "session_exists must return false for an unknown ID"
+        );
+        fs::remove_dir_all(base).expect("temp dir should clean up");
+    }
+
+    #[test]
+    fn managed_session_exists_for_mirrors_store_behaviour() {
+        // given
+        let base = temp_dir();
+        fs::create_dir_all(&base).expect("base dir should exist");
+        let session = persist_session(&base, "free-function existence check");
+
+        // when / then
+        assert!(
+            managed_session_exists_for(&base, &session.session_id)
+                .expect("exists check should not fail"),
+            "managed_session_exists_for must return true for a known session"
+        );
+        assert!(
+            !managed_session_exists_for(&base, "no-such-session")
+                .expect("exists check should not fail"),
+            "managed_session_exists_for must return false for an unknown session"
+        );
+        fs::remove_dir_all(base).expect("temp dir should clean up");
+    }
+
+    #[test]
+    fn delete_session_removes_file_and_session_no_longer_listed() {
+        // given
+        let base = temp_dir();
+        fs::create_dir_all(&base).expect("base dir should exist");
+        let store = SessionStore::from_cwd(&base).expect("store should build");
+        let session = persist_session_via_store(&store, "to be deleted");
+        assert_eq!(store.list_sessions().expect("list").len(), 1);
+
+        // when
+        store
+            .delete_session(&session.session_id)
+            .expect("delete should succeed");
+
+        // then
+        assert!(
+            !store.session_exists(&session.session_id),
+            "session file must be gone after delete"
+        );
+        assert_eq!(
+            store.list_sessions().expect("list after delete").len(),
+            0,
+            "deleted session must not appear in list"
+        );
+        fs::remove_dir_all(base).expect("temp dir should clean up");
+    }
+
+    #[test]
+    fn delete_session_via_latest_alias_removes_most_recent() {
+        // given
+        let base = temp_dir();
+        fs::create_dir_all(&base).expect("base dir should exist");
+        let store = SessionStore::from_cwd(&base).expect("store should build");
+        let _older = persist_session_via_store(&store, "older");
+        wait_for_next_millisecond();
+        let newer = persist_session_via_store(&store, "newer");
+
+        // when
+        store
+            .delete_session(LATEST_SESSION_REFERENCE)
+            .expect("delete via alias should succeed");
+
+        // then
+        assert!(
+            !store.session_exists(&newer.session_id),
+            "newest session must be gone"
+        );
+        assert_eq!(
+            store.list_sessions().expect("list after delete").len(),
+            1,
+            "older session must still be present"
+        );
+        fs::remove_dir_all(base).expect("temp dir should clean up");
+    }
+
+    #[test]
+    fn delete_managed_session_for_mirrors_store_behaviour() {
+        // given
+        let base = temp_dir();
+        fs::create_dir_all(&base).expect("base dir should exist");
+        let session = persist_session(&base, "free-function delete");
+
+        // when
+        delete_managed_session_for(&base, &session.session_id)
+            .expect("free-function delete should succeed");
+
+        // then
+        assert!(
+            !managed_session_exists_for(&base, &session.session_id)
+                .expect("exists check should not fail"),
+            "session must be gone after free-function delete"
+        );
+        fs::remove_dir_all(base).expect("temp dir should clean up");
+    }
+
+    #[test]
+    fn delete_session_returns_error_for_unknown_reference() {
+        // given
+        let base = temp_dir();
+        fs::create_dir_all(&base).expect("base dir should exist");
+        let store = SessionStore::from_cwd(&base).expect("store should build");
+
+        // when
+        let result = store.delete_session("session-ghost");
+
+        // then
+        assert!(
+            result.is_err(),
+            "deleting a non-existent session must return an error"
+        );
         fs::remove_dir_all(base).expect("temp dir should clean up");
     }
 
