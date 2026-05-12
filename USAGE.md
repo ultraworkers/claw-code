@@ -413,6 +413,27 @@ cd rust
 ./target/debug/claw system-prompt --cwd .. --date 2026-04-04
 ```
 
+## Install an external skill
+
+`claw skills install <path>` accepts a local skill directory that contains
+`SKILL.md` or a standalone markdown file. This is useful when a companion
+repository ships a skill prompt that should be available through `/skills`.
+
+For example, install TweetClaw as an X/Twitter automation skill:
+
+```bash
+# From a parent directory that contains claw-code
+git clone https://github.com/Xquik-dev/tweetclaw
+cd claw-code/rust
+./target/debug/claw skills install ../../tweetclaw/skills/tweetclaw
+./target/debug/claw skills show tweetclaw
+```
+
+TweetClaw gives `claw` users a local skill guide for OpenClaw/Xquik workflows
+such as tweet search, reply search, follower export, monitors, webhooks, and
+approval-gated posting. Configure any Xquik credentials outside the prompt and
+avoid pasting API keys into chat.
+
 ## Session management
 
 REPL turns are persisted under `.claw/sessions/` in the current workspace.
