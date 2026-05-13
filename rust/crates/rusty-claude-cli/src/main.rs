@@ -748,7 +748,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 }
                 return Ok(CliAction::Prompt {
                     prompt,
-                    model: resolve_model_alias_with_config(&model),
+                    model: resolve_noninteractive_model(&model, model_flag_raw.as_deref()),
                     output_format,
                     allowed_tools: normalize_allowed_tools(&allowed_tool_values)?,
                     permission_mode: permission_mode_override
@@ -824,7 +824,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             let piped = buf.trim().to_string();
             if !piped.is_empty() {
                 return Ok(CliAction::Prompt {
-                    model,
+                    model: resolve_noninteractive_model(&model, model_flag_raw.as_deref()),
                     prompt: piped,
                     allowed_tools,
                     permission_mode,
@@ -948,7 +948,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             match classify_skills_slash_command(args.as_deref()) {
                 SkillSlashDispatch::Invoke(prompt) => Ok(CliAction::Prompt {
                     prompt,
-                    model,
+                    model: resolve_noninteractive_model(&model, model_flag_raw.as_deref()),
                     output_format,
                     allowed_tools,
                     permission_mode,
@@ -975,7 +975,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             }
             Ok(CliAction::Prompt {
                 prompt,
-                model,
+                model: resolve_noninteractive_model(&model, model_flag_raw.as_deref()),
                 output_format,
                 allowed_tools,
                 permission_mode,
@@ -987,7 +987,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         }
         other if other.starts_with('/') => parse_direct_slash_cli_action(
             &rest,
-            model,
+            resolve_noninteractive_model(&model, model_flag_raw.as_deref()),
             output_format,
             allowed_tools,
             permission_mode,
@@ -1025,7 +1025,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             }
             Ok(CliAction::Prompt {
                 prompt: joined,
-                model,
+                model: resolve_noninteractive_model(&model, model_flag_raw.as_deref()),
                 output_format,
                 allowed_tools,
                 permission_mode,
@@ -1617,6 +1617,14 @@ fn resolve_repl_model(cli_model: String) -> String {
         return resolve_model_alias_with_config(&config_model);
     }
     cli_model
+}
+
+fn resolve_noninteractive_model(cli_model: &str, model_flag_raw: Option<&str>) -> String {
+    if model_flag_raw.is_some() {
+        cli_model.to_string()
+    } else {
+        resolve_repl_model(cli_model.to_string())
+    }
 }
 
 fn provider_label(kind: ProviderKind) -> &'static str {
@@ -7805,6 +7813,34 @@ impl runtime::PermissionPrompter for CliPermissionPrompter {
         &mut self,
         request: &runtime::PermissionRequest,
     ) -> runtime::PermissionPromptDecision {
+        if request.tool_name == "token_budget" {
+            println!();
+            println!("Token budget approval required");
+            if let Some(reason) = &request.reason {
+                println!("  Reason           {reason}");
+            }
+            println!("  Usage            {}", request.input);
+            print!("Continue this task? [y/N]: ");
+            let _ = io::stdout().flush();
+
+            let mut response = String::new();
+            return match io::stdin().read_line(&mut response) {
+                Ok(_) => {
+                    let normalized = response.trim().to_ascii_lowercase();
+                    if matches!(normalized.as_str(), "y" | "yes") {
+                        runtime::PermissionPromptDecision::Allow
+                    } else {
+                        runtime::PermissionPromptDecision::Deny {
+                            reason: "task continuation denied by token budget prompt".to_string(),
+                        }
+                    }
+                }
+                Err(error) => runtime::PermissionPromptDecision::Deny {
+                    reason: format!("token budget approval failed: {error}"),
+                },
+            };
+        }
+
         println!();
         println!("Permission approval required");
         println!("  Tool             {}", request.tool_name);
@@ -8014,6 +8050,7 @@ impl AnthropicRuntimeClient {
         let mut markdown_stream = MarkdownStreamState::default();
         let mut events = Vec::new();
         let mut pending_tool: Option<(String, String, String)> = None;
+        let mut active_thinking: Option<(u32, String, Option<String>)> = None;
         let mut block_has_thinking_summary = false;
         let mut saw_stop = false;
         let mut received_any_event = false;
@@ -8054,16 +8091,30 @@ impl AnthropicRuntimeClient {
                         )?;
                     }
                 }
-                ApiStreamEvent::ContentBlockStart(start) => {
-                    push_output_block(
-                        start.content_block,
-                        out,
-                        &mut events,
-                        &mut pending_tool,
-                        true,
-                        &mut block_has_thinking_summary,
-                    )?;
-                }
+                ApiStreamEvent::ContentBlockStart(start) => match start.content_block {
+                    OutputContentBlock::Thinking {
+                        thinking,
+                        signature,
+                    } => {
+                        render_thinking_block_summary(
+                            out,
+                            Some(thinking.chars().count()),
+                            false,
+                        )?;
+                        block_has_thinking_summary = true;
+                        active_thinking = Some((start.index, thinking, signature));
+                    }
+                    block => {
+                        push_output_block(
+                            block,
+                            out,
+                            &mut events,
+                            &mut pending_tool,
+                            true,
+                            &mut block_has_thinking_summary,
+                        )?;
+                    }
+                },
                 ApiStreamEvent::ContentBlockDelta(delta) => match delta.delta {
                     ContentBlockDelta::TextDelta { text } => {
                         if !text.is_empty() {
@@ -8083,15 +8134,34 @@ impl AnthropicRuntimeClient {
                             input.push_str(&partial_json);
                         }
                     }
-                    ContentBlockDelta::ThinkingDelta { .. } => {
+                    ContentBlockDelta::ThinkingDelta { thinking } => {
+                        if let Some((_, accumulated, _)) = &mut active_thinking {
+                            accumulated.push_str(&thinking);
+                        } else {
+                            active_thinking = Some((delta.index, thinking, None));
+                        }
                         if !block_has_thinking_summary {
                             render_thinking_block_summary(out, None, false)?;
                             block_has_thinking_summary = true;
                         }
                     }
-                    ContentBlockDelta::SignatureDelta { .. } => {}
+                    ContentBlockDelta::SignatureDelta { signature } => {
+                        if let Some((_, _, active_signature)) = &mut active_thinking {
+                            *active_signature = Some(signature);
+                        }
+                    }
                 },
-                ApiStreamEvent::ContentBlockStop(_) => {
+                ApiStreamEvent::ContentBlockStop(stop) => {
+                    if let Some((index, thinking, signature)) = active_thinking.take() {
+                        if index == stop.index {
+                            events.push(AssistantEvent::Thinking {
+                                thinking,
+                                signature,
+                            });
+                        } else {
+                            active_thinking = Some((index, thinking, signature));
+                        }
+                    }
                     block_has_thinking_summary = false;
                     if let Some(rendered) = markdown_stream.flush(&renderer) {
                         write!(out, "{rendered}")
@@ -9011,9 +9081,18 @@ fn push_output_block(
             };
             *pending_tool = Some((id, name, initial_input));
         }
-        OutputContentBlock::Thinking { thinking, .. } => {
+        OutputContentBlock::Thinking {
+            thinking,
+            signature,
+        } => {
             render_thinking_block_summary(out, Some(thinking.chars().count()), false)?;
             *block_has_thinking_summary = true;
+            if !streaming_tool_input {
+                events.push(AssistantEvent::Thinking {
+                    thinking,
+                    signature,
+                });
+            }
         }
         OutputContentBlock::RedactedThinking { .. } => {
             render_thinking_block_summary(out, None, true)?;
@@ -9234,7 +9313,13 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
                     ContentBlock::Text { text } => {
                         Some(InputContentBlock::Text { text: text.clone() })
                     }
-                    ContentBlock::Thinking { .. } => None,
+                    ContentBlock::Thinking {
+                        thinking,
+                        signature,
+                    } => Some(InputContentBlock::Thinking {
+                        thinking: thinking.clone(),
+                        signature: signature.clone(),
+                    }),
                     ContentBlock::ToolUse { id, name, input } => Some(InputContentBlock::ToolUse {
                         id: id.clone(),
                         name: name.clone(),
@@ -9464,7 +9549,7 @@ mod tests {
         SessionLifecycleKind, SessionLifecycleSummary, SlashCommand, StatusUsage, TmuxPaneSnapshot,
         DEFAULT_MODEL, LATEST_SESSION_REFERENCE, STUB_COMMANDS,
     };
-    use api::{ApiError, MessageResponse, OutputContentBlock, Usage};
+    use api::{ApiError, InputContentBlock, MessageResponse, OutputContentBlock, Usage};
     use plugins::{
         PluginManager, PluginManagerConfig, PluginTool, PluginToolDefinition, PluginToolPermission,
     };
@@ -11998,6 +12083,35 @@ mod tests {
     }
 
     #[test]
+    fn prompt_subcommand_uses_config_model_when_no_model_flag() {
+        let _guard = env_lock();
+        let root = temp_dir();
+        fs::create_dir_all(&root).expect("root dir");
+        let config_home = root.join("config");
+        fs::create_dir_all(&config_home).expect("config home dir");
+        fs::write(
+            config_home.join("settings.json"),
+            r#"{"model":"openai/deepseek-v4-pro"}"#,
+        )
+        .expect("settings should write");
+        std::env::set_var("CLAW_CONFIG_HOME", &config_home);
+        std::env::remove_var("ANTHROPIC_MODEL");
+
+        let parsed = with_current_dir(&root, || {
+            parse_args(&["prompt".to_string(), "hello".to_string()])
+                .expect("prompt should parse")
+        });
+
+        match parsed {
+            CliAction::Prompt { model, .. } => assert_eq!(model, "openai/deepseek-v4-pro"),
+            other => panic!("expected prompt action, got {other:?}"),
+        }
+
+        std::env::remove_var("CLAW_CONFIG_HOME");
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
     fn resolve_repl_model_returns_default_when_env_unset_and_no_config() {
         let _guard = env_lock();
         let root = temp_dir();
@@ -12866,6 +12980,34 @@ UU conflicted.rs",
         assert_eq!(converted[1].role, "assistant");
         assert_eq!(converted[2].role, "user");
     }
+
+    #[test]
+    fn converts_assistant_thinking_for_tool_history() {
+        let messages = vec![ConversationMessage::assistant(vec![
+            ContentBlock::Thinking {
+                thinking: "prior reasoning".to_string(),
+                signature: Some("sig_123".to_string()),
+            },
+            ContentBlock::ToolUse {
+                id: "tool-1".to_string(),
+                name: "WebSearch".to_string(),
+                input: "{\"query\":\"github WeChat-MCP\"}".to_string(),
+            },
+        ])];
+
+        let converted = super::convert_messages(&messages);
+        assert_eq!(converted.len(), 1);
+        assert_eq!(converted[0].role, "assistant");
+        assert!(matches!(
+            &converted[0].content[0],
+            InputContentBlock::Thinking { thinking, signature }
+                if thinking == "prior reasoning" && signature.as_deref() == Some("sig_123")
+        ));
+        assert!(matches!(
+            &converted[0].content[1],
+            InputContentBlock::ToolUse { id, name, .. } if id == "tool-1" && name == "WebSearch"
+        ));
+    }
     #[test]
     fn repl_help_mentions_history_completion_and_multiline() {
         let help = render_repl_help();
@@ -13357,6 +13499,11 @@ UU conflicted.rs",
 
         assert!(matches!(
             &events[0],
+            AssistantEvent::Thinking { thinking, signature }
+                if thinking == "step 1" && signature.as_deref() == Some("sig_123")
+        ));
+        assert!(matches!(
+            &events[1],
             AssistantEvent::TextDelta(text) if text == "Final answer"
         ));
         let rendered = String::from_utf8(out).expect("utf8");

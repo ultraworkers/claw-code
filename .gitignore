@@ -3,10 +3,14 @@ archive/
 .omx/
 .clawd-agents/
 # Claude Code local artifacts
+.claude/
 .claude/settings.local.json
 .claude/sessions/
+rust/.claude/
 # Claw Code local artifacts
+.claw/
 .claw/settings.local.json
 .claw/sessions/
+rust/.claw/
 .clawhip/
 status-help.txt

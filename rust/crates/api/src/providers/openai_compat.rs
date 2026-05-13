@@ -497,11 +497,7 @@ impl StreamState {
         }
 
         for choice in chunk.choices {
-            if let Some(reasoning) = choice
-                .delta
-                .reasoning_content
-                .filter(|value| !value.is_empty())
-            {
+            if let Some(reasoning) = choice.delta.reasoning_content {
                 if !self.thinking_started {
                     self.thinking_started = true;
                     events.push(StreamEvent::ContentBlockStart(ContentBlockStartEvent {
@@ -512,12 +508,14 @@ impl StreamState {
                         },
                     }));
                 }
-                events.push(StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
-                    index: 0,
-                    delta: ContentBlockDelta::ThinkingDelta {
-                        thinking: reasoning,
-                    },
-                }));
+                if !reasoning.is_empty() {
+                    events.push(StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
+                        index: 0,
+                        delta: ContentBlockDelta::ThinkingDelta {
+                            thinking: reasoning,
+                        },
+                    }));
+                }
             }
 
             if let Some(content) = choice.delta.content.filter(|value| !value.is_empty()) {
@@ -853,6 +851,8 @@ pub fn is_reasoning_model(model: &str) -> bool {
         || canonical.starts_with("qwen-qwq")
         || canonical.starts_with("qwq")
         || canonical.contains("thinking")
+        || canonical.starts_with("deepseek-v4")
+        || canonical == "deepseek-reasoner"
 }
 
 /// Returns true for OpenAI-compatible DeepSeek V4 models that require prior
@@ -963,7 +963,9 @@ pub fn build_chat_completion_request(
             Value::Array(tools.iter().map(openai_tool_definition).collect::<Vec<_>>());
     }
     if let Some(tool_choice) = &request.tool_choice {
-        payload["tool_choice"] = openai_tool_choice(tool_choice);
+        if !model_rejects_tool_choice(wire_model) {
+            payload["tool_choice"] = openai_tool_choice(tool_choice);
+        }
     }
 
     // OpenAI-compatible tuning parameters — only included when explicitly set.
@@ -1011,6 +1013,18 @@ pub fn model_rejects_is_error_field(model: &str) -> bool {
     canonical.starts_with("kimi")
 }
 
+/// Returns true for models whose thinking-mode tool calls reject the
+/// `tool_choice` field. DeepSeek V4 currently selects tools without this hint.
+fn model_rejects_tool_choice(model: &str) -> bool {
+    model_requires_reasoning_content_in_history(model)
+}
+
+/// Returns true for models whose assistant tool-call history must use an empty
+/// string content instead of JSON null.
+fn model_requires_assistant_content_for_tool_calls(model: &str) -> bool {
+    model_requires_reasoning_content_in_history(model)
+}
+
 /// Translates an `InputMessage` into OpenAI-compatible message format.
 /// Public for benchmarking purposes.
 #[must_use]
@@ -1020,13 +1034,17 @@ pub fn translate_message(message: &InputMessage, model: &str) -> Vec<Value> {
         "assistant" => {
             let mut text = String::new();
             let mut reasoning = String::new();
+            let mut reasoning_seen = false;
             let mut tool_calls = Vec::new();
             for block in &message.content {
                 match block {
                     InputContentBlock::Text { text: value } => text.push_str(value),
                     InputContentBlock::Thinking {
                         thinking: value, ..
-                    } => reasoning.push_str(value),
+                    } => {
+                        reasoning_seen = true;
+                        reasoning.push_str(value);
+                    }
                     InputContentBlock::ToolUse { id, name, input } => tool_calls.push(json!({
                         "id": id,
                         "type": "function",
@@ -1039,13 +1057,22 @@ pub fn translate_message(message: &InputMessage, model: &str) -> Vec<Value> {
                 }
             }
             let include_reasoning =
-                model_requires_reasoning_content_in_history(model) && !reasoning.is_empty();
+                model_requires_reasoning_content_in_history(model) && reasoning_seen;
             if text.is_empty() && tool_calls.is_empty() && !include_reasoning {
                 Vec::new()
             } else {
+                let content = if !text.is_empty() {
+                    Value::String(text)
+                } else if !tool_calls.is_empty()
+                    && model_requires_assistant_content_for_tool_calls(model)
+                {
+                    Value::String(String::new())
+                } else {
+                    Value::Null
+                };
                 let mut msg = serde_json::json!({
                     "role": "assistant",
-                    "content": (!text.is_empty()).then_some(text),
+                    "content": content,
                 });
                 if include_reasoning {
                     msg["reasoning_content"] = json!(reasoning);
@@ -1263,11 +1290,7 @@ fn normalize_response(
             "chat completion response missing choices",
         ))?;
     let mut content = Vec::new();
-    if let Some(thinking) = choice
-        .message
-        .reasoning_content
-        .filter(|value| !value.is_empty())
-    {
+    if let Some(thinking) = choice.message.reasoning_content {
         content.push(OutputContentBlock::Thinking {
             thinking,
             signature: None,
@@ -1626,6 +1649,91 @@ mod tests {
     }
 
     #[test]
+    fn deepseek_v4_tool_history_preserves_empty_reasoning_content_and_content() {
+        // Given a DeepSeek V4 assistant tool-call turn with an explicitly empty
+        // reasoning_content value. DeepSeek requires that empty string to be
+        // replayed verbatim in the next request.
+        let request = MessageRequest {
+            model: "openai/deepseek-v4-pro".to_string(),
+            max_tokens: 64,
+            messages: vec![InputMessage {
+                role: "assistant".to_string(),
+                content: vec![
+                    InputContentBlock::Thinking {
+                        thinking: String::new(),
+                        signature: None,
+                    },
+                    InputContentBlock::ToolUse {
+                        id: "call_1".to_string(),
+                        name: "web_search".to_string(),
+                        input: json!({"query": "wechat mcp"}),
+                    },
+                ],
+            }],
+            system: None,
+            tools: Some(vec![ToolDefinition {
+                name: "web_search".to_string(),
+                description: Some("Search the web".to_string()),
+                input_schema: json!({"type": "object"}),
+            }]),
+            tool_choice: Some(ToolChoice::Auto),
+            stream: false,
+            ..Default::default()
+        };
+
+        // When serializing for DeepSeek V4.
+        let payload = build_chat_completion_request(&request, OpenAiCompatConfig::openai());
+        let assistant = &payload["messages"][0];
+
+        // Then the empty reasoning field is retained, assistant tool-call
+        // content is an empty string rather than null, and tool_choice is
+        // omitted for DeepSeek V4 thinking-mode compatibility.
+        assert_eq!(assistant["reasoning_content"], json!(""));
+        assert_eq!(assistant["content"], json!(""));
+        assert!(assistant["tool_calls"].is_array());
+        assert!(payload.get("tool_choice").is_none());
+    }
+
+    #[test]
+    fn non_streaming_empty_reasoning_content_emits_thinking_block() {
+        // Given a non-streaming DeepSeek V4 response with an explicitly empty
+        // reasoning_content field and a tool call.
+        let response = super::ChatCompletionResponse {
+            id: "chatcmpl_empty_reasoning".to_string(),
+            model: "deepseek-v4-pro".to_string(),
+            choices: vec![super::ChatChoice {
+                message: super::ChatMessage {
+                    role: "assistant".to_string(),
+                    content: Some(String::new()),
+                    reasoning_content: Some(String::new()),
+                    tool_calls: vec![super::ResponseToolCall {
+                        id: "call_1".to_string(),
+                        function: super::ResponseToolFunction {
+                            name: "web_search".to_string(),
+                            arguments: "{\"query\":\"wechat mcp\"}".to_string(),
+                        },
+                    }],
+                },
+                finish_reason: Some("tool_calls".to_string()),
+            }],
+            usage: None,
+        };
+
+        // When normalizing the provider response.
+        let normalized = normalize_response("deepseek-v4-pro", response).expect("normalized");
+
+        // Then the empty thinking block is preserved before the tool call.
+        assert!(matches!(
+            &normalized.content[0],
+            OutputContentBlock::Thinking { thinking, .. } if thinking.is_empty()
+        ));
+        assert!(matches!(
+            &normalized.content[1],
+            OutputContentBlock::ToolUse { id, name, .. } if id == "call_1" && name == "web_search"
+        ));
+    }
+
+    #[test]
     fn non_streaming_response_with_reasoning_content_emits_thinking_block_first() {
         // Given a non-streaming OpenAI-compatible response with reasoning_content.
         let response = super::ChatCompletionResponse {
@@ -1737,6 +1845,65 @@ mod tests {
         assert!(matches!(
             events[6],
             StreamEvent::ContentBlockStop(ContentBlockStopEvent { index: 1 })
+        ));
+    }
+
+    #[test]
+    fn streaming_empty_reasoning_content_starts_and_stops_thinking_block() {
+        // Given DeepSeek V4 streaming emits reasoning_content as an empty string
+        // before a tool call.
+        let mut state = StreamState::new("deepseek-v4-pro".to_string());
+        let mut events = state
+            .ingest_chunk(super::ChatCompletionChunk {
+                id: "chatcmpl_empty_stream_reasoning".to_string(),
+                model: Some("deepseek-v4-pro".to_string()),
+                choices: vec![super::ChunkChoice {
+                    delta: super::ChunkDelta {
+                        content: None,
+                        reasoning_content: Some(String::new()),
+                        tool_calls: Vec::new(),
+                    },
+                    finish_reason: None,
+                }],
+                usage: None,
+            })
+            .expect("empty reasoning chunk");
+        events.extend(
+            state
+                .ingest_chunk(super::ChatCompletionChunk {
+                    id: "chatcmpl_empty_stream_reasoning".to_string(),
+                    model: None,
+                    choices: vec![super::ChunkChoice {
+                        delta: super::ChunkDelta {
+                            content: None,
+                            reasoning_content: None,
+                            tool_calls: vec![super::DeltaToolCall {
+                                index: 0,
+                                id: Some("call_1".to_string()),
+                                function: super::DeltaFunction {
+                                    name: Some("web_search".to_string()),
+                                    arguments: Some("{\"query\":\"wechat mcp\"}".to_string()),
+                                },
+                            }],
+                        },
+                        finish_reason: Some("tool_calls".to_string()),
+                    }],
+                    usage: None,
+                })
+                .expect("tool chunk"),
+        );
+
+        // Then a zero-length thinking block is still represented in the stream.
+        assert!(matches!(
+            events[1],
+            StreamEvent::ContentBlockStart(ContentBlockStartEvent {
+                index: 0,
+                content_block: OutputContentBlock::Thinking { .. },
+            })
+        ));
+        assert!(matches!(
+            events[2],
+            StreamEvent::ContentBlockStop(ContentBlockStopEvent { index: 0 })
         ));
     }
 

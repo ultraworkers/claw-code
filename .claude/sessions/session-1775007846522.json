@@ -1,1 +1,0 @@
-{"messages":[{"blocks":[{"text":"Say hi in one sentence","type":"text"}],"role":"user"},{"blocks":[{"text":"Hi! I'm Claude, ready to help you with any software engineering tasks or questions you have.","type":"text"}],"role":"assistant","usage":{"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"input_tokens":11,"output_tokens":23}}],"version":1}

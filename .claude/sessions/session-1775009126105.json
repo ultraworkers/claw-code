@@ -1,1 +1,0 @@
-{"messages":[{"blocks":[{"text":"say hi in 3 words","type":"text"}],"role":"user"},{"blocks":[{"text":"Hey there, friend!","type":"text"}],"role":"assistant","usage":{"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"input_tokens":1954,"output_tokens":8}}],"version":1}

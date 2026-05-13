@@ -10,13 +10,16 @@ use crate::compact::{
 use crate::config::RuntimeFeatureConfig;
 use crate::hooks::{HookAbortSignal, HookProgressReporter, HookRunResult, HookRunner};
 use crate::permissions::{
-    PermissionContext, PermissionOutcome, PermissionPolicy, PermissionPrompter,
+    PermissionContext, PermissionOutcome, PermissionPolicy, PermissionPromptDecision,
+    PermissionPrompter, PermissionRequest,
 };
 use crate::session::{ContentBlock, ConversationMessage, Session};
 use crate::usage::{TokenUsage, UsageTracker};
 
 const DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD: u32 = 100_000;
 const AUTO_COMPACTION_THRESHOLD_ENV_VAR: &str = "CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS";
+const DEFAULT_TURN_TOKEN_CONFIRM_THRESHOLD: u32 = 100_000;
+const TURN_TOKEN_CONFIRM_THRESHOLD_ENV_VAR: &str = "CLAW_TURN_TOKEN_CONFIRM_THRESHOLD";
 
 /// Fully assembled request payload sent to the upstream model client.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -140,6 +143,7 @@ pub struct ConversationRuntime<C, T> {
     hook_abort_signal: HookAbortSignal,
     hook_progress_reporter: Option<Box<dyn HookProgressReporter>>,
     session_tracer: Option<SessionTracer>,
+    turn_token_confirmation_threshold: u32,
 }
 
 impl<C, T> ConversationRuntime<C, T>
@@ -189,6 +193,7 @@ where
             hook_abort_signal: HookAbortSignal::default(),
             hook_progress_reporter: None,
             session_tracer: None,
+            turn_token_confirmation_threshold: turn_token_confirmation_threshold_from_env(),
         }
     }
 
@@ -201,6 +206,12 @@ where
     #[must_use]
     pub fn with_auto_compaction_input_tokens_threshold(mut self, threshold: u32) -> Self {
         self.auto_compaction_input_tokens_threshold = threshold;
+        self
+    }
+
+    #[must_use]
+    pub fn with_turn_token_confirmation_threshold(mut self, threshold: u32) -> Self {
+        self.turn_token_confirmation_threshold = threshold;
         self
     }
 
@@ -342,6 +353,9 @@ where
         let mut tool_results = Vec::new();
         let mut prompt_cache_events = Vec::new();
         let mut iterations = 0;
+        let mut auto_compaction = None;
+        let mut turn_usage = TokenUsage::default();
+        let mut turn_token_budget_confirmed = false;
 
         loop {
             iterations += 1;
@@ -352,6 +366,8 @@ where
                 self.record_turn_failed(iterations, &error);
                 return Err(error);
             }
+
+            merge_auto_compaction_event(&mut auto_compaction, self.maybe_preflight_auto_compact());
 
             let request = ApiRequest {
                 system_prompt: self.system_prompt.clone(),
@@ -374,6 +390,7 @@ where
                 };
             if let Some(usage) = usage {
                 self.usage_tracker.record(usage);
+                turn_usage = add_token_usage(turn_usage, usage);
             }
             prompt_cache_events.extend(turn_prompt_cache_events);
             let pending_tool_uses = assistant_message
@@ -399,6 +416,25 @@ where
 
             if pending_tool_uses.is_empty() {
                 break;
+            }
+
+            if !turn_token_budget_confirmed
+                && turn_usage.total_tokens() > self.turn_token_confirmation_threshold
+            {
+                let confirmation = if let Some(prompt) = prompter.as_mut() {
+                    self.confirm_turn_token_budget(turn_usage, *prompt)
+                } else {
+                    Err(self.turn_token_confirmation_required_error(turn_usage))
+                };
+                match confirmation {
+                    Ok(()) => {
+                        turn_token_budget_confirmed = true;
+                    }
+                    Err(error) => {
+                        self.record_turn_failed(iterations, &error);
+                        return Err(error);
+                    }
+                }
             }
 
             for (tool_use_id, tool_name, input) in pending_tool_uses {
@@ -503,7 +539,7 @@ where
             }
         }
 
-        let auto_compaction = self.maybe_auto_compact();
+        merge_auto_compaction_event(&mut auto_compaction, self.maybe_auto_compact());
 
         let summary = TurnSummary {
             assistant_messages,
@@ -579,6 +615,56 @@ where
         Some(AutoCompactionEvent {
             removed_message_count: result.removed_message_count,
         })
+    }
+
+    fn maybe_preflight_auto_compact(&mut self) -> Option<AutoCompactionEvent> {
+        let result = compact_session(&self.session, CompactionConfig::default());
+        if result.removed_message_count == 0 {
+            return None;
+        }
+
+        self.session = result.compacted_session;
+        Some(AutoCompactionEvent {
+            removed_message_count: result.removed_message_count,
+        })
+    }
+
+    fn confirm_turn_token_budget(
+        &self,
+        usage: TokenUsage,
+        prompter: &mut dyn PermissionPrompter,
+    ) -> Result<(), RuntimeError> {
+        let threshold = self.turn_token_confirmation_threshold;
+        let request = PermissionRequest {
+            tool_name: "token_budget".to_string(),
+            input: format!(
+                "turn_tokens={} threshold={} input={} output={} cache_write={} cache_read={}",
+                usage.total_tokens(),
+                threshold,
+                usage.input_tokens,
+                usage.output_tokens,
+                usage.cache_creation_input_tokens,
+                usage.cache_read_input_tokens
+            ),
+            current_mode: self.permission_policy.active_mode(),
+            required_mode: self.permission_policy.active_mode(),
+            reason: Some(format!(
+                "single-turn token usage exceeded {threshold}; confirm before continuing this task"
+            )),
+        };
+
+        match prompter.decide(&request) {
+            PermissionPromptDecision::Allow => Ok(()),
+            PermissionPromptDecision::Deny { reason } => Err(RuntimeError::new(reason)),
+        }
+    }
+
+    fn turn_token_confirmation_required_error(&self, usage: TokenUsage) -> RuntimeError {
+        let threshold = self.turn_token_confirmation_threshold;
+        RuntimeError::new(format!(
+            "turn token usage exceeded {threshold} tokens (current={}); confirmation is required before continuing",
+            usage.total_tokens()
+        ))
     }
 
     fn record_turn_started(&self, user_input: &str) {
@@ -705,6 +791,55 @@ fn parse_auto_compaction_threshold(value: Option<&str>) -> u32 {
         .and_then(|raw| raw.trim().parse::<u32>().ok())
         .filter(|threshold| *threshold > 0)
         .unwrap_or(DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD)
+}
+
+/// Reads the single-turn token confirmation threshold from the environment.
+#[must_use]
+pub fn turn_token_confirmation_threshold_from_env() -> u32 {
+    parse_turn_token_confirmation_threshold(
+        std::env::var(TURN_TOKEN_CONFIRM_THRESHOLD_ENV_VAR)
+            .ok()
+            .as_deref(),
+    )
+}
+
+#[must_use]
+fn parse_turn_token_confirmation_threshold(value: Option<&str>) -> u32 {
+    value
+        .and_then(|raw| raw.trim().parse::<u32>().ok())
+        .filter(|threshold| *threshold > 0)
+        .unwrap_or(DEFAULT_TURN_TOKEN_CONFIRM_THRESHOLD)
+}
+
+fn add_token_usage(left: TokenUsage, right: TokenUsage) -> TokenUsage {
+    TokenUsage {
+        input_tokens: left.input_tokens.saturating_add(right.input_tokens),
+        output_tokens: left.output_tokens.saturating_add(right.output_tokens),
+        cache_creation_input_tokens: left
+            .cache_creation_input_tokens
+            .saturating_add(right.cache_creation_input_tokens),
+        cache_read_input_tokens: left
+            .cache_read_input_tokens
+            .saturating_add(right.cache_read_input_tokens),
+    }
+}
+
+fn merge_auto_compaction_event(
+    current: &mut Option<AutoCompactionEvent>,
+    next: Option<AutoCompactionEvent>,
+) {
+    let Some(next) = next else {
+        return;
+    };
+
+    match current {
+        Some(current) => {
+            current.removed_message_count = current
+                .removed_message_count
+                .saturating_add(next.removed_message_count);
+        }
+        None => *current = Some(next),
+    }
 }
 
 fn build_assistant_message(
@@ -836,9 +971,11 @@ impl ToolExecutor for StaticToolExecutor {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_assistant_message, parse_auto_compaction_threshold, ApiClient, ApiRequest,
-        AssistantEvent, AutoCompactionEvent, ConversationRuntime, PromptCacheEvent, RuntimeError,
+        build_assistant_message, parse_auto_compaction_threshold,
+        parse_turn_token_confirmation_threshold, ApiClient, ApiRequest, AssistantEvent,
+        AutoCompactionEvent, ConversationRuntime, PromptCacheEvent, RuntimeError,
         StaticToolExecutor, ToolExecutor, DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD,
+        DEFAULT_TURN_TOKEN_CONFIRM_THRESHOLD,
     };
     use crate::compact::CompactionConfig;
     use crate::config::{RuntimeFeatureConfig, RuntimeHookConfig};
@@ -977,6 +1114,119 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn preflight_compacts_large_session_before_api_request() {
+        struct CompactAwareApi;
+        impl ApiClient for CompactAwareApi {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                assert!(
+                    matches!(request.messages.first().map(|message| message.role), Some(MessageRole::System)),
+                    "first request should receive compacted context before streaming"
+                );
+                assert!(
+                    request.messages.len() <= CompactionConfig::default().preserve_recent_messages + 1,
+                    "request should keep only compact summary plus recent tail, got {} messages",
+                    request.messages.len()
+                );
+                Ok(vec![
+                    AssistantEvent::TextDelta("done".to_string()),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let mut session = Session::new();
+        for index in 0..8 {
+            if index % 2 == 0 {
+                session
+                    .push_user_text("large user context ".repeat(700))
+                    .expect("user message should append");
+            } else {
+                session
+                    .push_message(crate::session::ConversationMessage::assistant(vec![
+                        ContentBlock::Text {
+                            text: "large assistant context ".repeat(700),
+                        },
+                    ]))
+                    .expect("assistant message should append");
+            }
+        }
+
+        let mut runtime = ConversationRuntime::new(
+            session,
+            CompactAwareApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+
+        let summary = runtime
+            .run_turn("new request", None)
+            .expect("turn should succeed after preflight compaction");
+
+        assert!(summary
+            .auto_compaction
+            .is_some_and(|event| event.removed_message_count > 0));
+        assert_eq!(runtime.session().messages[0].role, MessageRole::System);
+    }
+
+    #[test]
+    fn token_budget_confirmation_can_stop_tool_continuation() {
+        struct HighUsageToolApi;
+        impl ApiClient for HighUsageToolApi {
+            fn stream(&mut self, _request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                Ok(vec![
+                    AssistantEvent::ToolUse {
+                        id: "tool-1".to_string(),
+                        name: "expensive_next_step".to_string(),
+                        input: "{}".to_string(),
+                    },
+                    AssistantEvent::Usage(TokenUsage {
+                        input_tokens: 100_001,
+                        output_tokens: 0,
+                        cache_creation_input_tokens: 0,
+                        cache_read_input_tokens: 0,
+                    }),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        struct TokenBudgetRejectPrompter {
+            seen: Vec<PermissionRequest>,
+        }
+        impl PermissionPrompter for TokenBudgetRejectPrompter {
+            fn decide(&mut self, request: &PermissionRequest) -> PermissionPromptDecision {
+                self.seen.push(request.clone());
+                PermissionPromptDecision::Deny {
+                    reason: "token budget denied".to_string(),
+                }
+            }
+        }
+
+        let mut prompter = TokenBudgetRejectPrompter { seen: Vec::new() };
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            HighUsageToolApi,
+            StaticToolExecutor::new().register("expensive_next_step", |_input| {
+                panic!("tool should not run before token budget approval")
+            }),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_turn_token_confirmation_threshold(100_000);
+
+        let error = runtime
+            .run_turn("spend carefully", Some(&mut prompter))
+            .expect_err("token budget rejection should stop continuation");
+
+        assert_eq!(error.to_string(), "token budget denied");
+        assert_eq!(prompter.seen.len(), 1);
+        assert_eq!(prompter.seen[0].tool_name, "token_budget");
+        assert!(prompter.seen[0].input.contains("turn_tokens=100001"));
+        assert_eq!(runtime.session().messages.len(), 2);
     }
 
     #[test]
@@ -1622,6 +1872,23 @@ mod tests {
         assert_eq!(
             parse_auto_compaction_threshold(Some("not-a-number")),
             DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD
+        );
+    }
+
+    #[test]
+    fn token_confirmation_threshold_defaults_and_parses_values() {
+        assert_eq!(
+            parse_turn_token_confirmation_threshold(None),
+            DEFAULT_TURN_TOKEN_CONFIRM_THRESHOLD
+        );
+        assert_eq!(parse_turn_token_confirmation_threshold(Some("123456")), 123_456);
+        assert_eq!(
+            parse_turn_token_confirmation_threshold(Some("0")),
+            DEFAULT_TURN_TOKEN_CONFIRM_THRESHOLD
+        );
+        assert_eq!(
+            parse_turn_token_confirmation_threshold(Some("not-a-number")),
+            DEFAULT_TURN_TOKEN_CONFIRM_THRESHOLD
         );
     }
 

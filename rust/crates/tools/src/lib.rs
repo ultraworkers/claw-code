@@ -5562,7 +5562,7 @@ fn execute_repl(input: ReplInput) -> Result<ReplOutput, String> {
     }
     let runtime = resolve_repl_runtime(&input.language)?;
     let started = Instant::now();
-    let mut process = Command::new(runtime.program);
+    let mut process = Command::new(&runtime.program);
     process
         .args(runtime.args)
         .arg(&input.code)
@@ -5611,14 +5611,14 @@ fn execute_repl(input: ReplInput) -> Result<ReplOutput, String> {
 }
 
 struct ReplRuntime {
-    program: &'static str,
+    program: String,
     args: &'static [&'static str],
 }
 
 fn resolve_repl_runtime(language: &str) -> Result<ReplRuntime, String> {
     match language.trim().to_ascii_lowercase().as_str() {
         "python" | "py" => Ok(ReplRuntime {
-            program: detect_first_command(&["python3", "python"])
+            program: detect_first_command(&["python", "py", "python3"])
                 .ok_or_else(|| String::from("python runtime not found"))?,
             args: &["-c"],
         }),
@@ -5636,11 +5636,10 @@ fn resolve_repl_runtime(language: &str) -> Result<ReplRuntime, String> {
     }
 }
 
-fn detect_first_command(commands: &[&'static str]) -> Option<&'static str> {
+fn detect_first_command(commands: &[&'static str]) -> Option<String> {
     commands
         .iter()
-        .copied()
-        .find(|command| command_exists(command))
+        .find_map(|command| find_command(command).map(|path| path.display().to_string()))
 }
 
 #[derive(Clone, Copy)]
@@ -5964,18 +5963,18 @@ fn execute_powershell(input: PowerShellInput) -> std::io::Result<runtime::BashCo
     }
     let shell = detect_powershell_shell()?;
     execute_shell_command(
-        shell,
+        &shell,
         &input.command,
         input.timeout,
         input.run_in_background,
     )
 }
 
-fn detect_powershell_shell() -> std::io::Result<&'static str> {
-    if command_exists("pwsh") {
-        Ok("pwsh")
-    } else if command_exists("powershell") {
-        Ok("powershell")
+fn detect_powershell_shell() -> std::io::Result<String> {
+    if let Some(shell) = find_command("pwsh") {
+        Ok(shell.display().to_string())
+    } else if let Some(shell) = find_command("powershell") {
+        Ok(shell.display().to_string())
     } else {
         Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
@@ -5984,13 +5983,103 @@ fn detect_powershell_shell() -> std::io::Result<&'static str> {
     }
 }
 
-fn command_exists(command: &str) -> bool {
-    std::process::Command::new("sh")
-        .arg("-lc")
-        .arg(format!("command -v {command} >/dev/null 2>&1"))
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
+fn find_command(command: &str) -> Option<PathBuf> {
+    let command_path = Path::new(command);
+    if command_path.components().count() > 1 {
+        return command_path.is_file().then(|| command_path.to_path_buf());
+    }
+
+    let paths = path_env()?;
+
+    #[cfg(windows)]
+    {
+        find_command_windows(command, command_path, &paths)
+    }
+
+    #[cfg(not(windows))]
+    {
+        std::env::split_paths(&paths).find_map(|dir| {
+            let candidate = dir.join(command);
+            candidate.is_file().then_some(candidate)
+        })
+    }
+}
+
+fn path_env() -> Option<std::ffi::OsString> {
+    #[cfg(windows)]
+    {
+        let mut exact = None;
+        let mut case_match = None;
+        for (key, value) in std::env::vars_os() {
+            if key == "PATH" {
+                exact = Some(value.clone());
+            }
+            if key.to_string_lossy().eq_ignore_ascii_case("PATH") {
+                case_match = Some(value);
+            }
+        }
+        exact
+            .or(case_match)
+            .or_else(|| std::env::var_os("PATH"))
+            .or_else(|| std::env::var_os("Path"))
+    }
+
+    #[cfg(not(windows))]
+    {
+        std::env::var_os("PATH")
+    }
+}
+
+#[cfg(windows)]
+fn find_command_windows(
+    command: &str,
+    command_path: &Path,
+    paths: &std::ffi::OsStr,
+) -> Option<PathBuf> {
+    let has_extension = command_path.extension().is_some();
+    let pathext = std::env::var_os("PATHEXT")
+        .map(|value| {
+            value
+                .to_string_lossy()
+                .split(';')
+                .filter_map(|part| {
+                    let trimmed = part.trim();
+                    (!trimmed.is_empty()).then(|| {
+                        if trimmed.starts_with('.') {
+                            trimmed.to_string()
+                        } else {
+                            format!(".{trimmed}")
+                        }
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .filter(|exts| !exts.is_empty())
+        .unwrap_or_else(|| {
+            vec![
+                ".COM".to_string(),
+                ".EXE".to_string(),
+                ".BAT".to_string(),
+                ".CMD".to_string(),
+            ]
+        });
+
+    for dir in std::env::split_paths(paths) {
+        if has_extension {
+            let candidate = dir.join(command);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+            continue;
+        }
+        for ext in &pathext {
+            let candidate = dir.join(format!("{command}{ext}"));
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
 }
 
 #[allow(clippy::too_many_lines)]
@@ -9449,7 +9538,28 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&dir).expect("create dir");
+        #[cfg(windows)]
+        let script = dir.join("pwsh.cmd");
+        #[cfg(not(windows))]
         let script = dir.join("pwsh");
+
+        #[cfg(windows)]
+        std::fs::write(
+            &script,
+            r#"@echo off
+:loop
+if "%~1"=="-Command" goto found
+if "%~1"=="" exit /b 0
+shift
+goto loop
+:found
+shift
+<nul set /p dummy=pwsh:%~1
+"#,
+        )
+        .expect("write script");
+
+        #[cfg(not(windows))]
         std::fs::write(
             &script,
             r#"#!/bin/sh
@@ -9459,13 +9569,21 @@ printf 'pwsh:%s' "$1"
 "#,
         )
         .expect("write script");
+
+        #[cfg(not(windows))]
         std::process::Command::new("/bin/chmod")
             .arg("+x")
             .arg(&script)
             .status()
             .expect("chmod");
         let original_path = std::env::var("PATH").unwrap_or_default();
-        std::env::set_var("PATH", format!("{}:{}", dir.display(), original_path));
+        #[cfg(windows)]
+        let path_value = format!("{};{}", dir.display(), original_path);
+        #[cfg(not(windows))]
+        let path_value = format!("{}:{}", dir.display(), original_path);
+        std::env::set_var("PATH", &path_value);
+        #[cfg(windows)]
+        std::env::set_var("Path", &path_value);
 
         let result = execute_tool(
             "PowerShell",
@@ -9480,6 +9598,8 @@ printf 'pwsh:%s' "$1"
         .expect("PowerShell background should succeed");
 
         std::env::set_var("PATH", original_path);
+        #[cfg(windows)]
+        std::env::set_var("Path", std::env::var("PATH").unwrap_or_default());
         let _ = std::fs::remove_dir_all(dir);
 
         let output: serde_json::Value = serde_json::from_str(&result).expect("json");
@@ -9506,12 +9626,17 @@ printf 'pwsh:%s' "$1"
                 .as_nanos()
         ));
         std::fs::create_dir_all(&empty_dir).expect("create empty dir");
-        std::env::set_var("PATH", empty_dir.display().to_string());
+        let empty_path = empty_dir.display().to_string();
+        std::env::set_var("PATH", &empty_path);
+        #[cfg(windows)]
+        std::env::set_var("Path", &empty_path);
 
         let err = execute_tool("PowerShell", &json!({"command": "Write-Output hello"}))
             .expect_err("PowerShell should fail when shell is missing");
 
         std::env::set_var("PATH", original_path);
+        #[cfg(windows)]
+        std::env::set_var("Path", std::env::var("PATH").unwrap_or_default());
         let _ = std::fs::remove_dir_all(empty_dir);
 
         assert!(err.contains("PowerShell executable not found"));
