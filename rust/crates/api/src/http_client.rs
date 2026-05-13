@@ -73,6 +73,7 @@ pub fn build_http_client() -> Result<reqwest::Client, ApiError> {
 pub fn build_http_client_or_default() -> reqwest::Client {
     build_http_client().unwrap_or_else(|_| {
         reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::limited(10))
             .user_agent("clawd-rust-tools/0.1")
             .build()
             .expect("default client with user_agent should always succeed")
@@ -88,6 +89,7 @@ pub fn build_http_client_or_default() -> reqwest::Client {
 pub fn build_http_client_with(config: &ProxyConfig) -> Result<reqwest::Client, ApiError> {
     let mut builder = reqwest::Client::builder()
         .no_proxy()
+        .redirect(reqwest::redirect::Policy::limited(10))
         .user_agent("clawd-rust-tools/0.1");
 
     let no_proxy = config
