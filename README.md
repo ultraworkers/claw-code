@@ -169,6 +169,18 @@ source ~/.bashrc  # or source ~/.zshrc
 claw --help
 ```
 
+**Option 4: Add your profile to ~/.claw/.env**
+
+Write the followings in a new file named `.env` in `~/.claw/` (or `%USERPROFILE%` if you are using Windows):
+
+```
+ANTHROPIC_API_KEY=[PASTE_YOUR_OWN_API_KEY]
+ANTHROPIC_BASE_URL=https://api.deepseek.com/anthropic
+ANTHROPIC_MODEL=deepseek-v4-pro[1m]
+```
+
+And next time before you run `claw`, you will not have to `export ANTHROPIC_API_KEY=[YOUR_OWN_API_KEY]` and/or other details, again.
+
 ### Troubleshooting
 
 - **"command not found: claw"** — The binary is in `rust/target/debug/claw`, but it's not on your PATH. Use the full path `./rust/target/debug/claw` or symlink/install as above.

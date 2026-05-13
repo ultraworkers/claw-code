@@ -477,8 +477,20 @@ pub(crate) fn load_dotenv_file(
 /// Returns `None` when the file is missing, the key is absent, or the value
 /// is empty.
 pub(crate) fn dotenv_value(key: &str) -> Option<String> {
-    let cwd = std::env::current_dir().ok()?;
-    let values = load_dotenv_file(&cwd.join(".env"))?;
+    // Try project-level .env first (current working directory)
+    if let Ok(cwd) = std::env::current_dir() {
+        if let Some(values) = load_dotenv_file(&cwd.join(".env")) {
+            if let Some(val) = values.get(key).filter(|v| !v.is_empty()) {
+                return Some(val.clone());
+            }
+        }
+    }
+
+    // Fallback to global ~/.claw/.env
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .ok()?;
+    let values = load_dotenv_file(&std::path::Path::new(&home).join(".claw").join(".env"))?;
     values.get(key).filter(|value| !value.is_empty()).cloned()
 }
 
