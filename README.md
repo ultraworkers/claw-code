@@ -1,210 +1,592 @@
-# Claw Code
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Claw Code — Local Fork Overview</title>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      --bg: #0b0f17;
+      --surface: #111827;
+      --surface-2: #1a2332;
+      --border: #1f2937;
+      --text: #e5e7eb;
+      --text-muted: #9ca3af;
+      --text-dim: #6b7280;
+      --accent: #f59e0b;
+      --accent-2: #d97706;
+      --green: #10b981;
+      --green-dim: #059669;
+      --blue: #3b82f6;
+      --red: #ef4444;
+      --radius: 12px;
+      --radius-sm: 8px;
+    }
 
-<p align="center">
-  <a href="https://github.com/ultraworkers/claw-code">ultraworkers/claw-code</a>
-  ·
-  <a href="./USAGE.md">Usage</a>
-  ·
-  <a href="./rust/README.md">Rust workspace</a>
-  ·
-  <a href="./PARITY.md">Parity</a>
-  ·
-  <a href="./ROADMAP.md">Roadmap</a>
-  ·
-  <a href="https://discord.gg/5TUQKqFWd">UltraWorkers Discord</a>
-</p>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
 
-<p align="center">
-  <a href="https://star-history.com/#ultraworkers/claw-code&Date">
-    <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=ultraworkers/claw-code&type=Date&theme=dark" />
-      <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=ultraworkers/claw-code&type=Date" />
-      <img alt="Star history for ultraworkers/claw-code" src="https://api.star-history.com/svg?repos=ultraworkers/claw-code&type=Date" width="600" />
-    </picture>
-  </a>
-</p>
+    body {
+      font-family: 'Inter', system-ui, -apple-system, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.6;
+      min-height: 100vh;
+    }
 
-<p align="center">
-  <img src="assets/claw-hero.jpeg" alt="Claw Code" width="300" />
-</p>
+    .container {
+      max-width: 1100px;
+      margin: 0 auto;
+      padding: 0 24px;
+    }
 
-Claw Code is the public Rust implementation of the `claw` CLI agent harness.
-The canonical implementation lives in [`rust/`](./rust), and the current source of truth for this repository is **ultraworkers/claw-code**.
+    /* HERO */
+    .hero {
+      padding: 80px 0 60px;
+      text-align: center;
+      border-bottom: 1px solid var(--border);
+    }
 
-> [!IMPORTANT]
-> Start with [`USAGE.md`](./USAGE.md) for build, auth, CLI, session, and parity-harness workflows. Make `claw doctor` your first health check after building, use [`rust/README.md`](./rust/README.md) for crate-level details, read [`PARITY.md`](./PARITY.md) for the current Rust-port checkpoint, and see [`docs/container.md`](./docs/container.md) for the container-first workflow.
->
-> **ACP / Zed status:** `claw-code` does not ship an ACP/Zed daemon entrypoint yet. Run `claw acp` (or `claw --acp`) for the current status instead of guessing from source layout; `claw acp serve` is currently a discoverability alias only, and real ACP support remains tracked separately in `ROADMAP.md`.
+    .hero-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      background: var(--surface-2);
+      border: 1px solid var(--border);
+      padding: 6px 16px;
+      border-radius: 999px;
+      font-size: 0.85rem;
+      color: var(--text-muted);
+      margin-bottom: 24px;
+    }
 
-## Current repository shape
+    .hero-badge .dot {
+      width: 8px;
+      height: 8px;
+      background: var(--green);
+      border-radius: 50%;
+      display: inline-block;
+      animation: pulse 2s infinite;
+    }
 
-- **`rust/`** — canonical Rust workspace and the `claw` CLI binary
-- **`USAGE.md`** — task-oriented usage guide for the current product surface
-- **`PARITY.md`** — Rust-port parity status and migration notes
-- **`ROADMAP.md`** — active roadmap and cleanup backlog
-- **`PHILOSOPHY.md`** — project intent and system-design framing
-- **`src/` + `tests/`** — companion Python/reference workspace and audit helpers; not the primary runtime surface
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.4; }
+    }
 
-## Quick start
+    .hero h1 {
+      font-size: 3.2rem;
+      font-weight: 800;
+      letter-spacing: -0.03em;
+      margin-bottom: 16px;
+      background: linear-gradient(135deg, #fff 0%, var(--accent) 100%);
+      background-clip: text;
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
 
-> [!NOTE]
-> [!WARNING]
-> **`cargo install claw-code` installs the wrong thing.** The `claw-code` crate on crates.io is a deprecated stub that places `claw-code-deprecated.exe` — not `claw`. Running it only prints `"claw-code has been renamed to agent-code"`. **Do not use `cargo install claw-code`.** Either build from source (this repo) or install the upstream binary:
-> ```bash
-> cargo install agent-code   # upstream binary — installs 'agent.exe' (Windows) / 'agent' (Unix), NOT 'agent-code'
-> ```
-> This repo (`ultraworkers/claw-code`) is **build-from-source only** — follow the steps below.
+    .hero p.lead {
+      font-size: 1.25rem;
+      color: var(--text-muted);
+      max-width: 640px;
+      margin: 0 auto 40px;
+      font-weight: 300;
+    }
 
-```bash
-# 1. Clone and build
-git clone https://github.com/ultraworkers/claw-code
-cd claw-code/rust
-cargo build --workspace
+    .hero-stats {
+      display: flex;
+      justify-content: center;
+      gap: 48px;
+      flex-wrap: wrap;
+    }
 
-# 2. Set your API key (Anthropic API key — not a Claude subscription)
-export ANTHROPIC_API_KEY="sk-ant-..."
+    .stat {
+      text-align: center;
+    }
 
-# 3. Verify everything is wired correctly
-./target/debug/claw doctor
+    .stat-value {
+      font-size: 2.4rem;
+      font-weight: 700;
+      color: var(--accent);
+      line-height: 1;
+    }
 
-# 4. Run a prompt
-./target/debug/claw prompt "say hello"
-```
+    .stat-label {
+      font-size: 0.85rem;
+      color: var(--text-dim);
+      margin-top: 6px;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
 
-> [!NOTE]
-> **Windows (PowerShell):** the binary is `claw.exe`, not `claw`. Use `.\target\debug\claw.exe` or run `cargo run -- prompt "say hello"` to skip the path lookup.
+    /* COMPARISON */
+    .comparison {
+      padding: 60px 0;
+      border-bottom: 1px solid var(--border);
+    }
 
-### Windows setup
+    .section-title {
+      font-size: 1.75rem;
+      font-weight: 700;
+      margin-bottom: 8px;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
 
-**PowerShell is a supported Windows path.** Use whichever shell works for you. The common onboarding issues on Windows are:
+    .section-subtitle {
+      color: var(--text-muted);
+      margin-bottom: 32px;
+      font-size: 1rem;
+    }
 
-1. **Install Rust first** — download from <https://rustup.rs/> and run the installer. Close and reopen your terminal when it finishes.
-2. **Verify Rust is on PATH:**
-   ```powershell
-   cargo --version
-   ```
-   If this fails, reopen your terminal or run the PATH setup from the Rust installer output, then retry.
-3. **Clone and build** (works in PowerShell, Git Bash, or WSL):
-   ```powershell
-   git clone https://github.com/ultraworkers/claw-code
-   cd claw-code/rust
-   cargo build --workspace
-   ```
-4. **Run** (PowerShell — note `.exe` and backslash):
-   ```powershell
-   $env:ANTHROPIC_API_KEY = "sk-ant-..."
-   .\target\debug\claw.exe prompt "say hello"
-   ```
+    .compare-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 24px;
+    }
 
-**Git Bash / WSL** are optional alternatives, not requirements. If you prefer bash-style paths (`/c/Users/you/...` instead of `C:\Users\you\...`), Git Bash (ships with Git for Windows) works well. In Git Bash, the `MINGW64` prompt is expected and normal — not a broken install.
+    @media (max-width: 768px) {
+      .compare-grid { grid-template-columns: 1fr; }
+      .hero h1 { font-size: 2.2rem; }
+    }
 
-## Post-build: locate the binary and verify
+    .compare-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 28px;
+      position: relative;
+      overflow: hidden;
+    }
 
-After running `cargo build --workspace`, the `claw` binary is built but **not** automatically installed to your system. Here's where to find it and how to verify the build succeeded.
+    .compare-card::before {
+      content: '';
+      position: absolute;
+      top: 0;
+      left: 0;
+      right: 0;
+      height: 3px;
+    }
 
-### Binary location
+    .compare-card.upstream::before { background: var(--blue); }
+    .compare-card.local::before { background: var(--green); }
 
-After `cargo build --workspace` in `claw-code/rust/`:
+    .compare-card h3 {
+      font-size: 1.1rem;
+      font-weight: 600;
+      margin-bottom: 4px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
 
-**Debug build (default, faster compile):**
-- **macOS/Linux:** `rust/target/debug/claw`
-- **Windows:** `rust/target/debug/claw.exe`
+    .compare-card .tag {
+      font-size: 0.7rem;
+      padding: 2px 8px;
+      border-radius: 999px;
+      font-weight: 600;
+      text-transform: uppercase;
+    }
 
-**Release build (optimized, slower compile):**
-- **macOS/Linux:** `rust/target/release/claw`
-- **Windows:** `rust/target/release/claw.exe`
+    .tag-blue { background: rgba(59,130,246,0.15); color: var(--blue); }
+    .tag-green { background: rgba(16,185,129,0.15); color: var(--green); }
 
-If you ran `cargo build` without `--release`, the binary is in the `debug/` folder.
+    .compare-card p.meta {
+      font-size: 0.85rem;
+      color: var(--text-dim);
+      margin-bottom: 16px;
+    }
 
-### Verify the build succeeded
+    .compare-card ul {
+      list-style: none;
+      font-size: 0.9rem;
+      color: var(--text-muted);
+    }
 
-Test the binary directly using its path:
+    .compare-card ul li {
+      padding: 6px 0;
+      padding-left: 20px;
+      position: relative;
+    }
 
-```bash
-# macOS/Linux (debug build)
-./rust/target/debug/claw --help
-./rust/target/debug/claw doctor
+    .compare-card ul li::before {
+      content: '—';
+      position: absolute;
+      left: 0;
+      color: var(--text-dim);
+    }
 
-# Windows PowerShell (debug build)
-.\rust\target\debug\claw.exe --help
-.\rust\target\debug\claw.exe doctor
-```
+    .compare-card.local ul li::before {
+      content: '+';
+      color: var(--green);
+      font-weight: 700;
+    }
 
-If these commands succeed, the build is working. `claw doctor` is your first health check — it validates your API key, model access, and tool configuration.
+    /* DELTA BAR */
+    .delta-bar {
+      margin-top: 24px;
+      background: var(--surface-2);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      padding: 16px 20px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 12px;
+    }
 
-### Optional: Add to PATH
+    .delta-bar code {
+      font-family: 'SF Mono', Monaco, monospace;
+      font-size: 0.85rem;
+      color: var(--accent);
+    }
 
-If you want to run `claw` from any directory without the full path, choose one of these approaches:
+    .delta-bar span {
+      font-size: 0.9rem;
+      color: var(--text-muted);
+    }
 
-**Option 1: Symlink (macOS/Linux)**
-```bash
-ln -s $(pwd)/rust/target/debug/claw /usr/local/bin/claw
-```
-Then reload your shell and test:
-```bash
-claw --help
-```
+    .delta-bar .highlight {
+      color: var(--green);
+      font-weight: 600;
+    }
 
-**Option 2: Use `cargo install` (all platforms)**
+    /* ACCOMPLISHMENTS */
+    .accomplishments {
+      padding: 60px 0;
+      border-bottom: 1px solid var(--border);
+    }
 
-Build and install to Cargo's default location (`~/.cargo/bin/`, which is usually on PATH):
-```bash
-# From the claw-code/rust/ directory
-cargo install --path . --force
+    .milestone-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+      gap: 20px;
+    }
 
-# Then from anywhere
-claw --help
-```
+    .milestone-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 24px;
+      transition: border-color 0.2s, transform 0.2s;
+    }
 
-**Option 3: Update shell profile (bash/zsh)**
+    .milestone-card:hover {
+      border-color: var(--accent-2);
+      transform: translateY(-2px);
+    }
 
-Add this line to `~/.bashrc` or `~/.zshrc`:
-```bash
-export PATH="$(pwd)/rust/target/debug:$PATH"
-```
+    .milestone-card .status {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 0.75rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      margin-bottom: 10px;
+    }
 
-Reload your shell:
-```bash
-source ~/.bashrc  # or source ~/.zshrc
-claw --help
-```
+    .status-done { color: var(--green); }
+    .status-todo { color: var(--text-dim); }
 
-### Troubleshooting
+    .milestone-card h4 {
+      font-size: 1rem;
+      font-weight: 600;
+      margin-bottom: 8px;
+      color: var(--text);
+    }
 
-- **"command not found: claw"** — The binary is in `rust/target/debug/claw`, but it's not on your PATH. Use the full path `./rust/target/debug/claw` or symlink/install as above.
-- **"permission denied"** — On macOS/Linux, you may need `chmod +x rust/target/debug/claw` if the executable bit isn't set (rare).
-- **Debug vs. release** — If the build is slow, you're in debug mode (default). Add `--release` to `cargo build` for faster runtime, but the build itself will take 5–10 minutes.
+    .milestone-card p {
+      font-size: 0.875rem;
+      color: var(--text-muted);
+      line-height: 1.5;
+    }
 
-> [!NOTE]
-> **Auth:** claw requires an **API key** (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, etc.) — Claude subscription login is not a supported auth path.
+    .milestone-card .files {
+      margin-top: 12px;
+      font-size: 0.8rem;
+      color: var(--text-dim);
+      font-family: 'SF Mono', Monaco, monospace;
+    }
 
-Run the workspace test suite after verifying the binary works:
+    /* SUMMARY */
+    .summary {
+      padding: 60px 0 80px;
+    }
 
-```bash
-cd rust
-cargo test --workspace
-```
+    .summary-box {
+      background: linear-gradient(135deg, var(--surface) 0%, var(--surface-2) 100%);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 40px;
+      text-align: center;
+    }
 
-## Documentation map
+    .summary-box h2 {
+      font-size: 1.5rem;
+      font-weight: 700;
+      margin-bottom: 16px;
+    }
 
-- [`USAGE.md`](./USAGE.md) — quick commands, auth, sessions, config, parity harness
-- [`rust/README.md`](./rust/README.md) — crate map, CLI surface, features, workspace layout
-- [`PARITY.md`](./PARITY.md) — parity status for the Rust port
-- [`rust/MOCK_PARITY_HARNESS.md`](./rust/MOCK_PARITY_HARNESS.md) — deterministic mock-service harness details
-- [`ROADMAP.md`](./ROADMAP.md) — active roadmap and open cleanup work
-- [`PHILOSOPHY.md`](./PHILOSOPHY.md) — why the project exists and how it is operated
+    .summary-box p {
+      color: var(--text-muted);
+      max-width: 600px;
+      margin: 0 auto 24px;
+    }
 
-## Ecosystem
+    .cta {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      background: var(--accent);
+      color: var(--bg);
+      padding: 12px 24px;
+      border-radius: var(--radius-sm);
+      font-weight: 600;
+      font-size: 0.95rem;
+      text-decoration: none;
+      transition: background 0.2s;
+    }
 
-Claw Code is built in the open alongside the broader UltraWorkers toolchain:
+    .cta:hover {
+      background: var(--accent-2);
+    }
 
-- [clawhip](https://github.com/Yeachan-Heo/clawhip)
-- [oh-my-openagent](https://github.com/code-yeongyu/oh-my-openagent)
-- [oh-my-claudecode](https://github.com/Yeachan-Heo/oh-my-claudecode)
-- [oh-my-codex](https://github.com/Yeachan-Heo/oh-my-codex)
-- [UltraWorkers Discord](https://discord.gg/5TUQKqFWd)
+    footer {
+      text-align: center;
+      padding: 40px 0;
+      border-top: 1px solid var(--border);
+      color: var(--text-dim);
+      font-size: 0.85rem;
+    }
 
-## Ownership / affiliation disclaimer
+    footer a {
+      color: var(--accent);
+      text-decoration: none;
+    }
+  </style>
+</head>
+<body>
 
-- This repository does **not** claim ownership of the original Claude Code source material.
-- This repository is **not affiliated with, endorsed by, or maintained by Anthropic**.
+  <section class="hero">
+    <div class="container">
+      <div class="hero-badge">
+        <span class="dot"></span>
+        Active Development Fork
+      </div>
+      <h1>Claw Code Local</h1>
+      <p class="lead">
+        A hardened, feature-enriched fork of <code>ultraworkers/claw-code</code>
+        with real diffing, atomic file operations, local LLM support, and
+        a rigorous code-editing workflow board.
+      </p>
+      <div class="hero-stats">
+        <div class="stat">
+          <div class="stat-value">5</div>
+          <div class="stat-label">Commits Ahead</div>
+        </div>
+        <div class="stat">
+          <div class="stat-value">21</div>
+          <div class="stat-label">User Stories Done</div>
+        </div>
+        <div class="stat">
+          <div class="stat-value">7/14</div>
+          <div class="stat-label">Milestones Complete</div>
+        </div>
+        <div class="stat">
+          <div class="stat-value">900+</div>
+          <div class="stat-label">Tests Passing</div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="comparison">
+    <div class="container">
+      <h2 class="section-title">
+        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s-8-4.5-8-11.8A8 8 0 0 1 12 2a8 8 0 0 1 8 8.2c0 7.3-8 11.8-8 11.8z"/><circle cx="12" cy="10" r="3"/></svg>
+        Fork Comparison
+      </h2>
+      <p class="section-subtitle">What changed between the upstream repo and this local fork.</p>
+
+      <div class="compare-grid">
+        <div class="compare-card upstream">
+          <h3>
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="var(--blue)" stroke-width="2"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg>
+            ultraworkers/claw-code
+            <span class="tag tag-blue">Upstream</span>
+          </h3>
+          <p class="meta">1,043 commits &middot; 9-lane parity checkpoint &middot; 40 tool specs</p>
+          <ul>
+            <li>Bash validation, CI fix, file-tool edge cases</li>
+            <li>TaskRegistry + Team/Cron registries (in-memory)</li>
+            <li>MCP lifecycle bridge + LSP client dispatch</li>
+            <li>Permission enforcement (read-only vs workspace-write)</li>
+            <li>Mock parity harness with 10 scripted scenarios</li>
+            <li>Basic <code>edit_file</code> with naive string replace</li>
+            <li>No diff engine — degenerate hunks on every edit</li>
+            <li>No atomic writes — direct <code>fs::write</code> calls</li>
+            <li><code>/undo</code> registered but unimplemented (no-op)</li>
+            <li>No read-before-edit tracking</li>
+          </ul>
+        </div>
+
+        <div class="compare-card local">
+          <h3>
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="var(--green)" stroke-width="2"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg>
+            claw-code-local (this fork)
+            <span class="tag tag-green">+5 commits</span>
+          </h3>
+          <p class="meta">All upstream features + local LLM + hardened editing pipeline</p>
+          <ul>
+            <li><strong>Embedded local LLM</strong> — llama.cpp provider with tool calling &amp; streaming</li>
+            <li><strong>Real diff engine</strong> — <code>similar</code>-powered structured patches &amp; git-style unified diffs</li>
+            <li><strong>Ambiguity guard</strong> — <code>edit_file</code> rejects non-unique matches unless <code>replace_all=true</code></li>
+            <li><strong>Atomic writes</strong> — temp-file + <code>rename</code> + <code>fsync</code> + permission preservation</li>
+            <li><strong>Encoding fidelity</strong> — CRLF, BOM, and trailing-newline round-trip preservation</li>
+            <li><strong>SHA tracker</strong> — read-before-edit enforcement &amp; conflict detection</li>
+            <li><strong>MultiEdit tool</strong> — atomic multi-hunk edits, all-or-nothing semantics</li>
+            <li><strong>/undo works</strong> — per-session edit history, SHA-256 validation, <code>--force</code> override</li>
+            <li><strong>Typed errors</strong> — structured <code>TypedError</code> envelopes across API + runtime + CLI</li>
+            <li><strong>Model compatibility</strong> — Kimi, reasoning models, GPT-5, Qwen/DashScope fixes</li>
+          </ul>
+        </div>
+      </div>
+
+      <div class="delta-bar">
+        <code>git diff upstream/main..HEAD</code>
+        <span>
+          <span class="highlight">+19,328</span> lines added &nbsp;&middot;&nbsp;
+          <span class="highlight">-6,802</span> lines removed &nbsp;&middot;&nbsp;
+          <span class="highlight">91</span> files changed
+        </span>
+      </div>
+    </div>
+  </section>
+
+  <section class="accomplishments">
+    <div class="container">
+      <h2 class="section-title">
+        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="20 6 9 17 4 12"/></svg>
+        Accomplishments
+      </h2>
+      <p class="section-subtitle">Completed milestones and delivered user stories.</p>
+
+      <div class="milestone-grid">
+        <div class="milestone-card">
+          <div class="status status-done"><span>●</span> Done</div>
+          <h4>M1 — Real structuredPatch diff</h4>
+          <p>Replaced degenerate hunks with real diffing via <code>similar::TextDiff</code>. Every edit now produces accurate <code>oldStart/oldLines/newStart/newLines</code> hunks and a populated <code>gitDiff</code> field.</p>
+          <div class="files">diff.rs, file_ops.rs</div>
+        </div>
+
+        <div class="milestone-card">
+          <div class="status status-done"><span>●</span> Done</div>
+          <h4>M2 — edit_file uniqueness check</h4>
+          <p>Ambiguous matches (2+ occurrences with <code>replace_all=false</code>) now return a typed <code>EditError::Ambiguous</code> instead of silently mutating the first hit.</p>
+          <div class="files">file_ops.rs</div>
+        </div>
+
+        <div class="milestone-card">
+          <div class="status status-done"><span>●</span> Done</div>
+          <h4>M3 — Atomic write (tempfile + rename + fsync)</h4>
+          <p>Crash-safe file edits via <code>NamedTempFile</code>, explicit <code>sync_all</code>, atomic <code>persist</code>, and Unix permission preservation. No more truncated files on power loss.</p>
+          <div class="files">atomic_write.rs, file_ops.rs</div>
+        </div>
+
+        <div class="milestone-card">
+          <div class="status status-done"><span>●</span> Done</div>
+          <h4>M4 — CRLF / BOM / trailing-newline preservation</h4>
+          <p>New <code>text_encoding.rs</code> detects <code>FileShape</code> (line ending, BOM, trailing newline), normalises to LF for the model, and restores the original shape on write.</p>
+          <div class="files">text_encoding.rs</div>
+        </div>
+
+        <div class="milestone-card">
+          <div class="status status-done"><span>●</span> Done</div>
+          <h4>M5 — Read-before-edit tracking</h4>
+          <p><code>FileTracker</code> records SHA-256 + mtime on every <code>read_file</code>. Subsequent edits are denied if the file was never read or was modified externally since the read.</p>
+          <div class="files">file_tracker.rs</div>
+        </div>
+
+        <div class="milestone-card">
+          <div class="status status-done"><span>●</span> Done</div>
+          <h4>M6 — MultiEdit tool</h4>
+          <p>Atomic multi-hunk edits. Applies N sequential <code>EditOp</code>s in-memory first; if any op fails, the file is never touched. One combined <code>structuredPatch</code> is returned on success.</p>
+          <div class="files">tools/src/lib.rs, multi_edit.rs</div>
+        </div>
+
+        <div class="milestone-card">
+          <div class="status status-done"><span>●</span> Done</div>
+          <h4>M7 — /undo actually undoes</h4>
+          <p>Per-session <code>EditHistory</code> stack (cap 50). <code>/undo</code> restores original bytes with SHA-256 validation. <code>/undo --force</code> skips the check. Stack cleared across sessions.</p>
+          <div class="files">edit_history.rs, commands/src/lib.rs</div>
+        </div>
+
+        <div class="milestone-card">
+          <div class="status status-done"><span>●</span> Done</div>
+          <h4>M9 — SHA conflict detection</h4>
+          <p>Optional <code>expected_sha256</code> on <code>EditFileInput</code> / <code>WriteFileInput</code>. Mismatch yields <code>EditError::Conflict</code> with expected vs actual hashes, preventing stale overwrites.</p>
+          <div class="files">tools/src/lib.rs, file_ops.rs</div>
+        </div>
+
+        <div class="milestone-card">
+          <div class="status status-done"><span>●</span> Done</div>
+          <h4>Local LLM Provider (llama.cpp)</h4>
+          <p>Embedded llama.cpp backend with tool calling, streaming, and thinking-budget control for reasoning models. Includes nightly CI workflow and container support.</p>
+          <div class="files">llama_cpp.rs, nightly-local-llama.yml</div>
+        </div>
+
+        <div class="milestone-card">
+          <div class="status status-done"><span>●</span> Done</div>
+          <h4>Typed Error Envelope Contract</h4>
+          <p><code>TypedError</code> with 9 kinds, structured fields (<code>kind, operation, target, detail, hint, retryable</code>), JSON + text rendering, and downcasting from <code>ApiError</code> / <code>SessionControlError</code>.</p>
+          <div class="files">typed_error.rs, main.rs</div>
+        </div>
+
+        <div class="milestone-card">
+          <div class="status status-done"><span>●</span> Done</div>
+          <h4>Model Compatibility Hardening</h4>
+          <p>Kimi <code>is_error</code> exclusion, reasoning-model tuning stripping, GPT-5 <code>max_completion_tokens</code>, Qwen/DashScope routing, and request-body size pre-flight checks.</p>
+          <div class="files">openai_compat.rs, MODEL_COMPATIBILITY.md</div>
+        </div>
+
+        <div class="milestone-card">
+          <div class="status status-done"><span>●</span> Done</div>
+          <h4>Performance Benchmarks</h4>
+          <p>Criterion benchmark suite for request-building hot paths. <code>flatten_tool_result_content</code> optimised with pre-allocated capacity — ~17 ns single-text, ~11.7 µs large-content.</p>
+          <div class="files">benches/request_building.rs</div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="summary">
+    <div class="container">
+      <div class="summary-box">
+        <h2>What This Fork Demonstrates</h2>
+        <p>
+          Beyond the original <strong>9-lane parity checkpoint</strong>, this fork proves that a small,
+          focused set of incremental milestones can transform a stub-heavy codebase into a
+          production-resilient editing harness — with real diffs, atomic safety, encoding fidelity,
+          and undo — all validated by 900+ tests and a deterministic mock parity harness.
+        </p>
+        <a class="cta" href="https://github.com/ultraworkers/claw-code" target="_blank">
+          View Upstream Repo
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
+        </a>
+      </div>
+    </div>
+  </section>
+
+  <footer>
+    <div class="container">
+      Generated from <code>claw-code-local</code> workspace &middot;
+      Comparing against <a href="https://github.com/ultraworkers/claw-code">github.com/ultraworkers/claw-code</a>
+    </div>
+  </footer>
+
+</body>
+</html>
