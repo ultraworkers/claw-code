@@ -2111,25 +2111,26 @@ fn check_auth_health() -> DiagnosticCheck {
     let auth_token_present = env::var("ANTHROPIC_AUTH_TOKEN")
         .ok()
         .is_some_and(|value| !value.trim().is_empty());
+    let openai_key_present = env::var("OPENAI_API_KEY")
+        .ok()
+        .is_some_and(|value| !value.trim().is_empty());
+    let any_auth_present = api_key_present || auth_token_present || openai_key_present;
     let env_details = format!(
-        "Environment       api_key={} auth_token={}",
+        "Environment       api_key={} auth_token={} openai_key={}",
         if api_key_present { "present" } else { "absent" },
-        if auth_token_present {
-            "present"
-        } else {
-            "absent"
-        }
+        if auth_token_present { "present" } else { "absent" },
+        if openai_key_present { "present" } else { "absent" }
     );
 
     match load_oauth_credentials() {
         Ok(Some(token_set)) => DiagnosticCheck::new(
             "Auth",
-            if api_key_present || auth_token_present {
+            if any_auth_present {
                 DiagnosticLevel::Ok
             } else {
                 DiagnosticLevel::Warn
             },
-            if api_key_present || auth_token_present {
+            if any_auth_present {
                 "supported auth env vars are configured; legacy saved OAuth is ignored"
             } else {
                 "legacy saved OAuth credentials are present but unsupported"
@@ -2172,12 +2173,12 @@ fn check_auth_health() -> DiagnosticCheck {
         ])),
         Ok(None) => DiagnosticCheck::new(
             "Auth",
-            if api_key_present || auth_token_present {
+            if any_auth_present {
                 DiagnosticLevel::Ok
             } else {
                 DiagnosticLevel::Warn
             },
-            if api_key_present || auth_token_present {
+            if any_auth_present {
                 "supported auth env vars are configured"
             } else {
                 "no supported auth env vars were found"
