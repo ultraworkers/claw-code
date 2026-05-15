@@ -76,6 +76,7 @@ fn create_sample_request(message_count: usize) -> MessageRequest {
         presence_penalty: None,
         stop: None,
         reasoning_effort: None,
+        extra_body: std::collections::BTreeMap::new(),
     }
 }
 

@@ -307,11 +307,23 @@ pub fn edit_file(
 
 /// Expands a glob pattern and returns matching filenames.
 pub fn glob_search(pattern: &str, path: Option<&str>) -> io::Result<GlobSearchOutput> {
+    glob_search_impl(pattern, path, None)
+}
+
+fn glob_search_impl(
+    pattern: &str,
+    path: Option<&str>,
+    workspace_root: Option<&Path>,
+) -> io::Result<GlobSearchOutput> {
     let started = Instant::now();
     let base_dir = path
         .map(normalize_path)
         .transpose()?
         .unwrap_or(std::env::current_dir()?);
+    let canonical_root = workspace_root.map(canonicalize_workspace_root);
+    if let Some(root) = canonical_root.as_deref() {
+        validate_workspace_boundary(&base_dir, root)?;
+    }
     let search_pattern = if Path::new(pattern).is_absolute() {
         pattern.to_owned()
     } else {
@@ -329,6 +341,12 @@ pub fn glob_search(pattern: &str, path: Option<&str>) -> io::Result<GlobSearchOu
         let compiled = Pattern::new(pat)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
         let walk_root = derive_glob_walk_root(pat);
+        if let Some(root) = canonical_root.as_deref() {
+            let canonical_walk_root = walk_root
+                .canonicalize()
+                .unwrap_or_else(|_| walk_root.clone());
+            validate_workspace_boundary(&canonical_walk_root, root)?;
+        }
         let entries = WalkDir::new(&walk_root)
             .into_iter()
             .filter_entry(|entry| !should_skip_glob_dir(entry));
@@ -338,6 +356,10 @@ pub fn glob_search(pattern: &str, path: Option<&str>) -> io::Result<GlobSearchOu
                 && compiled.matches_path(candidate)
                 && seen.insert(candidate.to_path_buf())
             {
+                if let Some(root) = canonical_root.as_deref() {
+                    let canonical_candidate = candidate.canonicalize()?;
+                    validate_workspace_boundary(&canonical_candidate, root)?;
+                }
                 matches.push(candidate.to_path_buf());
             }
         }
@@ -367,12 +389,23 @@ pub fn glob_search(pattern: &str, path: Option<&str>) -> io::Result<GlobSearchOu
 
 /// Runs a regex search over workspace files with optional context lines.
 pub fn grep_search(input: &GrepSearchInput) -> io::Result<GrepSearchOutput> {
+    grep_search_impl(input, None)
+}
+
+fn grep_search_impl(
+    input: &GrepSearchInput,
+    workspace_root: Option<&Path>,
+) -> io::Result<GrepSearchOutput> {
     let base_path = input
         .path
         .as_deref()
         .map(normalize_path)
         .transpose()?
         .unwrap_or(std::env::current_dir()?);
+    let canonical_root = workspace_root.map(canonicalize_workspace_root);
+    if let Some(root) = canonical_root.as_deref() {
+        validate_workspace_boundary(&base_path, root)?;
+    }
 
     let regex = RegexBuilder::new(&input.pattern)
         .case_insensitive(input.case_insensitive.unwrap_or(false))
@@ -398,6 +431,10 @@ pub fn grep_search(input: &GrepSearchInput) -> io::Result<GrepSearchOutput> {
     let mut total_matches = 0usize;
 
     for file_path in collect_search_files(&base_path)? {
+        if let Some(root) = canonical_root.as_deref() {
+            let canonical_file = file_path.canonicalize()?;
+            validate_workspace_boundary(&canonical_file, root)?;
+        }
         if !matches_optional_filters(&file_path, glob_filter.as_ref(), file_type) {
             continue;
         }
@@ -447,32 +484,52 @@ pub fn grep_search(input: &GrepSearchInput) -> io::Result<GrepSearchOutput> {
 
     let (filenames, applied_limit, applied_offset) =
         apply_limit(filenames, input.head_limit, input.offset);
-    let content_output = if output_mode == "content" {
-        let (lines, limit, offset) = apply_limit(content_lines, input.head_limit, input.offset);
-        return Ok(GrepSearchOutput {
-            mode: Some(output_mode),
-            num_files: filenames.len(),
+    if output_mode == "content" {
+        return Ok(build_grep_content_output(
+            output_mode,
             filenames,
-            num_lines: Some(lines.len()),
-            content: Some(lines.join("\n")),
-            num_matches: None,
-            applied_limit: limit,
-            applied_offset: offset,
-        });
-    } else {
-        None
-    };
+            content_lines,
+            input.head_limit,
+            input.offset,
+        ));
+    }
 
     Ok(GrepSearchOutput {
         mode: Some(output_mode.clone()),
         num_files: filenames.len(),
         filenames,
-        content: content_output,
+        content: None,
         num_lines: None,
         num_matches: (output_mode == "count").then_some(total_matches),
         applied_limit,
         applied_offset,
     })
+}
+
+fn build_grep_content_output(
+    output_mode: String,
+    filenames: Vec<String>,
+    content_lines: Vec<String>,
+    head_limit: Option<usize>,
+    offset: Option<usize>,
+) -> GrepSearchOutput {
+    let (lines, limit, offset) = apply_limit(content_lines, head_limit, offset);
+    GrepSearchOutput {
+        mode: Some(output_mode),
+        num_files: filenames.len(),
+        filenames,
+        num_lines: Some(lines.len()),
+        content: Some(lines.join("\n")),
+        num_matches: None,
+        applied_limit: limit,
+        applied_offset: offset,
+    }
+}
+
+fn canonicalize_workspace_root(workspace_root: &Path) -> PathBuf {
+    workspace_root
+        .canonicalize()
+        .unwrap_or_else(|_| workspace_root.to_path_buf())
 }
 
 fn should_skip_glob_dir(entry: &DirEntry) -> bool {
@@ -625,9 +682,7 @@ pub fn read_file_in_workspace(
     workspace_root: &Path,
 ) -> io::Result<ReadFileOutput> {
     let absolute_path = normalize_path(path)?;
-    let canonical_root = workspace_root
-        .canonicalize()
-        .unwrap_or_else(|_| workspace_root.to_path_buf());
+    let canonical_root = canonicalize_workspace_root(workspace_root);
     validate_workspace_boundary(&absolute_path, &canonical_root)?;
     read_file(path, offset, limit)
 }
@@ -640,9 +695,7 @@ pub fn write_file_in_workspace(
     workspace_root: &Path,
 ) -> io::Result<WriteFileOutput> {
     let absolute_path = normalize_path_allow_missing(path)?;
-    let canonical_root = workspace_root
-        .canonicalize()
-        .unwrap_or_else(|_| workspace_root.to_path_buf());
+    let canonical_root = canonicalize_workspace_root(workspace_root);
     validate_workspace_boundary(&absolute_path, &canonical_root)?;
     write_file(path, content)
 }
@@ -657,11 +710,28 @@ pub fn edit_file_in_workspace(
     workspace_root: &Path,
 ) -> io::Result<EditFileOutput> {
     let absolute_path = normalize_path(path)?;
-    let canonical_root = workspace_root
-        .canonicalize()
-        .unwrap_or_else(|_| workspace_root.to_path_buf());
+    let canonical_root = canonicalize_workspace_root(workspace_root);
     validate_workspace_boundary(&absolute_path, &canonical_root)?;
     edit_file(path, old_string, new_string, replace_all)
+}
+
+/// Expand a glob pattern with workspace boundary enforcement.
+#[allow(dead_code)]
+pub fn glob_search_in_workspace(
+    pattern: &str,
+    path: Option<&str>,
+    workspace_root: &Path,
+) -> io::Result<GlobSearchOutput> {
+    glob_search_impl(pattern, path, Some(workspace_root))
+}
+
+/// Search file contents with workspace boundary enforcement.
+#[allow(dead_code)]
+pub fn grep_search_in_workspace(
+    input: &GrepSearchInput,
+    workspace_root: &Path,
+) -> io::Result<GrepSearchOutput> {
+    grep_search_impl(input, Some(workspace_root))
 }
 
 /// Check whether a path is a symlink that resolves outside the workspace.
@@ -708,7 +778,7 @@ mod tests {
     use super::{
         component_contains_glob, derive_glob_walk_root, edit_file, expand_braces, glob_search,
         grep_search, is_symlink_escape, read_file, read_file_in_workspace, write_file,
-        GrepSearchInput, MAX_WRITE_SIZE,
+        write_file_in_workspace, GrepSearchInput, MAX_WRITE_SIZE,
     };
 
     fn temp_path(name: &str) -> std::path::PathBuf {
@@ -806,6 +876,68 @@ mod tests {
         let normal = workspace.join("normal.txt");
         std::fs::write(&normal, "normal content").expect("normal file should write");
         assert!(!is_symlink_escape(&normal, &workspace).expect("check should succeed"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn workspace_read_rejects_symlink_escape_regression_3007_class() {
+        let workspace = temp_path("workspace-read-symlink-escape");
+        let outside = temp_path("workspace-read-symlink-target");
+        std::fs::create_dir_all(&workspace).expect("workspace dir should be created");
+        std::fs::create_dir_all(&outside).expect("outside dir should be created");
+        let outside_file = outside.join("secret.txt");
+        std::fs::write(&outside_file, "outside secret").expect("outside file should write");
+
+        let link_path = workspace.join("linked-secret.txt");
+        std::os::unix::fs::symlink(&outside_file, &link_path).expect("symlink should create");
+
+        let result =
+            read_file_in_workspace(link_path.to_string_lossy().as_ref(), None, None, &workspace);
+
+        assert!(result.is_err(), "symlink escape must be rejected");
+        let error = result.unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(
+            error.to_string().contains("escapes workspace"),
+            "error should explain workspace escape: {error}"
+        );
+
+        let _ = std::fs::remove_dir_all(&workspace);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn workspace_write_rejects_parent_symlink_escape_regression_3007_class() {
+        let workspace = temp_path("workspace-write-symlink-escape");
+        let outside = temp_path("workspace-write-symlink-target");
+        std::fs::create_dir_all(&workspace).expect("workspace dir should be created");
+        std::fs::create_dir_all(&outside).expect("outside dir should be created");
+
+        let link_dir = workspace.join("linked-outside");
+        std::os::unix::fs::symlink(&outside, &link_dir).expect("symlink dir should create");
+        let escaped_child = link_dir.join("created.txt");
+
+        let result = write_file_in_workspace(
+            escaped_child.to_string_lossy().as_ref(),
+            "must not escape",
+            &workspace,
+        );
+
+        assert!(result.is_err(), "parent symlink escape must be rejected");
+        let error = result.unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(
+            error.to_string().contains("escapes workspace"),
+            "error should explain workspace escape: {error}"
+        );
+        assert!(
+            !outside.join("created.txt").exists(),
+            "write should not create through an escaping symlink"
+        );
+
+        let _ = std::fs::remove_dir_all(&workspace);
+        let _ = std::fs::remove_dir_all(&outside);
     }
 
     #[test]

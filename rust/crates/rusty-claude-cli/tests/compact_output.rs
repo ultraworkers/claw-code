@@ -1,3 +1,5 @@
+#![allow(clippy::while_let_on_iterator)]
+
 use std::fs;
 use std::path::PathBuf;
 use std::process::{Command, Output};

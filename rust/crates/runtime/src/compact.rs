@@ -212,8 +212,7 @@ fn summarize_messages(messages: &[ConversationMessage]) -> String {
         .filter_map(|block| match block {
             ContentBlock::ToolUse { name, .. } => Some(name.as_str()),
             ContentBlock::ToolResult { tool_name, .. } => Some(tool_name.as_str()),
-            ContentBlock::Text { .. } => None,
-            ContentBlock::Thinking { .. } => None,
+            ContentBlock::Text { .. } | ContentBlock::Thinking { .. } => None,
         })
         .collect::<Vec<_>>();
     tool_names.sort_unstable();

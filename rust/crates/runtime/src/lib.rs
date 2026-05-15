@@ -4,6 +4,7 @@
 //! MCP plumbing, tool-facing file operations, and the core conversation loop
 //! that drives interactive and one-shot turns.
 
+mod approval_tokens;
 mod bash;
 pub mod bash_validation;
 mod bootstrap;
@@ -13,6 +14,7 @@ mod config;
 pub mod config_validate;
 mod conversation;
 mod file_ops;
+pub mod g004_conformance;
 mod git_context;
 pub mod green_contract;
 mod hooks;
@@ -33,6 +35,7 @@ mod policy_engine;
 mod prompt;
 pub mod recovery_recipes;
 mod remote;
+mod report_schema;
 pub mod sandbox;
 mod session;
 pub mod session_control;
@@ -49,6 +52,10 @@ mod trust_resolver;
 mod usage;
 pub mod worker_boot;
 
+pub use approval_tokens::{
+    ApprovalDelegationHop, ApprovalScope, ApprovalTokenAudit, ApprovalTokenError,
+    ApprovalTokenGrant, ApprovalTokenLedger, ApprovalTokenStatus,
+};
 pub use bash::{execute_bash, BashCommandInput, BashCommandOutput};
 pub use bootstrap::{BootstrapPhase, BootstrapPlan};
 pub use branch_lock::{detect_branch_lock_collisions, BranchLockCollision, BranchLockIntent};
@@ -74,9 +81,10 @@ pub use conversation::{
     ToolExecutor, TurnSummary,
 };
 pub use file_ops::{
-    edit_file, glob_search, grep_search, read_file, write_file, EditFileOutput, GlobSearchOutput,
-    GrepSearchInput, GrepSearchOutput, ReadFileOutput, StructuredPatchHunk, TextFilePayload,
-    WriteFileOutput,
+    edit_file, edit_file_in_workspace, glob_search, glob_search_in_workspace, grep_search,
+    grep_search_in_workspace, read_file, read_file_in_workspace, write_file,
+    write_file_in_workspace, EditFileOutput, GlobSearchOutput, GrepSearchInput, GrepSearchOutput,
+    ReadFileOutput, StructuredPatchHunk, TextFilePayload, WriteFileOutput,
 };
 pub use git_context::{GitCommitEntry, GitContext};
 pub use hooks::{
@@ -127,21 +135,30 @@ pub use plugin_lifecycle::{
     PluginState, ResourceInfo, ServerHealth, ServerStatus, ToolInfo,
 };
 pub use policy_engine::{
-    evaluate, DiffScope, GreenLevel, LaneBlocker, LaneContext, PolicyAction, PolicyCondition,
-    PolicyEngine, PolicyRule, ReconcileReason, ReviewStatus,
+    evaluate, evaluate_with_events, ApprovalToken, DiffScope, GreenLevel, LaneBlocker, LaneContext,
+    PolicyAction, PolicyCondition, PolicyDecisionEvent, PolicyDecisionKind, PolicyEngine,
+    PolicyEvaluation, PolicyRule, ReconcileReason, ReviewStatus,
 };
 pub use prompt::{
     load_system_prompt, prepend_bullets, ContextFile, ModelFamilyIdentity, ProjectContext,
     PromptBuildError, SystemPromptBuilder, FRONTIER_MODEL_NAME, SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
 };
 pub use recovery_recipes::{
-    attempt_recovery, recipe_for, EscalationPolicy, FailureScenario, RecoveryContext,
-    RecoveryEvent, RecoveryRecipe, RecoveryResult, RecoveryStep,
+    attempt_recovery, recipe_for, EscalationPolicy, FailureScenario, RecoveryAttemptState,
+    RecoveryAttemptType, RecoveryCommandResult, RecoveryContext, RecoveryEvent,
+    RecoveryLedgerEntry, RecoveryRecipe, RecoveryResult, RecoveryStatusReport, RecoveryStep,
 };
 pub use remote::{
     inherited_upstream_proxy_env, no_proxy_list, read_token, upstream_proxy_ws_url,
     RemoteSessionContext, UpstreamProxyBootstrap, UpstreamProxyState, DEFAULT_REMOTE_BASE_URL,
     DEFAULT_SESSION_TOKEN_PATH, DEFAULT_SYSTEM_CA_BUNDLE, NO_PROXY_HOSTS, UPSTREAM_PROXY_ENV_KEYS,
+};
+pub use report_schema::{
+    canonicalize_report, project_report, report_content_hash, report_schema_v1_registry,
+    CanonicalReportV1, ClaimKind, ConsumerCapabilities, FieldDelta, FieldDeltaState,
+    NegativeEvidence, NegativeFindingStatus, ProjectionProvenance, RedactionProvenance,
+    ReportClaim, ReportConfidence, ReportIdentity, ReportProjectionV1, ReportSchemaField,
+    ReportSchemaRegistry, SensitivityClass, DEFAULT_PROJECTION_POLICY_V1, REPORT_SCHEMA_V1,
 };
 pub use sandbox::{
     build_linux_sandbox_command, detect_container_environment, detect_container_environment_from,
@@ -151,7 +168,7 @@ pub use sandbox::{
 };
 pub use session::{
     ContentBlock, ConversationMessage, MessageRole, Session, SessionCompaction, SessionError,
-    SessionFork, SessionPromptEntry,
+    SessionFork, SessionHeartbeat, SessionLiveness, SessionPromptEntry,
 };
 pub use sse::{IncrementalSseParser, SseEvent};
 pub use stale_base::{
@@ -162,7 +179,10 @@ pub use stale_branch::{
     apply_policy, check_freshness, BranchFreshness, StaleBranchAction, StaleBranchEvent,
     StaleBranchPolicy,
 };
-pub use task_packet::{validate_packet, TaskPacket, TaskPacketValidationError, ValidatedPacket};
+pub use task_packet::{
+    validate_packet, TaskPacket, TaskPacketValidationError, TaskResource, ValidatedPacket,
+};
+pub use task_registry::{LaneBoard, LaneBoardEntry, LaneFreshness, LaneHeartbeat};
 #[cfg(test)]
 pub use trust_resolver::{TrustConfig, TrustDecision, TrustEvent, TrustPolicy, TrustResolver};
 pub use usage::{

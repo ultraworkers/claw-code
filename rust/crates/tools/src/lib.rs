@@ -12,22 +12,22 @@ use api::{
 use plugins::PluginTool;
 use reqwest::blocking::Client;
 use runtime::{
-    check_freshness, dedupe_superseded_commit_events, edit_file, execute_bash, glob_search,
-    grep_search, load_system_prompt,
+    check_freshness, dedupe_superseded_commit_events, edit_file_in_workspace, execute_bash,
+    glob_search_in_workspace, grep_search_in_workspace, load_system_prompt,
     lsp_client::LspRegistry,
     mcp_tool_bridge::McpToolRegistry,
     permission_enforcer::{EnforcementResult, PermissionEnforcer},
-    read_file,
+    read_file_in_workspace,
     summary_compression::compress_summary_text,
     task_registry::TaskRegistry,
     team_cron_registry::{CronRegistry, TeamRegistry},
     worker_boot::{WorkerReadySnapshot, WorkerRegistry, WorkerTaskReceipt},
-    write_file, ApiClient, ApiRequest, AssistantEvent, BashCommandInput, BashCommandOutput,
-    BranchFreshness, ConfigLoader, ContentBlock, ConversationMessage, ConversationRuntime,
-    GrepSearchInput, LaneCommitProvenance, LaneEvent, LaneEventBlocker, LaneEventName,
-    LaneEventStatus, LaneFailureClass, McpDegradedReport, MessageRole, PermissionMode,
-    PermissionPolicy, PromptCacheEvent, ProviderFallbackConfig, RuntimeError, Session, TaskPacket,
-    ToolError, ToolExecutor,
+    write_file_in_workspace, ApiClient, ApiRequest, AssistantEvent, BashCommandInput,
+    BashCommandOutput, BranchFreshness, ConfigLoader, ContentBlock, ConversationMessage,
+    ConversationRuntime, GrepSearchInput, LaneCommitProvenance, LaneEvent, LaneEventBlocker,
+    LaneEventName, LaneEventStatus, LaneFailureClass, McpDegradedReport, MessageRole,
+    PermissionMode, PermissionPolicy, PromptCacheEvent, ProviderFallbackConfig, RuntimeError,
+    Session, TaskPacket, ToolError, ToolExecutor,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -1198,6 +1198,7 @@ pub fn execute_tool(name: &str, input: &Value) -> Result<String, String> {
     execute_tool_with_enforcer(None, name, input)
 }
 
+#[allow(clippy::too_many_lines)]
 fn execute_tool_with_enforcer(
     enforcer: Option<&PermissionEnforcer>,
     name: &str,
@@ -1212,24 +1213,34 @@ fn execute_tool_with_enforcer(
             run_bash(bash_input)
         }
         "read_file" => {
-            maybe_enforce_permission_check(enforcer, name, input)?;
-            from_value::<ReadFileInput>(input).and_then(run_read_file)
+            let file_input: ReadFileInput = from_value(input)?;
+            let required_mode = classify_read_path_permission(&file_input.path, false);
+            maybe_enforce_permission_check_with_mode(enforcer, name, input, required_mode)?;
+            run_read_file(file_input)
         }
         "write_file" => {
-            maybe_enforce_permission_check(enforcer, name, input)?;
-            from_value::<WriteFileInput>(input).and_then(run_write_file)
+            let file_input: WriteFileInput = from_value(input)?;
+            let required_mode = classify_file_path_permission(&file_input.path, true);
+            maybe_enforce_permission_check_with_mode(enforcer, name, input, required_mode)?;
+            run_write_file(file_input)
         }
         "edit_file" => {
-            maybe_enforce_permission_check(enforcer, name, input)?;
-            from_value::<EditFileInput>(input).and_then(run_edit_file)
+            let file_input: EditFileInput = from_value(input)?;
+            let required_mode = classify_file_path_permission(&file_input.path, false);
+            maybe_enforce_permission_check_with_mode(enforcer, name, input, required_mode)?;
+            run_edit_file(file_input)
         }
         "glob_search" => {
-            maybe_enforce_permission_check(enforcer, name, input)?;
-            from_value::<GlobSearchInputValue>(input).and_then(run_glob_search)
+            let glob_input: GlobSearchInputValue = from_value(input)?;
+            let required_mode = classify_glob_permission(&glob_input);
+            maybe_enforce_permission_check_with_mode(enforcer, name, input, required_mode)?;
+            run_glob_search(glob_input)
         }
         "grep_search" => {
-            maybe_enforce_permission_check(enforcer, name, input)?;
-            from_value::<GrepSearchInput>(input).and_then(run_grep_search)
+            let grep_input: GrepSearchInput = from_value(input)?;
+            let required_mode = classify_grep_permission(&grep_input);
+            maybe_enforce_permission_check_with_mode(enforcer, name, input, required_mode)?;
+            run_grep_search(grep_input)
         }
         "WebFetch" => from_value::<WebFetchInput>(input).and_then(run_web_fetch),
         "WebSearch" => from_value::<WebSearchInput>(input).and_then(run_web_search),
@@ -1296,17 +1307,6 @@ fn execute_tool_with_enforcer(
         }
         _ => Err(format!("unsupported tool: {name}")),
     }
-}
-
-fn maybe_enforce_permission_check(
-    enforcer: Option<&PermissionEnforcer>,
-    tool_name: &str,
-    input: &Value,
-) -> Result<(), String> {
-    if let Some(enforcer) = enforcer {
-        enforce_permission_check(enforcer, tool_name, input)?;
-    }
-    Ok(())
 }
 
 /// Enforce permission check with a dynamically classified permission mode.
@@ -1500,15 +1500,13 @@ fn run_task_output(input: TaskIdInput) -> Result<String, String> {
 fn run_worker_create(input: WorkerCreateInput) -> Result<String, String> {
     // Merge config-level trusted_roots with per-call overrides.
     // Config provides the default allowlist; per-call roots add on top.
-    let config_roots: Vec<String> = ConfigLoader::default_for(&input.cwd)
+    let merged_roots: Vec<String> = ConfigLoader::default_for(&input.cwd)
         .load()
         .ok()
-        .map(|c| c.trusted_roots().to_vec())
-        .unwrap_or_default();
-    let merged_roots: Vec<String> = config_roots
-        .into_iter()
-        .chain(input.trusted_roots.iter().cloned())
-        .collect();
+        .map_or_else(
+            || input.trusted_roots.clone(),
+            |config| config.trusted_roots_with_overrides(&input.trusted_roots),
+        );
     let worker = global_worker_registry().create(
         &input.cwd,
         &merged_roots,
@@ -1885,11 +1883,28 @@ fn classify_bash_permission(command: &str) -> PermissionMode {
 fn has_dangerous_paths(command: &str) -> bool {
     // Look for absolute paths
     let tokens: Vec<&str> = command.split_whitespace().collect();
+    let cwd = std::env::current_dir()
+        .ok()
+        .map(|cwd| cwd.canonicalize().unwrap_or(cwd));
 
     for token in tokens {
+        let token = token.trim_matches(|ch: char| {
+            matches!(
+                ch,
+                '"' | '\'' | '`' | ',' | ';' | ')' | '(' | '[' | ']' | '{' | '}'
+            )
+        });
         // Skip flags/options
         if token.starts_with('-') {
             continue;
+        }
+
+        if token.contains('$') {
+            return true;
+        }
+
+        if looks_like_windows_absolute_path(token) {
+            return true;
         }
 
         // Check for absolute paths
@@ -1897,8 +1912,9 @@ fn has_dangerous_paths(command: &str) -> bool {
             // Check if it's within CWD
             let path =
                 PathBuf::from(token.replace('~', &std::env::var("HOME").unwrap_or_default()));
-            if let Ok(cwd) = std::env::current_dir() {
-                if !path.starts_with(&cwd) {
+            if let Some(cwd) = cwd.as_ref() {
+                let resolved = path.canonicalize().unwrap_or(path);
+                if !resolved.starts_with(cwd) {
                     return true; // Path outside workspace
                 }
             }
@@ -1908,9 +1924,33 @@ fn has_dangerous_paths(command: &str) -> bool {
         if token.contains("../..") || token.starts_with("../") && !token.starts_with("./") {
             return true;
         }
+
+        if let Some(cwd) = cwd.as_ref() {
+            if token.starts_with('.') || token.contains('/') || Path::new(token).exists() {
+                let candidate = if Path::new(token).is_absolute() {
+                    PathBuf::from(token)
+                } else {
+                    cwd.join(token)
+                };
+                if let Ok(canonical) = candidate.canonicalize() {
+                    if !canonical.starts_with(cwd) {
+                        return true;
+                    }
+                }
+            }
+        }
     }
 
     false
+}
+
+fn looks_like_windows_absolute_path(token: &str) -> bool {
+    let bytes = token.as_bytes();
+    (bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'/' | b'\\'))
+        || token.starts_with(r"\\")
 }
 
 fn run_bash(input: BashCommandInput) -> Result<String, String> {
@@ -1996,8 +2036,7 @@ fn git_ref_exists(reference: &str) -> bool {
     Command::new("git")
         .args(["rev-parse", "--verify", "--quiet", reference])
         .output()
-        .map(|output| output.status.success())
-        .unwrap_or(false)
+        .is_ok_and(|output| output.status.success())
 }
 
 fn git_stdout(args: &[&str]) -> Option<String> {
@@ -2069,22 +2108,31 @@ fn branch_divergence_output(
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_read_file(input: ReadFileInput) -> Result<String, String> {
-    to_pretty_json(read_file(&input.path, input.offset, input.limit).map_err(io_to_string)?)
+    let workspace = std::env::current_dir().map_err(|error| error.to_string())?;
+    to_pretty_json(
+        read_file_in_workspace(&input.path, input.offset, input.limit, &workspace)
+            .map_err(io_to_string)?,
+    )
 }
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_write_file(input: WriteFileInput) -> Result<String, String> {
-    to_pretty_json(write_file(&input.path, &input.content).map_err(io_to_string)?)
+    let workspace = std::env::current_dir().map_err(|error| error.to_string())?;
+    to_pretty_json(
+        write_file_in_workspace(&input.path, &input.content, &workspace).map_err(io_to_string)?,
+    )
 }
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_edit_file(input: EditFileInput) -> Result<String, String> {
+    let workspace = std::env::current_dir().map_err(|error| error.to_string())?;
     to_pretty_json(
-        edit_file(
+        edit_file_in_workspace(
             &input.path,
             &input.old_string,
             &input.new_string,
             input.replace_all.unwrap_or(false),
+            &workspace,
         )
         .map_err(io_to_string)?,
     )
@@ -2092,12 +2140,17 @@ fn run_edit_file(input: EditFileInput) -> Result<String, String> {
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_glob_search(input: GlobSearchInputValue) -> Result<String, String> {
-    to_pretty_json(glob_search(&input.pattern, input.path.as_deref()).map_err(io_to_string)?)
+    let workspace = std::env::current_dir().map_err(|error| error.to_string())?;
+    to_pretty_json(
+        glob_search_in_workspace(&input.pattern, input.path.as_deref(), &workspace)
+            .map_err(io_to_string)?,
+    )
 }
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_grep_search(input: GrepSearchInput) -> Result<String, String> {
-    to_pretty_json(grep_search(&input).map_err(io_to_string)?)
+    let workspace = std::env::current_dir().map_err(|error| error.to_string())?;
+    to_pretty_json(grep_search_in_workspace(&input, &workspace).map_err(io_to_string)?)
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -2156,6 +2209,85 @@ fn run_structured_output(input: StructuredOutputInput) -> Result<String, String>
 
 fn run_repl(input: ReplInput) -> Result<String, String> {
     to_pretty_json(execute_repl(input)?)
+}
+
+fn classify_file_path_permission(path: &str, allow_missing: bool) -> PermissionMode {
+    if path_within_current_workspace(path, allow_missing) {
+        PermissionMode::WorkspaceWrite
+    } else {
+        PermissionMode::DangerFullAccess
+    }
+}
+
+fn classify_read_path_permission(path: &str, allow_missing: bool) -> PermissionMode {
+    if path_within_current_workspace(path, allow_missing) {
+        PermissionMode::ReadOnly
+    } else {
+        PermissionMode::DangerFullAccess
+    }
+}
+
+fn classify_glob_permission(input: &GlobSearchInputValue) -> PermissionMode {
+    let base_allowed = input
+        .path
+        .as_deref()
+        .is_none_or(|path| path_within_current_workspace(path, false));
+    let pattern_allowed = path_within_current_workspace(&input.pattern, true);
+    if base_allowed && pattern_allowed {
+        PermissionMode::ReadOnly
+    } else {
+        PermissionMode::DangerFullAccess
+    }
+}
+
+fn classify_grep_permission(input: &GrepSearchInput) -> PermissionMode {
+    if input
+        .path
+        .as_deref()
+        .is_none_or(|path| path_within_current_workspace(path, false))
+    {
+        PermissionMode::ReadOnly
+    } else {
+        PermissionMode::DangerFullAccess
+    }
+}
+
+fn path_within_current_workspace(path: &str, allow_missing: bool) -> bool {
+    let trimmed = path.trim_matches(|ch: char| {
+        matches!(
+            ch,
+            '"' | '\'' | '`' | ',' | ';' | ')' | '(' | '[' | ']' | '{' | '}'
+        )
+    });
+    if looks_like_windows_absolute_path(trimmed) {
+        return false;
+    }
+
+    let Ok(cwd) = std::env::current_dir() else {
+        return false;
+    };
+    let cwd = cwd.canonicalize().unwrap_or(cwd);
+    let candidate = PathBuf::from(trimmed);
+    let absolute = if candidate.is_absolute() {
+        candidate
+    } else {
+        cwd.join(candidate)
+    };
+
+    let resolved = if allow_missing {
+        absolute
+            .parent()
+            .and_then(|parent| parent.canonicalize().ok())
+            .map(|parent| parent.join(absolute.file_name().unwrap_or_default()))
+            .unwrap_or(absolute)
+    } else {
+        match absolute.canonicalize() {
+            Ok(path) => path,
+            Err(_) => absolute,
+        }
+    };
+
+    resolved.starts_with(cwd)
 }
 
 /// Classify `PowerShell` command permission based on command type and path.
@@ -2217,12 +2349,24 @@ fn extract_powershell_path(command: &str) -> Option<String> {
 
 /// Check if a path is within the current workspace.
 fn is_within_workspace(path: &str) -> bool {
-    let path = PathBuf::from(path);
+    let trimmed = path.trim_matches(|ch: char| {
+        matches!(
+            ch,
+            '"' | '\'' | '`' | ',' | ';' | ')' | '(' | '[' | ']' | '{' | '}'
+        )
+    });
+    if looks_like_windows_absolute_path(trimmed) {
+        return false;
+    }
+
+    let path = PathBuf::from(trimmed);
 
     // If path is absolute, check if it starts with CWD
     if path.is_absolute() {
         if let Ok(cwd) = std::env::current_dir() {
-            return path.starts_with(&cwd);
+            let cwd = cwd.canonicalize().unwrap_or(cwd);
+            let resolved = path.canonicalize().unwrap_or(path);
+            return resolved.starts_with(&cwd);
         }
     }
 
@@ -5989,8 +6133,7 @@ fn command_exists(command: &str) -> bool {
         .arg("-lc")
         .arg(format!("command -v {command} >/dev/null 2>&1"))
         .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
+        .is_ok_and(|status| status.success())
 }
 
 #[allow(clippy::too_many_lines)]
@@ -6079,6 +6222,8 @@ Command exceeded timeout of {timeout_ms} ms",
                         stderr.trim_end()
                     )
                 };
+                let is_test = is_test_command(command);
+                let return_code_interpretation = if is_test { "test.hung" } else { "timeout" };
                 return Ok(runtime::BashCommandOutput {
                     stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
                     stderr,
@@ -6089,9 +6234,11 @@ Command exceeded timeout of {timeout_ms} ms",
                     backgrounded_by_user: None,
                     assistant_auto_backgrounded: None,
                     dangerously_disable_sandbox: None,
-                    return_code_interpretation: Some(String::from("timeout")),
+                    return_code_interpretation: Some(String::from(return_code_interpretation)),
                     no_output_expected: Some(false),
-                    structured_content: None,
+                    structured_content: Some(vec![test_timeout_provenance(
+                        command, timeout_ms, is_test,
+                    )]),
                     persisted_output_path: None,
                     persisted_output_size: None,
                     sandbox_status: None,
@@ -6122,6 +6269,37 @@ Command exceeded timeout of {timeout_ms} ms",
         persisted_output_path: None,
         persisted_output_size: None,
         sandbox_status: None,
+    })
+}
+
+fn is_test_command(command: &str) -> bool {
+    let normalized = command
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+    normalized.contains("cargo test")
+        || normalized.contains("cargo nextest")
+        || normalized.contains("npm test")
+        || normalized.contains("pnpm test")
+        || normalized.contains("yarn test")
+        || normalized.contains("pytest")
+}
+
+fn test_timeout_provenance(
+    command: &str,
+    timeout_ms: u64,
+    classified_as_test_hang: bool,
+) -> serde_json::Value {
+    json!({
+        "event": if classified_as_test_hang { "test.hung" } else { "command.timeout" },
+        "failureClass": if classified_as_test_hang { "test_hang" } else { "timeout" },
+        "data": {
+            "command": command,
+            "timeoutMs": timeout_ms,
+            "provenance": "shell.timeout",
+            "classification": if classified_as_test_hang { "test.hung" } else { "timeout" }
+        }
     })
 }
 
@@ -6430,6 +6608,45 @@ mod tests {
         assert_eq!(
             output["trust_auto_resolve"], true,
             "config-level trustedRoots should auto-resolve trust without per-call override"
+        );
+
+        fs::remove_dir_all(&worktree).ok();
+    }
+
+    #[test]
+    fn worker_create_merges_config_trusted_roots_with_per_call_roots() {
+        use std::fs;
+
+        let worktree = temp_path("config-and-call-trust-worktree");
+        let claw_dir = worktree.join(".claw");
+        fs::create_dir_all(&claw_dir).expect("create .claw dir");
+        fs::write(
+            claw_dir.join("settings.json"),
+            r#"{"trustedRoots": ["/definitely/not/this/worktree"]}"#,
+        )
+        .expect("write settings");
+
+        let cwd = worktree.to_str().expect("valid utf-8").to_string();
+        let parent = worktree
+            .parent()
+            .expect("temp path has parent")
+            .to_str()
+            .expect("valid parent utf-8")
+            .to_string();
+
+        let created = execute_tool(
+            "WorkerCreate",
+            &json!({
+                "cwd": cwd,
+                "trusted_roots": [parent]
+            }),
+        )
+        .expect("WorkerCreate should succeed");
+        let output: serde_json::Value = serde_json::from_str(&created).expect("json");
+
+        assert_eq!(
+            output["trust_auto_resolve"], true,
+            "per-call trusted_roots must extend config defaults for this create request"
         );
 
         fs::remove_dir_all(&worktree).ok();
@@ -6917,7 +7134,7 @@ mod tests {
             .expect_err("write tool should be denied before dispatch");
 
         // then
-        assert!(error.contains("requires workspace-write permission"));
+        assert!(error.contains("requires 'workspace-write' permission"));
     }
 
     #[test]
@@ -6942,7 +7159,7 @@ mod tests {
         // then
         assert!(error
             .to_string()
-            .contains("requires workspace-write permission"));
+            .contains("requires 'workspace-write' permission"));
     }
 
     #[test]
@@ -8630,8 +8847,12 @@ mod tests {
         let _guard = env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let path = temp_path("subagent-input.txt");
+        let root = temp_path("subagent-runtime");
+        std::fs::create_dir_all(&root).expect("create root");
+        let path = root.join("subagent-input.txt");
         std::fs::write(&path, "hello from child").expect("write input file");
+        let original_dir = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&root).expect("set cwd");
 
         let mut runtime = ConversationRuntime::new(
             Session::new(),
@@ -8663,7 +8884,8 @@ mod tests {
                     if output.contains("hello from child")
             )));
 
-        let _ = std::fs::remove_file(path);
+        std::env::set_current_dir(&original_dir).expect("restore cwd");
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -8848,6 +9070,23 @@ mod tests {
         let background_output: serde_json::Value = serde_json::from_str(&background).expect("json");
         assert!(background_output["backgroundTaskId"].as_str().is_some());
         assert_eq!(background_output["noOutputExpected"], true);
+    }
+
+    #[test]
+    fn bash_tool_classifies_test_timeout_as_hung_with_provenance() {
+        let timeout = execute_tool(
+            "bash",
+            &json!({ "command": "sleep 1 # cargo test slow_case", "timeout": 10 }),
+        )
+        .expect("bash timeout should return output");
+        let timeout_output: serde_json::Value = serde_json::from_str(&timeout).expect("json");
+        assert_eq!(timeout_output["interrupted"], true);
+        assert_eq!(timeout_output["returnCodeInterpretation"], "test.hung");
+        assert_eq!(timeout_output["structuredContent"][0]["event"], "test.hung");
+        assert_eq!(
+            timeout_output["structuredContent"][0]["data"]["provenance"],
+            "bash.timeout"
+        );
     }
 
     #[test]
@@ -9115,6 +9354,78 @@ mod tests {
 
         std::env::set_current_dir(&original_dir).expect("restore cwd");
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn file_tools_reject_paths_outside_current_workspace() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = temp_path("workspace-scope");
+        let outside = temp_path("workspace-scope-outside");
+        fs::create_dir_all(&root).expect("create root");
+        fs::create_dir_all(&outside).expect("create outside");
+        fs::write(outside.join("secret.txt"), "secret\n").expect("outside fixture");
+        let original_dir = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&root).expect("set cwd");
+
+        let read_error = execute_tool(
+            "read_file",
+            &json!({ "path": outside.join("secret.txt").display().to_string() }),
+        )
+        .expect_err("read outside workspace should fail");
+        assert!(read_error.contains("escapes workspace"));
+
+        let write_error = execute_tool(
+            "write_file",
+            &json!({ "path": outside.join("created.txt").display().to_string(), "content": "nope" }),
+        )
+        .expect_err("write outside workspace should fail");
+        assert!(write_error.contains("escapes workspace"));
+        assert!(!outside.join("created.txt").exists());
+
+        let glob_error = execute_tool(
+            "glob_search",
+            &json!({ "pattern": outside.join("*.txt").display().to_string() }),
+        )
+        .expect_err("absolute glob outside workspace should fail");
+        assert!(glob_error.contains("escapes workspace"));
+
+        let grep_error = execute_tool(
+            "grep_search",
+            &json!({ "pattern": "secret", "path": outside.display().to_string() }),
+        )
+        .expect_err("grep outside workspace should fail");
+        assert!(grep_error.contains("escapes workspace"));
+
+        std::env::set_current_dir(&original_dir).expect("restore cwd");
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(outside);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn file_tools_reject_symlink_escape_from_current_workspace() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = temp_path("workspace-symlink-scope");
+        let outside = temp_path("workspace-symlink-outside");
+        fs::create_dir_all(&root).expect("create root");
+        fs::create_dir_all(&outside).expect("create outside");
+        fs::write(outside.join("secret.txt"), "secret\n").expect("outside fixture");
+        std::os::unix::fs::symlink(outside.join("secret.txt"), root.join("link.txt"))
+            .expect("create symlink");
+        let original_dir = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&root).expect("set cwd");
+
+        let error = execute_tool("read_file", &json!({ "path": "link.txt" }))
+            .expect_err("symlink outside workspace should fail");
+        assert!(error.contains("escapes workspace"));
+
+        std::env::set_current_dir(&original_dir).expect("restore cwd");
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(outside);
     }
 
     #[test]
@@ -9530,6 +9841,19 @@ printf 'pwsh:%s' "$1"
         registry
     }
 
+    fn workspace_write_registry() -> super::GlobalToolRegistry {
+        use runtime::permission_enforcer::PermissionEnforcer;
+        use runtime::PermissionPolicy;
+
+        let policy = mvp_tool_specs().into_iter().fold(
+            PermissionPolicy::new(runtime::PermissionMode::WorkspaceWrite),
+            |policy, spec| policy.with_tool_requirement(spec.name, spec.required_permission),
+        );
+        let mut registry = super::GlobalToolRegistry::builtin();
+        registry.set_enforcer(PermissionEnforcer::new(policy));
+        registry
+    }
+
     #[test]
     fn given_read_only_enforcer_when_bash_then_denied() {
         let registry = read_only_registry();
@@ -9544,6 +9868,63 @@ printf 'pwsh:%s' "$1"
     }
 
     #[test]
+    fn given_workspace_write_enforcer_when_bash_uses_shell_expansion_then_denied() {
+        let registry = workspace_write_registry();
+        let err = registry
+            .execute("bash", &json!({ "command": "cat $HOME/.ssh/config" }))
+            .expect_err("shell-expanded path should require elevated permission");
+        assert!(
+            err.contains("requires 'danger-full-access'"),
+            "should require elevated mode: {err}"
+        );
+    }
+
+    #[test]
+    fn given_workspace_write_enforcer_when_bash_uses_windows_absolute_path_then_denied() {
+        let registry = workspace_write_registry();
+        let err = registry
+            .execute(
+                "bash",
+                &json!({ "command": r"cat C:\\Users\\alice\\.ssh\\config" }),
+            )
+            .expect_err("Windows absolute path should require elevated permission");
+        assert!(
+            err.contains("requires 'danger-full-access'"),
+            "should require elevated mode: {err}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn given_workspace_write_enforcer_when_bash_reads_symlink_escape_then_denied() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = temp_path("bash-symlink-scope");
+        let outside = temp_path("bash-symlink-outside");
+        fs::create_dir_all(&root).expect("create root");
+        fs::create_dir_all(&outside).expect("create outside");
+        fs::write(outside.join("secret.txt"), "secret\n").expect("outside fixture");
+        std::os::unix::fs::symlink(outside.join("secret.txt"), root.join("link.txt"))
+            .expect("create symlink");
+        let original_dir = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&root).expect("set cwd");
+
+        let registry = workspace_write_registry();
+        let err = registry
+            .execute("bash", &json!({ "command": "cat link.txt" }))
+            .expect_err("symlink escape should require elevated permission");
+        assert!(
+            err.contains("requires 'danger-full-access'"),
+            "should require elevated mode: {err}"
+        );
+
+        std::env::set_current_dir(&original_dir).expect("restore cwd");
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(outside);
+    }
+
+    #[test]
     fn given_read_only_enforcer_when_write_file_then_denied() {
         let registry = read_only_registry();
         let err = registry
@@ -9553,7 +9934,7 @@ printf 'pwsh:%s' "$1"
             )
             .expect_err("write_file should be denied in read-only mode");
         assert!(
-            err.contains("current mode is read-only"),
+            err.contains("current mode is 'read-only'"),
             "should cite active mode: {err}"
         );
     }
@@ -9568,7 +9949,7 @@ printf 'pwsh:%s' "$1"
             )
             .expect_err("edit_file should be denied in read-only mode");
         assert!(
-            err.contains("current mode is read-only"),
+            err.contains("current mode is 'read-only'"),
             "should cite active mode: {err}"
         );
     }
@@ -9582,11 +9963,14 @@ printf 'pwsh:%s' "$1"
         fs::create_dir_all(&root).expect("create root");
         let file = root.join("readable.txt");
         fs::write(&file, "content\n").expect("write test file");
+        let original_dir = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&root).expect("set cwd");
 
         let registry = read_only_registry();
         let result = registry.execute("read_file", &json!({ "path": file.display().to_string() }));
         assert!(result.is_ok(), "read_file should be allowed: {result:?}");
 
+        std::env::set_current_dir(&original_dir).expect("restore cwd");
         let _ = fs::remove_dir_all(root);
     }
 
@@ -9772,9 +10156,20 @@ printf 'pwsh:%s' "$1"
                 "cargo build --workspace".to_string(),
                 "cargo test --workspace".to_string(),
             ],
+            acceptance_criteria: vec!["task packet is accepted".to_string()],
+            resources: vec![runtime::TaskResource {
+                kind: "module".to_string(),
+                value: "runtime/task system".to_string(),
+            }],
+            model: Some("gpt-5.5".to_string()),
+            provider: Some("openai".to_string()),
+            permission_profile: Some("workspace-write".to_string()),
             commit_policy: "single commit".to_string(),
             reporting_contract: "print build/test result and sha".to_string(),
+            reporting_targets: vec!["leader".to_string()],
             escalation_policy: "manual escalation".to_string(),
+            recovery_policy: Some("retry once".to_string()),
+            verification_plan: vec!["cargo test --workspace".to_string()],
         })
         .expect("task packet should create a task");
 
@@ -9783,6 +10178,26 @@ printf 'pwsh:%s' "$1"
         assert_eq!(output["prompt"], "Ship packetized runtime task");
         assert_eq!(output["description"], "runtime/task system");
         assert_eq!(output["task_packet"]["repo"], "claw-code-parity");
+        assert_eq!(output["task_packet"]["resources"][0]["kind"], "module");
+        assert_eq!(
+            output["task_packet"]["resources"][0]["value"],
+            "runtime/task system"
+        );
+        assert_eq!(
+            output["task_packet"]["acceptance_criteria"][0],
+            "task packet is accepted"
+        );
+        assert_eq!(output["task_packet"]["model"], "gpt-5.5");
+        assert_eq!(output["task_packet"]["provider"], "openai");
+        assert_eq!(
+            output["task_packet"]["permission_profile"],
+            "workspace-write"
+        );
+        assert_eq!(
+            output["task_packet"]["verification_plan"][0],
+            "cargo test --workspace"
+        );
+        assert_eq!(output["task_packet"]["reporting_targets"][0], "leader");
         assert_eq!(
             output["task_packet"]["acceptance_tests"][1],
             "cargo test --workspace"

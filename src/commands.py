@@ -35,6 +35,11 @@ def load_command_snapshot() -> tuple[PortingModule, ...]:
 
 PORTED_COMMANDS = load_command_snapshot()
 
+COMMAND_ALIASES = {
+    'plugins': 'plugin',
+    'marketplace': 'plugin',
+}
+
 
 @lru_cache(maxsize=1)
 def built_in_command_names() -> frozenset[str]:
@@ -50,7 +55,7 @@ def command_names() -> list[str]:
 
 
 def get_command(name: str) -> PortingModule | None:
-    needle = name.lower()
+    needle = COMMAND_ALIASES.get(name.lower(), name.lower())
     for module in PORTED_COMMANDS:
         if module.name.lower() == needle:
             return module

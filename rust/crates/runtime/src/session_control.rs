@@ -163,6 +163,17 @@ impl SessionStore {
         })
     }
 
+    #[must_use]
+    pub fn session_exists(&self, reference: &str) -> bool {
+        self.resolve_reference(reference).is_ok()
+    }
+
+    pub fn delete_session(&self, reference: &str) -> Result<SessionHandle, SessionControlError> {
+        let handle = self.resolve_reference(reference)?;
+        fs::remove_file(&handle.path)?;
+        Ok(handle)
+    }
+
     pub fn load_session(
         &self,
         reference: &str,
@@ -480,6 +491,30 @@ pub fn load_managed_session(reference: &str) -> Result<LoadedManagedSession, Ses
     load_managed_session_for(env::current_dir()?, reference)
 }
 
+pub fn managed_session_exists(reference: &str) -> Result<bool, SessionControlError> {
+    managed_session_exists_for(env::current_dir()?, reference)
+}
+
+pub fn managed_session_exists_for(
+    base_dir: impl AsRef<Path>,
+    reference: &str,
+) -> Result<bool, SessionControlError> {
+    let store = SessionStore::from_cwd(base_dir)?;
+    Ok(store.session_exists(reference))
+}
+
+pub fn delete_managed_session(reference: &str) -> Result<SessionHandle, SessionControlError> {
+    delete_managed_session_for(env::current_dir()?, reference)
+}
+
+pub fn delete_managed_session_for(
+    base_dir: impl AsRef<Path>,
+    reference: &str,
+) -> Result<SessionHandle, SessionControlError> {
+    let store = SessionStore::from_cwd(base_dir)?;
+    store.delete_session(reference)
+}
+
 pub fn load_managed_session_for(
     base_dir: impl AsRef<Path>,
     reference: &str,
@@ -569,10 +604,10 @@ fn path_is_within_workspace(path: &Path, workspace_root: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        create_managed_session_handle_for, fork_managed_session_for, is_session_reference_alias,
-        list_managed_sessions_for, load_managed_session_for, resolve_session_reference_for,
-        workspace_fingerprint, ManagedSessionSummary, SessionControlError, SessionStore,
-        LATEST_SESSION_REFERENCE,
+        create_managed_session_handle_for, delete_managed_session_for, fork_managed_session_for,
+        is_session_reference_alias, list_managed_sessions_for, load_managed_session_for,
+        managed_session_exists_for, resolve_session_reference_for, workspace_fingerprint,
+        ManagedSessionSummary, SessionControlError, SessionStore, LATEST_SESSION_REFERENCE,
     };
     use crate::session::Session;
     use std::fs;
@@ -993,6 +1028,32 @@ mod tests {
         // then
         assert_eq!(latest.id, newer.session_id);
         assert_eq!(handle.id, newer.session_id);
+        fs::remove_dir_all(base).expect("temp dir should clean up");
+    }
+
+    #[test]
+    fn session_exists_and_delete_are_scoped_to_workspace_store() {
+        // given
+        let base = temp_dir();
+        fs::create_dir_all(&base).expect("base dir should exist");
+        let store = SessionStore::from_cwd(&base).expect("store should build");
+        let session = persist_session_via_store(&store, "delete me");
+
+        // when
+        assert!(
+            managed_session_exists_for(&base, &session.session_id).expect("exists should run"),
+            "persisted session should exist before deletion"
+        );
+        let deleted =
+            delete_managed_session_for(&base, &session.session_id).expect("delete should succeed");
+
+        // then
+        assert_eq!(deleted.id, session.session_id);
+        assert!(!deleted.path.exists(), "session file should be removed");
+        assert!(
+            !managed_session_exists_for(&base, &session.session_id).expect("exists should run"),
+            "deleted session should not exist"
+        );
         fs::remove_dir_all(base).expect("temp dir should clean up");
     }
 

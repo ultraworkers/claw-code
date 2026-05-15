@@ -8,10 +8,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::json::{JsonError, JsonValue};
 use crate::usage::TokenUsage;
+use serde::{Deserialize, Serialize};
 
 const SESSION_VERSION: u32 = 1;
 const ROTATE_AFTER_BYTES: u64 = 256 * 1024;
 const MAX_ROTATED_FILES: usize = 3;
+const MAX_JSONL_FIELD_CHARS: usize = 16 * 1024;
+const JSONL_TRUNCATION_MARKER: &str = "… [truncated for session JSONL]";
+const JSONL_REDACTION_MARKER: &str = "[redacted]";
 static SESSION_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 static LAST_TIMESTAMP_MS: AtomicU64 = AtomicU64::new(0);
 
@@ -80,6 +84,25 @@ pub struct SessionPromptEntry {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SessionPersistence {
     path: PathBuf,
+}
+
+/// Running-state liveness classification for a session heartbeat.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionLiveness {
+    Healthy,
+    Stalled,
+    TransportDead,
+    Unknown,
+}
+
+/// Heartbeat emitted from canonical session state, independent of terminal rendering.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionHeartbeat {
+    pub session_id: String,
+    pub observed_at_ms: u64,
+    pub transport_alive: bool,
+    pub liveness: SessionLiveness,
 }
 
 /// Persisted conversational state for the runtime and CLI session manager.
@@ -248,6 +271,35 @@ impl Session {
 
     pub fn push_user_text(&mut self, text: impl Into<String>) -> Result<(), SessionError> {
         self.push_message(ConversationMessage::user_text(text))
+    }
+
+    pub fn record_health_check(&mut self, timestamp_ms: u64) {
+        self.last_health_check_ms = Some(timestamp_ms);
+        self.touch();
+    }
+
+    #[must_use]
+    pub fn heartbeat_at(
+        &self,
+        now_ms: u64,
+        stalled_after_ms: u64,
+        transport_alive: bool,
+    ) -> SessionHeartbeat {
+        let liveness = match (transport_alive, self.last_health_check_ms) {
+            (false, _) => SessionLiveness::TransportDead,
+            (true, Some(last)) if now_ms.saturating_sub(last) <= stalled_after_ms => {
+                SessionLiveness::Healthy
+            }
+            (true, Some(_)) => SessionLiveness::Stalled,
+            (true, None) => SessionLiveness::Unknown,
+        };
+
+        SessionHeartbeat {
+            session_id: self.session_id.clone(),
+            observed_at_ms: now_ms,
+            transport_alive,
+            liveness,
+        }
     }
 
     pub fn record_compaction(&mut self, summary: impl Into<String>, removed_message_count: usize) {
@@ -871,7 +923,7 @@ impl SessionCompaction {
         );
         object.insert(
             "summary".to_string(),
-            JsonValue::String(self.summary.clone()),
+            JsonValue::String(sanitize_jsonl_field(&self.summary)),
         );
         Ok(JsonValue::Object(object))
     }
@@ -931,7 +983,10 @@ impl SessionPromptEntry {
             "timestamp_ms".to_string(),
             JsonValue::Number(i64::try_from(self.timestamp_ms).unwrap_or(i64::MAX)),
         );
-        object.insert("text".to_string(), JsonValue::String(self.text.clone()));
+        object.insert(
+            "text".to_string(),
+            JsonValue::String(sanitize_jsonl_field(&self.text)),
+        );
         JsonValue::Object(object)
     }
 
@@ -949,8 +1004,163 @@ impl SessionPromptEntry {
 fn message_record(message: &ConversationMessage) -> JsonValue {
     let mut object = BTreeMap::new();
     object.insert("type".to_string(), JsonValue::String("message".to_string()));
-    object.insert("message".to_string(), message.to_json());
+    object.insert("message".to_string(), persisted_message_json(message));
     JsonValue::Object(object)
+}
+
+fn persisted_message_json(message: &ConversationMessage) -> JsonValue {
+    let mut object = BTreeMap::new();
+    object.insert(
+        "role".to_string(),
+        JsonValue::String(
+            match message.role {
+                MessageRole::System => "system",
+                MessageRole::User => "user",
+                MessageRole::Assistant => "assistant",
+                MessageRole::Tool => "tool",
+            }
+            .to_string(),
+        ),
+    );
+    object.insert(
+        "blocks".to_string(),
+        JsonValue::Array(message.blocks.iter().map(persisted_block_json).collect()),
+    );
+    if let Some(usage) = message.usage {
+        object.insert("usage".to_string(), usage_to_json(usage));
+    }
+    JsonValue::Object(object)
+}
+
+fn persisted_block_json(block: &ContentBlock) -> JsonValue {
+    let mut object = BTreeMap::new();
+    match block {
+        ContentBlock::Text { text } => {
+            object.insert("type".to_string(), JsonValue::String("text".to_string()));
+            object.insert(
+                "text".to_string(),
+                JsonValue::String(sanitize_jsonl_field(text)),
+            );
+        }
+        ContentBlock::Thinking {
+            thinking,
+            signature,
+        } => {
+            object.insert(
+                "type".to_string(),
+                JsonValue::String("thinking".to_string()),
+            );
+            object.insert(
+                "thinking".to_string(),
+                JsonValue::String(sanitize_jsonl_field(thinking)),
+            );
+            if let Some(signature) = signature {
+                object.insert(
+                    "signature".to_string(),
+                    JsonValue::String(sanitize_jsonl_field(signature)),
+                );
+            }
+        }
+        ContentBlock::ToolUse { id, name, input } => {
+            object.insert(
+                "type".to_string(),
+                JsonValue::String("tool_use".to_string()),
+            );
+            object.insert(
+                "id".to_string(),
+                JsonValue::String(sanitize_jsonl_field(id)),
+            );
+            object.insert("name".to_string(), JsonValue::String(name.clone()));
+            object.insert(
+                "input".to_string(),
+                JsonValue::String(sanitize_jsonl_field(input)),
+            );
+        }
+        ContentBlock::ToolResult {
+            tool_use_id,
+            tool_name,
+            output,
+            is_error,
+        } => {
+            object.insert(
+                "type".to_string(),
+                JsonValue::String("tool_result".to_string()),
+            );
+            object.insert(
+                "tool_use_id".to_string(),
+                JsonValue::String(sanitize_jsonl_field(tool_use_id)),
+            );
+            object.insert(
+                "tool_name".to_string(),
+                JsonValue::String(tool_name.clone()),
+            );
+            object.insert(
+                "output".to_string(),
+                JsonValue::String(sanitize_jsonl_field(output)),
+            );
+            object.insert("is_error".to_string(), JsonValue::Bool(*is_error));
+        }
+    }
+    JsonValue::Object(object)
+}
+
+fn sanitize_jsonl_field(value: &str) -> String {
+    truncate_jsonl_field(&redact_jsonl_secrets(value))
+}
+
+fn truncate_jsonl_field(value: &str) -> String {
+    let char_count = value.chars().count();
+    if char_count <= MAX_JSONL_FIELD_CHARS {
+        return value.to_string();
+    }
+
+    let keep = MAX_JSONL_FIELD_CHARS.saturating_sub(JSONL_TRUNCATION_MARKER.chars().count());
+    let mut truncated = value.chars().take(keep).collect::<String>();
+    truncated.push_str(JSONL_TRUNCATION_MARKER);
+    truncated
+}
+
+fn redact_jsonl_secrets(value: &str) -> String {
+    let mut redacted = value.to_string();
+    for marker in [
+        "ANTHROPIC_API_KEY=",
+        "ANTHROPIC_AUTH_TOKEN=",
+        "OPENAI_API_KEY=",
+        "DASHSCOPE_API_KEY=",
+        "XAI_API_KEY=",
+        "Authorization: Bearer ",
+        "authorization: Bearer ",
+        "Bearer sk-",
+        "sk-ant-",
+    ] {
+        redacted = redact_after_marker(&redacted, marker);
+    }
+    redacted
+}
+
+fn redact_after_marker(value: &str, marker: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    let mut rest = value;
+
+    while let Some(index) = rest.find(marker) {
+        let (before, after_before) = rest.split_at(index);
+        output.push_str(before);
+        output.push_str(marker);
+        output.push_str(JSONL_REDACTION_MARKER);
+
+        let secret_start = marker.len();
+        let after_marker = &after_before[secret_start..];
+        let secret_end = after_marker
+            .char_indices()
+            .find_map(|(idx, ch)| {
+                (ch.is_whitespace() || matches!(ch, '\'' | '"' | ',' | '}' | ']')).then_some(idx)
+            })
+            .unwrap_or(after_marker.len());
+        rest = &after_marker[secret_end..];
+    }
+
+    output.push_str(rest);
+    output
 }
 
 fn usage_to_json(usage: TokenUsage) -> JsonValue {
@@ -1316,6 +1526,54 @@ mod tests {
     }
 
     #[test]
+    fn jsonl_persistence_redacts_and_truncates_oversized_payload_fields() {
+        let path = temp_session_path("jsonl-safeguards");
+        let secret = "sk-live-secret-should-not-persist";
+        let oversized_output = format!(
+            "OPENAI_API_KEY={secret}\n{}",
+            "tool-output ".repeat(super::MAX_JSONL_FIELD_CHARS)
+        );
+        let mut session = Session::new();
+        session
+            .push_message(ConversationMessage::assistant(vec![
+                ContentBlock::ToolUse {
+                    id: "tool-1".to_string(),
+                    name: "bash".to_string(),
+                    input: format!("Authorization: Bearer {secret}"),
+                },
+            ]))
+            .expect("tool use should append");
+        session
+            .push_message(ConversationMessage::tool_result(
+                "tool-1",
+                "bash",
+                oversized_output,
+                false,
+            ))
+            .expect("tool result should append");
+
+        session.save_to_path(&path).expect("session should save");
+        let persisted = fs::read_to_string(&path).expect("session jsonl should read");
+        let restored = Session::load_from_path(&path).expect("session should load");
+        fs::remove_file(&path).expect("temp file should be removable");
+
+        assert!(
+            !persisted.contains(secret),
+            "secret leaked into JSONL: {persisted}"
+        );
+        assert!(persisted.contains(super::JSONL_REDACTION_MARKER));
+        assert!(persisted.contains(super::JSONL_TRUNCATION_MARKER));
+
+        let ContentBlock::ToolResult { output, .. } = &restored.messages[1].blocks[0] else {
+            panic!("restored second message should be a tool result");
+        };
+        assert!(!output.contains(secret));
+        assert!(output.contains(super::JSONL_REDACTION_MARKER));
+        assert!(output.ends_with(super::JSONL_TRUNCATION_MARKER));
+        assert!(output.chars().count() <= super::MAX_JSONL_FIELD_CHARS);
+    }
+
+    #[test]
     fn persists_compaction_metadata() {
         let path = temp_session_path("compaction");
         let mut session = Session::new();
@@ -1598,5 +1856,27 @@ mod workspace_sessions_dir_tests {
 
         fs::remove_dir_all(&tmp_a).ok();
         fs::remove_dir_all(&tmp_b).ok();
+    }
+    #[test]
+    fn session_heartbeat_classifies_healthy_stalled_transport_dead_and_unknown() {
+        let mut session = Session::new();
+        assert_eq!(
+            session.heartbeat_at(1_000, 500, true).liveness,
+            SessionLiveness::Unknown
+        );
+
+        session.record_health_check(800);
+        assert_eq!(
+            session.heartbeat_at(1_000, 500, true).liveness,
+            SessionLiveness::Healthy
+        );
+        assert_eq!(
+            session.heartbeat_at(2_000, 500, true).liveness,
+            SessionLiveness::Stalled
+        );
+        assert_eq!(
+            session.heartbeat_at(1_000, 500, false).liveness,
+            SessionLiveness::TransportDead
+        );
     }
 }

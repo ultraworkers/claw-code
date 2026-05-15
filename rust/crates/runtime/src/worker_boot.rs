@@ -122,13 +122,37 @@ pub enum StartupFailureClassification {
     Unknown,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StartupHealthSummary {
+    /// Whether this subsystem appeared healthy at timeout.
+    pub healthy: bool,
+    /// Stable placeholder/source string until deeper transport and MCP probes are wired in.
+    pub summary: String,
+}
+
+impl StartupHealthSummary {
+    fn observed(name: &str, healthy: bool) -> Self {
+        let status = if healthy { "healthy" } else { "unhealthy" };
+        Self {
+            healthy,
+            summary: format!("{name}_{status}_placeholder"),
+        }
+    }
+}
+
 /// Evidence bundle collected when worker startup times out without clear evidence.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StartupEvidenceBundle {
     /// Last known worker lifecycle state before timeout
     pub last_lifecycle_state: WorkerStatus,
+    /// Timestamp of the last lifecycle state transition, unix epoch seconds
+    pub last_lifecycle_at: u64,
     /// The pane/command that was being executed
     pub pane_command: String,
+    /// Timestamp when the pane/command snapshot was observed, unix epoch seconds
+    pub pane_observed_at: u64,
+    /// Timestamp when the worker command was started, unix epoch seconds
+    pub command_started_at: u64,
     /// Timestamp when prompt was sent (if any), unix epoch seconds
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_sent_at: Option<u64>,
@@ -146,8 +170,12 @@ pub struct StartupEvidenceBundle {
     pub tool_permission_allow_scope: Option<ToolPermissionAllowScope>,
     /// Transport health summary (true = healthy/responsive)
     pub transport_healthy: bool,
+    /// Typed transport health placeholder for future concrete probes
+    pub transport_health: StartupHealthSummary,
     /// MCP health summary (true = all servers healthy)
     pub mcp_healthy: bool,
+    /// Typed MCP health placeholder for future concrete probes
+    pub mcp_health: StartupHealthSummary,
     /// Seconds since worker creation
     pub elapsed_seconds: u64,
 }
@@ -225,6 +253,7 @@ pub struct Worker {
     pub auto_recover_prompt_misdelivery: bool,
     pub prompt_delivery_attempts: u32,
     pub prompt_in_flight: bool,
+    pub prompt_sent_at: Option<u64>,
     pub last_prompt: Option<String>,
     pub expected_receipt: Option<WorkerTaskReceipt>,
     pub replay_prompt: Option<String>,
@@ -274,6 +303,7 @@ impl WorkerRegistry {
             auto_recover_prompt_misdelivery,
             prompt_delivery_attempts: 0,
             prompt_in_flight: false,
+            prompt_sent_at: None,
             last_prompt: None,
             expected_receipt: None,
             replay_prompt: None,
@@ -528,6 +558,7 @@ impl WorkerRegistry {
 
         worker.prompt_delivery_attempts += 1;
         worker.prompt_in_flight = true;
+        worker.prompt_sent_at = Some(now_secs());
         worker.last_prompt = Some(next_prompt.clone());
         worker.expected_receipt = task_receipt;
         worker.replay_prompt = None;
@@ -579,6 +610,7 @@ impl WorkerRegistry {
         worker.last_error = None;
         worker.prompt_delivery_attempts = 0;
         worker.prompt_in_flight = false;
+        worker.prompt_sent_at = None;
         push_event(
             worker,
             WorkerEventKind::Restarted,
@@ -696,12 +728,11 @@ impl WorkerRegistry {
         // Build evidence bundle
         let evidence = StartupEvidenceBundle {
             last_lifecycle_state: worker.status,
+            last_lifecycle_at: worker.updated_at,
             pane_command: pane_command.to_string(),
-            prompt_sent_at: if worker.prompt_delivery_attempts > 0 {
-                Some(worker.updated_at)
-            } else {
-                None
-            },
+            pane_observed_at: now,
+            command_started_at: worker.created_at,
+            prompt_sent_at: worker.prompt_sent_at,
             prompt_acceptance_state: worker.status == WorkerStatus::Running
                 && !worker.prompt_in_flight,
             trust_prompt_detected: worker
@@ -716,7 +747,9 @@ impl WorkerRegistry {
                 .map(|event| now.saturating_sub(event.timestamp)),
             tool_permission_allow_scope,
             transport_healthy,
+            transport_health: StartupHealthSummary::observed("transport", transport_healthy),
             mcp_healthy,
+            mcp_health: StartupHealthSummary::observed("mcp", mcp_healthy),
             elapsed_seconds: elapsed,
         };
 
@@ -1840,8 +1873,16 @@ mod tests {
                     "last state should be spawning"
                 );
                 assert_eq!(evidence.pane_command, "cargo test");
+                assert!(evidence.command_started_at <= evidence.pane_observed_at);
+                assert!(evidence.last_lifecycle_at <= evidence.pane_observed_at);
                 assert!(!evidence.transport_healthy);
+                assert!(!evidence.transport_health.healthy);
+                assert!(evidence
+                    .transport_health
+                    .summary
+                    .contains("transport_unhealthy"));
                 assert!(evidence.mcp_healthy);
+                assert!(evidence.mcp_health.healthy);
                 assert_eq!(*classification, StartupFailureClassification::TransportDead);
             }
             _ => panic!(
@@ -1933,10 +1974,52 @@ mod tests {
     }
 
     #[test]
+    fn startup_timeout_preserves_original_prompt_sent_timestamp() {
+        let registry = WorkerRegistry::new();
+        let worker = registry.create("/tmp/repo-prompt-timestamp", &[], true);
+
+        registry
+            .observe(&worker.worker_id, "Ready for input\n>")
+            .expect("ready observe should succeed");
+        let prompted = registry
+            .send_prompt(
+                &worker.worker_id,
+                Some("Run timestamp-sensitive work"),
+                None,
+            )
+            .expect("prompt send should succeed");
+        let sent_at = prompted
+            .prompt_sent_at
+            .expect("prompt send should record a prompt timestamp");
+
+        let timed_out = registry
+            .observe_startup_timeout(&worker.worker_id, "claw worker", true, true)
+            .expect("startup timeout observe should succeed");
+
+        let event = timed_out
+            .events
+            .iter()
+            .find(|e| e.kind == WorkerEventKind::StartupNoEvidence)
+            .expect("startup no evidence event should exist");
+
+        match event.payload.as_ref() {
+            Some(WorkerEventPayload::StartupNoEvidence { evidence, .. }) => {
+                assert_eq!(evidence.prompt_sent_at, Some(sent_at));
+                assert!(evidence.last_lifecycle_at <= evidence.pane_observed_at);
+                assert!(evidence.command_started_at <= sent_at);
+            }
+            _ => panic!("expected StartupNoEvidence payload"),
+        }
+    }
+
+    #[test]
     fn startup_evidence_bundle_serializes_correctly() {
         let bundle = StartupEvidenceBundle {
             last_lifecycle_state: WorkerStatus::Running,
+            last_lifecycle_at: 1_234_567_889,
             pane_command: "test command".to_string(),
+            pane_observed_at: 1_234_567_891,
+            command_started_at: 1_234_567_800,
             prompt_sent_at: Some(1_234_567_890),
             prompt_acceptance_state: false,
             trust_prompt_detected: true,
@@ -1944,7 +2027,9 @@ mod tests {
             tool_permission_prompt_age_seconds: None,
             tool_permission_allow_scope: None,
             transport_healthy: true,
+            transport_health: StartupHealthSummary::observed("transport", true),
             mcp_healthy: false,
+            mcp_health: StartupHealthSummary::observed("mcp", false),
             elapsed_seconds: 60,
         };
 
@@ -1953,8 +2038,13 @@ mod tests {
         assert!(json.contains("\"pane_command\""));
         assert!(json.contains("\"prompt_sent_at\":1234567890"));
         assert!(json.contains("\"trust_prompt_detected\":true"));
+        assert!(json.contains("\"last_lifecycle_at\":1234567889"));
+        assert!(json.contains("\"pane_observed_at\":1234567891"));
+        assert!(json.contains("\"command_started_at\":1234567800"));
         assert!(json.contains("\"transport_healthy\":true"));
+        assert!(json.contains("\"transport_health\""));
         assert!(json.contains("\"mcp_healthy\":false"));
+        assert!(json.contains("\"mcp_health\""));
 
         let deserialized: StartupEvidenceBundle =
             serde_json::from_str(&json).expect("should deserialize");
@@ -1966,7 +2056,10 @@ mod tests {
     fn classify_startup_failure_detects_transport_dead() {
         let evidence = StartupEvidenceBundle {
             last_lifecycle_state: WorkerStatus::Spawning,
+            last_lifecycle_at: 10,
             pane_command: "test".to_string(),
+            pane_observed_at: 40,
+            command_started_at: 1,
             prompt_sent_at: None,
             prompt_acceptance_state: false,
             trust_prompt_detected: false,
@@ -1974,7 +2067,9 @@ mod tests {
             tool_permission_prompt_age_seconds: None,
             tool_permission_allow_scope: None,
             transport_healthy: false,
+            transport_health: StartupHealthSummary::observed("transport", false),
             mcp_healthy: true,
+            mcp_health: StartupHealthSummary::observed("mcp", true),
             elapsed_seconds: 30,
         };
 
@@ -1986,7 +2081,10 @@ mod tests {
     fn classify_startup_failure_defaults_to_unknown() {
         let evidence = StartupEvidenceBundle {
             last_lifecycle_state: WorkerStatus::Spawning,
+            last_lifecycle_at: 10,
             pane_command: "test".to_string(),
+            pane_observed_at: 40,
+            command_started_at: 1,
             prompt_sent_at: None,
             prompt_acceptance_state: false,
             trust_prompt_detected: false,
@@ -1994,7 +2092,9 @@ mod tests {
             tool_permission_prompt_age_seconds: None,
             tool_permission_allow_scope: None,
             transport_healthy: true,
+            transport_health: StartupHealthSummary::observed("transport", true),
             mcp_healthy: true,
+            mcp_health: StartupHealthSummary::observed("mcp", true),
             elapsed_seconds: 10,
         };
 
@@ -2003,12 +2103,43 @@ mod tests {
     }
 
     #[test]
+    fn classify_startup_failure_detects_prompt_misdelivery_after_timeout() {
+        let evidence = StartupEvidenceBundle {
+            last_lifecycle_state: WorkerStatus::ReadyForPrompt,
+            last_lifecycle_at: 10,
+            pane_command: "test".to_string(),
+            pane_observed_at: 45,
+            command_started_at: 1,
+            prompt_sent_at: Some(10),
+            prompt_acceptance_state: false,
+            trust_prompt_detected: false,
+            tool_permission_prompt_detected: false,
+            tool_permission_prompt_age_seconds: None,
+            tool_permission_allow_scope: None,
+            transport_healthy: true,
+            transport_health: StartupHealthSummary::observed("transport", true),
+            mcp_healthy: true,
+            mcp_health: StartupHealthSummary::observed("mcp", true),
+            elapsed_seconds: 31,
+        };
+
+        let classification = classify_startup_failure(&evidence);
+        assert_eq!(
+            classification,
+            StartupFailureClassification::PromptMisdelivery
+        );
+    }
+
+    #[test]
     fn classify_startup_failure_detects_worker_crashed() {
         // Worker crashed scenario: transport healthy but MCP unhealthy
         // Don't have prompt in flight (no prompt_sent_at) to avoid matching PromptAcceptanceTimeout
         let evidence = StartupEvidenceBundle {
             last_lifecycle_state: WorkerStatus::Spawning,
+            last_lifecycle_at: 10,
             pane_command: "test".to_string(),
+            pane_observed_at: 40,
+            command_started_at: 1,
             prompt_sent_at: None, // No prompt sent yet
             prompt_acceptance_state: false,
             trust_prompt_detected: false,
@@ -2016,7 +2147,9 @@ mod tests {
             tool_permission_prompt_age_seconds: None,
             tool_permission_allow_scope: None,
             transport_healthy: true,
-            mcp_healthy: false, // MCP unhealthy but transport healthy suggests crash
+            transport_health: StartupHealthSummary::observed("transport", true),
+            mcp_healthy: false,
+            mcp_health: StartupHealthSummary::observed("mcp", false), // MCP unhealthy but transport healthy suggests crash
             elapsed_seconds: 45,
         };
 

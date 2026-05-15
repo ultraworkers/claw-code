@@ -216,6 +216,48 @@ fn doctor_command_runs_as_a_local_shell_entrypoint() {
 }
 
 #[test]
+fn local_smoke_commands_do_not_require_live_credentials() {
+    let temp_dir = unique_temp_dir("offline-local-smoke path with spaces");
+    let config_home = temp_dir.join("home with spaces").join(".claw");
+    fs::create_dir_all(&config_home).expect("config home should exist");
+    fs::create_dir_all(&temp_dir).expect("temp dir should exist");
+
+    for args in [
+        &["help"][..],
+        &["status"][..],
+        &["config", "env"][..],
+        &["doctor"][..],
+    ] {
+        let output = offline_command_in(&temp_dir, &config_home)
+            .args(args)
+            .output()
+            .unwrap_or_else(|error| panic!("claw {args:?} should launch: {error}"));
+
+        assert_success(&output);
+        let stdout = String::from_utf8(output.stdout).expect("stdout should be utf8");
+        let stderr = String::from_utf8(output.stderr).expect("stderr should be utf8");
+        assert!(
+            stdout.contains("claw")
+                || stdout.contains("Status")
+                || stdout.contains("Config")
+                || stdout.contains("Doctor"),
+            "unexpected stdout for {args:?}: {stdout}"
+        );
+        assert!(
+            !stderr.contains("missing Anthropic credentials")
+                && !stderr.contains("auth_unavailable"),
+            "local smoke command {args:?} should not require live credentials: {stderr}"
+        );
+        assert!(
+            !stdout.contains("Thinking"),
+            "local smoke command {args:?} should not enter prompt runtime"
+        );
+    }
+
+    fs::remove_dir_all(temp_dir).expect("cleanup temp dir");
+}
+
+#[test]
 fn local_subcommand_help_does_not_fall_through_to_runtime_or_provider_calls() {
     let temp_dir = unique_temp_dir("subcommand-help");
     let config_home = temp_dir.join("home").join(".claw");
@@ -256,6 +298,19 @@ fn local_subcommand_help_does_not_fall_through_to_runtime_or_provider_calls() {
     assert!(!status_stderr.contains("auth_unavailable"));
 
     fs::remove_dir_all(temp_dir).expect("cleanup temp dir");
+}
+
+fn offline_command_in(cwd: &Path, config_home: &Path) -> Command {
+    let mut command = command_in(cwd);
+    command
+        .env("CLAW_CONFIG_HOME", config_home)
+        .env_remove("ANTHROPIC_API_KEY")
+        .env_remove("ANTHROPIC_AUTH_TOKEN")
+        .env_remove("OPENAI_API_KEY")
+        .env_remove("XAI_API_KEY")
+        .env_remove("DASHSCOPE_API_KEY")
+        .env("ANTHROPIC_BASE_URL", "http://127.0.0.1:9");
+    command
 }
 
 fn command_in(cwd: &Path) -> Command {

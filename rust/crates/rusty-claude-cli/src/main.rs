@@ -36,7 +36,8 @@ use commands::{
     handle_mcp_slash_command, handle_mcp_slash_command_json, handle_plugins_slash_command,
     handle_skills_slash_command, handle_skills_slash_command_json, render_slash_command_help,
     render_slash_command_help_filtered, resolve_skill_invocation, resume_supported_slash_commands,
-    slash_command_specs, validate_slash_command_input, SkillSlashDispatch, SlashCommand,
+    slash_command_specs, validate_slash_command_input, PluginsCommandResult, SkillSlashDispatch,
+    SlashCommand,
 };
 use compat_harness::{extract_manifest, UpstreamPaths};
 use init::initialize_repo;
@@ -45,11 +46,11 @@ use render::{MarkdownStreamState, Spinner, TerminalRenderer};
 use runtime::{
     check_base_commit, format_stale_base_warning, format_usd, load_oauth_credentials,
     load_system_prompt, pricing_for_model, resolve_expected_base, resolve_sandbox_status,
-    ApiClient, ApiRequest, AssistantEvent, CompactionConfig, ConfigLoader, ConfigSource,
-    ContentBlock, ConversationMessage, ConversationRuntime, McpServer, McpServerManager,
-    McpServerSpec, McpTool, MessageRole, ModelPricing, PermissionMode, PermissionPolicy,
-    ProjectContext, PromptCacheEvent, ResolvedPermissionMode, RuntimeError, Session, TokenUsage,
-    ToolError, ToolExecutor, UsageTracker,
+    ApiClient, ApiRequest, AssistantEvent, BaseCommitState, CompactionConfig, ConfigLoader,
+    ConfigSource, ContentBlock, ConversationMessage, ConversationRuntime, McpServer,
+    McpServerManager, McpServerSpec, McpTool, MessageRole, ModelPricing, PermissionMode,
+    PermissionPolicy, ProjectContext, PromptCacheEvent, ResolvedPermissionMode, RuntimeError,
+    Session, TokenUsage, ToolError, ToolExecutor, UsageTracker,
 };
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -218,6 +219,7 @@ fn main() {
                     "error": short_reason,
                     "kind": kind,
                     "hint": hint,
+                    "exit_code": 1,
                 })
             );
         } else {
@@ -261,6 +263,8 @@ fn classify_error_kind(message: &str) -> &'static str {
         "session_load_failed"
     } else if message.contains("no managed sessions found") {
         "no_managed_sessions"
+    } else if message.contains("unsupported ACP invocation") {
+        "unsupported_acp_invocation"
     } else if message.contains("unrecognized argument") || message.contains("unknown option") {
         "cli_parse"
     } else if message.contains("invalid model syntax") {
@@ -328,6 +332,59 @@ fn merge_prompt_with_stdin(prompt: &str, stdin_content: Option<&str>) -> String 
         return trimmed.to_string();
     }
     format!("{prompt}\n\n{trimmed}")
+}
+
+fn plugin_command_json(
+    action: &str,
+    target: Option<&str>,
+    result: &commands::PluginsCommandResult,
+    report: &plugins::PluginRegistryReport,
+) -> Value {
+    let failures = report.failures();
+    json!({
+        "kind": "plugin",
+        "action": action,
+        "target": target,
+        "status": if failures.is_empty() { "ok" } else { "degraded" },
+        "message": result.message,
+        "reload_runtime": result.reload_runtime,
+        "plugins": report.summaries().iter().map(plugin_summary_json).collect::<Vec<_>>(),
+        "load_failures": failures.iter().map(plugin_load_failure_json).collect::<Vec<_>>(),
+    })
+}
+
+fn plugin_summary_json(plugin: &plugins::PluginSummary) -> Value {
+    json!({
+        "id": &plugin.metadata.id,
+        "name": &plugin.metadata.name,
+        "version": &plugin.metadata.version,
+        "description": &plugin.metadata.description,
+        "kind": plugin.metadata.kind.to_string(),
+        "source": &plugin.metadata.source,
+        "enabled": plugin.enabled,
+        "lifecycle_state": plugin.lifecycle_state(),
+        "lifecycle": {
+            "configured": !plugin.lifecycle.is_empty(),
+            "init": {
+                "configured": !plugin.lifecycle.init.is_empty(),
+                "command_count": plugin.lifecycle.init.len(),
+            },
+            "shutdown": {
+                "configured": !plugin.lifecycle.shutdown.is_empty(),
+                "command_count": plugin.lifecycle.shutdown.len(),
+            },
+        },
+    })
+}
+
+fn plugin_load_failure_json(failure: &plugins::PluginLoadFailure) -> Value {
+    json!({
+        "plugin_root": failure.plugin_root.display().to_string(),
+        "kind": failure.kind.to_string(),
+        "source": &failure.source,
+        "lifecycle_state": "load_failed",
+        "error": failure.error().to_string(),
+    })
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -940,9 +997,10 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         // only intercepts the bare single-word form. Catch all multi-word
         // forms here and return a structured guidance error so no network
         // call or session is created.
-        "permissions" => Err(format!(
+        "permissions" => Err(
             "`claw permissions` is a slash command. Start `claw` and run `/permissions` inside the REPL.\n  Usage  /permissions [read-only|workspace-write|danger-full-access]"
-        )),
+                .to_string(),
+        ),
         "skills" => {
             let args = join_optional_args(&rest[1..]);
             match classify_skills_slash_command(args.as_deref()) {
@@ -1147,6 +1205,9 @@ fn bare_slash_command_guidance(command_name: &str) -> Option<String> {
             | "bootstrap-plan"
             | "agents"
             | "mcp"
+            | "plugin"
+            | "plugins"
+            | "marketplace"
             | "skills"
             | "system-prompt"
             | "init"
@@ -1914,6 +1975,17 @@ impl DoctorReport {
         self.checks.iter().any(|check| check.level.is_failure())
     }
 
+    fn status(&self) -> &'static str {
+        let (_, warn_count, fail_count) = self.counts();
+        if fail_count > 0 {
+            "fail"
+        } else if warn_count > 0 {
+            "warn"
+        } else {
+            "ok"
+        }
+    }
+
     fn render(&self) -> String {
         let (ok_count, warn_count, fail_count) = self.counts();
         let mut lines = vec![
@@ -1931,6 +2003,7 @@ impl DoctorReport {
         let (ok_count, warn_count, fail_count) = self.counts();
         json!({
             "kind": "doctor",
+            "status": self.status(),
             "message": report,
             "report": report,
             "has_failures": self.has_failures(),
@@ -1972,8 +2045,17 @@ fn render_doctor_report() -> Result<DoctorReport, Box<dyn std::error::Error>> {
     let (project_root, git_branch) =
         parse_git_status_metadata(project_context.git_status.as_deref());
     let git_summary = parse_git_workspace_summary(project_context.git_status.as_deref());
+    let branch_freshness = BranchFreshness::from_git_status(project_context.git_status.as_deref());
+    let stale_base_state = stale_base_state_for(&cwd, None);
     let empty_config = runtime::RuntimeConfig::empty();
     let sandbox_config = config.as_ref().ok().unwrap_or(&empty_config);
+    let boot_preflight = build_boot_preflight_snapshot(
+        &cwd,
+        project_root.as_deref(),
+        project_context.git_status.as_deref(),
+        config.as_ref().ok(),
+        config.as_ref().err().map(ToString::to_string).as_deref(),
+    );
     let context = StatusContext {
         cwd: cwd.clone(),
         session_path: None,
@@ -1986,7 +2068,10 @@ fn render_doctor_report() -> Result<DoctorReport, Box<dyn std::error::Error>> {
         project_root,
         git_branch,
         git_summary,
+        branch_freshness,
+        stale_base_state,
         session_lifecycle: classify_session_lifecycle_for(&cwd),
+        boot_preflight,
         sandbox_status: resolve_sandbox_status(sandbox_config.sandbox(), &cwd),
         // Doctor path has its own config check; StatusContext here is only
         // fed into health renderers that don't read config_load_error.
@@ -1998,6 +2083,7 @@ fn render_doctor_report() -> Result<DoctorReport, Box<dyn std::error::Error>> {
             check_config_health(&config_loader, config.as_ref()),
             check_install_source_health(),
             check_workspace_health(&context),
+            check_boot_preflight_health(&context),
             check_sandbox_health(&context.sandbox_status),
             check_system_health(&cwd, config.as_ref().ok()),
         ],
@@ -2323,9 +2409,10 @@ fn check_install_source_health() -> DiagnosticCheck {
 
 fn check_workspace_health(context: &StatusContext) -> DiagnosticCheck {
     let in_repo = context.project_root.is_some();
+    let stale_base_warning = format_stale_base_warning(&context.stale_base_state);
     DiagnosticCheck::new(
         "Workspace",
-        if in_repo {
+        if in_repo && stale_base_warning.is_none() {
             DiagnosticLevel::Ok
         } else {
             DiagnosticLevel::Warn
@@ -2357,6 +2444,10 @@ fn check_workspace_health(context: &StatusContext) -> DiagnosticCheck {
         format!(
             "Memory files     {} · config files loaded {}/{}",
             context.memory_file_count, context.loaded_config_files, context.discovered_config_files
+        ),
+        format!(
+            "Stale base      {}",
+            stale_base_warning.as_deref().unwrap_or("ok")
         ),
     ])
     .with_data(Map::from_iter([
@@ -2390,7 +2481,78 @@ fn check_workspace_health(context: &StatusContext) -> DiagnosticCheck {
             "discovered_config_files".to_string(),
             json!(context.discovered_config_files),
         ),
+        (
+            "stale_base".to_string(),
+            stale_base_json_value(&context.stale_base_state),
+        ),
     ]))
+}
+
+fn check_boot_preflight_health(context: &StatusContext) -> DiagnosticCheck {
+    let preflight = &context.boot_preflight;
+    let missing_binaries = preflight
+        .required_binaries
+        .iter()
+        .filter(|binary| !binary.available)
+        .map(|binary| binary.name)
+        .collect::<Vec<_>>();
+    let socket_details = preflight
+        .control_sockets
+        .iter()
+        .map(|socket| {
+            format!(
+                "Control socket  {} configured={} exists={} path={}",
+                socket.name,
+                socket.configured,
+                socket.exists,
+                socket.path.as_deref().unwrap_or("<none>")
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut details = vec![
+        format!("Repo exists      {}", preflight.repo_exists),
+        format!("Worktree exists  {}", preflight.worktree_exists),
+        format!("Git dir exists   {}", preflight.git_dir_exists),
+        format!("Branch behind    {}", preflight.branch_freshness.behind),
+        format!("Trust allowlist  {:?}", preflight.trust_gate_allowed),
+        format!("Trusted roots    {}", preflight.trusted_roots_count),
+        format!(
+            "MCP eligible     {} · servers {}",
+            preflight.mcp_startup_eligible, preflight.mcp_servers_configured
+        ),
+        format!(
+            "Plugin eligible  {} · configured {}",
+            preflight.plugin_startup_eligible, preflight.plugins_configured
+        ),
+        format!(
+            "Last failed boot {}",
+            preflight
+                .last_failed_boot_reason
+                .as_deref()
+                .unwrap_or("<none>")
+        ),
+    ];
+    details.extend(preflight.required_binaries.iter().map(|binary| {
+        format!(
+            "Required binary {} available={}",
+            binary.name, binary.available
+        )
+    }));
+    details.extend(socket_details);
+    DiagnosticCheck::new(
+        "Boot preflight",
+        if preflight.repo_exists && preflight.worktree_exists && missing_binaries.is_empty() {
+            DiagnosticLevel::Ok
+        } else {
+            DiagnosticLevel::Warn
+        },
+        preflight.summary(),
+    )
+    .with_details(details)
+    .with_data(Map::from_iter([(
+        "boot_preflight".to_string(),
+        preflight.json_value(),
+    )]))
 }
 
 fn check_sandbox_health(status: &runtime::SandboxStatus) -> DiagnosticCheck {
@@ -2841,7 +3003,10 @@ struct StatusContext {
     project_root: Option<PathBuf>,
     git_branch: Option<String>,
     git_summary: GitWorkspaceSummary,
+    branch_freshness: BranchFreshness,
+    stale_base_state: BaseCommitState,
     session_lifecycle: SessionLifecycleSummary,
+    boot_preflight: BootPreflightSnapshot,
     sandbox_status: runtime::SandboxStatus,
     /// #143: when `.claw.json` (or another loaded config file) fails to parse,
     /// we capture the parse error here and still populate every field that
@@ -2850,6 +3015,162 @@ struct StatusContext {
     /// `status: "degraded"` so claws can distinguish "status ran but config
     /// is broken" from "status ran cleanly".
     config_load_error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BranchFreshness {
+    upstream: Option<String>,
+    ahead: u32,
+    behind: u32,
+    fresh: Option<bool>,
+}
+
+impl BranchFreshness {
+    fn from_git_status(status: Option<&str>) -> Self {
+        let first_line = status
+            .and_then(|status| status.lines().next())
+            .unwrap_or_default();
+        let upstream = first_line
+            .split_once("...")
+            .and_then(|(_, rest)| rest.split([' ', '[']).next())
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
+        let mut ahead = 0;
+        let mut behind = 0;
+        if let Some((_, bracketed)) = first_line.split_once('[') {
+            let bracketed = bracketed.trim_end_matches(']');
+            for part in bracketed.split(',').map(str::trim) {
+                if let Some(value) = part.strip_prefix("ahead ") {
+                    ahead = value.parse().unwrap_or(0);
+                } else if let Some(value) = part.strip_prefix("behind ") {
+                    behind = value.parse().unwrap_or(0);
+                }
+            }
+        }
+        let fresh = upstream.as_ref().map(|_| behind == 0);
+        Self {
+            upstream,
+            ahead,
+            behind,
+            fresh,
+        }
+    }
+
+    fn json_value(&self) -> serde_json::Value {
+        json!({
+            "upstream": self.upstream,
+            "ahead": self.ahead,
+            "behind": self.behind,
+            "fresh": self.fresh,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BinaryPreflight {
+    name: &'static str,
+    available: bool,
+}
+
+impl BinaryPreflight {
+    fn json_value(&self) -> serde_json::Value {
+        json!({
+            "name": self.name,
+            "available": self.available,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ControlSocketPreflight {
+    name: &'static str,
+    configured: bool,
+    exists: bool,
+    path: Option<String>,
+}
+
+impl ControlSocketPreflight {
+    fn json_value(&self) -> serde_json::Value {
+        json!({
+            "name": self.name,
+            "configured": self.configured,
+            "exists": self.exists,
+            "path": self.path,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BootPreflightSnapshot {
+    repo_exists: bool,
+    worktree_exists: bool,
+    git_dir_exists: bool,
+    branch_freshness: BranchFreshness,
+    trust_gate_allowed: Option<bool>,
+    trusted_roots_count: usize,
+    required_binaries: Vec<BinaryPreflight>,
+    control_sockets: Vec<ControlSocketPreflight>,
+    mcp_startup_eligible: bool,
+    mcp_servers_configured: usize,
+    plugin_startup_eligible: bool,
+    plugins_configured: usize,
+    last_failed_boot_reason: Option<String>,
+}
+
+impl BootPreflightSnapshot {
+    fn json_value(&self) -> serde_json::Value {
+        json!({
+            "repo": {
+                "exists": self.repo_exists,
+                "worktree_exists": self.worktree_exists,
+                "git_dir_exists": self.git_dir_exists,
+            },
+            "branch_freshness": self.branch_freshness.json_value(),
+            "trust_gate": {
+                "allowlisted": self.trust_gate_allowed,
+                "trusted_roots_count": self.trusted_roots_count,
+            },
+            "required_binaries": self.required_binaries.iter().map(BinaryPreflight::json_value).collect::<Vec<_>>(),
+            "control_sockets": self.control_sockets.iter().map(ControlSocketPreflight::json_value).collect::<Vec<_>>(),
+            "mcp_startup": {
+                "eligible": self.mcp_startup_eligible,
+                "servers_configured": self.mcp_servers_configured,
+            },
+            "plugin_startup": {
+                "eligible": self.plugin_startup_eligible,
+                "plugins_configured": self.plugins_configured,
+            },
+            "last_failed_boot_reason": self.last_failed_boot_reason,
+        })
+    }
+
+    fn summary(&self) -> String {
+        let trust = self
+            .trust_gate_allowed
+            .map(|value| {
+                if value {
+                    "allowlisted"
+                } else {
+                    "not allowlisted"
+                }
+            })
+            .unwrap_or("unknown");
+        let freshness = self
+            .branch_freshness
+            .fresh
+            .map(|fresh| if fresh { "fresh" } else { "behind" })
+            .unwrap_or("no upstream");
+        format!(
+            "repo={} worktree={} branch={} trust={} mcp={} plugins={} last_failed={}",
+            self.repo_exists,
+            self.worktree_exists,
+            freshness,
+            trust,
+            self.mcp_startup_eligible,
+            self.plugin_startup_eligible,
+            self.last_failed_boot_reason.as_deref().unwrap_or("none")
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3060,6 +3381,9 @@ fn parse_tmux_pane_snapshots(output: &str) -> Vec<TmuxPaneSnapshot> {
 }
 
 fn pane_path_matches_workspace(pane_path: &Path, workspace: &Path) -> bool {
+    if pane_path == workspace || pane_path.starts_with(workspace) {
+        return true;
+    }
     let pane_path = fs::canonicalize(pane_path).unwrap_or_else(|_| pane_path.to_path_buf());
     let workspace = fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf());
     pane_path == workspace || pane_path.starts_with(&workspace)
@@ -3179,18 +3503,21 @@ fn format_permissions_switch_report(previous: &str, next: &str) -> String {
 }
 
 fn format_cost_report(usage: TokenUsage) -> String {
+    let estimated_cost = usage.estimate_cost_usd();
     format!(
         "Cost
   Input tokens     {}
   Output tokens    {}
   Cache create     {}
   Cache read       {}
-  Total tokens     {}",
+  Total tokens     {}
+  Estimated cost   {}",
         usage.input_tokens,
         usage.output_tokens,
         usage.cache_creation_input_tokens,
         usage.cache_read_input_tokens,
         usage.total_tokens(),
+        format_usd(estimated_cost.total_cost_usd()),
     )
 }
 
@@ -3207,7 +3534,7 @@ fn render_resume_usage() -> String {
     format!(
         "Resume
   Usage            /resume <session-path|session-id|{LATEST_SESSION_REFERENCE}>
-  Auto-save        .claw/sessions/<session-id>.{PRIMARY_SESSION_EXTENSION}
+  Auto-save        .claw/sessions/<workspace-fingerprint>/<session-id>.{PRIMARY_SESSION_EXTENSION}
   Tip              use /session list to inspect saved sessions"
     )
 }
@@ -3294,6 +3621,123 @@ fn parse_git_workspace_summary(status: Option<&str>) -> GitWorkspaceSummary {
     summary
 }
 
+fn build_boot_preflight_snapshot(
+    cwd: &Path,
+    project_root: Option<&Path>,
+    git_status: Option<&str>,
+    runtime_config: Option<&runtime::RuntimeConfig>,
+    config_load_error: Option<&str>,
+) -> BootPreflightSnapshot {
+    let branch_freshness = BranchFreshness::from_git_status(git_status);
+    let worktree_exists = run_git_bool(cwd, &["rev-parse", "--is-inside-work-tree"]);
+    let git_dir_exists = run_git_capture_in(cwd, &["rev-parse", "--git-dir"])
+        .map(|path| {
+            let path = PathBuf::from(path.trim());
+            if path.is_absolute() {
+                path
+            } else {
+                cwd.join(path)
+            }
+        })
+        .is_some_and(|path| path.exists());
+    let trusted_roots = runtime_config
+        .map(runtime::RuntimeConfig::trusted_roots)
+        .unwrap_or(&[]);
+    let trust_gate_allowed = runtime_config.map(|_| {
+        trusted_roots
+            .iter()
+            .any(|root| path_matches_trusted_root_local(cwd, root))
+    });
+    let plugin_configured = runtime_config
+        .map(|config| config.plugins().enabled_plugins().len())
+        .unwrap_or_default();
+    let mcp_configured = runtime_config
+        .map(|config| config.mcp().servers().len())
+        .unwrap_or_default();
+    let config_ok = config_load_error.is_none();
+    BootPreflightSnapshot {
+        repo_exists: project_root.is_some_and(Path::exists),
+        worktree_exists,
+        git_dir_exists,
+        branch_freshness,
+        trust_gate_allowed,
+        trusted_roots_count: trusted_roots.len(),
+        required_binaries: vec![
+            BinaryPreflight {
+                name: "claw",
+                available: env::current_exe().is_ok_and(|path| path.exists()),
+            },
+            BinaryPreflight {
+                name: "git",
+                available: command_available("git"),
+            },
+            BinaryPreflight {
+                name: "tmux",
+                available: command_available("tmux"),
+            },
+        ],
+        control_sockets: vec![tmux_control_socket_preflight()],
+        mcp_startup_eligible: config_ok,
+        mcp_servers_configured: mcp_configured,
+        plugin_startup_eligible: config_ok,
+        plugins_configured: plugin_configured,
+        last_failed_boot_reason: last_failed_boot_reason(cwd),
+    }
+}
+
+fn run_git_bool(cwd: &Path, args: &[&str]) -> bool {
+    Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .is_ok_and(|output| output.status.success())
+}
+
+fn command_available(command: &str) -> bool {
+    Command::new(command)
+        .arg("--version")
+        .output()
+        .is_ok_and(|output| output.status.success())
+}
+
+fn tmux_control_socket_preflight() -> ControlSocketPreflight {
+    let path = env::var("TMUX")
+        .ok()
+        .and_then(|value| value.split(',').next().map(str::to_string))
+        .filter(|value| !value.is_empty());
+    let exists = path.as_ref().is_some_and(|path| Path::new(path).exists());
+    ControlSocketPreflight {
+        name: "tmux",
+        configured: path.is_some(),
+        exists,
+        path,
+    }
+}
+
+fn last_failed_boot_reason(cwd: &Path) -> Option<String> {
+    env::var("CLAW_LAST_FAILED_BOOT_REASON")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            fs::read_to_string(cwd.join(".claw").join("last-failed-boot.txt"))
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        })
+}
+
+fn path_matches_trusted_root_local(cwd: &Path, trusted_root: &str) -> bool {
+    let cwd = fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    let trusted_root = Path::new(trusted_root);
+    let trusted_root = if trusted_root.is_absolute() {
+        trusted_root.to_path_buf()
+    } else {
+        cwd.join(trusted_root)
+    };
+    let trusted_root = fs::canonicalize(&trusted_root).unwrap_or(trusted_root);
+    cwd == trusted_root || cwd.starts_with(trusted_root)
+}
+
 fn resolve_git_branch_for(cwd: &Path) -> Option<String> {
     let branch = run_git_capture_in(cwd, &["branch", "--show-current"])?;
     let branch = branch.trim();
@@ -3354,6 +3798,35 @@ fn run_resume_command(
     session: &Session,
     command: &SlashCommand,
 ) -> Result<ResumeCommandOutcome, Box<dyn std::error::Error>> {
+    let session_list_outcome = || -> Result<ResumeCommandOutcome, Box<dyn std::error::Error>> {
+        let sessions = list_managed_sessions().unwrap_or_default();
+        let session_ids: Vec<String> = sessions.iter().map(|s| s.id.clone()).collect();
+        let session_details: Vec<serde_json::Value> = sessions
+            .iter()
+            .map(|session| {
+                serde_json::json!({
+                    "id": session.id,
+                    "path": session.path.display().to_string(),
+                    "message_count": session.message_count,
+                    "updated_at_ms": session.updated_at_ms,
+                    "lifecycle": session.lifecycle.json_value(),
+                })
+            })
+            .collect();
+        let active_id = session.session_id.clone();
+        let text = render_session_list(&active_id).unwrap_or_else(|e| format!("error: {e}"));
+        Ok(ResumeCommandOutcome {
+            session: session.clone(),
+            message: Some(text),
+            json: Some(serde_json::json!({
+                "kind": "session_list",
+                "sessions": session_ids,
+                "session_details": session_details,
+                "active": active_id,
+            })),
+        })
+    };
+
     match command {
         SlashCommand::Help => Ok(ResumeCommandOutcome {
             session: session.clone(),
@@ -3477,6 +3950,8 @@ fn run_resume_command(
                     "cache_creation_input_tokens": usage.cache_creation_input_tokens,
                     "cache_read_input_tokens": usage.cache_read_input_tokens,
                     "total_tokens": usage.total_tokens(),
+                    "estimated_cost_usd": format_usd(usage.estimate_cost_usd().total_cost_usd()),
+                    "pricing": "estimated-default",
                 })),
             })
         }
@@ -3560,7 +4035,7 @@ fn run_resume_command(
                 message: Some(handle_agents_slash_command(args.as_deref(), &cwd)?),
                 json: Some(
                     serde_json::to_value(handle_agents_slash_command_json(args.as_deref(), &cwd)?)
-                        .unwrap_or_else(|_| serde_json::json!(null)),
+                        .unwrap_or(Value::Null),
                 ),
             })
         }
@@ -3589,22 +4064,22 @@ fn run_resume_command(
                 _ => {}
             }
             let cwd = env::current_dir()?;
-            let loader = ConfigLoader::default_for(&cwd);
-            let runtime_config = loader.load()?;
-            let mut manager = build_plugin_manager(&cwd, &loader, &runtime_config);
-            let result =
-                handle_plugins_slash_command(action.as_deref(), target.as_deref(), &mut manager)?;
+            let payload = plugins_command_payload_for(&cwd, action.as_deref(), target.as_deref())?;
             let action_str = action.as_deref().unwrap_or("list");
             let json = serde_json::json!({
                 "kind": "plugin",
                 "action": action_str,
                 "target": target,
-                "message": &result.message,
-                "reload_runtime": result.reload_runtime,
+                "status": payload.status,
+                "config_load_error": payload.config_load_error,
+                "message": &payload.message,
+                "reload_runtime": payload.reload_runtime,
+                "plugins": payload.plugins,
+                "load_failures": payload.load_failures,
             });
             Ok(ResumeCommandOutcome {
                 session: session.clone(),
-                message: Some(result.message),
+                message: Some(payload.message),
                 json: Some(json),
             })
         }
@@ -3628,6 +4103,8 @@ fn run_resume_command(
                     "cache_creation_input_tokens": usage.cache_creation_input_tokens,
                     "cache_read_input_tokens": usage.cache_read_input_tokens,
                     "total_tokens": usage.total_tokens(),
+                    "estimated_cost_usd": format_usd(usage.estimate_cost_usd().total_cost_usd()),
+                    "pricing": "estimated-default",
                 })),
             })
         }
@@ -3651,37 +4128,11 @@ fn run_resume_command(
             })
         }
         SlashCommand::Unknown(name) => Err(format_unknown_slash_command(name).into()),
-        // /session list can be served from the sessions directory without a live session.
-        SlashCommand::Session {
-            action: Some(ref act),
-            ..
-        } if act == "list" => {
-            let sessions = list_managed_sessions().unwrap_or_default();
-            let session_ids: Vec<String> = sessions.iter().map(|s| s.id.clone()).collect();
-            let session_details: Vec<serde_json::Value> = sessions
-                .iter()
-                .map(|session| {
-                    serde_json::json!({
-                        "id": session.id,
-                        "path": session.path.display().to_string(),
-                        "message_count": session.message_count,
-                        "updated_at_ms": session.updated_at_ms,
-                        "lifecycle": session.lifecycle.json_value(),
-                    })
-                })
-                .collect();
-            let active_id = session.session_id.clone();
-            let text = render_session_list(&active_id).unwrap_or_else(|e| format!("error: {e}"));
-            Ok(ResumeCommandOutcome {
-                session: session.clone(),
-                message: Some(text),
-                json: Some(serde_json::json!({
-                    "kind": "session_list",
-                    "sessions": session_ids,
-                    "session_details": session_details,
-                    "active": active_id,
-                })),
-            })
+        // /session list/exists/delete can be served from the managed sessions directory
+        // in resume mode without starting an interactive REPL. Mutating delete remains
+        // opt-in through /session delete <id> --force so JSON callers never hang on a prompt.
+        SlashCommand::Session { action, target } => {
+            run_resumed_session_command(session_path, session, action.as_deref(), target.as_deref())
         }
         SlashCommand::Bughunter { .. }
         | SlashCommand::Commit { .. }
@@ -3693,7 +4144,6 @@ fn run_resume_command(
         | SlashCommand::Resume { .. }
         | SlashCommand::Model { .. }
         | SlashCommand::Permissions { .. }
-        | SlashCommand::Session { .. }
         | SlashCommand::Login
         | SlashCommand::Logout
         | SlashCommand::Vim
@@ -3814,12 +4264,30 @@ fn enforce_broad_cwd_policy(
     }
 }
 
+fn stale_base_state_for(cwd: &Path, flag_value: Option<&str>) -> BaseCommitState {
+    let source = resolve_expected_base(flag_value, cwd);
+    check_base_commit(cwd, source.as_ref())
+}
+
+fn stale_base_json_value(state: &BaseCommitState) -> serde_json::Value {
+    match state {
+        BaseCommitState::Matches => json!({"status": "matches", "fresh": true}),
+        BaseCommitState::Diverged { expected, actual } => json!({
+            "status": "diverged",
+            "fresh": false,
+            "expected": expected,
+            "actual": actual,
+        }),
+        BaseCommitState::NoExpectedBase => json!({"status": "no_expected_base", "fresh": null}),
+        BaseCommitState::NotAGitRepo => json!({"status": "not_git_repo", "fresh": null}),
+    }
+}
+
 fn run_stale_base_preflight(flag_value: Option<&str>) {
     let Ok(cwd) = env::current_dir() else {
         return;
     };
-    let source = resolve_expected_base(flag_value, &cwd);
-    let state = check_base_commit(&cwd, source.as_ref());
+    let state = stale_base_state_for(&cwd, flag_value);
     if let Some(warning) = format_stale_base_warning(&state) {
         eprintln!("{warning}");
     }
@@ -4092,7 +4560,10 @@ impl RuntimeMcpState {
                         runtime::McpLifecyclePhase::ToolDiscovery,
                         Some(failure.server_name.clone()),
                         failure.error.clone(),
-                        std::collections::BTreeMap::new(),
+                        std::collections::BTreeMap::from([(
+                            "required".to_string(),
+                            failure.required.to_string(),
+                        )]),
                         true,
                     ),
                 })
@@ -4104,10 +4575,13 @@ impl RuntimeMcpState {
                             runtime::McpLifecyclePhase::ServerRegistration,
                             Some(server.server_name.clone()),
                             server.reason.clone(),
-                            std::collections::BTreeMap::from([(
-                                "transport".to_string(),
-                                format!("{:?}", server.transport).to_ascii_lowercase(),
-                            )]),
+                            std::collections::BTreeMap::from([
+                                (
+                                    "transport".to_string(),
+                                    format!("{:?}", server.transport).to_ascii_lowercase(),
+                                ),
+                                ("required".to_string(), server.required.to_string()),
+                            ]),
                             false,
                         ),
                     }
@@ -5169,20 +5643,21 @@ impl LiveCli {
         output_format: CliOutputFormat,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let cwd = env::current_dir()?;
-        let loader = ConfigLoader::default_for(&cwd);
-        let runtime_config = loader.load()?;
-        let mut manager = build_plugin_manager(&cwd, &loader, &runtime_config);
-        let result = handle_plugins_slash_command(action, target, &mut manager)?;
+        let payload = plugins_command_payload_for(&cwd, action, target)?;
         match output_format {
-            CliOutputFormat::Text => println!("{}", result.message),
+            CliOutputFormat::Text => println!("{}", payload.message),
             CliOutputFormat::Json => println!(
                 "{}",
                 serde_json::to_string_pretty(&json!({
                     "kind": "plugin",
                     "action": action.unwrap_or("list"),
                     "target": target,
-                    "message": result.message,
-                    "reload_runtime": result.reload_runtime,
+                    "status": payload.status,
+                    "config_load_error": payload.config_load_error,
+                    "message": payload.message,
+                    "reload_runtime": payload.reload_runtime,
+                    "plugins": payload.plugins,
+                    "load_failures": payload.load_failures,
                 }))?
             ),
         }
@@ -5221,6 +5696,22 @@ impl LiveCli {
         match action {
             None | Some("list") => {
                 println!("{}", render_session_list(&self.session.id)?);
+                Ok(false)
+            }
+            Some("exists") => {
+                let Some(target) = target else {
+                    println!("Usage: /session exists <session-id>");
+                    return Ok(false);
+                };
+                let exists = session_reference_exists(target)?;
+                let handle = resolve_session_reference(target).ok();
+                println!(
+                    "Session exists\n  Session          {target}\n  Exists           {exists}{}",
+                    handle
+                        .as_ref()
+                        .map(|handle| format!("\n  File             {}", handle.path.display()))
+                        .unwrap_or_default()
+                );
                 Ok(false)
             }
             Some("switch") => {
@@ -5337,7 +5828,7 @@ impl LiveCli {
             }
             Some(other) => {
                 println!(
-                    "Unknown /session action '{other}'. Use /session list, /session switch <session-id>, /session fork [branch-name], or /session delete <session-id> [--force]."
+                    "Unknown /session action '{other}'. Use /session list, /session exists <session-id>, /session switch <session-id>, /session fork [branch-name], or /session delete <session-id> [--force]."
                 );
                 Ok(false)
             }
@@ -5350,12 +5841,9 @@ impl LiveCli {
         target: Option<&str>,
     ) -> Result<bool, Box<dyn std::error::Error>> {
         let cwd = env::current_dir()?;
-        let loader = ConfigLoader::default_for(&cwd);
-        let runtime_config = loader.load()?;
-        let mut manager = build_plugin_manager(&cwd, &loader, &runtime_config);
-        let result = handle_plugins_slash_command(action, target, &mut manager)?;
-        println!("{}", result.message);
-        if result.reload_runtime {
+        let payload = plugins_command_payload_for(&cwd, action, target)?;
+        println!("{}", payload.message);
+        if payload.reload_runtime {
             self.reload_runtime_features()?;
         }
         Ok(false)
@@ -5521,6 +6009,10 @@ fn resolve_session_reference(reference: &str) -> Result<SessionHandle, Box<dyn s
     })
 }
 
+fn session_reference_exists(reference: &str) -> Result<bool, Box<dyn std::error::Error>> {
+    Ok(current_session_store()?.session_exists(reference))
+}
+
 fn resolve_managed_session_path(session_id: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
     current_session_store()?
         .resolve_managed_path(session_id)
@@ -5596,6 +6088,140 @@ fn confirm_session_deletion(session_id: &str) -> bool {
         return false;
     }
     matches!(answer.trim(), "y" | "Y" | "yes" | "Yes" | "YES")
+}
+
+fn session_details_json(sessions: &[ManagedSessionSummary]) -> Vec<serde_json::Value> {
+    sessions
+        .iter()
+        .map(|session| {
+            serde_json::json!({
+                "id": session.id,
+                "path": session.path.display().to_string(),
+                "message_count": session.message_count,
+                "updated_at_ms": session.updated_at_ms,
+                "modified_epoch_millis": session.modified_epoch_millis,
+                "parent_session_id": session.parent_session_id,
+                "branch_name": session.branch_name,
+                "lifecycle": session.lifecycle.json_value(),
+            })
+        })
+        .collect()
+}
+
+fn session_exists_json(
+    target: &str,
+    active_session_id: &str,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let handle = create_managed_session_handle(target)?;
+    let resolved = resolve_session_reference(target).ok();
+    let exists = resolved.is_some();
+    let resolved_id = resolved
+        .as_ref()
+        .map_or(target, |handle| handle.id.as_str());
+    Ok(serde_json::json!({
+        "kind": "session_exists",
+        "session_id": resolved_id,
+        "session": target,
+        "requested": target,
+        "exists": exists,
+        "active": resolved_id == active_session_id,
+        "path": resolved
+            .as_ref()
+            .map(|handle| handle.path.display().to_string()),
+        "candidate_path": handle.path.display().to_string(),
+    }))
+}
+
+fn run_resumed_session_command(
+    session_path: &Path,
+    session: &Session,
+    action: Option<&str>,
+    target: Option<&str>,
+) -> Result<ResumeCommandOutcome, Box<dyn std::error::Error>> {
+    match action {
+        None | Some("list") => {
+            let sessions = list_managed_sessions().unwrap_or_default();
+            let session_ids: Vec<String> = sessions.iter().map(|s| s.id.clone()).collect();
+            let active_id = session.session_id.clone();
+            let text = render_session_list(&active_id).unwrap_or_else(|e| format!("error: {e}"));
+            Ok(ResumeCommandOutcome {
+                session: session.clone(),
+                message: Some(text),
+                json: Some(serde_json::json!({
+                    "kind": "session_list",
+                    "sessions": session_ids,
+                    "session_details": session_details_json(&sessions),
+                    "active": active_id,
+                })),
+            })
+        }
+        Some("exists") => {
+            let Some(target) = target else {
+                return Err("/session exists requires a session id".into());
+            };
+            let value = session_exists_json(target, &session.session_id)?;
+            let exists = value
+                .get("exists")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            Ok(ResumeCommandOutcome {
+                session: session.clone(),
+                message: Some(format!(
+                    "Session exists\n  Session          {}\n  Exists           {}",
+                    target,
+                    if exists { "yes" } else { "no" }
+                )),
+                json: Some(value),
+            })
+        }
+        Some("delete") => {
+            let Some(target) = target else {
+                return Err("/session delete requires a session id".into());
+            };
+            Ok(ResumeCommandOutcome {
+                session: session.clone(),
+                message: Some(format!(
+                    "delete: confirmation required; rerun with /session delete {target} --force"
+                )),
+                json: Some(serde_json::json!({
+                    "kind": "error",
+                    "error": "confirmation required",
+                    "hint": format!("rerun with /session delete {target} --force"),
+                    "session_id": target,
+                })),
+            })
+        }
+        Some("delete-force") => {
+            let Some(target) = target else {
+                return Err("/session delete requires a session id".into());
+            };
+            let handle = resolve_session_reference(target)?;
+            if handle.id == session.session_id || handle.path == session_path {
+                return Err(format!(
+                    "delete: refusing to delete the active session '{}'. Resume or switch to another session first.",
+                    handle.id
+                )
+                .into());
+            }
+            delete_managed_session(&handle.path)?;
+            Ok(ResumeCommandOutcome {
+                session: session.clone(),
+                message: Some(format!(
+                    "Session deleted\n  Deleted session  {}\n  File             {}",
+                    handle.id,
+                    handle.path.display(),
+                )),
+                json: Some(serde_json::json!({
+                    "kind": "session_delete",
+                    "deleted": true,
+                    "session_id": handle.id,
+                    "path": handle.path.display().to_string(),
+                })),
+            })
+        }
+        Some("switch" | "fork") => Err("unsupported resumed slash command".into()),
+        Some(other) => Err(format!("unsupported resumed /session action: {other}").into()),
+    }
 }
 
 fn render_session_list(active_session_id: &str) -> Result<String, Box<dyn std::error::Error>> {
@@ -5687,7 +6313,8 @@ fn render_repl_help() -> String {
         "  Tab                  Complete commands, modes, and recent sessions".to_string(),
         "  Ctrl-C               Clear input (or exit on empty prompt)".to_string(),
         "  Shift+Enter/Ctrl+J   Insert a newline".to_string(),
-        "  Auto-save            .claw/sessions/<session-id>.jsonl".to_string(),
+        "  Auto-save            .claw/sessions/<workspace-fingerprint>/<session-id>.jsonl"
+            .to_string(),
         "  Resume latest        /resume latest".to_string(),
         "  Browse sessions      /session list".to_string(),
         "  Show prompt history  /history [count]".to_string(),
@@ -5790,11 +6417,26 @@ fn status_json_value(
         "usage": {
             "messages": usage.message_count,
             "turns": usage.turns,
+            "latest_input": usage.latest.input_tokens,
+            "latest_output": usage.latest.output_tokens,
+            "latest_cache_creation_input": usage.latest.cache_creation_input_tokens,
+            "latest_cache_read_input": usage.latest.cache_read_input_tokens,
             "latest_total": usage.latest.total_tokens(),
             "cumulative_input": usage.cumulative.input_tokens,
             "cumulative_output": usage.cumulative.output_tokens,
+            "cumulative_cache_creation_input": usage.cumulative.cache_creation_input_tokens,
+            "cumulative_cache_read_input": usage.cumulative.cache_read_input_tokens,
             "cumulative_total": usage.cumulative.total_tokens(),
+            "estimated_cost_usd": format_usd(usage.cumulative.estimate_cost_usd().total_cost_usd()),
+            "pricing": "estimated-default",
             "estimated_tokens": usage.estimated_tokens,
+        },
+        "lane_board": {
+            "schema": "task_registry_v1",
+            "status_json_supported": true,
+            "heartbeat_freshness_supported": true,
+            "states": ["active", "blocked", "finished"],
+            "freshness_states": ["healthy", "stalled", "transport_dead", "unknown"],
         },
         "workspace": {
             "cwd": context.cwd,
@@ -5812,6 +6454,8 @@ fn status_json_value(
                 path.file_stem().map(|n| n.to_string_lossy().into_owned())
             }),
             "session_lifecycle": context.session_lifecycle.json_value(),
+            "branch_freshness": context.branch_freshness.json_value(),
+            "boot_preflight": context.boot_preflight.json_value(),
             "loaded_config_files": context.loaded_config_files,
             "discovered_config_files": context.discovered_config_files,
             "memory_file_count": context.memory_file_count,
@@ -5845,7 +6489,8 @@ fn status_context(
     // so that one malformed `mcpServers.*` entry doesn't take down the whole
     // health surface (workspace, git, model, permission, sandbox can still be
     // reported independently).
-    let (loaded_config_files, sandbox_status, config_load_error) = match loader.load() {
+    let runtime_config = loader.load();
+    let (loaded_config_files, sandbox_status, config_load_error) = match runtime_config.as_ref() {
         Ok(runtime_config) => (
             runtime_config.loaded_entries().len(),
             resolve_sandbox_status(runtime_config.sandbox(), &cwd),
@@ -5866,6 +6511,15 @@ fn status_context(
     let (project_root, git_branch) =
         parse_git_status_metadata(project_context.git_status.as_deref());
     let git_summary = parse_git_workspace_summary(project_context.git_status.as_deref());
+    let branch_freshness = BranchFreshness::from_git_status(project_context.git_status.as_deref());
+    let stale_base_state = stale_base_state_for(&cwd, None);
+    let boot_preflight = build_boot_preflight_snapshot(
+        &cwd,
+        project_root.as_deref(),
+        project_context.git_status.as_deref(),
+        runtime_config.as_ref().ok(),
+        config_load_error.as_deref(),
+    );
     Ok(StatusContext {
         cwd: cwd.clone(),
         session_path: session_path.map(Path::to_path_buf),
@@ -5875,7 +6529,10 @@ fn status_context(
         project_root,
         git_branch,
         git_summary,
+        branch_freshness,
+        stale_base_state,
         session_lifecycle: classify_session_lifecycle_for(&cwd),
+        boot_preflight,
         sandbox_status,
         config_load_error,
     })
@@ -5932,11 +6589,17 @@ fn format_status_report(
   Latest total     {}
   Cumulative input {}
   Cumulative output {}
-  Cumulative total {}",
+  Cache create     {}
+  Cache read       {}
+  Cumulative total {}
+  Estimated cost   {}",
             usage.latest.total_tokens(),
             usage.cumulative.input_tokens,
             usage.cumulative.output_tokens,
+            usage.cumulative.cache_creation_input_tokens,
+            usage.cumulative.cache_read_input_tokens,
             usage.cumulative.total_tokens(),
+            format_usd(usage.cumulative.estimate_cost_usd().total_cost_usd()),
         ),
         format!(
             "Workspace
@@ -5950,6 +6613,8 @@ fn format_status_report(
   Untracked        {}
   Session          {}
   Lifecycle        {}
+  Branch fresh     {}
+  Boot preflight   {}
   Config files     loaded {}/{}
   Memory files     {}
   Suggested flow   /status → /diff → /commit",
@@ -5969,6 +6634,12 @@ fn format_status_report(
                 |path| path.display().to_string()
             ),
             context.session_lifecycle.signal(),
+            context
+                .branch_freshness
+                .fresh
+                .map(|fresh| if fresh { "yes" } else { "behind" })
+                .unwrap_or("no upstream"),
+            context.boot_preflight.summary(),
             context.loaded_config_files,
             context.discovered_config_files,
             context.memory_file_count,
@@ -6254,34 +6925,58 @@ fn print_help_topic(
     Ok(())
 }
 
+fn acp_status_message() -> &'static str {
+    "ACP/Zed editor integration is not implemented in claw-code yet. `claw acp serve` is only a discoverability alias today; it does not launch a daemon, JSON-RPC endpoint, or Zed-specific protocol endpoint. Use the normal terminal surfaces for now and track ROADMAP #76 for real ACP support."
+}
+
+fn acp_status_json() -> serde_json::Value {
+    json!({
+        "schema_version": "1.0",
+        "kind": "acp",
+        "status": "unsupported",
+        "phase": "discoverability_only",
+        "supported": false,
+        "exit_code": 0,
+        "serve_alias_only": true,
+        "message": acp_status_message(),
+        "launch_command": serde_json::Value::Null,
+        "protocol": {
+            "name": "ACP/Zed",
+            "json_rpc": false,
+            "daemon": false,
+            "endpoint": serde_json::Value::Null,
+            "serve_starts_daemon": false
+        },
+        "contracts": {
+            "blocking_gates": [
+                "task_packet_schema",
+                "session_control_schema",
+                "event_report_schema"
+            ],
+            "stable_status_surface": "claw acp [serve] --output-format json",
+            "unsupported_invocation_kind": "unsupported_acp_invocation"
+        },
+        "aliases": ["acp", "--acp", "-acp"],
+        "discoverability_tracking": "ROADMAP #64a",
+        "tracking": "ROADMAP #76 / #3033 / #3004",
+        "recommended_workflows": [
+            "claw prompt TEXT",
+            "claw",
+            "claw doctor"
+        ],
+    })
+}
+
 fn print_acp_status(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::Error>> {
-    let message = "ACP/Zed editor integration is not implemented in claw-code yet. `claw acp serve` is only a discoverability alias today; it does not launch a daemon or Zed-specific protocol endpoint. Use the normal terminal surfaces for now and track ROADMAP #76 for real ACP support.";
     match output_format {
         CliOutputFormat::Text => {
             println!(
-                "ACP / Zed\n  Status           discoverability only\n  Launch           `claw acp serve` / `claw --acp` / `claw -acp` report status only; no editor daemon is available yet\n  Today            use `claw prompt`, the REPL, or `claw doctor` for local verification\n  Tracking         ROADMAP #76\n  Message          {message}"
+                "ACP / Zed\n  Status           unsupported (discoverability only)\n  Exit code        0 for status queries; unsupported invocations exit 1\n  Launch           `claw acp serve` / `claw --acp` / `claw -acp` report status only; no editor daemon or JSON-RPC endpoint is available yet\n  Today            use `claw prompt`, the REPL, or `claw doctor` for local verification\n  Tracking         ROADMAP #76 / #3033 / #3004\n  Message          {}",
+                acp_status_message()
             );
         }
         CliOutputFormat::Json => {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&json!({
-                    "kind": "acp",
-                    "status": "discoverability_only",
-                    "supported": false,
-                    "serve_alias_only": true,
-                    "message": message,
-                    "launch_command": serde_json::Value::Null,
-                    "aliases": ["acp", "--acp", "-acp"],
-                    "discoverability_tracking": "ROADMAP #64a",
-                    "tracking": "ROADMAP #76",
-                    "recommended_workflows": [
-                        "claw prompt TEXT",
-                        "claw",
-                        "claw doctor"
-                    ],
-                }))?
-            );
+            println!("{}", serde_json::to_string_pretty(&acp_status_json())?);
         }
     }
     Ok(())
@@ -7274,6 +7969,63 @@ fn build_system_prompt(model: &str) -> Result<Vec<String>, Box<dyn std::error::E
     )?)
 }
 
+struct PluginsCommandPayload {
+    message: String,
+    reload_runtime: bool,
+    status: &'static str,
+    config_load_error: Option<String>,
+    plugins: Vec<Value>,
+    load_failures: Vec<Value>,
+}
+
+fn plugins_command_payload_for(
+    cwd: &Path,
+    action: Option<&str>,
+    target: Option<&str>,
+) -> Result<PluginsCommandPayload, Box<dyn std::error::Error>> {
+    let loader = ConfigLoader::default_for(cwd);
+    let (runtime_config, config_load_error) = match loader.load() {
+        Ok(runtime_config) => (runtime_config, None),
+        Err(error) => (runtime::RuntimeConfig::empty(), Some(error.to_string())),
+    };
+    let mut manager = build_plugin_manager(cwd, &loader, &runtime_config);
+    let result = handle_plugins_slash_command(action, target, &mut manager)?;
+    let report = manager.installed_plugin_registry_report()?;
+    Ok(plugins_command_payload_from_result(
+        result,
+        config_load_error,
+        &report,
+    ))
+}
+
+fn plugins_command_payload_from_result(
+    result: PluginsCommandResult,
+    config_load_error: Option<String>,
+    report: &plugins::PluginRegistryReport,
+) -> PluginsCommandPayload {
+    let failures = report.failures();
+    let status = if config_load_error.is_some() || !failures.is_empty() {
+        "degraded"
+    } else {
+        "ok"
+    };
+    let message = match config_load_error.as_deref() {
+        Some(error) => format!(
+            "Config load error\n  Status           fail\n  Summary          runtime config failed to load; reporting partial plugins view\n  Details          {error}\n  Hint             `claw doctor` classifies config parse errors; fix the listed field and rerun\n\n{}",
+            result.message
+        ),
+        None => result.message,
+    };
+    PluginsCommandPayload {
+        message,
+        reload_runtime: result.reload_runtime,
+        status,
+        config_load_error,
+        plugins: report.summaries().iter().map(plugin_summary_json).collect(),
+        load_failures: failures.iter().map(plugin_load_failure_json).collect(),
+    }
+}
+
 fn build_runtime_plugin_state() -> Result<RuntimePluginState, Box<dyn std::error::Error>> {
     let cwd = env::current_dir()?;
     let loader = ConfigLoader::default_for(&cwd);
@@ -7935,6 +8687,7 @@ fn resolve_cli_auth_source() -> Result<AuthSource, Box<dyn std::error::Error>> {
     Ok(resolve_cli_auth_source_for_cwd()?)
 }
 
+#[allow(clippy::result_large_err)]
 fn resolve_cli_auth_source_for_cwd() -> Result<AuthSource, api::ApiError> {
     resolve_startup_auth_source(|| Ok(None))
 }
@@ -9440,7 +10193,7 @@ fn print_help(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::
 #[cfg(test)]
 mod tests {
     use super::{
-        build_runtime_plugin_state_with_loader, build_runtime_with_plugin_state,
+        acp_status_json, build_runtime_plugin_state_with_loader, build_runtime_with_plugin_state,
         classify_error_kind, classify_session_lifecycle_from_panes, collect_session_prompt_history,
         create_managed_session_handle, describe_tool_progress, filter_tool_specs,
         format_bughunter_report, format_commit_preflight_report, format_commit_skipped_report,
@@ -10464,6 +11217,41 @@ mod tests {
                 output_format: CliOutputFormat::Json,
             }
         );
+        for alias in ["plugin", "marketplace"] {
+            assert_eq!(
+                parse_args(&[alias.to_string()]).expect("plugin alias should parse"),
+                CliAction::Plugins {
+                    action: None,
+                    target: None,
+                    output_format: CliOutputFormat::Text,
+                },
+                "{alias} should route to local plugin handling, not Prompt"
+            );
+            assert_eq!(
+                parse_args(&[alias.to_string(), "list".to_string()])
+                    .expect("plugin alias list should parse"),
+                CliAction::Plugins {
+                    action: Some("list".to_string()),
+                    target: None,
+                    output_format: CliOutputFormat::Text,
+                },
+                "{alias} list should route to local plugin handling, not Prompt"
+            );
+            assert_eq!(
+                parse_args(&[
+                    alias.to_string(),
+                    "install".to_string(),
+                    "./fixtures/plugin-demo".to_string(),
+                ])
+                .expect("plugin alias install should parse"),
+                CliAction::Plugins {
+                    action: Some("install".to_string()),
+                    target: Some("./fixtures/plugin-demo".to_string()),
+                    output_format: CliOutputFormat::Text,
+                },
+                "{alias} install should route to local plugin handling, not Prompt"
+            );
+        }
         // #146: `config` and `diff` must parse as standalone CLI actions,
         // not fall through to the "is a slash command" error. Both are
         // pure-local read-only introspection.
@@ -10640,6 +11428,41 @@ mod tests {
                 output_format: CliOutputFormat::Text,
             }
         );
+        assert_eq!(
+            parse_args(&[
+                "acp".to_string(),
+                "serve".to_string(),
+                "--output-format".to_string(),
+                "json".to_string()
+            ])
+            .expect("acp serve json should parse"),
+            CliAction::Acp {
+                output_format: CliOutputFormat::Json,
+            }
+        );
+        let unsupported = parse_args(&["acp".to_string(), "start".to_string()])
+            .expect_err("unknown ACP subcommand should fail with a typed contract");
+        assert!(unsupported.contains("unsupported ACP invocation"));
+    }
+
+    #[test]
+    fn acp_status_json_is_truthful_unsupported_contract() {
+        let value = acp_status_json();
+        assert_eq!(value["schema_version"], "1.0");
+        assert_eq!(value["kind"], "acp");
+        assert_eq!(value["status"], "unsupported");
+        assert_eq!(value["phase"], "discoverability_only");
+        assert_eq!(value["supported"], false);
+        assert_eq!(value["exit_code"], 0);
+        assert_eq!(value["serve_alias_only"], true);
+        assert_eq!(value["protocol"]["json_rpc"], false);
+        assert_eq!(value["protocol"]["daemon"], false);
+        assert_eq!(value["protocol"]["serve_starts_daemon"], false);
+        assert!(value["protocol"]["endpoint"].is_null());
+        assert_eq!(
+            value["contracts"]["unsupported_invocation_kind"],
+            "unsupported_acp_invocation"
+        );
     }
 
     #[test]
@@ -10760,6 +11583,52 @@ mod tests {
     }
 
     #[test]
+    fn plugins_degrades_gracefully_on_malformed_mcp_config() {
+        // Keep the plugins surface consistent with status/doctor/mcp: a bad
+        // MCP entry should not make local plugin introspection unusable.
+        let _guard = env_lock();
+        let root = temp_dir();
+        let cwd = root.join("project-with-malformed-mcp-for-plugins");
+        let config_home = root.join("config-home");
+        std::fs::create_dir_all(&cwd).expect("project dir should exist");
+        std::fs::create_dir_all(&config_home).expect("config home should exist");
+        std::fs::write(
+            cwd.join(".claw.json"),
+            r#"{
+  "mcpServers": {
+    "missing-command": {"args": ["arg-only-no-command"]}
+  }
+}
+"#,
+        )
+        .expect("write malformed .claw.json");
+
+        let previous_config_home = std::env::var("CLAW_CONFIG_HOME").ok();
+        std::env::set_var("CLAW_CONFIG_HOME", &config_home);
+        let payload = super::plugins_command_payload_for(&cwd, None, None)
+            .expect("plugins list should not hard-fail on malformed MCP config");
+        match previous_config_home {
+            Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
+            None => std::env::remove_var("CLAW_CONFIG_HOME"),
+        }
+
+        assert_eq!(payload.status, "degraded");
+        let err = payload
+            .config_load_error
+            .as_deref()
+            .expect("config_load_error should be populated");
+        assert!(
+            err.contains("mcpServers.missing-command"),
+            "config_load_error should name the malformed MCP field: {err}"
+        );
+        assert!(payload.message.contains("Config load error"));
+        assert!(payload.message.contains("partial plugins view"));
+        assert!(payload.message.contains("Plugins"));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn status_degrades_gracefully_on_malformed_mcp_config_143() {
         // #143: previously `claw status` hard-failed on any config parse error,
         // taking down the entire health surface for one malformed MCP entry.
@@ -10848,6 +11717,18 @@ mod tests {
         assert!(
             json.get("workspace").is_some(),
             "workspace field still reported"
+        );
+        assert_eq!(
+            json.pointer("/lane_board/status_json_supported")
+                .and_then(|v| v.as_bool()),
+            Some(true),
+            "status JSON should advertise lane board support: {json}"
+        );
+        assert_eq!(
+            json.pointer("/lane_board/freshness_states/2")
+                .and_then(|v| v.as_str()),
+            Some("transport_dead"),
+            "status JSON should advertise transport-dead freshness: {json}"
         );
         assert!(
             json.get("sandbox").is_some(),
@@ -11079,6 +11960,10 @@ mod tests {
         assert_eq!(
             classify_error_kind("unrecognized argument `--foo` for subcommand `doctor`"),
             "cli_parse"
+        );
+        assert_eq!(
+            classify_error_kind("unsupported ACP invocation. Use `claw acp`."),
+            "unsupported_acp_invocation"
         );
         assert_eq!(
             classify_error_kind("invalid model syntax: 'gpt-4'. Expected ..."),
@@ -11444,6 +12329,9 @@ mod tests {
 
     #[test]
     fn parses_direct_agents_mcp_and_skills_slash_commands() {
+        let _guard = env_lock();
+        let _cwd_guard = cwd_guard();
+        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
         assert_eq!(
             parse_args(&["/agents".to_string()]).expect("/agents should parse"),
             CliAction::Agents {
@@ -11556,6 +12444,15 @@ mod tests {
         .expect_err("invalid /plugins list shape should be rejected");
         assert!(plugins_error.contains("Usage: /plugin list"));
         assert!(plugins_error.contains("Aliases          /plugins, /marketplace"));
+
+        for alias in ["/plugin", "/plugins", "/marketplace"] {
+            let error = parse_args(&[alias.to_string()])
+                .expect_err("valid plugin slash aliases are local/interactive, never prompts");
+            assert!(
+                error.contains("interactive-only"),
+                "{alias} should reject as an interactive plugin command outside the REPL, got: {error}"
+            );
+        }
     }
 
     #[test]
@@ -11897,7 +12794,8 @@ mod tests {
         assert!(help.contains("/export [file]"));
         // Batch 5 added `/session delete`; match on the stable core rather than
         // the trailing bracket so future additions don't re-break this.
-        assert!(help.contains("/session [list|switch <session-id>|fork [branch-name]"));
+        assert!(help
+            .contains("/session [list|exists <session-id>|switch <session-id>|fork [branch-name]"));
         assert!(help.contains(
             "/plugin [list|install <path>|enable <name>|disable <name>|uninstall <id>|update <id>]"
         ));
@@ -11905,7 +12803,9 @@ mod tests {
         assert!(help.contains("/agents"));
         assert!(help.contains("/skills"));
         assert!(help.contains("/exit"));
-        assert!(help.contains("Auto-save            .claw/sessions/<session-id>.jsonl"));
+        assert!(help.contains(
+            "Auto-save            .claw/sessions/<workspace-fingerprint>/<session-id>.jsonl"
+        ));
         assert!(help.contains("Resume latest        /resume latest"));
     }
 
@@ -12036,6 +12936,26 @@ mod tests {
     }
 
     #[test]
+    fn session_exists_resume_command_reports_json_contract() {
+        let session = Session::new();
+        let path = PathBuf::from("missing-session.jsonl");
+        let outcome = run_resume_command(
+            &path,
+            &session,
+            &SlashCommand::Session {
+                action: Some("exists".to_string()),
+                target: Some("definitely-missing-session".to_string()),
+            },
+        )
+        .expect("exists command should not fail for missing sessions");
+
+        let json = outcome.json.expect("json contract");
+        assert_eq!(json["kind"], "session_exists");
+        assert_eq!(json["exists"], false);
+        assert_eq!(json["session"], "definitely-missing-session");
+    }
+
+    #[test]
     fn resume_report_uses_sectioned_layout() {
         let report = format_resume_report("session.jsonl", 14, 6);
         assert!(report.contains("Session resumed"));
@@ -12068,6 +12988,7 @@ mod tests {
         assert!(report.contains("Cache create     3"));
         assert!(report.contains("Cache read       1"));
         assert!(report.contains("Total tokens     32"));
+        assert!(report.contains("Estimated cost"));
     }
 
     #[test]
@@ -12121,6 +13042,33 @@ mod tests {
         assert!(report.contains("Switch models with /model <name>"));
     }
 
+    fn test_branch_freshness() -> super::BranchFreshness {
+        super::BranchFreshness {
+            upstream: Some("origin/main".to_string()),
+            ahead: 0,
+            behind: 0,
+            fresh: Some(true),
+        }
+    }
+
+    fn test_boot_preflight() -> super::BootPreflightSnapshot {
+        super::BootPreflightSnapshot {
+            repo_exists: true,
+            worktree_exists: true,
+            git_dir_exists: true,
+            branch_freshness: test_branch_freshness(),
+            trust_gate_allowed: Some(false),
+            trusted_roots_count: 0,
+            required_binaries: Vec::new(),
+            control_sockets: Vec::new(),
+            mcp_startup_eligible: true,
+            mcp_servers_configured: 0,
+            plugin_startup_eligible: true,
+            plugins_configured: 0,
+            last_failed_boot_reason: None,
+        }
+    }
+
     #[test]
     fn model_switch_report_preserves_context_summary() {
         let report = format_model_switch_report("claude-sonnet", "claude-opus", 9);
@@ -12167,6 +13115,8 @@ mod tests {
                     untracked_files: 1,
                     conflicted_files: 0,
                 },
+                branch_freshness: test_branch_freshness(),
+                stale_base_state: super::BaseCommitState::NoExpectedBase,
                 session_lifecycle: SessionLifecycleSummary {
                     kind: SessionLifecycleKind::IdleShell,
                     pane_id: Some("%7".to_string()),
@@ -12175,6 +13125,7 @@ mod tests {
                     workspace_dirty: true,
                     abandoned: true,
                 },
+                boot_preflight: test_boot_preflight(),
                 sandbox_status: runtime::SandboxStatus::default(),
                 config_load_error: None,
             },
@@ -12185,7 +13136,10 @@ mod tests {
         assert!(status.contains("Permission mode  workspace-write"));
         assert!(status.contains("Messages         7"));
         assert!(status.contains("Latest total     10"));
+        assert!(status.contains("Cache create     2"));
+        assert!(status.contains("Cache read       1"));
         assert!(status.contains("Cumulative total 31"));
+        assert!(status.contains("Estimated cost"));
         assert!(status.contains("Cwd              /tmp/project"));
         assert!(status.contains("Project root     /tmp"));
         assert!(status.contains("Git branch       main"));
@@ -12292,6 +13246,46 @@ mod tests {
     }
 
     #[test]
+    fn workspace_health_warns_when_stale_base_diverged() {
+        let context = super::StatusContext {
+            cwd: PathBuf::from("/tmp/project"),
+            session_path: None,
+            loaded_config_files: 0,
+            discovered_config_files: 0,
+            memory_file_count: 0,
+            project_root: Some(PathBuf::from("/tmp/project")),
+            git_branch: Some("feature/stale-base".to_string()),
+            git_summary: GitWorkspaceSummary::default(),
+            branch_freshness: test_branch_freshness(),
+            stale_base_state: super::BaseCommitState::Diverged {
+                expected: "base".to_string(),
+                actual: "head".to_string(),
+            },
+            session_lifecycle: SessionLifecycleSummary {
+                kind: SessionLifecycleKind::SavedOnly,
+                pane_id: None,
+                pane_command: None,
+                pane_path: None,
+                workspace_dirty: false,
+                abandoned: false,
+            },
+            boot_preflight: test_boot_preflight(),
+            sandbox_status: runtime::SandboxStatus::default(),
+            config_load_error: None,
+        };
+
+        let check = super::check_workspace_health(&context);
+
+        assert_eq!(check.level, super::DiagnosticLevel::Warn);
+        assert_eq!(check.data["stale_base"]["status"], "diverged");
+        assert_eq!(check.data["stale_base"]["fresh"], false);
+        assert!(check
+            .details
+            .iter()
+            .any(|detail| detail.contains("stale codebase")));
+    }
+
+    #[test]
     fn status_json_surfaces_session_lifecycle_for_clawhip() {
         let context = super::StatusContext {
             cwd: PathBuf::from("/tmp/project"),
@@ -12302,6 +13296,8 @@ mod tests {
             project_root: Some(PathBuf::from("/tmp/project")),
             git_branch: Some("feature/session-lifecycle".to_string()),
             git_summary: GitWorkspaceSummary::default(),
+            branch_freshness: test_branch_freshness(),
+            stale_base_state: super::BaseCommitState::NoExpectedBase,
             session_lifecycle: SessionLifecycleSummary {
                 kind: SessionLifecycleKind::RunningProcess,
                 pane_id: Some("%9".to_string()),
@@ -12310,6 +13306,7 @@ mod tests {
                 workspace_dirty: false,
                 abandoned: false,
             },
+            boot_preflight: test_boot_preflight(),
             sandbox_status: runtime::SandboxStatus::default(),
             config_load_error: None,
         };
@@ -12338,6 +13335,67 @@ mod tests {
             "claw"
         );
         assert_eq!(value["workspace"]["session_lifecycle"]["abandoned"], false);
+        assert_eq!(value["workspace"]["branch_freshness"]["fresh"], true);
+        assert_eq!(
+            value["workspace"]["boot_preflight"]["repo"]["worktree_exists"],
+            true
+        );
+        assert_eq!(
+            value["workspace"]["boot_preflight"]["mcp_startup"]["eligible"],
+            true
+        );
+        assert_eq!(
+            value["workspace"]["boot_preflight"]["last_failed_boot_reason"],
+            serde_json::Value::Null
+        );
+    }
+
+    #[test]
+    fn branch_freshness_parses_ahead_behind_status_header() {
+        let freshness = super::BranchFreshness::from_git_status(Some(
+            "## feature/boot...origin/feature/boot [ahead 2, behind 3]\n M src/main.rs",
+        ));
+
+        assert_eq!(freshness.upstream.as_deref(), Some("origin/feature/boot"));
+        assert_eq!(freshness.ahead, 2);
+        assert_eq!(freshness.behind, 3);
+        assert_eq!(freshness.fresh, Some(false));
+    }
+
+    #[test]
+    fn boot_preflight_snapshot_reports_machine_readable_contract_fields() {
+        let _guard = env_lock();
+        let workspace = temp_workspace("boot-preflight-json");
+        fs::create_dir_all(&workspace).expect("workspace should create");
+        git(&["init", "--quiet"], &workspace);
+        git(&["config", "user.email", "tests@example.com"], &workspace);
+        git(&["config", "user.name", "Rusty Claude Tests"], &workspace);
+        fs::write(workspace.join("tracked.txt"), "hello\n").expect("write tracked");
+        fs::write(workspace.join(".claw.json"), r#"{"trustedRoots": ["."]}"#)
+            .expect("write config");
+        git(&["add", "tracked.txt"], &workspace);
+        git(&["commit", "-m", "init", "--quiet"], &workspace);
+
+        let loader = ConfigLoader::default_for(&workspace);
+        let config = loader.load().expect("config should load");
+        let status = super::run_git_capture_in(&workspace, &["status", "--short", "--branch"]);
+        let snapshot = super::build_boot_preflight_snapshot(
+            &workspace,
+            Some(&workspace),
+            status.as_deref(),
+            Some(&config),
+            None,
+        );
+        let json = snapshot.json_value();
+
+        assert_eq!(json["repo"]["exists"], true);
+        assert_eq!(json["repo"]["worktree_exists"], true);
+        assert_eq!(json["trust_gate"]["allowlisted"], true);
+        assert_eq!(json["mcp_startup"]["eligible"], true);
+        assert!(json["required_binaries"]
+            .as_array()
+            .is_some_and(|items| { items.iter().any(|item| item["name"] == "git") }));
+        fs::remove_dir_all(workspace).expect("cleanup temp dir");
     }
 
     #[test]
@@ -12697,6 +13755,68 @@ UU conflicted.rs",
     }
 
     #[test]
+    fn resumed_session_exists_and_delete_have_json_contracts() {
+        let _guard = cwd_guard();
+        let workspace = temp_workspace("resume-session-json-contracts");
+        std::fs::create_dir_all(&workspace).expect("workspace should create");
+        let previous = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&workspace).expect("switch cwd");
+
+        let active = create_managed_session_handle("session-active").expect("active handle");
+        let active_session = Session::new()
+            .with_workspace_root(workspace.clone())
+            .with_persistence_path(active.path.clone());
+        active_session
+            .save_to_path(&active.path)
+            .expect("active session should save");
+        let saved = create_managed_session_handle("session-saved").expect("saved handle");
+        Session::new()
+            .with_workspace_root(workspace.clone())
+            .with_persistence_path(saved.path.clone())
+            .save_to_path(&saved.path)
+            .expect("saved session should save");
+
+        let exists_command = SlashCommand::parse("/session exists session-saved")
+            .expect("parse should succeed")
+            .expect("command should exist");
+        let exists = run_resume_command(&active.path, &active_session, &exists_command)
+            .expect("exists should run")
+            .json
+            .expect("exists should return json");
+        assert_eq!(exists["kind"], "session_exists");
+        assert_eq!(exists["session_id"], "session-saved");
+        assert_eq!(exists["exists"], true);
+        assert_eq!(exists["active"], false);
+        assert!(exists["path"].as_str().is_some());
+
+        let missing_command = SlashCommand::parse("/session exists missing-session")
+            .expect("parse should succeed")
+            .expect("command should exist");
+        let missing = run_resume_command(&active.path, &active_session, &missing_command)
+            .expect("missing exists should run")
+            .json
+            .expect("missing exists should return json");
+        assert_eq!(missing["kind"], "session_exists");
+        assert_eq!(missing["exists"], false);
+        assert_eq!(missing["session_id"], "missing-session");
+        assert!(missing["candidate_path"].as_str().is_some());
+
+        let delete_command = SlashCommand::parse("/session delete session-saved --force")
+            .expect("parse should succeed")
+            .expect("command should exist");
+        let deleted = run_resume_command(&active.path, &active_session, &delete_command)
+            .expect("delete should run")
+            .json
+            .expect("delete should return json");
+        assert_eq!(deleted["kind"], "session_delete");
+        assert_eq!(deleted["deleted"], true);
+        assert!(!saved.path.exists(), "saved session should be deleted");
+
+        std::env::set_current_dir(previous).expect("restore cwd");
+        std::fs::remove_dir_all(workspace).expect("workspace should clean up");
+    }
+
+    #[test]
     fn latest_session_alias_resolves_most_recent_managed_session() {
         let _guard = cwd_guard();
         let workspace = temp_workspace("latest-session-alias");
@@ -12796,7 +13916,7 @@ UU conflicted.rs",
     fn resume_usage_mentions_latest_shortcut() {
         let usage = render_resume_usage();
         assert!(usage.contains("/resume <session-path|session-id|latest>"));
-        assert!(usage.contains(".claw/sessions/<session-id>.jsonl"));
+        assert!(usage.contains(".claw/sessions/<workspace-fingerprint>/<session-id>.jsonl"));
         assert!(usage.contains("/session list"));
     }
 

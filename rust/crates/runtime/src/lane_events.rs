@@ -449,18 +449,21 @@ pub fn compute_event_fingerprint(
     status: &LaneEventStatus,
     data: Option<&serde_json::Value>,
 ) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
+    use sha2::{Digest, Sha256};
 
-    let mut hasher = DefaultHasher::new();
-    format!("{event:?}").hash(&mut hasher);
-    format!("{status:?}").hash(&mut hasher);
-    if let Some(d) = data {
-        serde_json::to_string(d)
-            .unwrap_or_default()
-            .hash(&mut hasher);
+    let payload = serde_json::json!({
+        "event": event,
+        "status": status,
+        "data": data,
+    });
+    let canonical = serde_json::to_vec(&payload).unwrap_or_default();
+    let digest = Sha256::digest(canonical);
+    let mut fingerprint = String::with_capacity(16);
+    for byte in &digest[..8] {
+        use std::fmt::Write as _;
+        write!(&mut fingerprint, "{byte:02x}").expect("writing to String should not fail");
     }
-    format!("{:016x}", hasher.finish())
+    fingerprint
 }
 
 /// Classification of event terminality for reconciliation.
@@ -1045,6 +1048,7 @@ impl LaneEvent {
             emitted_at,
         )
         .with_optional_detail(detail)
+        .with_terminal_fingerprint()
     }
 
     #[must_use]
@@ -1098,7 +1102,7 @@ impl LaneEvent {
             event =
                 event.with_data(serde_json::to_value(subphase).expect("subphase should serialize"));
         }
-        event
+        event.with_terminal_fingerprint()
     }
 
     /// Ship prepared — §4.44.5
@@ -1170,6 +1174,21 @@ impl LaneEvent {
     #[must_use]
     pub fn with_data(mut self, data: Value) -> Self {
         self.data = Some(data);
+        if is_terminal_event(self.event) {
+            self = self.with_terminal_fingerprint();
+        }
+        self
+    }
+
+    #[must_use]
+    fn with_terminal_fingerprint(mut self) -> Self {
+        if is_terminal_event(self.event) {
+            self.metadata.event_fingerprint = Some(compute_event_fingerprint(
+                &self.event,
+                &self.status,
+                self.data.as_ref(),
+            ));
+        }
         self
     }
 }
@@ -1373,6 +1392,39 @@ mod tests {
         let round_trip: LaneEvent =
             serde_json::from_value(pushed_json).expect("ship event should deserialize");
         assert_eq!(round_trip.event, LaneEventName::ShipPushedMain);
+    }
+
+    #[test]
+    fn convenience_terminal_events_attach_and_refresh_fingerprints() {
+        let finished = LaneEvent::finished("2026-04-04T00:00:00Z", Some("done".to_string()));
+        let initial_fingerprint = finished
+            .metadata
+            .event_fingerprint
+            .clone()
+            .expect("finished events should carry terminal fingerprint");
+
+        let with_payload = finished.with_data(json!({"result": "ok", "attempt": 1}));
+        assert!(with_payload.metadata.event_fingerprint.is_some());
+        assert_ne!(
+            Some(initial_fingerprint),
+            with_payload.metadata.event_fingerprint,
+            "payload changes must refresh the actionable terminal fingerprint"
+        );
+    }
+
+    #[test]
+    fn tool_style_finished_events_dedupe_after_payload_is_added() {
+        let first = LaneEvent::finished("2026-04-04T00:00:00Z", Some("done".to_string()))
+            .with_data(json!({"result": "ok"}));
+        let duplicate = LaneEvent::finished("2026-04-04T00:00:01Z", Some("done again".to_string()))
+            .with_data(json!({"result": "ok"}));
+
+        assert_eq!(
+            first.metadata.event_fingerprint,
+            duplicate.metadata.event_fingerprint
+        );
+        let deduped = dedupe_terminal_events(&[first, duplicate]);
+        assert_eq!(deduped.len(), 1);
     }
 
     #[test]

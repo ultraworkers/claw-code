@@ -31,7 +31,7 @@ cd rust
 cargo build --workspace
 ```
 
-The CLI binary is available at `rust/target/debug/claw` after a debug build. Make the doctor check above your first post-build step.
+The CLI binary is available at `rust/target/debug/claw` after a debug build (`rust\target\debug\claw.exe` on Windows). Make the doctor check above your first post-build step. For PowerShell-first install, release ZIP, PATH, provider-switching, and Windows/WSL notification examples, see [`docs/windows-install-release.md`](./docs/windows-install-release.md).
 
 ## Quick start
 
@@ -230,9 +230,37 @@ export ANTHROPIC_AUTH_TOKEN="anthropic-oauth-or-proxy-bearer-token"
 
 **If you meant a different provider:** if `claw` reports missing Anthropic credentials but you already have `OPENAI_API_KEY`, `XAI_API_KEY`, or `DASHSCOPE_API_KEY` exported, you most likely forgot to prefix the model name with the provider's routing prefix. Use `--model openai/gpt-4.1-mini` (OpenAI-compat / OpenRouter / Ollama), `--model grok` (xAI), or `--model qwen-plus` (DashScope) and the prefix router will select the right backend regardless of the ambient credentials. The error message now includes a hint that names the detected env var.
 
+
+### Windows PowerShell provider switching
+
+The same provider rules work in PowerShell. Use placeholder values in docs and tests; put real keys only in your private environment. Remove unrelated provider env vars when validating a switch so failures are easy to diagnose.
+
+`CLAUDE_CODE_PROVIDER` is not required for normal Claw routing; prefer explicit model prefixes such as `openai/` and provider-specific env vars so PowerShell examples stay portable.
+
+```powershell
+# Anthropic direct
+$env:ANTHROPIC_API_KEY = "sk-ant-REPLACE_ME"
+Remove-Item Env:\OPENAI_BASE_URL -ErrorAction SilentlyContinue
+Remove-Item Env:\OPENAI_API_KEY -ErrorAction SilentlyContinue
+.\target\debug\claw.exe --model "sonnet" prompt "reply with ready"
+
+# OpenAI-compatible gateway / OpenRouter
+Remove-Item Env:\ANTHROPIC_API_KEY -ErrorAction SilentlyContinue
+$env:OPENAI_BASE_URL = "https://openrouter.ai/api/v1"
+$env:OPENAI_API_KEY = "sk-or-v1-REPLACE_ME"
+.\target\debug\claw.exe --model "openai/gpt-4.1-mini" prompt "reply with ready"
+
+# Local OpenAI-compatible server
+$env:OPENAI_BASE_URL = "http://127.0.0.1:11434/v1"
+Remove-Item Env:\OPENAI_API_KEY -ErrorAction SilentlyContinue
+.\target\debug\claw.exe --model "llama3.2" prompt "reply with ready"
+```
+
+See the full [Windows install and release quickstart](./docs/windows-install-release.md) for release artifact setup, persistent `setx` usage, and WSL notes.
+
 ## Local Models
 
-`claw` can talk to local servers and provider gateways through either Anthropic-compatible or OpenAI-compatible endpoints. Use `ANTHROPIC_BASE_URL` with `ANTHROPIC_AUTH_TOKEN` for Anthropic-compatible services, or `OPENAI_BASE_URL` with `OPENAI_API_KEY` for OpenAI-compatible services.
+`claw` can talk to local servers and provider gateways through either Anthropic-compatible or OpenAI-compatible endpoints. Use `ANTHROPIC_BASE_URL` with `ANTHROPIC_AUTH_TOKEN` for Anthropic-compatible services, or `OPENAI_BASE_URL` with `OPENAI_API_KEY` for OpenAI-compatible services. For copyable Ollama, llama.cpp, vLLM, raw `/v1/chat/completions`, and local skills install examples, see [`docs/local-openai-compatible-providers.md`](./docs/local-openai-compatible-providers.md).
 
 ### Anthropic-compatible endpoint
 
@@ -306,7 +334,7 @@ Reasoning variants (`qwen-qwq-*`, `qwq-*`, `*-thinking`) automatically strip `te
 
 The OpenAI-compatible backend also serves as the gateway for **OpenRouter**, **Ollama**, and any other service that speaks the OpenAI `/v1/chat/completions` wire format — just point `OPENAI_BASE_URL` at the service.
 
-**Model-name prefix routing:** If a model name starts with `openai/`, `gpt-`, `qwen/`, or `qwen-`, the provider is selected by the prefix regardless of which env vars are set. This prevents accidental misrouting to Anthropic when multiple credentials exist in the environment.
+**Model-name prefix routing:** If a model name starts with `openai/`, `gpt-`, `qwen/`, `qwen-`, `kimi/`, or `kimi-`, the provider is selected by the prefix regardless of which env vars are set. This prevents accidental misrouting to Anthropic when multiple credentials exist in the environment. For the default OpenAI API, `openai/` is a routing prefix and is stripped before the request hits the wire. For a custom `OPENAI_BASE_URL`, slash-containing OpenAI-compatible slugs (for example OpenRouter-style `openai/gpt-4.1-mini`) are preserved so the gateway receives the model ID it expects.
 
 ### Tested models and aliases
 
@@ -320,8 +348,11 @@ These are the models registered in the built-in alias table with known token lim
 | `grok` / `grok-3` | `grok-3` | xAI | 64 000 | 131 072 |
 | `grok-mini` / `grok-3-mini` | `grok-3-mini` | xAI | 64 000 | 131 072 |
 | `grok-2` | `grok-2` | xAI | — | — |
+| `kimi` | `kimi-k2.5` | DashScope | 16 384 | 256 000 |
+| `gpt-4.1` / `gpt-4.1-mini` / `gpt-4.1-nano` | same | OpenAI-compatible | 32 768 | 1 047 576 |
+| `gpt-5.4` / `gpt-5.4-mini` / `gpt-5.4-nano` | same | OpenAI-compatible | 128 000 | 1 000 000 / 400 000 |
 
-Any model name that does not match an alias is passed through verbatim. This is how you use OpenRouter model slugs (`openai/gpt-4.1-mini`), Ollama tags (`llama3.2`), or full Anthropic model IDs (`claude-sonnet-4-20250514`).
+Any model name that does not match an alias is passed through verbatim after provider routing is resolved. This is how you use OpenRouter model slugs (`openai/gpt-4.1-mini` with a custom `OPENAI_BASE_URL`), Ollama tags (`llama3.2`), or full Anthropic model IDs (`claude-sonnet-4-20250514`).
 
 ### User-defined aliases
 
@@ -343,10 +374,28 @@ Local project settings override user-level settings. Aliases resolve through the
 
 1. If the resolved model name starts with `claude` → Anthropic.
 2. If it starts with `grok` → xAI.
-3. Otherwise, `claw` checks which credential is set: `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN` first, then `OPENAI_API_KEY`, then `XAI_API_KEY`.
-4. If nothing matches, it defaults to Anthropic.
+3. If it starts with `openai/` or `gpt-` → OpenAI-compatible.
+4. If it starts with `qwen/`, `qwen-`, `kimi/`, or `kimi-` → DashScope-compatible OpenAI wire format.
+5. If `OPENAI_BASE_URL` and `OPENAI_API_KEY` are set, unknown model names route to the OpenAI-compatible client for local/gateway servers.
+6. Otherwise, `claw` checks which credential is set: Anthropic first, then OpenAI, then xAI. If only `OPENAI_BASE_URL` is set, it still routes to OpenAI-compatible for authless local servers.
+7. If nothing matches, it defaults to Anthropic.
+
+
+### Provider diagnostics and custom OpenAI-compatible parameters
+
+The API layer exposes a provider diagnostics snapshot via `api::provider_diagnostics_for_model(model)`. It reports the resolved provider, auth/base-url environment variables, default base URL, whether the provider uses the OpenAI-compatible wire format, whether reasoning tuning parameters are stripped, whether DeepSeek V4 reasoning history is preserved, proxy support, extra-body support, and whether slash-containing model IDs are preserved for custom OpenAI-compatible gateways.
+
+For gateway features that are not first-class request fields yet, `MessageRequest::extra_body` passes through provider-specific JSON parameters such as `web_search_options` or `parallel_tool_calls`. Core protocol fields (`model`, `messages`, `stream`, `tools`, `tool_choice`, `max_tokens`, and `max_completion_tokens`) are protected and cannot be overridden through `extra_body`.
+
+## File context and navigation
+
+Use `@path/to/file` in prompts to submit repository files as context, for example `Read @src/app.ts and explain the bug`, `Compare @old.md and @new.md`, or `Use @logs/error.txt as context and suggest a fix`. Prompt history, `Ctrl-r`, and long-output scrolling come from your shell, terminal, or tmux rather than from Claw itself. See [`docs/navigation-file-context.md`](./docs/navigation-file-context.md) for scrollback, attachment, and secret-redaction guidance.
 
 ## FAQ
+
+### Is Claw Code Claude-only?
+
+No. Claw Code is a Claude-Code-shaped workflow/runtime, not a Claude-only product. It can target Anthropic and OpenAI-compatible/provider-routed/local models depending on config. Non-Claude providers may require stricter response-shape and tool-call compatibility, so some workflows can be rougher than first-party Anthropic/OpenAI paths; provider-specific identity leaks are bugs, not product intent. See [`docs/local-openai-compatible-providers.md`](./docs/local-openai-compatible-providers.md) for local provider examples.
 
 ### What about Codex?
 
@@ -400,6 +449,18 @@ let client = build_http_client_with(&config).expect("proxy client");
 - `NO_PROXY` accepts a comma-separated list of host suffixes (for example `.corp.example`) and IP literals.
 - Empty values are treated as unset, so leaving `HTTPS_PROXY=""` in your shell will not enable a proxy.
 - If a proxy URL cannot be parsed, `claw` falls back to a direct (no-proxy) client so existing workflows keep working; double-check the URL if you expected the request to be tunnelled.
+
+## Skills
+
+Use `/skills list` in the interactive REPL or `claw skills --output-format json` from the direct CLI to inspect installed skills. For offline/local installs, install the directory that contains `SKILL.md`, then verify the discovered name before invoking it:
+
+```text
+/skills install /absolute/path/to/my-skill
+/skills list
+/skills my-skill
+```
+
+If install succeeds but invocation fails with a provider HTTP error, treat provider setup separately: run `claw doctor` and a one-shot prompt smoke test before reinstalling the skill. See [`docs/local-openai-compatible-providers.md`](./docs/local-openai-compatible-providers.md#local-skills-install-from-disk) for the full checklist.
 
 ## Common operational commands
 

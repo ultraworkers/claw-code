@@ -92,17 +92,53 @@ fn status_and_sandbox_emit_json_when_requested() {
 }
 
 #[test]
+fn status_json_surfaces_permission_mode_override_for_security_audit() {
+    let root = unique_temp_dir("status-json-permission-mode");
+    fs::create_dir_all(&root).expect("temp dir should exist");
+
+    let parsed = assert_json_command(
+        &root,
+        &[
+            "--permission-mode",
+            "read-only",
+            "--output-format",
+            "json",
+            "status",
+        ],
+    );
+
+    assert_eq!(parsed["kind"], "status");
+    assert_eq!(parsed["permission_mode"], "read-only");
+    assert!(
+        parsed["workspace"]["cwd"].as_str().is_some(),
+        "status JSON should retain workspace context with permission mode"
+    );
+
+    fs::remove_dir_all(root).expect("cleanup temp dir");
+}
+
+#[test]
 fn acp_guidance_emits_json_when_requested() {
     let root = unique_temp_dir("acp-json");
     fs::create_dir_all(&root).expect("temp dir should exist");
 
     let acp = assert_json_command(&root, &["--output-format", "json", "acp"]);
     assert_eq!(acp["kind"], "acp");
-    assert_eq!(acp["status"], "discoverability_only");
+    assert_eq!(acp["schema_version"], "1.0");
+    assert_eq!(acp["status"], "unsupported");
+    assert_eq!(acp["phase"], "discoverability_only");
     assert_eq!(acp["supported"], false);
+    assert_eq!(acp["exit_code"], 0);
     assert_eq!(acp["serve_alias_only"], true);
+    assert_eq!(acp["protocol"]["json_rpc"], false);
+    assert_eq!(acp["protocol"]["daemon"], false);
+    assert!(acp["protocol"]["endpoint"].is_null());
+    assert_eq!(
+        acp["contracts"]["unsupported_invocation_kind"],
+        "unsupported_acp_invocation"
+    );
     assert_eq!(acp["discoverability_tracking"], "ROADMAP #64a");
-    assert_eq!(acp["tracking"], "ROADMAP #76");
+    assert_eq!(acp["tracking"], "ROADMAP #76 / #3033 / #3004");
     assert!(acp["message"]
         .as_str()
         .expect("acp message")
@@ -146,6 +182,8 @@ fn inventory_commands_emit_structured_json_when_requested() {
     let mcp = assert_json_command(&root, &["--output-format", "json", "mcp"]);
     assert_eq!(mcp["kind"], "mcp");
     assert_eq!(mcp["action"], "list");
+    assert_eq!(mcp["status"], "ok");
+    assert!(mcp["config_load_error"].is_null());
 
     let skills = assert_json_command(&root, &["--output-format", "json", "skills"]);
     assert_eq!(skills["kind"], "skills");
@@ -154,6 +192,8 @@ fn inventory_commands_emit_structured_json_when_requested() {
     let plugins = assert_json_command(&root, &["--output-format", "json", "plugins"]);
     assert_eq!(plugins["kind"], "plugin");
     assert_eq!(plugins["action"], "list");
+    assert_eq!(plugins["status"], "ok");
+    assert!(plugins["config_load_error"].is_null());
     assert!(
         plugins["reload_runtime"].is_boolean(),
         "plugins reload_runtime should be a boolean"
@@ -162,6 +202,98 @@ fn inventory_commands_emit_structured_json_when_requested() {
         plugins["target"].is_null(),
         "plugins target should be null when no plugin is targeted"
     );
+    assert_eq!(plugins["status"], "ok");
+    let plugin_entries = plugins["plugins"].as_array().expect("plugins array");
+    for plugin in plugin_entries {
+        assert!(
+            plugin["lifecycle_state"].is_string(),
+            "plugin entries should expose lifecycle_state"
+        );
+        assert!(
+            plugin["lifecycle"]["configured"].is_boolean(),
+            "plugin entries should expose lifecycle contract summary"
+        );
+    }
+    assert!(plugins["load_failures"]
+        .as_array()
+        .expect("plugin load failures array")
+        .is_empty());
+}
+
+#[test]
+fn plugins_json_surfaces_lifecycle_contract_when_plugin_is_installed() {
+    let root = unique_temp_dir("plugin-lifecycle-json");
+    let workspace = root.join("workspace");
+    let home = root.join("home");
+    let config_home = root.join("config-home");
+    let plugin_root = root.join("source-plugin");
+    fs::create_dir_all(&workspace).expect("workspace should exist");
+    fs::create_dir_all(plugin_root.join(".claude-plugin")).expect("manifest dir should exist");
+    fs::create_dir_all(plugin_root.join("lifecycle")).expect("lifecycle dir should exist");
+    fs::write(
+        plugin_root.join("lifecycle").join("init.sh"),
+        "#!/bin/sh\nexit 0\n",
+    )
+    .expect("init lifecycle script should write");
+    fs::write(
+        plugin_root.join("lifecycle").join("shutdown.sh"),
+        "#!/bin/sh\nexit 0\n",
+    )
+    .expect("shutdown lifecycle script should write");
+    fs::write(
+        plugin_root.join(".claude-plugin").join("plugin.json"),
+        r#"{
+  "name": "lifecycle-json",
+  "version": "1.0.0",
+  "description": "lifecycle JSON fixture",
+  "lifecycle": {
+    "Init": ["./lifecycle/init.sh"],
+    "Shutdown": ["./lifecycle/shutdown.sh"]
+  }
+}"#,
+    )
+    .expect("plugin manifest should write");
+
+    let parsed = assert_json_command_with_env(
+        &workspace,
+        &[
+            "--output-format",
+            "json",
+            "plugins",
+            "install",
+            plugin_root
+                .to_str()
+                .expect("plugin source path should be utf8"),
+        ],
+        &[
+            ("HOME", home.to_str().expect("home path should be utf8")),
+            (
+                "CLAW_CONFIG_HOME",
+                config_home.to_str().expect("config path should be utf8"),
+            ),
+        ],
+    );
+
+    assert_eq!(parsed["kind"], "plugin");
+    assert_eq!(parsed["action"], "install");
+    assert_eq!(parsed["status"], "ok");
+    assert_eq!(parsed["reload_runtime"], true);
+    assert!(parsed["load_failures"]
+        .as_array()
+        .expect("load_failures array")
+        .is_empty());
+    let plugins = parsed["plugins"].as_array().expect("plugins array");
+    let plugin = plugins
+        .iter()
+        .find(|plugin| plugin["id"] == "lifecycle-json@external")
+        .expect("installed plugin should be present");
+    assert_eq!(plugin["enabled"], true);
+    assert_eq!(plugin["lifecycle_state"], "ready");
+    assert_eq!(plugin["lifecycle"]["configured"], true);
+    assert_eq!(plugin["lifecycle"]["init"]["configured"], true);
+    assert_eq!(plugin["lifecycle"]["init"]["command_count"], 1);
+    assert_eq!(plugin["lifecycle"]["shutdown"]["configured"], true);
+    assert_eq!(plugin["lifecycle"]["shutdown"]["command_count"], 1);
 }
 
 #[test]
@@ -277,6 +409,10 @@ fn doctor_and_resume_status_emit_json_when_requested() {
 
     let doctor = assert_json_command(&root, &["--output-format", "json", "doctor"]);
     assert_eq!(doctor["kind"], "doctor");
+    assert!(
+        matches!(doctor["status"].as_str(), Some("ok" | "warn")),
+        "doctor may warn on platforms without namespace sandbox/tmux support: {doctor}"
+    );
     assert!(doctor["message"].is_string());
     let summary = doctor["summary"].as_object().expect("doctor summary");
     assert!(summary["ok"].as_u64().is_some());
@@ -284,7 +420,7 @@ fn doctor_and_resume_status_emit_json_when_requested() {
     assert!(summary["failures"].as_u64().is_some());
 
     let checks = doctor["checks"].as_array().expect("doctor checks");
-    assert_eq!(checks.len(), 6);
+    assert_eq!(checks.len(), 7);
     let check_names = checks
         .iter()
         .map(|check| {
@@ -301,6 +437,7 @@ fn doctor_and_resume_status_emit_json_when_requested() {
             "config",
             "install source",
             "workspace",
+            "boot preflight",
             "sandbox",
             "system"
         ]
@@ -325,6 +462,14 @@ fn doctor_and_resume_status_emit_json_when_requested() {
         .expect("workspace check");
     assert!(workspace["cwd"].as_str().is_some());
     assert!(workspace["in_git_repo"].is_boolean());
+
+    let boot_preflight = checks
+        .iter()
+        .find(|check| check["name"] == "boot preflight")
+        .expect("boot preflight check");
+    assert!(boot_preflight["boot_preflight"]["repo"]["exists"].is_boolean());
+    assert!(boot_preflight["boot_preflight"]["mcp_startup"]["eligible"].is_boolean());
+    assert!(boot_preflight["boot_preflight"]["required_binaries"].is_array());
 
     let sandbox = checks
         .iter()
@@ -453,6 +598,8 @@ fn resumed_inventory_commands_emit_structured_json_when_requested() {
     );
     assert_eq!(plugins["kind"], "plugin");
     assert_eq!(plugins["action"], "list");
+    assert_eq!(plugins["status"], "ok");
+    assert!(plugins["config_load_error"].is_null());
     assert!(
         plugins["reload_runtime"].is_boolean(),
         "plugins reload_runtime should be a boolean"
@@ -533,6 +680,141 @@ fn config_section_json_emits_section_and_value() {
     assert_eq!(bad["ok"], false);
     assert!(bad["error"].as_str().is_some());
     assert!(bad["section"].as_str().is_some());
+}
+
+#[test]
+fn mcp_json_reports_required_optional_and_redacts_secret_values() {
+    let root = unique_temp_dir("mcp-required-optional");
+    let config_home = root.join("config-home");
+    let home = root.join("home");
+    fs::create_dir_all(root.join(".claw")).expect("workspace config should exist");
+    fs::create_dir_all(&config_home).expect("config home should exist");
+    fs::create_dir_all(&home).expect("home should exist");
+    fs::write(
+        root.join(".claw").join("settings.json"),
+        r#"{
+          "mcpServers": {
+            "required-stdio": {
+              "command": "python3",
+              "args": ["-c", "print('ready')"],
+              "env": {"TOKEN": "secret-token-value"},
+              "required": true
+            },
+            "optional-remote": {
+              "type": "http",
+              "url": "https://example.test/mcp",
+              "headers": {
+                "Authorization": "Bearer secret-header-value",
+                "X-Trace": "visible-key-only"
+              },
+              "required": false
+            }
+          }
+        }"#,
+    )
+    .expect("mcp config should write");
+
+    let envs = [
+        (
+            "CLAW_CONFIG_HOME",
+            config_home.to_str().expect("config home"),
+        ),
+        ("HOME", home.to_str().expect("home")),
+    ];
+    let list = assert_json_command_with_env(&root, &["--output-format", "json", "mcp"], &envs);
+
+    assert_eq!(list["kind"], "mcp");
+    assert_eq!(list["action"], "list");
+    assert_eq!(list["status"], "ok");
+    assert_eq!(list["configured_servers"], 2);
+    let servers = list["servers"].as_array().expect("servers array");
+    let required = servers
+        .iter()
+        .find(|server| server["name"] == "required-stdio")
+        .expect("required stdio server should be listed");
+    let optional = servers
+        .iter()
+        .find(|server| server["name"] == "optional-remote")
+        .expect("optional remote server should be listed");
+    assert_eq!(required["required"], true);
+    assert_eq!(optional["required"], false);
+    assert_eq!(required["details"]["env_keys"][0], "TOKEN");
+    assert_eq!(optional["details"]["header_keys"][0], "Authorization");
+    assert_eq!(optional["details"]["header_keys"][1], "X-Trace");
+
+    let list_text = serde_json::to_string(&list).expect("mcp list json should serialize");
+    assert!(!list_text.contains("secret-token-value"));
+    assert!(!list_text.contains("secret-header-value"));
+    assert!(!list_text.contains("visible-key-only"));
+
+    let show = assert_json_command_with_env(
+        &root,
+        &["--output-format", "json", "mcp", "show", "optional-remote"],
+        &envs,
+    );
+    assert_eq!(show["action"], "show");
+    assert_eq!(show["status"], "ok");
+    assert_eq!(show["server"]["required"], false);
+    assert_eq!(show["server"]["details"]["header_keys"][0], "Authorization");
+    let show_text = serde_json::to_string(&show).expect("mcp show json should serialize");
+    assert!(!show_text.contains("secret-header-value"));
+    assert!(!show_text.contains("visible-key-only"));
+}
+
+#[test]
+fn mcp_degraded_config_and_failed_usage_are_distinct_json_contracts() {
+    let root = unique_temp_dir("mcp-degraded-vs-failed");
+    let config_home = root.join("config-home");
+    let home = root.join("home");
+    fs::create_dir_all(&root).expect("workspace should exist");
+    fs::create_dir_all(&config_home).expect("config home should exist");
+    fs::create_dir_all(&home).expect("home should exist");
+    fs::write(
+        root.join(".claw.json"),
+        r#"{
+          "mcpServers": {
+            "missing-command": {
+              "args": ["arg-only-no-command"],
+              "required": true
+            }
+          }
+        }"#,
+    )
+    .expect("malformed mcp config should write");
+    let envs = [
+        (
+            "CLAW_CONFIG_HOME",
+            config_home.to_str().expect("config home"),
+        ),
+        ("HOME", home.to_str().expect("home")),
+    ];
+
+    let degraded = assert_json_command_with_env(&root, &["--output-format", "json", "mcp"], &envs);
+    assert_eq!(degraded["kind"], "mcp");
+    assert_eq!(degraded["action"], "list");
+    assert_eq!(degraded["status"], "degraded");
+    assert!(degraded["config_load_error"]
+        .as_str()
+        .is_some_and(|error| error.contains("mcpServers.missing-command")));
+    assert_eq!(degraded["configured_servers"], 0);
+    assert!(degraded["servers"].as_array().expect("servers").is_empty());
+
+    let failed_output = run_claw(
+        &root,
+        &["--output-format", "json", "mcp", "list", "extra"],
+        &envs,
+    );
+    assert!(
+        !failed_output.status.success(),
+        "unsupported MCP action should exit non-zero"
+    );
+    let failed: Value =
+        serde_json::from_slice(&failed_output.stdout).expect("failed stdout should be json");
+    assert_eq!(failed["kind"], "mcp");
+    assert_eq!(failed["action"], "error");
+    assert_eq!(failed["ok"], false);
+    assert_eq!(failed["error_kind"], "unsupported_action");
+    assert!(failed.get("config_load_error").is_none());
 }
 
 fn assert_json_command(current_dir: &Path, args: &[&str]) -> Value {
