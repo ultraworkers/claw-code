@@ -939,7 +939,7 @@ fn wire_model_for_base_url<'a>(
         return Cow::Borrowed(&model[pos + 1..]);
     }
 
-    if matches!(lowered_prefix.as_str(), "xai" | "grok" | "qwen" | "kimi") {
+    if matches!(lowered_prefix.as_str(), "local" | "xai" | "grok" | "qwen" | "kimi") {
         return Cow::Borrowed(&model[pos + 1..]);
     }
 
