@@ -609,7 +609,15 @@ impl MarkdownStreamState {
         let split = find_stream_safe_boundary(&self.pending)?;
         let ready = self.pending[..split].to_string();
         self.pending.drain(..split);
-        Some(renderer.markdown_to_ansi(&ready))
+        let rendered = renderer.markdown_to_ansi(&ready);
+        // markdown_to_ansi strips trailing newlines via trim_end(); restore them
+        // so consecutive streamed chunks are separated in the terminal output.
+        let trailing = if ready.ends_with("\n\n") { "\n\n" } else { "\n" };
+        Some(if rendered.ends_with('\n') {
+            rendered
+        } else {
+            rendered + trailing
+        })
     }
 
     #[must_use]
