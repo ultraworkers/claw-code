@@ -1,1 +1,0 @@
-{"messages":[{"blocks":[{"text":"What is 2+2? Reply with just the number.","type":"text"}],"role":"user"},{"blocks":[{"text":"4","type":"text"}],"role":"assistant","usage":{"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"input_tokens":19,"output_tokens":5}}],"version":1}
