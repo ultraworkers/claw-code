@@ -58,16 +58,16 @@ class WorkspacePathScopeTests(unittest.TestCase):
             outside = root / 'outside'
             workspace.mkdir()
             outside.mkdir()
-            previous = os.environ.get('CLAW_SCOPE_OUTSIDE')
-            os.environ['CLAW_SCOPE_OUTSIDE'] = str(outside)
+            previous = os.environ.get('BREWCODE_SCOPE_OUTSIDE')
+            os.environ['BREWCODE_SCOPE_OUTSIDE'] = str(outside)
             try:
-                self.assertEqual((f'{outside}/secret.txt',), extract_path_candidates('cat $CLAW_SCOPE_OUTSIDE/secret.txt'))
-                decision = WorkspacePathScope.from_root(workspace).validate_payload('cat $CLAW_SCOPE_OUTSIDE/secret.txt')
+                self.assertEqual((f'{outside}/secret.txt',), extract_path_candidates('cat $BREWCODE_SCOPE_OUTSIDE/secret.txt'))
+                decision = WorkspacePathScope.from_root(workspace).validate_payload('cat $BREWCODE_SCOPE_OUTSIDE/secret.txt')
             finally:
                 if previous is None:
-                    os.environ.pop('CLAW_SCOPE_OUTSIDE', None)
+                    os.environ.pop('BREWCODE_SCOPE_OUTSIDE', None)
                 else:
-                    os.environ['CLAW_SCOPE_OUTSIDE'] = previous
+                    os.environ['BREWCODE_SCOPE_OUTSIDE'] = previous
 
             self.assertFalse(decision.allowed)
             self.assertIn(str(outside.resolve()), decision.resolved or '')

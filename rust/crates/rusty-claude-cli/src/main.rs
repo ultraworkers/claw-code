@@ -60,8 +60,8 @@ use tools::{
 
 const DEFAULT_MODEL: &str = "claude-opus-4-6";
 
-/// #148: Model provenance for `claw status` JSON/text output. Records where
-/// the resolved model string came from so claws don't have to re-read argv
+/// #148: Model provenance for `brewcode status` JSON/text output. Records where
+/// the resolved model string came from so brewcodes don't have to re-read argv
 /// to audit whether their `--model` flag was honored vs falling back to env
 /// or config or default.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,7 +70,7 @@ enum ModelSource {
     Flag,
     /// ANTHROPIC_MODEL environment variable (when no flag was passed).
     Env,
-    /// `model` key in `.claw.json` / `.claw/settings.json` (when neither
+    /// `model` key in `.brewcode.json` / `.brewcode/settings.json` (when neither
     /// flag nor env set it).
     Config,
     /// Compiled-in DEFAULT_MODEL fallback.
@@ -168,7 +168,7 @@ const PRIMARY_SESSION_EXTENSION: &str = "jsonl";
 const LEGACY_SESSION_EXTENSION: &str = "json";
 const OFFICIAL_REPO_URL: &str = "https://github.com/ultraworkers/claw-code";
 const OFFICIAL_REPO_SLUG: &str = "ultraworkers/claw-code";
-const DEPRECATED_INSTALL_COMMAND: &str = "cargo install claw-code";
+const DEPRECATED_INSTALL_COMMAND: &str = "cargo install brew-code";
 const LATEST_SESSION_REFERENCE: &str = "latest";
 const SESSION_REFERENCE_ALIASES: &[&str] = &[LATEST_SESSION_REFERENCE, "last", "recent"];
 const CLI_OPTION_SUGGESTIONS: &[&str] = &[
@@ -208,7 +208,7 @@ fn main() {
             .any(|w| w[0] == "--output-format" && w[1] == "json")
             || argv.iter().any(|a| a == "--output-format=json");
         if json_output {
-            // #77: classify error by prefix so downstream claws can route without
+            // #77: classify error by prefix so downstream brewcodes can route without
             // regex-scraping the prose. Split short-reason from hint-runbook.
             let kind = classify_error_kind(&message);
             let (short_reason, hint) = split_error_hint(&message);
@@ -226,7 +226,7 @@ fn main() {
             // #156: Add machine-readable error kind to text output so stderr observers
             // don't need to regex-scrape the prose.
             let kind = classify_error_kind(&message);
-            if message.contains("`claw --help`") {
+            if message.contains("`brewcode --help`") {
                 eprintln!(
                     "[error-kind: {kind}]
 error: {message}"
@@ -236,7 +236,7 @@ error: {message}"
                     "[error-kind: {kind}]
 error: {message}
 
-Run `claw --help` for usage."
+Run `brewcode --help` for usage."
                 );
             }
         }
@@ -604,7 +604,7 @@ enum CliAction {
     Init {
         output_format: CliOutputFormat,
     },
-    // #146: `claw config` and `claw diff` are pure-local read-only
+    // #146: `brewcode config` and `brewcode diff` are pure-local read-only
     // introspection commands; wire them as standalone CLI subcommands.
     Config {
         section: Option<String>,
@@ -643,7 +643,7 @@ enum LocalHelpTopic {
     Doctor,
     Acp,
     // #141: extend the local-help pattern to every subcommand so
-    // `claw <subcommand> --help` has one consistent contract.
+    // `brewcode <subcommand> --help` has one consistent contract.
     Init,
     State,
     Export,
@@ -700,7 +700,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                     && matches!(rest[0].as_str(), "prompt" | "commit" | "pr" | "issue") =>
             {
                 // `--help` following a subcommand that would otherwise forward
-                // the arg to the API (e.g. `claw prompt --help`) should show
+                // the arg to the API (e.g. `brewcode prompt --help`) should show
                 // top-level help instead. Subcommands that consume their own
                 // args (agents, mcp, plugins, skills) and local help-topic
                 // subcommands (status, sandbox, doctor, init, state, export,
@@ -798,7 +798,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 index += 1;
             }
             "-p" => {
-                // Claw Code compat: -p "prompt" = one-shot prompt
+                // Brew Code compat: -p "prompt" = one-shot prompt
                 let prompt = args[index + 1..].join(" ");
                 if prompt.trim().is_empty() {
                     return Err("-p requires a prompt string".to_string());
@@ -817,7 +817,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 });
             }
             "--print" => {
-                // Claw Code compat: --print makes output non-interactive
+                // Brew Code compat: --print makes output non-interactive
                 output_format = CliOutputFormat::Text;
                 index += 1;
             }
@@ -933,8 +933,8 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             output_format,
         }),
         // #145: `plugins` was routed through the prompt fallback because no
-        // top-level parser arm produced CliAction::Plugins. That made `claw
-        // plugins` (and `claw plugins --help`, `claw plugins list`, ...)
+        // top-level parser arm produced CliAction::Plugins. That made `brewcode
+        // plugins` (and `brewcode plugins --help`, `brewcode plugins list`, ...)
         // attempt an Anthropic network call, surfacing the misleading error
         // `missing Anthropic credentials` even though the command is purely
         // local introspection. Mirror `agents`/`mcp`/`skills`: action is the
@@ -948,7 +948,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             let target = tail.get(1).cloned();
             if tail.len() > 2 {
                 return Err(format!(
-                    "unexpected extra arguments after `claw {} {}`: {}",
+                    "unexpected extra arguments after `brewcode {} {}`: {}",
                     rest[0],
                     tail[..2].join(" "),
                     tail[2..].join(" ")
@@ -961,9 +961,9 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             })
         }
         // #146: `config` is pure-local read-only introspection (merges
-        // `.claw.json` + `.claw/settings.json` from disk, no network, no
+        // `.brewcode.json` + `.brewcode/settings.json` from disk, no network, no
         // state mutation). Previously callers had to spin up a session with
-        // `claw --resume SESSION.jsonl /config` to see their own config,
+        // `brewcode --resume SESSION.jsonl /config` to see their own config,
         // which is synthetic friction. Accepts an optional section name
         // (env|hooks|model|plugins) matching the slash command shape.
         "config" => {
@@ -971,7 +971,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             let section = tail.first().cloned();
             if tail.len() > 1 {
                 return Err(format!(
-                    "unexpected extra arguments after `claw config {}`: {}",
+                    "unexpected extra arguments after `brewcode config {}`: {}",
                     tail[0],
                     tail[1..].join(" ")
                 ));
@@ -986,19 +986,19 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         "diff" => {
             if rest.len() > 1 {
                 return Err(format!(
-                    "unexpected extra arguments after `claw diff`: {}",
+                    "unexpected extra arguments after `brewcode diff`: {}",
                     rest[1..].join(" ")
                 ));
             }
             Ok(CliAction::Diff { output_format })
         }
-        // `claw permissions <mode>` falls through to the LLM when called
+        // `brewcode permissions <mode>` falls through to the LLM when called
         // with a subcommand argument because parse_single_word_command_alias
         // only intercepts the bare single-word form. Catch all multi-word
         // forms here and return a structured guidance error so no network
         // call or session is created.
         "permissions" => Err(
-            "`claw permissions` is a slash command. Start `claw` and run `/permissions` inside the REPL.\n  Usage  /permissions [read-only|workspace-write|danger-full-access]"
+            "`brewcode permissions` is a slash command. Start `brewcode` and run `/permissions` inside the REPL.\n  Usage  /permissions [read-only|workspace-write|danger-full-access]"
                 .to_string(),
         ),
         "skills" => {
@@ -1063,21 +1063,21 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                         message.push_str(&line);
                     }
                     message.push_str(
-                        "\nRun `claw --help` for the full list. If you meant to send a prompt literally, use `claw prompt <text>`.",
+                        "\nRun `brewcode --help` for the full list. If you meant to send a prompt literally, use `brewcode prompt <text>`.",
                     );
                     return Err(message);
                 }
             }
             // #147: guard empty/whitespace-only prompts at the fallthrough
             // path the same way `"prompt"` arm above does. Without this,
-            // `claw ""`, `claw "   "`, and `claw "" ""` silently route to
+            // `brewcode ""`, `brewcode "   "`, and `brewcode "" ""` silently route to
             // the Anthropic call and surface a misleading
             // `missing Anthropic credentials` error (or burn API tokens on
             // an empty prompt when credentials are present).
             let joined = rest.join(" ");
             if joined.trim().is_empty() {
                 return Err(
-                    "empty prompt: provide a subcommand (run `claw --help`) or a non-empty prompt string"
+                    "empty prompt: provide a subcommand (run `brewcode --help`) or a non-empty prompt string"
                         .to_string(),
                 );
             }
@@ -1221,11 +1221,11 @@ fn bare_slash_command_guidance(command_name: &str) -> Option<String> {
         .find(|spec| spec.name == command_name)?;
     let guidance = if slash_command.resume_supported {
         format!(
-            "`claw {command_name}` is a slash command. Use `claw --resume SESSION.jsonl /{command_name}` or start `claw` and run `/{command_name}`."
+            "`brewcode {command_name}` is a slash command. Use `brewcode --resume SESSION.jsonl /{command_name}` or start `brewcode` and run `/{command_name}`."
         )
     } else {
         format!(
-            "`claw {command_name}` is a slash command. Start `claw` and run `/{command_name}` inside the REPL."
+            "`brewcode {command_name}` is a slash command. Start `brewcode` and run `/{command_name}` inside the REPL."
         )
     };
     Some(guidance)
@@ -1233,7 +1233,7 @@ fn bare_slash_command_guidance(command_name: &str) -> Option<String> {
 
 fn removed_auth_surface_error(command_name: &str) -> String {
     format!(
-        "`claw {command_name}` has been removed. Set ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN instead."
+        "`brewcode {command_name}` has been removed. Set ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN instead."
     )
 }
 
@@ -1242,7 +1242,7 @@ fn parse_acp_args(args: &[String], output_format: CliOutputFormat) -> Result<Cli
         [] => Ok(CliAction::Acp { output_format }),
         [subcommand] if subcommand == "serve" => Ok(CliAction::Acp { output_format }),
         _ => Err(String::from(
-            "unsupported ACP invocation. Use `claw acp`, `claw acp serve`, `claw --acp`, or `claw -acp`.",
+            "unsupported ACP invocation. Use `brewcode acp`, `brewcode acp serve`, `brewcode --acp`, or `brewcode -acp`.",
         )),
     }
 }
@@ -1320,7 +1320,7 @@ fn parse_direct_slash_cli_action(
         Ok(Some(command)) => Err({
             let _ = command;
             format!(
-                "slash command {command_name} is interactive-only. Start `claw` and run it there, or use `claw --resume SESSION.jsonl {command_name}` / `claw --resume {latest} {command_name}` when the command is marked [resume] in /help.",
+                "slash command {command_name} is interactive-only. Start `brewcode` and run it there, or use `brewcode --resume SESSION.jsonl {command_name}` / `brewcode --resume {latest} {command_name}` when the command is marked [resume] in /help.",
                 command_name = rest[0],
                 latest = LATEST_SESSION_REFERENCE,
             )
@@ -1337,7 +1337,7 @@ fn format_unknown_option(option: &str) -> String {
         message.push_str(suggestion);
         message.push('?');
     }
-    message.push_str("\nRun `claw --help` for usage.");
+    message.push_str("\nRun `brewcode --help` for usage.");
     message
 }
 
@@ -1352,7 +1352,7 @@ fn format_unknown_direct_slash_command(name: &str) -> String {
         message.push('\n');
         message.push_str(note);
     }
-    message.push_str("\nRun `claw --help` for CLI usage, or start `claw` and use /help.");
+    message.push_str("\nRun `brewcode --help` for CLI usage, or start `brewcode` and use /help.");
     message
 }
 
@@ -1374,7 +1374,7 @@ fn format_unknown_slash_command(name: &str) -> String {
 fn omc_compatibility_note_for_unknown_slash_command(name: &str) -> Option<&'static str> {
     name.starts_with("oh-my-claudecode:")
         .then_some(
-            "Compatibility note: `/oh-my-claudecode:*` is a Claude Code/OMC plugin command. `claw` does not yet load plugin slash commands, Claude statusline stdin, or OMC session hooks.",
+            "Compatibility note: `/oh-my-claudecode:*` is a Claude Code/OMC plugin command. `brewcode` does not yet load plugin slash commands, Claude statusline stdin, or OMC session hooks.",
         )
 }
 
@@ -2105,33 +2105,33 @@ fn run_doctor(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::
     Ok(())
 }
 
-/// Starts a minimal Model Context Protocol server that exposes claw's
+/// Starts a minimal Model Context Protocol server that exposes brewcode's
 /// built-in tools over stdio.
 ///
 /// Tool descriptors come from [`tools::mvp_tool_specs`] and calls are
 /// dispatched through [`tools::execute_tool`], so this server exposes exactly
-/// Read `.claw/worker-state.json` from the current working directory and print it.
+/// Read `.brewcode/worker-state.json` from the current working directory and print it.
 /// This is the file-based worker observability surface: `push_event()` in `worker_boot.rs`
-/// atomically writes state transitions here so external observers (clawhip, orchestrators)
+/// atomically writes state transitions here so external observers (brewcodehip, orchestrators)
 /// can poll current `WorkerStatus` without needing an HTTP route on the opencode binary.
 fn run_worker_state(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::Error>> {
     let cwd = env::current_dir()?;
-    let state_path = cwd.join(".claw").join("worker-state.json");
+    let state_path = cwd.join(".brewcode").join("worker-state.json");
     if !state_path.exists() {
         // #139: this error used to say "run a worker first" without telling
         // callers how to run one. "worker" is an internal concept (there is
-        // no `claw worker` subcommand), so claws/CI had no discoverable path
+        // no `brewcode worker` subcommand), so brewcodes/CI had no discoverable path
         // from the error to a fix. Emit an actionable, structured error that
         // names the two concrete commands that produce worker state.
         //
         // Format in both text and JSON modes is stable so scripts can match:
         //   error: no worker state file found at <path>
         //     Hint: worker state is written by the interactive REPL or a non-interactive prompt.
-        //     Run:   claw               # start the REPL (writes state on first turn)
-        //     Or:    claw prompt <text> # run one non-interactive turn
-        //     Then rerun: claw state [--output-format json]
+        //     Run:   brewcode               # start the REPL (writes state on first turn)
+        //     Or:    brewcode prompt <text> # run one non-interactive turn
+        //     Then rerun: brewcode state [--output-format json]
         return Err(format!(
-            "no worker state file found at {path}\n  Hint: worker state is written by the interactive REPL or a non-interactive prompt.\n  Run:   claw               # start the REPL (writes state on first turn)\n  Or:    claw prompt <text> # run one non-interactive turn\n  Then rerun: claw state [--output-format json]",
+            "no worker state file found at {path}\n  Hint: worker state is written by the interactive REPL or a non-interactive prompt.\n  Run:   brewcode               # start the REPL (writes state on first turn)\n  Or:    brewcode prompt <text> # run one non-interactive turn\n  Then rerun: brewcode state [--output-format json]",
             path = state_path.display()
         )
         .into());
@@ -2162,7 +2162,7 @@ fn run_mcp_serve() -> Result<(), Box<dyn std::error::Error>> {
         .collect();
 
     let spec = McpServerSpec {
-        server_name: "claw".to_string(),
+        server_name: "brewcode".to_string(),
         server_version: VERSION.to_string(),
         tools,
         tool_handler: Box::new(execute_tool),
@@ -2228,7 +2228,7 @@ fn check_auth_health() -> DiagnosticCheck {
                     token_set.scopes.join(",")
                 }
             ),
-            "Suggested action  set ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN; `claw login` is removed"
+            "Suggested action  set ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN; `brewcode login` is removed"
                 .to_string(),
         ])
         .with_data(Map::from_iter([
@@ -2390,7 +2390,7 @@ fn check_install_source_health() -> DiagnosticCheck {
         "Recommended path  build from this repo or use the upstream binary documented in README.md"
             .to_string(),
         format!(
-            "Deprecated crate  `{DEPRECATED_INSTALL_COMMAND}` installs a deprecated stub and does not provide the `claw` binary"
+            "Deprecated crate  `{DEPRECATED_INSTALL_COMMAND}` installs a deprecated stub and does not provide the `brewcode` binary"
         )
             .to_string(),
     ])
@@ -2680,7 +2680,7 @@ fn dump_manifests(
 }
 
 const DUMP_MANIFESTS_OVERRIDE_HINT: &str =
-    "Hint: set CLAUDE_CODE_UPSTREAM=/path/to/upstream or pass `claw dump-manifests --manifests-dir /path/to/upstream`.";
+    "Hint: set CLAUDE_CODE_UPSTREAM=/path/to/upstream or pass `brewcode dump-manifests --manifests-dir /path/to/upstream`.";
 
 // Internal function for testing that accepts a workspace directory path.
 fn dump_manifests_at_path(
@@ -3008,11 +3008,11 @@ struct StatusContext {
     session_lifecycle: SessionLifecycleSummary,
     boot_preflight: BootPreflightSnapshot,
     sandbox_status: runtime::SandboxStatus,
-    /// #143: when `.claw.json` (or another loaded config file) fails to parse,
+    /// #143: when `.brewcode.json` (or another loaded config file) fails to parse,
     /// we capture the parse error here and still populate every field that
     /// doesn't depend on runtime config (workspace, git, sandbox defaults,
     /// discovery counts). Top-level JSON output then reports
-    /// `status: "degraded"` so claws can distinguish "status ran but config
+    /// `status: "degraded"` so brewcodes can distinguish "status ran but config
     /// is broken" from "status ran cleanly".
     config_load_error: Option<String>,
 }
@@ -3534,7 +3534,7 @@ fn render_resume_usage() -> String {
     format!(
         "Resume
   Usage            /resume <session-path|session-id|{LATEST_SESSION_REFERENCE}>
-  Auto-save        .claw/sessions/<workspace-fingerprint>/<session-id>.{PRIMARY_SESSION_EXTENSION}
+  Auto-save        .brewcode/sessions/<workspace-fingerprint>/<session-id>.{PRIMARY_SESSION_EXTENSION}
   Tip              use /session list to inspect saved sessions"
     )
 }
@@ -3664,7 +3664,7 @@ fn build_boot_preflight_snapshot(
         trusted_roots_count: trusted_roots.len(),
         required_binaries: vec![
             BinaryPreflight {
-                name: "claw",
+                name: "brewcode",
                 available: env::current_exe().is_ok_and(|path| path.exists()),
             },
             BinaryPreflight {
@@ -3715,11 +3715,11 @@ fn tmux_control_socket_preflight() -> ControlSocketPreflight {
 }
 
 fn last_failed_boot_reason(cwd: &Path) -> Option<String> {
-    env::var("CLAW_LAST_FAILED_BOOT_REASON")
+    env::var("BREWCODE_LAST_FAILED_BOOT_REASON")
         .ok()
         .filter(|value| !value.trim().is_empty())
         .or_else(|| {
-            fs::read_to_string(cwd.join(".claw").join("last-failed-boot.txt"))
+            fs::read_to_string(cwd.join(".brewcode").join("last-failed-boot.txt"))
                 .ok()
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty())
@@ -3878,7 +3878,7 @@ fn run_resume_command(
             Ok(ResumeCommandOutcome {
                 session: cleared,
                 message: Some(format!(
-                    "Session cleared\n  Mode             resumed session reset\n  Previous session {previous_session_id}\n  Backup           {}\n  Resume previous  claw --resume {}\n  New session      {new_session_id}\n  Session file     {}",
+                    "Session cleared\n  Mode             resumed session reset\n  Previous session {previous_session_id}\n  Backup           {}\n  Resume previous  brewcode --resume {}\n  New session      {new_session_id}\n  Session file     {}",
                     backup_path.display(),
                     backup_path.display(),
                     session_path.display()
@@ -4042,7 +4042,7 @@ fn run_resume_command(
         SlashCommand::Skills { args } => {
             if let SkillSlashDispatch::Invoke(_) = classify_skills_slash_command(args.as_deref()) {
                 return Err(
-                    "resumed /skills invocations are interactive-only; start `claw` and run `/skills <skill>` in the REPL".into(),
+                    "resumed /skills invocations are interactive-only; start `brewcode` and run `/skills <skill>` in the REPL".into(),
                 );
             }
             let cwd = env::current_dir()?;
@@ -4058,7 +4058,7 @@ fn run_resume_command(
                 Some("install") | Some("uninstall") | Some("enable") | Some("disable")
                 | Some("update") => {
                     return Err(
-                        "resumed /plugins mutations are interactive-only; start `claw` and run `/plugins` in the REPL".into(),
+                        "resumed /plugins mutations are interactive-only; start `brewcode` and run `/plugins` in the REPL".into(),
                     );
                 }
                 _ => {}
@@ -4221,9 +4221,9 @@ fn enforce_broad_cwd_policy(
     if is_interactive {
         // Interactive mode: print warning and ask for confirmation
         eprintln!(
-            "Warning: claw is running from a very broad directory ({}).\n\
+            "Warning: brewcode is running from a very broad directory ({}).\n\
              The agent can read and search everything under this path.\n\
-             Consider running from inside your project: cd /path/to/project && claw",
+             Consider running from inside your project: cd /path/to/project && brewcode",
             cwd.display()
         );
         eprint!("Continue anyway? [y/N]: ");
@@ -4240,10 +4240,10 @@ fn enforce_broad_cwd_policy(
     } else {
         // Non-interactive mode: exit with error (JSON or text)
         let message = format!(
-            "claw is running from a very broad directory ({}). \
+            "brewcode is running from a very broad directory ({}). \
              The agent can read and search everything under this path. \
              Use --allow-broad-cwd to proceed anyway, \
-             or run from inside your project: cd /path/to/project && claw",
+             or run from inside your project: cd /path/to/project && brewcode",
             cwd.display()
         );
         match output_format {
@@ -5596,7 +5596,7 @@ impl LiveCli {
         args: Option<&str>,
         output_format: CliOutputFormat,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        // `claw mcp serve` starts a stdio MCP server exposing claw's built-in
+        // `brewcode mcp serve` starts a stdio MCP server exposing brewcode's built-in
         // tools. All other `mcp` subcommands fall through to the existing
         // configured-server reporter (`list`, `status`, ...).
         if matches!(args.map(str::trim), Some("serve")) {
@@ -6311,7 +6311,7 @@ fn render_repl_help() -> String {
         "  Tab                  Complete commands, modes, and recent sessions".to_string(),
         "  Ctrl-C               Clear input (or exit on empty prompt)".to_string(),
         "  Shift+Enter/Ctrl+J   Insert a newline".to_string(),
-        "  Auto-save            .claw/sessions/<workspace-fingerprint>/<session-id>.jsonl"
+        "  Auto-save            .brewcode/sessions/<workspace-fingerprint>/<session-id>.jsonl"
             .to_string(),
         "  Resume latest        /resume latest".to_string(),
         "  Browse sessions      /session list".to_string(),
@@ -6390,7 +6390,7 @@ fn status_json_value(
     provenance: Option<&ModelProvenance>,
     allowed_tools: Option<&AllowedToolSet>,
 ) -> serde_json::Value {
-    // #143: top-level `status` marker so claws can distinguish
+    // #143: top-level `status` marker so brewcodes can distinguish
     // a clean run from a degraded run (config parse failed but other fields
     // are still populated). `config_load_error` carries the parse-error string
     // when present; it's a string rather than a typed object in Phase 1 and
@@ -6448,7 +6448,7 @@ fn status_json_value(
             "session": context.session_path.as_ref().map_or_else(|| "live-repl".to_string(), |path| path.display().to_string()),
             "session_id": context.session_path.as_ref().and_then(|path| {
                 // Session files are named <session-id>.jsonl directly under
-                // .claw/sessions/. Extract the stem (drop the .jsonl extension).
+                // .brewcode/sessions/. Extract the stem (drop the .jsonl extension).
                 path.file_stem().map(|n| n.to_string_lossy().into_owned())
             }),
             "session_lifecycle": context.session_lifecycle.json_value(),
@@ -6483,7 +6483,7 @@ fn status_context(
     let loader = ConfigLoader::default_for(&cwd);
     let discovered_config_files = loader.discover().len();
     // #143: degrade gracefully on config parse failure rather than hard-fail.
-    // `claw doctor` already does this; `claw status` now matches that contract
+    // `brewcode doctor` already does this; `brewcode status` now matches that contract
     // so that one malformed `mcpServers.*` entry doesn't take down the whole
     // health surface (workspace, git, model, permission, sandbox can still be
     // reported independently).
@@ -6496,7 +6496,7 @@ fn status_context(
         ),
         Err(err) => (
             0,
-            // Fall back to defaults for sandbox resolution so claws still see
+            // Fall back to defaults for sandbox resolution so brewcodes still see
             // a populated sandbox section instead of a missing field. Defaults
             // produce the same output as a runtime config with no sandbox
             // overrides, which is the right degraded-mode shape: we cannot
@@ -6558,7 +6558,7 @@ fn format_status_report(
     let mut blocks: Vec<String> = Vec::new();
     if let Some(err) = context.config_load_error.as_deref() {
         blocks.push(format!(
-            "Config load error\n  Status           fail\n  Summary          runtime config failed to load; reporting partial status\n  Details          {err}\n  Hint             `claw doctor` classifies config parse errors; fix the listed field and rerun"
+            "Config load error\n  Status           fail\n  Summary          runtime config failed to load; reporting partial status\n  Details          {err}\n  Hint             `brewcode doctor` classifies config parse errors; fix the listed field and rerun"
         ));
     }
     // #148: render Model source line after Model, showing where the string
@@ -6754,85 +6754,85 @@ fn sandbox_json_value(status: &runtime::SandboxStatus) -> serde_json::Value {
 fn render_help_topic(topic: LocalHelpTopic) -> String {
     match topic {
         LocalHelpTopic::Status => "Status
-  Usage            claw status [--output-format <format>]
+  Usage            brewcode status [--output-format <format>]
   Purpose          show the local workspace snapshot without entering the REPL
   Output           model, permissions, git state, config files, and sandbox status
   Formats          text (default), json
-  Related          /status · claw --resume latest /status"
+  Related          /status · brewcode --resume latest /status"
             .to_string(),
         LocalHelpTopic::Sandbox => "Sandbox
-  Usage            claw sandbox [--output-format <format>]
+  Usage            brewcode sandbox [--output-format <format>]
   Purpose          inspect the resolved sandbox and isolation state for the current directory
   Output           namespace, network, filesystem, and fallback details
   Formats          text (default), json
-  Related          /sandbox · claw status"
+  Related          /sandbox · brewcode status"
             .to_string(),
         LocalHelpTopic::Doctor => "Doctor
-  Usage            claw doctor [--output-format <format>]
+  Usage            brewcode doctor [--output-format <format>]
   Purpose          diagnose local auth, config, workspace, sandbox, and build metadata
   Output           local-only health report; no provider request or session resume required
   Formats          text (default), json
-  Related          /doctor · claw --resume latest /doctor"
+  Related          /doctor · brewcode --resume latest /doctor"
             .to_string(),
         LocalHelpTopic::Acp => "ACP / Zed
-  Usage            claw acp [serve] [--output-format <format>]
-  Aliases          claw --acp · claw -acp
+  Usage            brewcode acp [serve] [--output-format <format>]
+  Aliases          brewcode --acp · brewcode -acp
   Purpose          explain the current editor-facing ACP/Zed launch contract without starting the runtime
   Status           discoverability only; `serve` is a status alias and does not launch a daemon yet
   Formats          text (default), json
-  Related          ROADMAP #64a (discoverability) · ROADMAP #76 (real ACP support) · claw --help"
+  Related          ROADMAP #64a (discoverability) · ROADMAP #76 (real ACP support) · brewcode --help"
             .to_string(),
         LocalHelpTopic::Init => "Init
-  Usage            claw init [--output-format <format>]
-  Purpose          create .claw/, .claw.json, .gitignore, and CLAUDE.md in the current project
+  Usage            brewcode init [--output-format <format>]
+  Purpose          create .brewcode/, .brewcode.json, .gitignore, and CLAUDE.md in the current project
   Output           list of created vs. skipped files (idempotent: safe to re-run)
   Formats          text (default), json
-  Related          claw status · claw doctor"
+  Related          brewcode status · brewcode doctor"
             .to_string(),
         LocalHelpTopic::State => "State
-  Usage            claw state [--output-format <format>]
-  Purpose          read .claw/worker-state.json written by the interactive REPL or a one-shot prompt
+  Usage            brewcode state [--output-format <format>]
+  Purpose          read .brewcode/worker-state.json written by the interactive REPL or a one-shot prompt
   Output           worker id, model, permissions, session reference (text or json)
   Formats          text (default), json
-  Produces state   `claw` (interactive REPL) or `claw prompt <text>` (one non-interactive turn)
-  Observes state   `claw state` reads; clawhip/CI may poll this file without HTTP
+  Produces state   `brewcode` (interactive REPL) or `brewcode prompt <text>` (one non-interactive turn)
+  Observes state   `brewcode state` reads; brewcodehip/CI may poll this file without HTTP
   Exit codes       0 if state file exists and parses; 1 with actionable hint otherwise
-  Related          claw status · ROADMAP #139 (this worker-concept contract)"
+  Related          brewcode status · ROADMAP #139 (this worker-concept contract)"
             .to_string(),
         LocalHelpTopic::Export => "Export
-  Usage            claw export [--session <id|latest>] [--output <path>] [--output-format <format>]
+  Usage            brewcode export [--session <id|latest>] [--output <path>] [--output-format <format>]
   Purpose          serialize a managed session to JSON for review, transfer, or archival
-  Defaults         --session latest (most recent managed session in .claw/sessions/)
+  Defaults         --session latest (most recent managed session in .brewcode/sessions/)
   Formats          text (default), json
-  Related          /session list · claw --resume latest"
+  Related          /session list · brewcode --resume latest"
             .to_string(),
         LocalHelpTopic::Version => "Version
-  Usage            claw version [--output-format <format>]
-  Aliases          claw --version · claw -V
-  Purpose          print the claw CLI version and build metadata
+  Usage            brewcode version [--output-format <format>]
+  Aliases          brewcode --version · brewcode -V
+  Purpose          print the brewcode CLI version and build metadata
   Formats          text (default), json
-  Related          claw doctor (full build/auth/config diagnostic)"
+  Related          brewcode doctor (full build/auth/config diagnostic)"
             .to_string(),
         LocalHelpTopic::SystemPrompt => "System Prompt
-  Usage            claw system-prompt [--cwd <path>] [--date YYYY-MM-DD] [--output-format <format>]
-  Purpose          render the resolved system prompt that `claw` would send for the given cwd + date
+  Usage            brewcode system-prompt [--cwd <path>] [--date YYYY-MM-DD] [--output-format <format>]
+  Purpose          render the resolved system prompt that `brewcode` would send for the given cwd + date
   Options          --cwd overrides the workspace dir · --date injects a deterministic date stamp
   Formats          text (default), json
-  Related          claw doctor · claw dump-manifests"
+  Related          brewcode doctor · brewcode dump-manifests"
             .to_string(),
         LocalHelpTopic::DumpManifests => "Dump Manifests
-  Usage            claw dump-manifests [--manifests-dir <path>] [--output-format <format>]
+  Usage            brewcode dump-manifests [--manifests-dir <path>] [--output-format <format>]
   Purpose          emit every skill/agent/tool manifest the resolver would load for the current cwd
   Options          --manifests-dir scopes discovery to a specific directory
   Formats          text (default), json
-  Related          claw skills · claw agents · claw doctor"
+  Related          brewcode skills · brewcode agents · brewcode doctor"
             .to_string(),
         LocalHelpTopic::BootstrapPlan => "Bootstrap Plan
-  Usage            claw bootstrap-plan [--output-format <format>]
+  Usage            brewcode bootstrap-plan [--output-format <format>]
   Purpose          list the ordered startup phases the CLI would execute before dispatch
   Output           phase names (text) or structured phase list (json) — primary output is the plan itself
   Formats          text (default), json
-  Related          claw doctor · claw status"
+  Related          brewcode doctor · brewcode status"
             .to_string(),
     }
 }
@@ -6858,11 +6858,11 @@ fn render_export_help_json() -> serde_json::Value {
         "kind": "help",
         "topic": "export",
         "command": "export",
-        "usage": "claw export [--session <id|latest>] [--output <path>] [--output-format <format>]",
+        "usage": "brewcode export [--session <id|latest>] [--output <path>] [--output-format <format>]",
         "purpose": "serialize a managed session to JSON for review, transfer, or archival",
         "defaults": {
             "session": LATEST_SESSION_REFERENCE,
-            "session_source": ".claw/sessions/",
+            "session_source": ".brewcode/sessions/",
             "output": "derived from the selected session when omitted"
         },
         "formats": ["text", "json"],
@@ -6892,7 +6892,7 @@ fn render_export_help_json() -> serde_json::Value {
                 "description": "show help for the export command"
             }
         ],
-        "related": ["/session list", "claw --resume latest"]
+        "related": ["/session list", "brewcode --resume latest"]
     })
 }
 
@@ -6924,7 +6924,7 @@ fn print_help_topic(
 }
 
 fn acp_status_message() -> &'static str {
-    "ACP/Zed editor integration is not implemented in claw-code yet. `claw acp serve` is only a discoverability alias today; it does not launch a daemon, JSON-RPC endpoint, or Zed-specific protocol endpoint. Use the normal terminal surfaces for now and track ROADMAP #76 for real ACP support."
+    "ACP/Zed editor integration is not implemented in brew-code yet. `brewcode acp serve` is only a discoverability alias today; it does not launch a daemon, JSON-RPC endpoint, or Zed-specific protocol endpoint. Use the normal terminal surfaces for now and track ROADMAP #76 for real ACP support."
 }
 
 fn acp_status_json() -> serde_json::Value {
@@ -6951,16 +6951,16 @@ fn acp_status_json() -> serde_json::Value {
                 "session_control_schema",
                 "event_report_schema"
             ],
-            "stable_status_surface": "claw acp [serve] --output-format json",
+            "stable_status_surface": "brewcode acp [serve] --output-format json",
             "unsupported_invocation_kind": "unsupported_acp_invocation"
         },
         "aliases": ["acp", "--acp", "-acp"],
         "discoverability_tracking": "ROADMAP #64a",
         "tracking": "ROADMAP #76 / #3033 / #3004",
         "recommended_workflows": [
-            "claw prompt TEXT",
-            "claw",
-            "claw doctor"
+            "brewcode prompt TEXT",
+            "brewcode",
+            "brewcode doctor"
         ],
     })
 }
@@ -6969,7 +6969,7 @@ fn print_acp_status(output_format: CliOutputFormat) -> Result<(), Box<dyn std::e
     match output_format {
         CliOutputFormat::Text => {
             println!(
-                "ACP / Zed\n  Status           unsupported (discoverability only)\n  Exit code        0 for status queries; unsupported invocations exit 1\n  Launch           `claw acp serve` / `claw --acp` / `claw -acp` report status only; no editor daemon or JSON-RPC endpoint is available yet\n  Today            use `claw prompt`, the REPL, or `claw doctor` for local verification\n  Tracking         ROADMAP #76 / #3033 / #3004\n  Message          {}",
+                "ACP / Zed\n  Status           unsupported (discoverability only)\n  Exit code        0 for status queries; unsupported invocations exit 1\n  Launch           `brewcode acp serve` / `brewcode --acp` / `brewcode -acp` report status only; no editor daemon or JSON-RPC endpoint is available yet\n  Today            use `brewcode prompt`, the REPL, or `brewcode doctor` for local verification\n  Tracking         ROADMAP #76 / #3033 / #3004\n  Message          {}",
                 acp_status_message()
             );
         }
@@ -7222,7 +7222,7 @@ fn run_init(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::Er
 }
 
 /// #142: emit first-class structured fields alongside the legacy `message`
-/// string so claws can detect per-artifact state without substring matching.
+/// string so brewcodes can detect per-artifact state without substring matching.
 fn init_json_value(report: &crate::init::InitReport, message: &str) -> serde_json::Value {
     use crate::init::InitStatus;
     json!({
@@ -7699,7 +7699,7 @@ fn render_version_report() -> String {
     let git_sha = GIT_SHA.unwrap_or("unknown");
     let target = BUILD_TARGET.unwrap_or("unknown");
     format!(
-        "Claw Code\n  Version          {VERSION}\n  Git SHA          {git_sha}\n  Target           {target}\n  Build date       {DEFAULT_DATE}"
+        "Brew Code\n  Version          {VERSION}\n  Git SHA          {git_sha}\n  Target           {target}\n  Build date       {DEFAULT_DATE}"
     )
 }
 
@@ -8009,7 +8009,7 @@ fn plugins_command_payload_from_result(
     };
     let message = match config_load_error.as_deref() {
         Some(error) => format!(
-            "Config load error\n  Status           fail\n  Summary          runtime config failed to load; reporting partial plugins view\n  Details          {error}\n  Hint             `claw doctor` classifies config parse errors; fix the listed field and rerun\n\n{}",
+            "Config load error\n  Status           fail\n  Summary          runtime config failed to load; reporting partial plugins view\n  Details          {error}\n  Hint             `brewcode doctor` classifies config parse errors; fix the listed field and rerun\n\n{}",
             result.message
         ),
         None => result.message,
@@ -8635,7 +8635,7 @@ impl AnthropicRuntimeClient {
         // reads `ANTHROPIC_BASE_URL` and is required for the local
         // mock-server test harness
         // (`crates/rusty-claude-cli/tests/compact_output.rs`) to point
-        // claw at its fake Anthropic endpoint. We also attach a
+        // brewcode at its fake Anthropic endpoint. We also attach a
         // session-scoped prompt cache on the Anthropic path; the
         // prompt cache is Anthropic-only so non-Anthropic variants
         // skip it.
@@ -8999,7 +8999,7 @@ fn format_context_window_blocked_error(session_id: &str, error: &api::ApiError) 
     lines.push("Recovery".to_string());
     lines.push("  Compact          /compact".to_string());
     lines.push(format!(
-        "  Resume compact   claw --resume {session_id} /compact"
+        "  Resume compact   brewcode --resume {session_id} /compact"
     ));
     lines.push("  Fresh session    /clear --confirm".to_string());
     lines.push(
@@ -10018,49 +10018,49 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
 
 #[allow(clippy::too_many_lines)]
 fn print_help_to(out: &mut impl Write) -> io::Result<()> {
-    writeln!(out, "claw v{VERSION}")?;
+    writeln!(out, "brewcode v{VERSION}")?;
     writeln!(out)?;
     writeln!(out, "Usage:")?;
     writeln!(
         out,
-        "  claw [--model MODEL] [--allowedTools TOOL[,TOOL...]]"
+        "  brewcode [--model MODEL] [--allowedTools TOOL[,TOOL...]]"
     )?;
     writeln!(out, "      Start the interactive REPL")?;
     writeln!(
         out,
-        "  claw [--model MODEL] [--output-format text|json] prompt TEXT"
+        "  brewcode [--model MODEL] [--output-format text|json] prompt TEXT"
     )?;
     writeln!(out, "      Send one prompt and exit")?;
     writeln!(
         out,
-        "  claw [--model MODEL] [--output-format text|json] TEXT"
+        "  brewcode [--model MODEL] [--output-format text|json] TEXT"
     )?;
     writeln!(out, "      Shorthand non-interactive prompt mode")?;
     writeln!(
         out,
-        "  claw --resume [SESSION.jsonl|session-id|latest] [/status] [/compact] [...]"
+        "  brewcode --resume [SESSION.jsonl|session-id|latest] [/status] [/compact] [...]"
     )?;
     writeln!(
         out,
         "      Inspect or maintain a saved session without entering the REPL"
     )?;
-    writeln!(out, "  claw help")?;
+    writeln!(out, "  brewcode help")?;
     writeln!(out, "      Alias for --help")?;
-    writeln!(out, "  claw version")?;
+    writeln!(out, "  brewcode version")?;
     writeln!(out, "      Alias for --version")?;
-    writeln!(out, "  claw status")?;
+    writeln!(out, "  brewcode status")?;
     writeln!(
         out,
         "      Show the current local workspace status snapshot"
     )?;
-    writeln!(out, "  claw sandbox")?;
+    writeln!(out, "  brewcode sandbox")?;
     writeln!(out, "      Show the current sandbox isolation snapshot")?;
-    writeln!(out, "  claw doctor")?;
+    writeln!(out, "  brewcode doctor")?;
     writeln!(
         out,
         "      Diagnose local auth, config, workspace, and sandbox health"
     )?;
-    writeln!(out, "  claw acp [serve]")?;
+    writeln!(out, "  brewcode acp [serve]")?;
     writeln!(
         out,
         "      Show ACP/Zed editor integration status (currently unsupported; aliases: --acp, -acp)"
@@ -10070,16 +10070,16 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
         out,
         "      Warning: do not `{DEPRECATED_INSTALL_COMMAND}` (deprecated stub)"
     )?;
-    writeln!(out, "  claw dump-manifests [--manifests-dir PATH]")?;
-    writeln!(out, "  claw bootstrap-plan")?;
-    writeln!(out, "  claw agents")?;
-    writeln!(out, "  claw mcp")?;
-    writeln!(out, "  claw skills")?;
-    writeln!(out, "  claw system-prompt [--cwd PATH] [--date YYYY-MM-DD]")?;
-    writeln!(out, "  claw init")?;
+    writeln!(out, "  brewcode dump-manifests [--manifests-dir PATH]")?;
+    writeln!(out, "  brewcode bootstrap-plan")?;
+    writeln!(out, "  brewcode agents")?;
+    writeln!(out, "  brewcode mcp")?;
+    writeln!(out, "  brewcode skills")?;
+    writeln!(out, "  brewcode system-prompt [--cwd PATH] [--date YYYY-MM-DD]")?;
+    writeln!(out, "  brewcode init")?;
     writeln!(
         out,
-        "  claw export [PATH] [--session SESSION] [--output PATH]"
+        "  brewcode export [PATH] [--session SESSION] [--output PATH]"
     )?;
     writeln!(
         out,
@@ -10130,7 +10130,7 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(out, "Session shortcuts:")?;
     writeln!(
         out,
-        "  REPL turns auto-save to .claw/sessions/<session-id>.{PRIMARY_SESSION_EXTENSION}"
+        "  REPL turns auto-save to .brewcode/sessions/<session-id>.{PRIMARY_SESSION_EXTENSION}"
     )?;
     writeln!(
         out,
@@ -10141,33 +10141,33 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
         "  Use /session list in the REPL to browse managed sessions"
     )?;
     writeln!(out, "Examples:")?;
-    writeln!(out, "  claw --model claude-opus \"summarize this repo\"")?;
+    writeln!(out, "  brewcode --model claude-opus \"summarize this repo\"")?;
     writeln!(
         out,
-        "  claw --output-format json prompt \"explain src/main.rs\""
+        "  brewcode --output-format json prompt \"explain src/main.rs\""
     )?;
-    writeln!(out, "  claw --compact \"summarize Cargo.toml\" | wc -l")?;
+    writeln!(out, "  brewcode --compact \"summarize Cargo.toml\" | wc -l")?;
     writeln!(
         out,
-        "  claw --allowedTools read,glob \"summarize Cargo.toml\""
+        "  brewcode --allowedTools read,glob \"summarize Cargo.toml\""
     )?;
-    writeln!(out, "  claw --resume {LATEST_SESSION_REFERENCE}")?;
+    writeln!(out, "  brewcode --resume {LATEST_SESSION_REFERENCE}")?;
     writeln!(
         out,
-        "  claw --resume {LATEST_SESSION_REFERENCE} /status /diff /export notes.txt"
+        "  brewcode --resume {LATEST_SESSION_REFERENCE} /status /diff /export notes.txt"
     )?;
-    writeln!(out, "  claw agents")?;
-    writeln!(out, "  claw mcp show my-server")?;
-    writeln!(out, "  claw /skills")?;
-    writeln!(out, "  claw doctor")?;
+    writeln!(out, "  brewcode agents")?;
+    writeln!(out, "  brewcode mcp show my-server")?;
+    writeln!(out, "  brewcode /skills")?;
+    writeln!(out, "  brewcode doctor")?;
     writeln!(out, "  source of truth: {OFFICIAL_REPO_URL}")?;
     writeln!(
         out,
         "  do not run `{DEPRECATED_INSTALL_COMMAND}` — it installs a deprecated stub"
     )?;
-    writeln!(out, "  claw init")?;
-    writeln!(out, "  claw export")?;
-    writeln!(out, "  claw export conversation.md")?;
+    writeln!(out, "  brewcode init")?;
+    writeln!(out, "  brewcode export")?;
+    writeln!(out, "  brewcode export conversation.md")?;
     Ok(())
 }
 
@@ -10336,7 +10336,7 @@ mod tests {
         );
         assert!(rendered.contains("Compact          /compact"), "{rendered}");
         assert!(
-            rendered.contains("Resume compact   claw --resume session-issue-32 /compact"),
+            rendered.contains("Resume compact   brewcode --resume session-issue-32 /compact"),
             "{rendered}"
         );
         assert!(
@@ -10444,7 +10444,7 @@ mod tests {
         );
         assert!(rendered.contains("Compact          /compact"), "{rendered}");
         assert!(
-            rendered.contains("Resume compact   claw --resume session-issue-32 /compact"),
+            rendered.contains("Resume compact   brewcode --resume session-issue-32 /compact"),
             "{rendered}"
         );
     }
@@ -10570,24 +10570,24 @@ mod tests {
         let root = temp_dir();
         let cwd = root.join("project");
         let config_home = root.join("config-home");
-        std::fs::create_dir_all(cwd.join(".claw")).expect("project config dir should exist");
+        std::fs::create_dir_all(cwd.join(".brewcode")).expect("project config dir should exist");
         std::fs::create_dir_all(&config_home).expect("config home should exist");
         std::fs::write(
-            cwd.join(".claw").join("settings.json"),
+            cwd.join(".brewcode").join("settings.json"),
             r#"{"permissionMode":"acceptEdits"}"#,
         )
         .expect("project config should write");
 
-        let original_config_home = std::env::var("CLAW_CONFIG_HOME").ok();
+        let original_config_home = std::env::var("BREWCODE_CONFIG_HOME").ok();
         let original_permission_mode = std::env::var("RUSTY_CLAUDE_PERMISSION_MODE").ok();
-        std::env::set_var("CLAW_CONFIG_HOME", &config_home);
+        std::env::set_var("BREWCODE_CONFIG_HOME", &config_home);
         std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
 
         let resolved = with_current_dir(&cwd, super::default_permission_mode);
 
         match original_config_home {
-            Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
-            None => std::env::remove_var("CLAW_CONFIG_HOME"),
+            Some(value) => std::env::set_var("BREWCODE_CONFIG_HOME", value),
+            None => std::env::remove_var("BREWCODE_CONFIG_HOME"),
         }
         match original_permission_mode {
             Some(value) => std::env::set_var("RUSTY_CLAUDE_PERMISSION_MODE", value),
@@ -10604,24 +10604,24 @@ mod tests {
         let root = temp_dir();
         let cwd = root.join("project");
         let config_home = root.join("config-home");
-        std::fs::create_dir_all(cwd.join(".claw")).expect("project config dir should exist");
+        std::fs::create_dir_all(cwd.join(".brewcode")).expect("project config dir should exist");
         std::fs::create_dir_all(&config_home).expect("config home should exist");
         std::fs::write(
-            cwd.join(".claw").join("settings.json"),
+            cwd.join(".brewcode").join("settings.json"),
             r#"{"permissionMode":"acceptEdits"}"#,
         )
         .expect("project config should write");
 
-        let original_config_home = std::env::var("CLAW_CONFIG_HOME").ok();
+        let original_config_home = std::env::var("BREWCODE_CONFIG_HOME").ok();
         let original_permission_mode = std::env::var("RUSTY_CLAUDE_PERMISSION_MODE").ok();
-        std::env::set_var("CLAW_CONFIG_HOME", &config_home);
+        std::env::set_var("BREWCODE_CONFIG_HOME", &config_home);
         std::env::set_var("RUSTY_CLAUDE_PERMISSION_MODE", "read-only");
 
         let resolved = with_current_dir(&cwd, super::default_permission_mode);
 
         match original_config_home {
-            Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
-            None => std::env::remove_var("CLAW_CONFIG_HOME"),
+            Some(value) => std::env::set_var("BREWCODE_CONFIG_HOME", value),
+            None => std::env::remove_var("BREWCODE_CONFIG_HOME"),
         }
         match original_permission_mode {
             Some(value) => std::env::set_var("RUSTY_CLAUDE_PERMISSION_MODE", value),
@@ -10638,10 +10638,10 @@ mod tests {
         let config_home = temp_dir();
         std::fs::create_dir_all(&config_home).expect("config home should exist");
 
-        let original_config_home = std::env::var("CLAW_CONFIG_HOME").ok();
+        let original_config_home = std::env::var("BREWCODE_CONFIG_HOME").ok();
         let original_api_key = std::env::var("ANTHROPIC_API_KEY").ok();
         let original_auth_token = std::env::var("ANTHROPIC_AUTH_TOKEN").ok();
-        std::env::set_var("CLAW_CONFIG_HOME", &config_home);
+        std::env::set_var("BREWCODE_CONFIG_HOME", &config_home);
         std::env::remove_var("ANTHROPIC_API_KEY");
         std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
 
@@ -10657,8 +10657,8 @@ mod tests {
             .expect_err("saved oauth should be ignored without env auth");
 
         match original_config_home {
-            Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
-            None => std::env::remove_var("CLAW_CONFIG_HOME"),
+            Some(value) => std::env::set_var("BREWCODE_CONFIG_HOME", value),
+            None => std::env::remove_var("BREWCODE_CONFIG_HOME"),
         }
         match original_api_key {
             Some(value) => std::env::set_var("ANTHROPIC_API_KEY", value),
@@ -10878,16 +10878,16 @@ mod tests {
         let root = temp_dir();
         let cwd = root.join("project");
         let config_home = root.join("config-home");
-        std::fs::create_dir_all(cwd.join(".claw")).expect("project config dir should exist");
+        std::fs::create_dir_all(cwd.join(".brewcode")).expect("project config dir should exist");
         std::fs::create_dir_all(&config_home).expect("config home should exist");
         std::fs::write(
-            cwd.join(".claw").join("settings.json"),
+            cwd.join(".brewcode").join("settings.json"),
             r#"{"aliases":{"fast":"claude-haiku-4-5-20251213","smart":"opus","cheap":"grok-3-mini"}}"#,
         )
         .expect("project config should write");
 
-        let original_config_home = std::env::var("CLAW_CONFIG_HOME").ok();
-        std::env::set_var("CLAW_CONFIG_HOME", &config_home);
+        let original_config_home = std::env::var("BREWCODE_CONFIG_HOME").ok();
+        std::env::set_var("BREWCODE_CONFIG_HOME", &config_home);
 
         // when
         let direct = with_current_dir(&cwd, || resolve_model_alias_with_config("fast"));
@@ -10897,8 +10897,8 @@ mod tests {
         let builtin = with_current_dir(&cwd, || resolve_model_alias_with_config("haiku"));
 
         match original_config_home {
-            Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
-            None => std::env::remove_var("CLAW_CONFIG_HOME"),
+            Some(value) => std::env::set_var("BREWCODE_CONFIG_HOME", value),
+            None => std::env::remove_var("BREWCODE_CONFIG_HOME"),
         }
         std::fs::remove_dir_all(root).expect("temp config root should clean up");
 
@@ -11570,7 +11570,7 @@ mod tests {
         assert_eq!(value["command"], "export");
         assert_eq!(
             value["usage"],
-            "claw export [--session <id|latest>] [--output <path>] [--output-format <format>]"
+            "brewcode export [--session <id|latest>] [--output <path>] [--output-format <format>]"
         );
         assert_eq!(value["defaults"]["session"], LATEST_SESSION_REFERENCE);
         assert!(value["options"].as_array().expect("options array").len() >= 4);
@@ -11591,7 +11591,7 @@ mod tests {
         std::fs::create_dir_all(&cwd).expect("project dir should exist");
         std::fs::create_dir_all(&config_home).expect("config home should exist");
         std::fs::write(
-            cwd.join(".claw.json"),
+            cwd.join(".brewcode.json"),
             r#"{
   "mcpServers": {
     "missing-command": {"args": ["arg-only-no-command"]}
@@ -11599,15 +11599,15 @@ mod tests {
 }
 "#,
         )
-        .expect("write malformed .claw.json");
+        .expect("write malformed .brewcode.json");
 
-        let previous_config_home = std::env::var("CLAW_CONFIG_HOME").ok();
-        std::env::set_var("CLAW_CONFIG_HOME", &config_home);
+        let previous_config_home = std::env::var("BREWCODE_CONFIG_HOME").ok();
+        std::env::set_var("BREWCODE_CONFIG_HOME", &config_home);
         let payload = super::plugins_command_payload_for(&cwd, None, None)
             .expect("plugins list should not hard-fail on malformed MCP config");
         match previous_config_home {
-            Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
-            None => std::env::remove_var("CLAW_CONFIG_HOME"),
+            Some(value) => std::env::set_var("BREWCODE_CONFIG_HOME", value),
+            None => std::env::remove_var("BREWCODE_CONFIG_HOME"),
         }
 
         assert_eq!(payload.status, "degraded");
@@ -11628,9 +11628,9 @@ mod tests {
 
     #[test]
     fn status_degrades_gracefully_on_malformed_mcp_config_143() {
-        // #143: previously `claw status` hard-failed on any config parse error,
+        // #143: previously `brewcode status` hard-failed on any config parse error,
         // taking down the entire health surface for one malformed MCP entry.
-        // `claw doctor` already degrades gracefully; this test locks `status`
+        // `brewcode doctor` already degrades gracefully; this test locks `status`
         // to the same contract.
         let _guard = env_lock();
         let root = temp_dir();
@@ -11638,7 +11638,7 @@ mod tests {
         std::fs::create_dir_all(&cwd).expect("project dir should exist");
         // One valid server + one malformed entry missing `command`.
         std::fs::write(
-            cwd.join(".claw.json"),
+            cwd.join(".brewcode.json"),
             r#"{
   "mcpServers": {
     "everything": {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-everything"]},
@@ -11647,7 +11647,7 @@ mod tests {
 }
 "#,
         )
-        .expect("write malformed .claw.json");
+        .expect("write malformed .brewcode.json");
 
         let context = with_current_dir(&cwd, || {
             super::status_context(None)
@@ -11797,8 +11797,8 @@ mod tests {
 
     #[test]
     fn state_error_surfaces_actionable_worker_commands_139() {
-        // #139: the error for missing `.claw/worker-state.json` must name
-        // the concrete commands that produce worker state, otherwise claws
+        // #139: the error for missing `.brewcode/worker-state.json` must name
+        // the concrete commands that produce worker state, otherwise brewcodes
         // have no discoverable path from the error to a fix.
         let _guard = env_lock();
         let root = temp_dir();
@@ -11817,27 +11817,27 @@ mod tests {
         );
         // New actionable hints — this is what #139 is fixing.
         assert!(
-            message.contains("claw prompt"),
-            "error should name `claw prompt <text>` as a producer: {message}"
+            message.contains("brewcode prompt"),
+            "error should name `brewcode prompt <text>` as a producer: {message}"
         );
         assert!(
             message.contains("REPL"),
             "error should mention the interactive REPL as a producer: {message}"
         );
         assert!(
-            message.contains("claw state"),
+            message.contains("brewcode state"),
             "error should tell the user what to rerun once state exists: {message}"
         );
         // And the State --help topic must document the worker relationship
-        // so claws can discover the contract without hitting the error first.
+        // so brewcodes can discover the contract without hitting the error first.
         let state_help = render_help_topic(LocalHelpTopic::State);
         assert!(
             state_help.contains("Produces state"),
             "state help must document how state is produced: {state_help}"
         );
         assert!(
-            state_help.contains("claw prompt"),
-            "state help must name `claw prompt <text>` as a producer: {state_help}"
+            state_help.contains("brewcode prompt"),
+            "state help must name `brewcode prompt <text>` as a producer: {state_help}"
         );
     }
 
@@ -11960,7 +11960,7 @@ mod tests {
             "cli_parse"
         );
         assert_eq!(
-            classify_error_kind("unsupported ACP invocation. Use `claw acp`."),
+            classify_error_kind("unsupported ACP invocation. Use `brewcode acp`."),
             "unsupported_acp_invocation"
         );
         assert_eq!(
@@ -12424,7 +12424,7 @@ mod tests {
         let error = parse_args(&["/status".to_string()])
             .expect_err("/status should remain REPL-only when invoked directly");
         assert!(error.contains("interactive-only"));
-        assert!(error.contains("claw --resume SESSION.jsonl /status"));
+        assert!(error.contains("brewcode --resume SESSION.jsonl /status"));
     }
 
     #[test]
@@ -12546,7 +12546,7 @@ mod tests {
     #[test]
     fn punctuation_bearing_single_token_still_dispatches_to_prompt() {
         // #140: Guard against test pollution — isolate cwd + env so this test
-        // doesn't pick up a stale .claw/settings.json from other tests that
+        // doesn't pick up a stale .brewcode/settings.json from other tests that
         // may have set `permissionMode: acceptEdits` in a shared cwd.
         let _guard = env_lock();
         let root = temp_dir();
@@ -12648,7 +12648,7 @@ mod tests {
         let error = parse_args(&["--resum".to_string()]).expect_err("unknown option should fail");
         assert!(error.contains("unknown option: --resum"));
         assert!(error.contains("Did you mean --resume?"));
-        assert!(error.contains("claw --help"));
+        assert!(error.contains("brewcode --help"));
     }
 
     #[test]
@@ -12802,7 +12802,7 @@ mod tests {
         assert!(help.contains("/skills"));
         assert!(help.contains("/exit"));
         assert!(help.contains(
-            "Auto-save            .claw/sessions/<workspace-fingerprint>/<session-id>.jsonl"
+            "Auto-save            .brewcode/sessions/<workspace-fingerprint>/<session-id>.jsonl"
         ));
         assert!(help.contains("Resume latest        /resume latest"));
     }
@@ -12884,7 +12884,7 @@ mod tests {
         fs::create_dir_all(&root).expect("root dir");
         let config_home = root.join("config");
         fs::create_dir_all(&config_home).expect("config home dir");
-        std::env::set_var("CLAW_CONFIG_HOME", &config_home);
+        std::env::set_var("BREWCODE_CONFIG_HOME", &config_home);
         std::env::remove_var("ANTHROPIC_MODEL");
         std::env::set_var("ANTHROPIC_MODEL", "sonnet");
 
@@ -12893,7 +12893,7 @@ mod tests {
         assert_eq!(resolved, "claude-sonnet-4-6");
 
         std::env::remove_var("ANTHROPIC_MODEL");
-        std::env::remove_var("CLAW_CONFIG_HOME");
+        std::env::remove_var("BREWCODE_CONFIG_HOME");
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
 
@@ -12904,14 +12904,14 @@ mod tests {
         fs::create_dir_all(&root).expect("root dir");
         let config_home = root.join("config");
         fs::create_dir_all(&config_home).expect("config home dir");
-        std::env::set_var("CLAW_CONFIG_HOME", &config_home);
+        std::env::set_var("BREWCODE_CONFIG_HOME", &config_home);
         std::env::remove_var("ANTHROPIC_MODEL");
 
         let resolved = with_current_dir(&root, || resolve_repl_model(DEFAULT_MODEL.to_string()));
 
         assert_eq!(resolved, DEFAULT_MODEL);
 
-        std::env::remove_var("CLAW_CONFIG_HOME");
+        std::env::remove_var("BREWCODE_CONFIG_HOME");
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
 
@@ -13015,20 +13015,20 @@ mod tests {
         let mut help = Vec::new();
         print_help_to(&mut help).expect("help should render");
         let help = String::from_utf8(help).expect("help should be utf8");
-        assert!(help.contains("claw help"));
-        assert!(help.contains("claw version"));
-        assert!(help.contains("claw status"));
-        assert!(help.contains("claw sandbox"));
-        assert!(help.contains("claw init"));
-        assert!(help.contains("claw acp [serve]"));
-        assert!(help.contains("claw agents"));
-        assert!(help.contains("claw mcp"));
-        assert!(help.contains("claw skills"));
-        assert!(help.contains("claw /skills"));
+        assert!(help.contains("brewcode help"));
+        assert!(help.contains("brewcode version"));
+        assert!(help.contains("brewcode status"));
+        assert!(help.contains("brewcode sandbox"));
+        assert!(help.contains("brewcode init"));
+        assert!(help.contains("brewcode acp [serve]"));
+        assert!(help.contains("brewcode agents"));
+        assert!(help.contains("brewcode mcp"));
+        assert!(help.contains("brewcode skills"));
+        assert!(help.contains("brewcode /skills"));
         assert!(help.contains("ultraworkers/claw-code"));
-        assert!(help.contains("cargo install claw-code"));
-        assert!(!help.contains("claw login"));
-        assert!(!help.contains("claw logout"));
+        assert!(help.contains("cargo install brew-code"));
+        assert!(!help.contains("brewcode login"));
+        assert!(!help.contains("brewcode logout"));
     }
 
     #[test]
@@ -13170,7 +13170,7 @@ mod tests {
                 },
                 TmuxPaneSnapshot {
                     pane_id: "%2".to_string(),
-                    current_command: "claw".to_string(),
+                    current_command: "brewcode".to_string(),
                     current_path: workspace.join("rust"),
                 },
             ],
@@ -13178,7 +13178,7 @@ mod tests {
 
         assert_eq!(lifecycle.kind, SessionLifecycleKind::RunningProcess);
         assert_eq!(lifecycle.pane_id.as_deref(), Some("%2"));
-        assert_eq!(lifecycle.pane_command.as_deref(), Some("claw"));
+        assert_eq!(lifecycle.pane_command.as_deref(), Some("brewcode"));
         assert!(!lifecycle.abandoned);
     }
 
@@ -13219,7 +13219,7 @@ mod tests {
         git(&["init", "--quiet"], &workspace);
         git(&["config", "user.email", "tests@example.com"], &workspace);
         git(&["config", "user.name", "Rusty Claude Tests"], &workspace);
-        fs::write(workspace.join(".gitignore"), ".claw/\n").expect("write gitignore");
+        fs::write(workspace.join(".gitignore"), ".brewcode/\n").expect("write gitignore");
         fs::write(workspace.join("tracked.txt"), "hello\n").expect("write tracked");
         git(&["add", ".gitignore", "tracked.txt"], &workspace);
         git(&["commit", "-m", "init", "--quiet"], &workspace);
@@ -13284,7 +13284,7 @@ mod tests {
     }
 
     #[test]
-    fn status_json_surfaces_session_lifecycle_for_clawhip() {
+    fn status_json_surfaces_session_lifecycle_for_brewcodehip() {
         let context = super::StatusContext {
             cwd: PathBuf::from("/tmp/project"),
             session_path: None,
@@ -13299,7 +13299,7 @@ mod tests {
             session_lifecycle: SessionLifecycleSummary {
                 kind: SessionLifecycleKind::RunningProcess,
                 pane_id: Some("%9".to_string()),
-                pane_command: Some("claw".to_string()),
+                pane_command: Some("brewcode".to_string()),
                 pane_path: Some(PathBuf::from("/tmp/project")),
                 workspace_dirty: false,
                 abandoned: false,
@@ -13330,7 +13330,7 @@ mod tests {
         );
         assert_eq!(
             value["workspace"]["session_lifecycle"]["pane_command"],
-            "claw"
+            "brewcode"
         );
         assert_eq!(value["workspace"]["session_lifecycle"]["abandoned"], false);
         assert_eq!(value["workspace"]["branch_freshness"]["fresh"], true);
@@ -13369,7 +13369,7 @@ mod tests {
         git(&["config", "user.email", "tests@example.com"], &workspace);
         git(&["config", "user.name", "Rusty Claude Tests"], &workspace);
         fs::write(workspace.join("tracked.txt"), "hello\n").expect("write tracked");
-        fs::write(workspace.join(".claw.json"), r#"{"trustedRoots": ["."]}"#)
+        fs::write(workspace.join(".brewcode.json"), r#"{"trustedRoots": ["."]}"#)
             .expect("write config");
         git(&["add", "tracked.txt"], &workspace);
         git(&["commit", "-m", "init", "--quiet"], &workspace);
@@ -13707,10 +13707,10 @@ UU conflicted.rs",
         let mut help = Vec::new();
         print_help_to(&mut help).expect("help should render");
         let help = String::from_utf8(help).expect("help should be utf8");
-        assert!(help.contains("claw --resume [SESSION.jsonl|session-id|latest]"));
+        assert!(help.contains("brewcode --resume [SESSION.jsonl|session-id|latest]"));
         assert!(help.contains("Use `latest` with --resume, /resume, or /session switch"));
-        assert!(help.contains("claw --resume latest"));
-        assert!(help.contains("claw --resume latest /status /diff /export notes.txt"));
+        assert!(help.contains("brewcode --resume latest"));
+        assert!(help.contains("brewcode --resume latest /status /diff /export notes.txt"));
     }
 
     #[test]
@@ -13724,7 +13724,7 @@ UU conflicted.rs",
         let handle = create_managed_session_handle("session-alpha").expect("jsonl handle");
         assert!(handle.path.ends_with("session-alpha.jsonl"));
 
-        let legacy_path = workspace.join(".claw/sessions/legacy.json");
+        let legacy_path = workspace.join(".brewcode/sessions/legacy.json");
         std::fs::create_dir_all(
             legacy_path
                 .parent()
@@ -13857,7 +13857,7 @@ UU conflicted.rs",
         let previous = std::env::current_dir().expect("cwd");
         std::env::set_current_dir(&workspace_b).expect("switch cwd");
 
-        let session_path = workspace_a.join(".claw/sessions/legacy-cross.jsonl");
+        let session_path = workspace_a.join(".brewcode/sessions/legacy-cross.jsonl");
         std::fs::create_dir_all(
             session_path
                 .parent()
@@ -13914,7 +13914,7 @@ UU conflicted.rs",
     fn resume_usage_mentions_latest_shortcut() {
         let usage = render_resume_usage();
         assert!(usage.contains("/resume <session-path|session-id|latest>"));
-        assert!(usage.contains(".claw/sessions/<workspace-fingerprint>/<session-id>.jsonl"));
+        assert!(usage.contains(".brewcode/sessions/<workspace-fingerprint>/<session-id>.jsonl"));
         assert!(usage.contains("/session list"));
     }
 
@@ -13946,7 +13946,7 @@ UU conflicted.rs",
             .duration_since(std::time::UNIX_EPOCH)
             .expect("system time should be after epoch")
             .as_nanos();
-        std::env::temp_dir().join(format!("claw-cli-{label}-{nanos}"))
+        std::env::temp_dir().join(format!("brewcode-cli-{label}-{nanos}"))
     }
 
     #[test]
@@ -14985,7 +14985,7 @@ mod dump_manifests_tests {
     #[test]
     fn dump_manifests_shows_helpful_error_when_manifests_missing() {
         let root = std::env::temp_dir().join(format!(
-            "claw_test_missing_manifests_{}",
+            "brewcode_test_missing_manifests_{}",
             std::process::id()
         ));
         let workspace = root.join("workspace");
@@ -15022,7 +15022,7 @@ mod dump_manifests_tests {
     #[test]
     fn dump_manifests_uses_explicit_manifest_dir() {
         let root = std::env::temp_dir().join(format!(
-            "claw_test_explicit_manifest_dir_{}",
+            "brewcode_test_explicit_manifest_dir_{}",
             std::process::id()
         ));
         let workspace = root.join("workspace");

@@ -1,4 +1,4 @@
-# TUI Enhancement Plan — Claw Code (`rusty-claude-cli`)
+# TUI Enhancement Plan — Brew Code (`rusty-claude-cli`)
 
 ## Executive Summary
 

@@ -7,7 +7,7 @@ Windows CI, and minimal release jobs. It validates:
 * required repository policy files exist;
 * local Markdown links and image targets resolve;
 * local heading anchors referenced from Markdown resolve; and
-* command examples do not present the deprecated `cargo install claw-code`
+* command examples do not present the deprecated `cargo install brew-code`
   package as an executable install path.
 """
 
@@ -142,11 +142,11 @@ def validate_command_examples(errors: list[str]) -> None:
                 stripped = line.strip()
                 if not stripped or stripped.startswith(("#", ">")):
                     continue
-                if re.search(r"\bcargo\s+install\s+claw-code\b", stripped):
+                if re.search(r"\bcargo\s+install\s+brew-code\b", stripped):
                     line_no = text.count("\n", 0, match.start()) + offset + 1
                     errors.append(
                         f"{path.relative_to(ROOT)}:{line_no}: deprecated "
-                        "`cargo install claw-code` appears in an executable "
+                        "`cargo install brew-code` appears in an executable "
                         "command block; use build-from-source docs instead"
                     )
 

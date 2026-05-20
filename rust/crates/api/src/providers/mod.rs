@@ -347,8 +347,7 @@ pub fn detect_provider_kind(model: &str) -> ProviderKind {
     // even when the model name has no recognized prefix — this is the
     // common case for local providers (Ollama, LM Studio, vLLM, etc.)
     // where model names like "qwen2.5-coder:7b" don't match any prefix.
-    if std::env::var_os("OPENAI_BASE_URL").is_some() && openai_compat::has_api_key("OPENAI_API_KEY")
-    {
+    if env_or_dotenv_present("OPENAI_BASE_URL") && openai_compat::has_api_key("OPENAI_API_KEY") {
         return ProviderKind::OpenAi;
     }
     if anthropic::has_auth_from_env_or_saved().unwrap_or(false) {
@@ -362,7 +361,7 @@ pub fn detect_provider_kind(model: &str) -> ProviderKind {
     }
     // Last resort: if OPENAI_BASE_URL is set without OPENAI_API_KEY (some
     // local providers like Ollama don't require auth), still route there.
-    if std::env::var_os("OPENAI_BASE_URL").is_some() {
+    if env_or_dotenv_present("OPENAI_BASE_URL") {
         return ProviderKind::OpenAi;
     }
     ProviderKind::Anthropic
@@ -624,6 +623,17 @@ pub fn model_token_limit(model: &str) -> Option<ModelTokenLimit> {
         "gpt-4.1" | "gpt-4.1-mini" | "gpt-4.1-nano" => Some(ModelTokenLimit {
             max_output_tokens: 32_768,
             context_window_tokens: 1_047_576,
+        }),
+        // GPT-4o family via the OpenAI API.
+        "gpt-4o" | "gpt-4o-mini" => Some(ModelTokenLimit {
+            max_output_tokens: 16_384,
+            context_window_tokens: 128_000,
+        }),
+        // Qwen3-Coder via Ollama Cloud (or any OpenAI-compat gateway exposing
+        // the same model IDs). Context window per Alibaba: up to 256K tokens.
+        "qwen3-coder:480b" | "qwen3-coder:30b" | "qwen3-coder" => Some(ModelTokenLimit {
+            max_output_tokens: 32_768,
+            context_window_tokens: 256_000,
         }),
         // GPT-5.4 family via the OpenAI API.
         "gpt-5.4" => Some(ModelTokenLimit {
@@ -1036,7 +1046,7 @@ mod tests {
 
     #[test]
     fn qwen_prefix_routes_to_dashscope_not_anthropic() {
-        // User request from Discord #clawcode-get-help: web3g wants to use
+        // User request from Discord #brewcodecode-get-help: web3g wants to use
         // Qwen 3.6 Plus via native Alibaba DashScope API (not OpenRouter,
         // which has lower rate limits). metadata_for_model must route
         // qwen/* and bare qwen-* to the OpenAi provider kind pointed at
@@ -1129,8 +1139,8 @@ mod tests {
             .as_nanos();
         let root = std::env::temp_dir().join(format!("api-plugin-max-tokens-{nanos}"));
         let cwd = root.join("project");
-        let home = root.join("home").join(".claw");
-        std::fs::create_dir_all(cwd.join(".claw")).expect("project config dir");
+        let home = root.join("home").join(".brewcode");
+        std::fs::create_dir_all(cwd.join(".brewcode")).expect("project config dir");
         std::fs::create_dir_all(&home).expect("home config dir");
         std::fs::write(
             home.join("settings.json"),
@@ -1695,4 +1705,12 @@ NO_EQUALS_LINE
     // (env_lock only protects within a single binary). The detection logic
     // is covered: OPENAI_BASE_URL alone routes to OpenAi as a last-resort
     // fallback in detect_provider_kind().
+
+    #[test]
+    fn gpt_4o_mini_is_registered_with_correct_limits() {
+        let limit =
+            model_token_limit("gpt-4o-mini").expect("gpt-4o-mini must be in the model registry");
+        assert_eq!(limit.max_output_tokens, 16_384);
+        assert_eq!(limit.context_window_tokens, 128_000);
+    }
 }

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate the generated Claw Code 2.0 board coverage and schema."""
+"""Validate the generated Brew Code 2.0 board coverage and schema."""
 from __future__ import annotations
 
 import argparse
@@ -26,7 +26,7 @@ STATUSES = {
     "stale_done",
     "superseded",
     "deferred_with_rationale",
-    "rejected_not_claw",
+    "rejected_not_brewcode",
 }
 
 def roadmap_heading_lines(path: Path) -> list[int]:

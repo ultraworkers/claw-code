@@ -18,7 +18,7 @@ fn compact_slash_command_in_repl_does_not_start_nested_tokio_runtime() {
     fs::create_dir_all(&home).expect("home should exist");
 
     // when
-    let output = run_claw_repl(&workspace, &config_home, &home, "/compact\n/exit\n");
+    let output = run_brewcode_repl(&workspace, &config_home, &home, "/compact\n/exit\n");
 
     // then
     assert!(
@@ -49,18 +49,18 @@ fn compact_slash_command_in_repl_does_not_start_nested_tokio_runtime() {
     fs::remove_dir_all(&workspace).expect("workspace cleanup should succeed");
 }
 
-fn run_claw_repl(
+fn run_brewcode_repl(
     cwd: &std::path::Path,
     config_home: &std::path::Path,
     home: &std::path::Path,
     stdin: &str,
 ) -> Output {
-    let mut command = python_pty_command(env!("CARGO_BIN_EXE_claw"));
+    let mut command = python_pty_command(env!("CARGO_BIN_EXE_brewcode"));
     let mut child = command
         .current_dir(cwd)
         .env_clear()
         .env("ANTHROPIC_API_KEY", "test-compact-repl-key")
-        .env("CLAW_CONFIG_HOME", config_home)
+        .env("BREWCODE_CONFIG_HOME", config_home)
         .env("HOME", home)
         .env("NO_COLOR", "1")
         .env("PATH", "/usr/bin:/bin")
@@ -68,7 +68,7 @@ fn run_claw_repl(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("claw should launch");
+        .expect("brewcode should launch");
 
     child
         .stdin
@@ -77,10 +77,10 @@ fn run_claw_repl(
         .write_all(stdin.as_bytes())
         .expect("stdin should write");
 
-    child.wait_with_output().expect("claw should finish")
+    child.wait_with_output().expect("brewcode should finish")
 }
 
-fn python_pty_command(claw: &str) -> Command {
+fn python_pty_command(brewcode: &str) -> Command {
     let mut command = Command::new("python3");
     command.args([
         "-c",
@@ -90,10 +90,10 @@ import pty
 import subprocess
 import sys
 
-claw = sys.argv[1]
+brewcode = sys.argv[1]
 payload = sys.stdin.buffer.read()
 master, slave = pty.openpty()
-child = subprocess.Popen([claw], stdin=slave, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+child = subprocess.Popen([brewcode], stdin=slave, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 os.close(slave)
 os.write(master, payload)
 stdout, stderr = child.communicate(timeout=30)
@@ -102,7 +102,7 @@ sys.stdout.buffer.write(stdout)
 sys.stderr.buffer.write(stderr)
 raise SystemExit(child.returncode)
 "#,
-        claw,
+        brewcode,
     ]);
     command
 }
@@ -114,7 +114,7 @@ fn unique_temp_dir(label: &str) -> PathBuf {
         .as_millis();
     let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
     std::env::temp_dir().join(format!(
-        "claw-{label}-{}-{millis}-{counter}",
+        "brewcode-{label}-{}-{millis}-{counter}",
         std::process::id()
     ))
 }

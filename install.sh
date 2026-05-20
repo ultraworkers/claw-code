@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Claw Code installer
+# Brew Code installer
 #
 # Detects the host OS, verifies the Rust toolchain (rustc + cargo),
-# builds the `claw` binary from the `rust/` workspace, and runs a
+# builds the `brewcode` binary from the `rust/` workspace, and runs a
 # post-install verification step. Supports Linux, macOS, and WSL.
 #
 # Usage:
@@ -12,8 +12,8 @@
 #   ./install.sh --help         # print usage
 #
 # Environment overrides:
-#   CLAW_BUILD_PROFILE=debug|release   same as --release toggle
-#   CLAW_SKIP_VERIFY=1                 same as --no-verify
+#   BREWCODE_BUILD_PROFILE=debug|release   same as --release toggle
+#   BREWCODE_SKIP_VERIFY=1                 same as --no-verify
 
 set -euo pipefail
 
@@ -66,7 +66,7 @@ print_banner() {
   \____||_| \__,_|  \_/\_/   \____\___/ \__,_|\___|
 EOF
     printf '%s\n' "${COLOR_RESET}"
-    printf '%sClaw Code installer%s\n' "${COLOR_DIM}" "${COLOR_RESET}"
+    printf '%sBrew Code installer%s\n' "${COLOR_DIM}" "${COLOR_RESET}"
 }
 
 print_usage() {
@@ -80,8 +80,8 @@ Options:
   -h, --help      Show this help text and exit.
 
 Environment overrides:
-  CLAW_BUILD_PROFILE   debug | release
-  CLAW_SKIP_VERIFY     set to 1 to skip verification
+  BREWCODE_BUILD_PROFILE   debug | release
+  BREWCODE_SKIP_VERIFY     set to 1 to skip verification
 EOF
 }
 
@@ -89,8 +89,8 @@ EOF
 # Argument parsing
 # ---------------------------------------------------------------------------
 
-BUILD_PROFILE="${CLAW_BUILD_PROFILE:-debug}"
-SKIP_VERIFY="${CLAW_SKIP_VERIFY:-0}"
+BUILD_PROFILE="${BREWCODE_BUILD_PROFILE:-debug}"
+SKIP_VERIFY="${BREWCODE_SKIP_VERIFY:-0}"
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -163,9 +163,9 @@ ${COLOR_DIM}---------------${COLOR_RESET}
        cd rust && cargo clean && cargo build --workspace
      If the failure mentions ring/openssl, double check step 2.
 
-  ${COLOR_BOLD}6. 'claw' not found after install${COLOR_RESET}
+  ${COLOR_BOLD}6. 'brewcode' not found after install${COLOR_RESET}
      The binary lives at:
-       rust/target/${BUILD_PROFILE}/claw
+       rust/target/${BUILD_PROFILE}/brewcode
      Add it to your PATH or invoke it with the full path.
 
 EOF
@@ -305,7 +305,7 @@ fi
 # Step 4: build the workspace
 # ---------------------------------------------------------------------------
 
-step "Building the claw workspace (${BUILD_PROFILE})"
+step "Building the brewcode workspace (${BUILD_PROFILE})"
 
 CARGO_FLAGS=("build" "--workspace")
 if [ "${BUILD_PROFILE}" = "release" ]; then
@@ -320,15 +320,15 @@ info "this may take a few minutes on the first build"
     CARGO_TERM_COLOR="${CARGO_TERM_COLOR:-always}" cargo "${CARGO_FLAGS[@]}"
 )
 
-CLAW_BIN="${RUST_DIR}/target/${BUILD_PROFILE}/claw"
+BREWCODE_BIN="${RUST_DIR}/target/${BUILD_PROFILE}/brewcode"
 
-if [ ! -x "${CLAW_BIN}" ]; then
-    error "Expected binary not found at ${CLAW_BIN}"
+if [ ! -x "${BREWCODE_BIN}" ]; then
+    error "Expected binary not found at ${BREWCODE_BIN}"
     error "The build reported success but the binary is missing — check cargo output above."
     exit 1
 fi
 
-ok "built ${CLAW_BIN}"
+ok "built ${BREWCODE_BIN}"
 
 # ---------------------------------------------------------------------------
 # Step 5: post-install verification
@@ -337,22 +337,22 @@ ok "built ${CLAW_BIN}"
 step "Verifying the installed binary"
 
 if [ "${SKIP_VERIFY}" = "1" ]; then
-    warn "verification skipped (--no-verify or CLAW_SKIP_VERIFY=1)"
+    warn "verification skipped (--no-verify or BREWCODE_SKIP_VERIFY=1)"
 else
-    info "running: claw --version"
-    if VERSION_OUT="$("${CLAW_BIN}" --version 2>&1)"; then
-        ok "claw --version -> ${VERSION_OUT}"
+    info "running: brewcode --version"
+    if VERSION_OUT="$("${BREWCODE_BIN}" --version 2>&1)"; then
+        ok "brewcode --version -> ${VERSION_OUT}"
     else
-        error "claw --version failed:"
+        error "brewcode --version failed:"
         printf '%s\n' "${VERSION_OUT}" 1>&2
         exit 1
     fi
 
-    info "running: claw --help (smoke test)"
-    if "${CLAW_BIN}" --help >/dev/null 2>&1; then
-        ok "claw --help responded"
+    info "running: brewcode --help (smoke test)"
+    if "${BREWCODE_BIN}" --help >/dev/null 2>&1; then
+        ok "brewcode --help responded"
     else
-        error "claw --help failed"
+        error "brewcode --help failed"
         exit 1
     fi
 fi
@@ -364,28 +364,28 @@ fi
 step "Next steps"
 
 cat <<EOF
-${COLOR_GREEN}Claw Code is built and ready.${COLOR_RESET}
+${COLOR_GREEN}Brew Code is built and ready.${COLOR_RESET}
 
-  Binary:  ${COLOR_BOLD}${CLAW_BIN}${COLOR_RESET}
+  Binary:  ${COLOR_BOLD}${BREWCODE_BIN}${COLOR_RESET}
   Profile: ${BUILD_PROFILE}
 
 Try it out:
 
   ${COLOR_DIM}# interactive REPL${COLOR_RESET}
-  ${CLAW_BIN}
+  ${BREWCODE_BIN}
 
   ${COLOR_DIM}# one-shot prompt${COLOR_RESET}
-  ${CLAW_BIN} prompt "summarize this repository"
+  ${BREWCODE_BIN} prompt "summarize this repository"
 
   ${COLOR_DIM}# health check (run /doctor inside the REPL)${COLOR_RESET}
-  ${CLAW_BIN}
+  ${BREWCODE_BIN}
   /doctor
 
 Authentication:
 
   export ANTHROPIC_API_KEY="sk-ant-..."
   ${COLOR_DIM}# or use OAuth:${COLOR_RESET}
-  ${CLAW_BIN} login
+  ${BREWCODE_BIN} login
 
 For deeper docs, see USAGE.md and rust/README.md.
 EOF

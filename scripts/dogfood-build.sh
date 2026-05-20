@@ -1,24 +1,24 @@
 #!/usr/bin/env bash
-# dogfood-build.sh — Build claw from current checkout and verify provenance.
+# dogfood-build.sh — Build brewcode from current checkout and verify provenance.
 #
 # Injects GIT_SHA at build time so version JSON is non-null.
 # Suppresses Cargo compile noise on stderr.
 # Prints the verified binary path on success. Use as:
 #
-#   CLAW=$(bash scripts/dogfood-build.sh)
+#   BREWCODE=$(bash scripts/dogfood-build.sh)
 #
 # Then dogfood with config isolation (avoids real user config bleeding in):
 #
-#   CLAW_CONFIG_HOME=$(mktemp -d) $CLAW plugins list --output-format json
+#   BREWCODE_CONFIG_HOME=$(mktemp -d) $BREWCODE plugins list --output-format json
 #
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RUST_DIR="$REPO_ROOT/rust"
-BINARY="$RUST_DIR/target/debug/claw"
+BINARY="$RUST_DIR/target/debug/brewcode"
 EXPECTED_SHA="$(git -C "$REPO_ROOT" rev-parse --short HEAD)"
 
-echo "▶ Building claw from $REPO_ROOT" >&2
+echo "▶ Building brewcode from $REPO_ROOT" >&2
 echo "  Commit: $(git -C "$REPO_ROOT" log --oneline -1)" >&2
 
 # Inject GIT_SHA so version JSON returns a non-null sha.
@@ -56,13 +56,13 @@ fi
 
 echo "✓ Binary verified: $BINARY_SHA == HEAD" >&2
 echo "" >&2
-echo "  export CLAW=$BINARY" >&2
+echo "  export BREWCODE=$BINARY" >&2
 echo "" >&2
 echo "  Dogfood with isolated config (no real user config on stderr):" >&2
-echo "    CLAW_ISOLATED=\$(mktemp -d)" >&2
-echo "    CLAW_CONFIG_HOME=\$CLAW_ISOLATED \$CLAW plugins list --output-format json" >&2
-echo "    rm -rf \$CLAW_ISOLATED" >&2
+echo "    BREWCODE_ISOLATED=\$(mktemp -d)" >&2
+echo "    BREWCODE_CONFIG_HOME=\$BREWCODE_ISOLATED \$BREWCODE plugins list --output-format json" >&2
+echo "    rm -rf \$BREWCODE_ISOLATED" >&2
 echo "" >&2
 echo "  cargo run overhead: ~1s/invocation vs 7ms for pre-built binary." >&2
-echo "  Prefer pre-built binary (\$CLAW) for dogfood loops." >&2
+echo "  Prefer pre-built binary (\$BREWCODE) for dogfood loops." >&2
 echo "$BINARY"

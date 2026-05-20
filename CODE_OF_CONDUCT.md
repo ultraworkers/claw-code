@@ -2,7 +2,7 @@
 
 ## Our pledge
 
-We aim to make Claw Code a practical, respectful, and evidence-oriented
+We aim to make Brew Code a practical, respectful, and evidence-oriented
 community. Contributors and maintainers are expected to communicate with
 patience, assume good intent, and focus critique on the work rather than the
 person.

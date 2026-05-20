@@ -1,6 +1,6 @@
-# Contributing to Claw Code
+# Contributing to Brew Code
 
-Thanks for helping improve Claw Code. This repository is a Rust-first CLI
+Thanks for helping improve Brew Code. This repository is a Rust-first CLI
 workspace with supporting docs and compatibility fixtures.
 
 ## Ground rules
@@ -19,7 +19,7 @@ workspace with supporting docs and compatibility fixtures.
 
 ```bash
 git clone https://github.com/ultraworkers/claw-code
-cd claw-code/rust
+cd brew-code/rust
 cargo build --workspace
 cargo test --workspace
 ```
@@ -28,9 +28,9 @@ On Windows PowerShell, build from the same `rust` workspace and run the binary
 with the `.exe` suffix:
 
 ```powershell
-cd claw-code\rust
+cd brew-code\rust
 cargo build --workspace
-.\target\debug\claw.exe --help
+.\target\debug\brewcode.exe --help
 ```
 
 ## Checks before opening a pull request

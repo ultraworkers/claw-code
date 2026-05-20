@@ -1,19 +1,19 @@
-# Claw Code 2.0 PR and Issue Resolution Gate
+# Brew Code 2.0 PR and Issue Resolution Gate
 
-This gate was added to the Claw Code 2.0 Ultragoal after the explicit requirement:
+This gate was added to the Brew Code 2.0 Ultragoal after the explicit requirement:
 
 > all PRs should be merged and all issues should be resolved if resolvable and correct.
 
 ## Scope
 
-Before the Claw Code 2.0 Ultragoal can be marked complete:
+Before the Brew Code 2.0 Ultragoal can be marked complete:
 
 1. Every open GitHub PR at the current final-gate snapshot must be triaged.
-2. PRs that are correct, compatible with Claw Code 2.0 direction, and pass required verification must be merged.
-3. PRs that are stale, incorrect, duplicative, unsafe, spam, or outside Claw Code scope must not be merged; each needs a recorded rationale.
+2. PRs that are correct, compatible with Brew Code 2.0 direction, and pass required verification must be merged.
+3. PRs that are stale, incorrect, duplicative, unsafe, spam, or outside Brew Code scope must not be merged; each needs a recorded rationale.
 4. Every open GitHub issue at the current final-gate snapshot must be triaged.
 5. Issues that are resolvable and correct must be fixed or explicitly linked to a merged fix.
-6. Issues that are spam, duplicates, incorrect, unactionable, externally blocked, or not Claw Code work must be closed or labeled/commented with rationale when repository policy allows.
+6. Issues that are spam, duplicates, incorrect, unactionable, externally blocked, or not Brew Code work must be closed or labeled/commented with rationale when repository policy allows.
 7. The final completion audit must use a fresh GitHub snapshot, not only the planning snapshot.
 
 ## Current live snapshot
@@ -44,7 +44,7 @@ Automation lanes may recommend labels, comments, defer/close rationales, or merg
 
 ## G012 final PR reconciliation snapshot
 
-Worker-3 captured a fresh PR ledger for the final Claw Code 2.0 gate in `docs/pr-triage-g012-final-gate.json`.
+Worker-3 captured a fresh PR ledger for the final Brew Code 2.0 gate in `docs/pr-triage-g012-final-gate.json`.
 
 - Captured on: 2026-05-15T02:58:00Z during G012 final-gate execution.
 - Commands: `gh pr list --state open --limit 100 ...` plus `gh pr view <number> ...` for per-PR file and merge-state evidence.

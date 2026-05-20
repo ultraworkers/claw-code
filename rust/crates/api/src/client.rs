@@ -235,4 +235,35 @@ mod tests {
             other => panic!("Expected ProviderClient::OpenAi for qwen-plus, got: {other:?}"),
         }
     }
+
+    #[test]
+    fn openai_model_with_ollama_cloud_base_url_resolves_to_ollama_cloud_gateway() {
+        // Regression: `--model openai/<x>` with `OPENAI_BASE_URL=https://ollama.com/v1`
+        // used to send `model: "openai/<x>"` on the wire and Ollama Cloud 404'd
+        // because it assumed any non-default OpenAI base URL was OpenRouter.
+        // After the Gateway refactor the client must recognize Ollama Cloud
+        // distinctly so the wire model is bare and future per-gateway logic
+        // (body-size pre-flight, error mapping) sees the right backend.
+        use crate::providers::openai_compat::Gateway;
+
+        let _lock = env_lock();
+        let _ollama_key = EnvVarGuard::set("OPENAI_API_KEY", Some("ollama-cloud-key"));
+        let _ollama_url = EnvVarGuard::set("OPENAI_BASE_URL", Some("https://ollama.com/v1"));
+        let _anthropic = EnvVarGuard::set("ANTHROPIC_API_KEY", None);
+        let _anthropic_tok = EnvVarGuard::set("ANTHROPIC_AUTH_TOKEN", None);
+
+        let client = ProviderClient::from_model("openai/gpt-oss:20b")
+            .expect("openai/<model> with OPENAI_BASE_URL should build");
+        match client {
+            ProviderClient::OpenAi(c) => {
+                assert_eq!(
+                    c.gateway(),
+                    Gateway::OllamaCloud,
+                    "Ollama Cloud base URL must produce OllamaCloud gateway, got {:?}",
+                    c.gateway()
+                );
+            }
+            other => panic!("Expected ProviderClient::OpenAi, got: {other:?}"),
+        }
+    }
 }

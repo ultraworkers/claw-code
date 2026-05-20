@@ -15,7 +15,7 @@ fn status_command_applies_model_and_permission_mode_flags() {
     fs::create_dir_all(&temp_dir).expect("temp dir should exist");
 
     // when
-    let output = Command::new(env!("CARGO_BIN_EXE_claw"))
+    let output = Command::new(env!("CARGO_BIN_EXE_brewcode"))
         .current_dir(&temp_dir)
         .args([
             "--model",
@@ -25,7 +25,7 @@ fn status_command_applies_model_and_permission_mode_flags() {
             "status",
         ])
         .output()
-        .expect("claw should launch");
+        .expect("brewcode should launch");
 
     // then
     assert_success(&output);
@@ -45,7 +45,7 @@ fn resume_flag_loads_a_saved_session_and_dispatches_status() {
     let session_path = write_session(&temp_dir, "resume-status");
 
     // when
-    let output = Command::new(env!("CARGO_BIN_EXE_claw"))
+    let output = Command::new(env!("CARGO_BIN_EXE_brewcode"))
         .current_dir(&temp_dir)
         .args([
             "--resume",
@@ -53,7 +53,7 @@ fn resume_flag_loads_a_saved_session_and_dispatches_status() {
             "/status",
         ])
         .output()
-        .expect("claw should launch");
+        .expect("brewcode should launch");
 
     // then
     assert_success(&output);
@@ -73,16 +73,16 @@ fn slash_command_names_match_known_commands_and_suggest_nearby_unknown_ones() {
     fs::create_dir_all(&temp_dir).expect("temp dir should exist");
 
     // when
-    let help_output = Command::new(env!("CARGO_BIN_EXE_claw"))
+    let help_output = Command::new(env!("CARGO_BIN_EXE_brewcode"))
         .current_dir(&temp_dir)
         .arg("/help")
         .output()
-        .expect("claw should launch");
-    let unknown_output = Command::new(env!("CARGO_BIN_EXE_claw"))
+        .expect("brewcode should launch");
+    let unknown_output = Command::new(env!("CARGO_BIN_EXE_brewcode"))
         .current_dir(&temp_dir)
         .arg("/zstats")
         .output()
-        .expect("claw should launch");
+        .expect("brewcode should launch");
 
     // then
     assert_success(&help_output);
@@ -109,11 +109,11 @@ fn omc_namespaced_slash_commands_surface_a_targeted_compatibility_hint() {
     let temp_dir = unique_temp_dir("slash-dispatch-omc");
     fs::create_dir_all(&temp_dir).expect("temp dir should exist");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_claw"))
+    let output = Command::new(env!("CARGO_BIN_EXE_brewcode"))
         .current_dir(&temp_dir)
         .arg("/oh-my-claudecode:hud")
         .output()
-        .expect("claw should launch");
+        .expect("brewcode should launch");
 
     assert!(
         !output.status.success(),
@@ -133,16 +133,16 @@ fn omc_namespaced_slash_commands_surface_a_targeted_compatibility_hint() {
 fn config_command_loads_defaults_from_standard_config_locations() {
     // given
     let temp_dir = unique_temp_dir("config-defaults");
-    let config_home = temp_dir.join("home").join(".claw");
-    fs::create_dir_all(temp_dir.join(".claw")).expect("project config dir should exist");
+    let config_home = temp_dir.join("home").join(".brewcode");
+    fs::create_dir_all(temp_dir.join(".brewcode")).expect("project config dir should exist");
     fs::create_dir_all(&config_home).expect("home config dir should exist");
 
     fs::write(config_home.join("settings.json"), r#"{"model":"haiku"}"#)
         .expect("write user settings");
-    fs::write(temp_dir.join(".claw.json"), r#"{"model":"sonnet"}"#)
+    fs::write(temp_dir.join(".brewcode.json"), r#"{"model":"sonnet"}"#)
         .expect("write project settings");
     fs::write(
-        temp_dir.join(".claw").join("settings.local.json"),
+        temp_dir.join(".brewcode").join("settings.local.json"),
         r#"{"model":"opus"}"#,
     )
     .expect("write local settings");
@@ -150,7 +150,7 @@ fn config_command_loads_defaults_from_standard_config_locations() {
 
     // when
     let output = command_in(&temp_dir)
-        .env("CLAW_CONFIG_HOME", &config_home)
+        .env("BREWCODE_CONFIG_HOME", &config_home)
         .args([
             "--resume",
             session_path.to_str().expect("utf8 path"),
@@ -158,7 +158,7 @@ fn config_command_loads_defaults_from_standard_config_locations() {
             "model",
         ])
         .output()
-        .expect("claw should launch");
+        .expect("brewcode should launch");
 
     // then
     assert_success(&output);
@@ -173,10 +173,10 @@ fn config_command_loads_defaults_from_standard_config_locations() {
             .to_str()
             .expect("utf8 path")
     ));
-    assert!(stdout.contains(temp_dir.join(".claw.json").to_str().expect("utf8 path")));
+    assert!(stdout.contains(temp_dir.join(".brewcode.json").to_str().expect("utf8 path")));
     assert!(stdout.contains(
         temp_dir
-            .join(".claw")
+            .join(".brewcode")
             .join("settings.local.json")
             .to_str()
             .expect("utf8 path")
@@ -189,18 +189,18 @@ fn config_command_loads_defaults_from_standard_config_locations() {
 fn doctor_command_runs_as_a_local_shell_entrypoint() {
     // given
     let temp_dir = unique_temp_dir("doctor-entrypoint");
-    let config_home = temp_dir.join("home").join(".claw");
+    let config_home = temp_dir.join("home").join(".brewcode");
     fs::create_dir_all(&config_home).expect("config home should exist");
 
     // when
     let output = command_in(&temp_dir)
-        .env("CLAW_CONFIG_HOME", &config_home)
+        .env("BREWCODE_CONFIG_HOME", &config_home)
         .env_remove("ANTHROPIC_API_KEY")
         .env_remove("ANTHROPIC_AUTH_TOKEN")
         .env("ANTHROPIC_BASE_URL", "http://127.0.0.1:9")
         .arg("doctor")
         .output()
-        .expect("claw doctor should launch");
+        .expect("brewcode doctor should launch");
 
     // then
     assert_success(&output);
@@ -218,7 +218,7 @@ fn doctor_command_runs_as_a_local_shell_entrypoint() {
 #[test]
 fn local_smoke_commands_do_not_require_live_credentials() {
     let temp_dir = unique_temp_dir("offline-local-smoke path with spaces");
-    let config_home = temp_dir.join("home with spaces").join(".claw");
+    let config_home = temp_dir.join("home with spaces").join(".brewcode");
     fs::create_dir_all(&config_home).expect("config home should exist");
     fs::create_dir_all(&temp_dir).expect("temp dir should exist");
 
@@ -231,13 +231,13 @@ fn local_smoke_commands_do_not_require_live_credentials() {
         let output = offline_command_in(&temp_dir, &config_home)
             .args(args)
             .output()
-            .unwrap_or_else(|error| panic!("claw {args:?} should launch: {error}"));
+            .unwrap_or_else(|error| panic!("brewcode {args:?} should launch: {error}"));
 
         assert_success(&output);
         let stdout = String::from_utf8(output.stdout).expect("stdout should be utf8");
         let stderr = String::from_utf8(output.stderr).expect("stderr should be utf8");
         assert!(
-            stdout.contains("claw")
+            stdout.contains("brewcode")
                 || stdout.contains("Status")
                 || stdout.contains("Config")
                 || stdout.contains("Doctor"),
@@ -260,11 +260,11 @@ fn local_smoke_commands_do_not_require_live_credentials() {
 #[test]
 fn local_subcommand_help_does_not_fall_through_to_runtime_or_provider_calls() {
     let temp_dir = unique_temp_dir("subcommand-help");
-    let config_home = temp_dir.join("home").join(".claw");
+    let config_home = temp_dir.join("home").join(".brewcode");
     fs::create_dir_all(&config_home).expect("config home should exist");
 
     let doctor_help = command_in(&temp_dir)
-        .env("CLAW_CONFIG_HOME", &config_home)
+        .env("BREWCODE_CONFIG_HOME", &config_home)
         .env_remove("ANTHROPIC_API_KEY")
         .env_remove("ANTHROPIC_AUTH_TOKEN")
         .env("ANTHROPIC_BASE_URL", "http://127.0.0.1:9")
@@ -272,7 +272,7 @@ fn local_subcommand_help_does_not_fall_through_to_runtime_or_provider_calls() {
         .output()
         .expect("doctor help should launch");
     let status_help = command_in(&temp_dir)
-        .env("CLAW_CONFIG_HOME", &config_home)
+        .env("BREWCODE_CONFIG_HOME", &config_home)
         .env_remove("ANTHROPIC_API_KEY")
         .env_remove("ANTHROPIC_AUTH_TOKEN")
         .env("ANTHROPIC_BASE_URL", "http://127.0.0.1:9")
@@ -282,13 +282,13 @@ fn local_subcommand_help_does_not_fall_through_to_runtime_or_provider_calls() {
 
     assert_success(&doctor_help);
     let doctor_stdout = String::from_utf8(doctor_help.stdout).expect("stdout should be utf8");
-    assert!(doctor_stdout.contains("Usage            claw doctor"));
+    assert!(doctor_stdout.contains("Usage            brewcode doctor"));
     assert!(doctor_stdout.contains("local-only health report"));
     assert!(!doctor_stdout.contains("Thinking"));
 
     assert_success(&status_help);
     let status_stdout = String::from_utf8(status_help.stdout).expect("stdout should be utf8");
-    assert!(status_stdout.contains("Usage            claw status"));
+    assert!(status_stdout.contains("Usage            brewcode status"));
     assert!(status_stdout.contains("local workspace snapshot"));
     assert!(!status_stdout.contains("Thinking"));
 
@@ -303,7 +303,7 @@ fn local_subcommand_help_does_not_fall_through_to_runtime_or_provider_calls() {
 fn offline_command_in(cwd: &Path, config_home: &Path) -> Command {
     let mut command = command_in(cwd);
     command
-        .env("CLAW_CONFIG_HOME", config_home)
+        .env("BREWCODE_CONFIG_HOME", config_home)
         .env_remove("ANTHROPIC_API_KEY")
         .env_remove("ANTHROPIC_AUTH_TOKEN")
         .env_remove("OPENAI_API_KEY")
@@ -314,7 +314,7 @@ fn offline_command_in(cwd: &Path, config_home: &Path) -> Command {
 }
 
 fn command_in(cwd: &Path) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_claw"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_brewcode"));
     command.current_dir(cwd);
     command
 }
@@ -347,7 +347,7 @@ fn unique_temp_dir(label: &str) -> PathBuf {
         .as_millis();
     let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
     std::env::temp_dir().join(format!(
-        "claw-{label}-{}-{millis}-{counter}",
+        "brewcode-{label}-{}-{millis}-{counter}",
         std::process::id()
     ))
 }

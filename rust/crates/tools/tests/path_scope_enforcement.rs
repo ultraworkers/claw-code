@@ -15,7 +15,7 @@ fn temp_path(name: &str) -> PathBuf {
         .duration_since(std::time::UNIX_EPOCH)
         .expect("time")
         .as_nanos();
-    std::env::temp_dir().join(format!("claw-path-scope-{unique}-{name}"))
+    std::env::temp_dir().join(format!("brewcode-path-scope-{unique}-{name}"))
 }
 
 fn workspace_write_registry() -> GlobalToolRegistry {

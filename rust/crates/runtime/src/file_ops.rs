@@ -786,7 +786,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("time should move forward")
             .as_nanos();
-        std::env::temp_dir().join(format!("clawd-native-{name}-{unique}"))
+        std::env::temp_dir().join(format!("brewcoded-native-{name}-{unique}"))
     }
 
     #[test]

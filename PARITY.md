@@ -1,4 +1,4 @@
-# Parity Status — claw-code Rust Port
+# Parity Status — brew-code Rust Port
 
 Last updated: 2026-04-03
 

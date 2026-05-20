@@ -162,14 +162,27 @@ async fn send_message_preserves_deepseek_reasoning_content_before_text() {
 }
 
 #[tokio::test]
-async fn custom_openai_gateway_preserves_slash_model_ids_and_extra_body_params() {
+async fn custom_openai_gateway_strips_openai_prefix_and_sanitizes_extra_body() {
+    // Contract:
+    //   1. `--model "openai/<name>"` against a generic OpenAI-compatible
+    //      gateway (anything other than OpenRouter) MUST send a bare model
+    //      name on the wire. Leaking the `openai/` prefix causes 404s on
+    //      backends like Ollama Cloud, local Ollama, vLLM, and llama.cpp.
+    //      Only OpenRouter preserves the slug — covered by the
+    //      `wire_model_preserves_slug_for_openrouter` unit test in the
+    //      openai_compat tests module.
+    //
+    //   2. `extra_body` passes user-supplied params through to the server
+    //      while quietly dropping any attempt to override sensitive top-
+    //      level fields like `model`, `tools`, or `tool_choice` — defends
+    //      against prompt-injection style overrides.
     let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
     let body = concat!(
         "{",
-        "\"id\":\"chatcmpl_slash_model\",",
-        "\"model\":\"openai/gpt-4.1-mini\",",
+        "\"id\":\"chatcmpl_bare_model\",",
+        "\"model\":\"gpt-4.1-mini\",",
         "\"choices\":[{",
-        "\"message\":{\"role\":\"assistant\",\"content\":\"Gateway accepted slug\",\"tool_calls\":[]},",
+        "\"message\":{\"role\":\"assistant\",\"content\":\"Gateway accepted bare model\",\"tool_calls\":[]},",
         "\"finish_reason\":\"stop\"",
         "}],",
         "\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2}",
@@ -200,13 +213,18 @@ async fn custom_openai_gateway_preserves_slash_model_ids_and_extra_body_params()
         .await
         .expect("gateway request should succeed");
 
-    assert_eq!(response.model, "openai/gpt-4.1-mini");
+    // The server echoes back whatever model string it received in its
+    // response — assert this independently of the wire format.
+    assert_eq!(response.model, "gpt-4.1-mini");
     assert_eq!(response.total_tokens(), 5);
 
     let captured = state.lock().await;
     let request = captured.first().expect("captured request");
     let body: serde_json::Value = serde_json::from_str(&request.body).expect("json body");
-    assert_eq!(body["model"], json!("openai/gpt-4.1-mini"));
+    // The prefix is stripped: mock server's URL is 127.0.0.1:<random-port>
+    // which detects as Gateway::Generic. The user typed `openai/gpt-4.1-mini`
+    // but the wire body carries the bare name. This is the regression fix.
+    assert_eq!(body["model"], json!("gpt-4.1-mini"));
     assert_eq!(
         body["web_search_options"],
         json!({"search_context_size": "low"})

@@ -33,7 +33,7 @@ fn export_help_emits_bounded_json_when_requested_384() {
     assert_eq!(parsed["command"], "export");
     assert_eq!(
         parsed["usage"],
-        "claw export [--session <id|latest>] [--output <path>] [--output-format <format>]"
+        "brewcode export [--session <id|latest>] [--output <path>] [--output-format <format>]"
     );
     assert_eq!(parsed["defaults"]["session"], "latest");
     assert!(parsed["options"].as_array().expect("options").len() >= 4);
@@ -45,7 +45,7 @@ fn export_help_preserves_plaintext_in_text_mode_384() {
     let root = unique_temp_dir("export-help-text");
     fs::create_dir_all(&root).expect("temp dir should exist");
 
-    let output = run_claw(&root, &["export", "--help"], &[]);
+    let output = run_brewcode(&root, &["export", "--help"], &[]);
     assert!(
         output.status.success(),
         "stdout:\n{}\n\nstderr:\n{}",
@@ -54,7 +54,7 @@ fn export_help_preserves_plaintext_in_text_mode_384() {
     );
     let stdout = String::from_utf8(output.stdout).expect("stdout utf8");
     assert!(stdout.starts_with("Export\n"));
-    assert!(stdout.contains("Usage            claw export"));
+    assert!(stdout.contains("Usage            brewcode export"));
     serde_json::from_str::<Value>(&stdout).expect_err("text help should remain plaintext");
 }
 
@@ -161,7 +161,7 @@ fn inventory_commands_emit_structured_json_when_requested() {
         &[
             ("HOME", isolated_home.to_str().expect("utf8 home")),
             (
-                "CLAW_CONFIG_HOME",
+                "BREWCODE_CONFIG_HOME",
                 isolated_config.to_str().expect("utf8 config home"),
             ),
             (
@@ -268,7 +268,7 @@ fn plugins_json_surfaces_lifecycle_contract_when_plugin_is_installed() {
         &[
             ("HOME", home.to_str().expect("home path should be utf8")),
             (
-                "CLAW_CONFIG_HOME",
+                "BREWCODE_CONFIG_HOME",
                 config_home.to_str().expect("config path should be utf8"),
             ),
         ],
@@ -334,7 +334,7 @@ fn agents_command_emits_structured_agent_entries_when_requested() {
         &[
             ("HOME", home.to_str().expect("utf8 home")),
             (
-                "CLAW_CONFIG_HOME",
+                "BREWCODE_CONFIG_HOME",
                 isolated_config.to_str().expect("utf8 config home"),
             ),
             (
@@ -350,12 +350,12 @@ fn agents_command_emits_structured_agent_entries_when_requested() {
     assert_eq!(parsed["summary"]["active"], 2);
     assert_eq!(parsed["summary"]["shadowed"], 1);
     assert_eq!(parsed["agents"][0]["name"], "planner");
-    assert_eq!(parsed["agents"][0]["source"]["id"], "project_claw");
+    assert_eq!(parsed["agents"][0]["source"]["id"], "project_brewcode");
     assert_eq!(parsed["agents"][0]["active"], true);
     assert_eq!(parsed["agents"][1]["name"], "verifier");
     assert_eq!(parsed["agents"][2]["name"], "planner");
     assert_eq!(parsed["agents"][2]["active"], false);
-    assert_eq!(parsed["agents"][2]["shadowed_by"]["id"], "project_claw");
+    assert_eq!(parsed["agents"][2]["shadowed_by"]["id"], "project_brewcode");
 }
 
 #[test]
@@ -453,7 +453,7 @@ fn doctor_and_resume_status_emit_json_when_requested() {
     );
     assert_eq!(
         install_source["deprecated_install"],
-        "cargo install claw-code"
+        "cargo install brew-code"
     );
 
     let workspace = checks
@@ -519,7 +519,7 @@ fn resumed_inventory_commands_emit_structured_json_when_requested() {
         ],
         &[
             (
-                "CLAW_CONFIG_HOME",
+                "BREWCODE_CONFIG_HOME",
                 config_home.to_str().expect("utf8 config home"),
             ),
             ("HOME", home.to_str().expect("utf8 home")),
@@ -540,7 +540,7 @@ fn resumed_inventory_commands_emit_structured_json_when_requested() {
         ],
         &[
             (
-                "CLAW_CONFIG_HOME",
+                "BREWCODE_CONFIG_HOME",
                 config_home.to_str().expect("utf8 config home"),
             ),
             ("HOME", home.to_str().expect("utf8 home")),
@@ -562,7 +562,7 @@ fn resumed_inventory_commands_emit_structured_json_when_requested() {
         ],
         &[
             (
-                "CLAW_CONFIG_HOME",
+                "BREWCODE_CONFIG_HOME",
                 config_home.to_str().expect("utf8 config home"),
             ),
             ("HOME", home.to_str().expect("utf8 home")),
@@ -590,7 +590,7 @@ fn resumed_inventory_commands_emit_structured_json_when_requested() {
         ],
         &[
             (
-                "CLAW_CONFIG_HOME",
+                "BREWCODE_CONFIG_HOME",
                 config_home.to_str().expect("utf8 config home"),
             ),
             ("HOME", home.to_str().expect("utf8 home")),
@@ -687,11 +687,11 @@ fn mcp_json_reports_required_optional_and_redacts_secret_values() {
     let root = unique_temp_dir("mcp-required-optional");
     let config_home = root.join("config-home");
     let home = root.join("home");
-    fs::create_dir_all(root.join(".claw")).expect("workspace config should exist");
+    fs::create_dir_all(root.join(".brewcode")).expect("workspace config should exist");
     fs::create_dir_all(&config_home).expect("config home should exist");
     fs::create_dir_all(&home).expect("home should exist");
     fs::write(
-        root.join(".claw").join("settings.json"),
+        root.join(".brewcode").join("settings.json"),
         r#"{
           "mcpServers": {
             "required-stdio": {
@@ -716,7 +716,7 @@ fn mcp_json_reports_required_optional_and_redacts_secret_values() {
 
     let envs = [
         (
-            "CLAW_CONFIG_HOME",
+            "BREWCODE_CONFIG_HOME",
             config_home.to_str().expect("config home"),
         ),
         ("HOME", home.to_str().expect("home")),
@@ -770,7 +770,7 @@ fn mcp_degraded_config_and_failed_usage_are_distinct_json_contracts() {
     fs::create_dir_all(&config_home).expect("config home should exist");
     fs::create_dir_all(&home).expect("home should exist");
     fs::write(
-        root.join(".claw.json"),
+        root.join(".brewcode.json"),
         r#"{
           "mcpServers": {
             "missing-command": {
@@ -783,7 +783,7 @@ fn mcp_degraded_config_and_failed_usage_are_distinct_json_contracts() {
     .expect("malformed mcp config should write");
     let envs = [
         (
-            "CLAW_CONFIG_HOME",
+            "BREWCODE_CONFIG_HOME",
             config_home.to_str().expect("config home"),
         ),
         ("HOME", home.to_str().expect("home")),
@@ -799,7 +799,7 @@ fn mcp_degraded_config_and_failed_usage_are_distinct_json_contracts() {
     assert_eq!(degraded["configured_servers"], 0);
     assert!(degraded["servers"].as_array().expect("servers").is_empty());
 
-    let failed_output = run_claw(
+    let failed_output = run_brewcode(
         &root,
         &["--output-format", "json", "mcp", "list", "extra"],
         &envs,
@@ -822,7 +822,7 @@ fn assert_json_command(current_dir: &Path, args: &[&str]) -> Value {
 }
 
 fn assert_json_command_with_env(current_dir: &Path, args: &[&str], envs: &[(&str, &str)]) -> Value {
-    let output = run_claw(current_dir, args, envs);
+    let output = run_brewcode(current_dir, args, envs);
     assert!(
         output.status.success(),
         "stdout:\n{}\n\nstderr:\n{}",
@@ -832,17 +832,17 @@ fn assert_json_command_with_env(current_dir: &Path, args: &[&str], envs: &[(&str
     serde_json::from_slice(&output.stdout).expect("stdout should be valid json")
 }
 
-fn run_claw(current_dir: &Path, args: &[&str], envs: &[(&str, &str)]) -> Output {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_claw"));
+fn run_brewcode(current_dir: &Path, args: &[&str], envs: &[(&str, &str)]) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_brewcode"));
     command.current_dir(current_dir).args(args);
     for (key, value) in envs {
         command.env(key, value);
     }
-    command.output().expect("claw should launch")
+    command.output().expect("brewcode should launch")
 }
 
 fn write_upstream_fixture(root: &Path) -> PathBuf {
-    let upstream = root.join("claw-code");
+    let upstream = root.join("brew-code");
     let src = upstream.join("src");
     let entrypoints = src.join("entrypoints");
     fs::create_dir_all(&entrypoints).expect("upstream entrypoints dir should exist");
@@ -900,7 +900,7 @@ fn unique_temp_dir(label: &str) -> PathBuf {
         .as_millis();
     let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
     std::env::temp_dir().join(format!(
-        "claw-output-format-{label}-{}-{millis}-{counter}",
+        "brewcode-output-format-{label}-{}-{millis}-{counter}",
         std::process::id()
     ))
 }

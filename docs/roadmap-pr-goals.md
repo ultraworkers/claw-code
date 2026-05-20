@@ -1,12 +1,12 @@
 # Roadmap PR goal intake
 
-Captured: 2026-05-14 (Asia/Seoul) during the Claw Code 2.0 Ultragoal run.
+Captured: 2026-05-14 (Asia/Seoul) during the Brew Code 2.0 Ultragoal run.
 
 Purpose: make the user's follow-up requirement durable: all roadmap PRs should be merged when correct/resolvable, and unresolved roadmap deltas should become Ultragoal work rather than being lost. This file is a tracked companion to the leader-owned `.omx/ultragoal/goals.json` and `.omx/ultragoal/ledger.jsonl` artifacts.
 
 ## Merge policy
 
-- Merge only PRs that are still relevant to Claw Code 2.0, are non-draft, target `main`, and are conflict-free after a fresh mergeability refresh.
+- Merge only PRs that are still relevant to Brew Code 2.0, are non-draft, target `main`, and are conflict-free after a fresh mergeability refresh.
 - Prefer squash merges with a Lore-style body when GitHub allows a direct PR merge.
 - If a PR is documentation-only but adds a real roadmap gap, merging it is acceptable once checks/conflicts are clean.
 - If a PR is stale, duplicated by already-landed work, or not product-aligned, do not force-merge; record the rationale and map any still-correct requirement into G011/G012.
@@ -44,7 +44,7 @@ These have no check rollup in the live snapshot; validate locally or refresh CI 
 
 ## Product-fit review before merge
 
-These may be broader than the Claw Code 2.0 roadmap scope and need a product-fit decision before merge.
+These may be broader than the Brew Code 2.0 roadmap scope and need a product-fit decision before merge.
 
 | PR | Title | Branch | Checks | Mergeable | URL |
 | --- | --- | --- | --- | --- | --- |

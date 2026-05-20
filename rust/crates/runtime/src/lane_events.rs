@@ -175,7 +175,7 @@ impl SessionIdentity {
 pub struct LaneOwnership {
     /// Owner/assignee identity
     pub owner: String,
-    /// Workflow scope (e.g., claw-code-dogfood, external-git-maintenance)
+    /// Workflow scope (e.g., brew-code-dogfood, external-git-maintenance)
     pub workflow_scope: String,
     /// Whether the watcher is expected to act, observe, or ignore
     pub watcher_action: WatcherAction,
@@ -231,7 +231,7 @@ pub struct LaneEventMetadata {
     /// Environment/channel label (e.g., production, staging, dev)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub environment_label: Option<String>,
-    /// Emitter identity (e.g., clawd, plugin-name, operator-id)
+    /// Emitter identity (e.g., brewcoded, plugin-name, operator-id)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub emitter_identity: Option<String>,
     /// Confidence/trust level for downstream automation
@@ -1613,13 +1613,13 @@ mod tests {
     #[test]
     fn lane_ownership_binding_includes_workflow_scope() {
         let ownership = LaneOwnership {
-            owner: "claw-1".to_string(),
-            workflow_scope: "claw-code-dogfood".to_string(),
+            owner: "brewcode-1".to_string(),
+            workflow_scope: "brew-code-dogfood".to_string(),
             watcher_action: WatcherAction::Act,
         };
 
-        assert_eq!(ownership.owner, "claw-1");
-        assert_eq!(ownership.workflow_scope, "claw-code-dogfood");
+        assert_eq!(ownership.owner, "brewcode-1");
+        assert_eq!(ownership.workflow_scope, "brew-code-dogfood");
         assert_eq!(ownership.watcher_action, WatcherAction::Act);
     }
 
@@ -2219,11 +2219,11 @@ mod tests {
     fn lane_event_metadata_includes_us014_fields() {
         let meta = LaneEventMetadata::new(42, EventProvenance::LiveLane)
             .with_environment("production")
-            .with_emitter("clawd-1")
+            .with_emitter("brewcoded-1")
             .with_confidence(ConfidenceLevel::High);
 
         assert_eq!(meta.environment_label, Some("production".to_string()));
-        assert_eq!(meta.emitter_identity, Some("clawd-1".to_string()));
+        assert_eq!(meta.emitter_identity, Some("brewcoded-1".to_string()));
         assert_eq!(meta.confidence_level, Some(ConfidenceLevel::High));
     }
 
@@ -2382,7 +2382,7 @@ mod tests {
     fn lane_ownership_attached_to_metadata() {
         let ownership = LaneOwnership {
             owner: "bot-1".to_string(),
-            workflow_scope: "claw-code-dogfood".to_string(),
+            workflow_scope: "brew-code-dogfood".to_string(),
             watcher_action: WatcherAction::Act,
         };
 
@@ -2399,7 +2399,7 @@ mod tests {
         assert_eq!(event.metadata.ownership.as_ref().unwrap().owner, "bot-1");
         assert_eq!(
             event.metadata.ownership.as_ref().unwrap().workflow_scope,
-            "claw-code-dogfood"
+            "brew-code-dogfood"
         );
         assert_eq!(
             event.metadata.ownership.as_ref().unwrap().watcher_action,
@@ -2490,7 +2490,7 @@ mod tests {
 
         let observe_ownership = LaneOwnership {
             owner: "monitor-bot".to_string(),
-            workflow_scope: "claw-code-dogfood".to_string(),
+            workflow_scope: "brew-code-dogfood".to_string(),
             watcher_action: WatcherAction::Observe,
         };
 

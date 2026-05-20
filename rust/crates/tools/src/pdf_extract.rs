@@ -486,7 +486,7 @@ mod tests {
     fn extracts_text_from_file_on_disk() {
         // given
         let pdf_bytes = build_simple_pdf("Disk Test");
-        let dir = std::env::temp_dir().join("clawd-pdf-extract-test");
+        let dir = std::env::temp_dir().join("brewcoded-pdf-extract-test");
         std::fs::create_dir_all(&dir).unwrap();
         let pdf_path = dir.join("test.pdf");
         std::fs::write(&pdf_path, &pdf_bytes).unwrap();
@@ -528,7 +528,7 @@ mod tests {
     fn maybe_extract_pdf_from_prompt_extracts_existing_file() {
         // given
         let pdf_bytes = build_simple_pdf("Auto Extracted");
-        let dir = std::env::temp_dir().join("clawd-pdf-auto-extract-test");
+        let dir = std::env::temp_dir().join("brewcoded-pdf-auto-extract-test");
         std::fs::create_dir_all(&dir).unwrap();
         let pdf_path = dir.join("auto.pdf");
         std::fs::write(&pdf_path, &pdf_bytes).unwrap();

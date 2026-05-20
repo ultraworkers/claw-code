@@ -3,7 +3,7 @@
 Snapshot: 2026-05-15T02:59:29Z on `origin/main` / `HEAD` `2e93264919f38835410668ff6ca588606bc629f0`.
 
 This is the worker-1 roadmap/board audit and release-readiness evidence map for the
-Claw Code 2.0 final gate. It is intentionally repo-local and non-destructive: it
+Brew Code 2.0 final gate. It is intentionally repo-local and non-destructive: it
 references `.omx/ultragoal` evidence without modifying leader-owned ultragoal
 state, and it does not merge PRs or close issues owned by the W3/W4 lanes.
 

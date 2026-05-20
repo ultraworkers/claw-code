@@ -169,7 +169,7 @@ async fn send_message_applies_request_profile_and_records_telemetry() {
         .with_base_url(server.base_url())
         .with_client_identity(ClientIdentity::new("claude-code", "9.9.9").with_runtime("rust-cli"))
         .with_beta("tools-2026-04-01")
-        .with_extra_body_param("metadata", json!({"source": "clawd-code"}))
+        .with_extra_body_param("metadata", json!({"source": "brewcoded-code"}))
         .with_session_tracer(SessionTracer::new("session-telemetry", sink.clone()));
 
     let response = client
@@ -191,7 +191,7 @@ async fn send_message_applies_request_profile_and_records_telemetry() {
     );
     let body: serde_json::Value =
         serde_json::from_str(&request.body).expect("request body should be json");
-    assert_eq!(body["metadata"]["source"], json!("clawd-code"));
+    assert_eq!(body["metadata"]["source"], json!("brewcoded-code"));
     assert!(
         body.get("betas").is_none(),
         "betas must travel via the anthropic-beta header, not the request body"

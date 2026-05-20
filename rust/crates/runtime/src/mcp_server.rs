@@ -4,7 +4,7 @@
 //! answers `initialize`, `tools/list`, and `tools/call` requests. The framing
 //! matches the client transport implemented in [`crate::mcp_stdio`] so this
 //! server can be driven by either an external MCP client (e.g. Claude
-//! Desktop) or `claw`'s own [`McpServerManager`](crate::McpServerManager).
+//! Desktop) or `brewcode`'s own [`McpServerManager`](crate::McpServerManager).
 //!
 //! The server is intentionally small: it exposes a list of pre-built
 //! [`McpTool`] descriptors and delegates `tools/call` to a caller-supplied
@@ -37,7 +37,7 @@ pub const MCP_SERVER_PROTOCOL_VERSION: &str = "2025-03-26";
 /// Returning `Ok(text)` yields a single `text` content block and
 /// `isError: false`. Returning `Err(message)` yields a `text` block with the
 /// error and `isError: true`, mirroring the error-surfacing convention used
-/// elsewhere in claw.
+/// elsewhere in brewcode.
 pub type ToolCallHandler =
     Box<dyn Fn(&str, &JsonValue) -> Result<String, String> + Send + Sync + 'static>;
 

@@ -369,7 +369,7 @@ mod tests {
             scope: TaskScope::Module,
             scope_path: Some("runtime/task system".to_string()),
             worktree: Some("/tmp/wt-task".to_string()),
-            repo: "claw-code-parity".to_string(),
+            repo: "brew-code-parity".to_string(),
             branch_policy: "origin/main only".to_string(),
             acceptance_tests: vec!["cargo test --workspace".to_string()],
             acceptance_criteria: vec!["task is inspectable".to_string()],

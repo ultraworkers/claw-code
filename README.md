@@ -1,4 +1,4 @@
-# Claw Code
+# Brew Code
 
 <p align="center">
   <a href="https://github.com/ultraworkers/claw-code">ultraworkers/claw-code</a>
@@ -29,20 +29,20 @@
 </p>
 
 <p align="center">
-  <img src="assets/claw-hero.jpeg" alt="Claw Code" width="300" />
+  <img src="assets/brewcode-hero.jpeg" alt="Brew Code" width="300" />
 </p>
 
-Claw Code is the public Rust implementation of the `claw` CLI agent harness.
+Brew Code is the public Rust implementation of the `brewcode` CLI agent harness.
 The canonical implementation lives in [`rust/`](./rust), and the current source of truth for this repository is **ultraworkers/claw-code**.
 
 > [!IMPORTANT]
-> Start with [`USAGE.md`](./USAGE.md) for build, auth, CLI, session, and parity-harness workflows. For file submission/navigation questions, see [Navigation and file context](./docs/navigation-file-context.md). For local OpenAI-compatible models and offline skill installs, see [Local OpenAI-compatible providers and skills setup](./docs/local-openai-compatible-providers.md). Windows users can jump to the PowerShell-first [Windows install and release quickstart](./docs/windows-install-release.md). Make `claw doctor` your first health check after building, use [`rust/README.md`](./rust/README.md) for crate-level details, read [`PARITY.md`](./PARITY.md) for the current Rust-port checkpoint, and see [`docs/container.md`](./docs/container.md) for the container-first workflow.
+> Start with [`USAGE.md`](./USAGE.md) for build, auth, CLI, session, and parity-harness workflows. For file submission/navigation questions, see [Navigation and file context](./docs/navigation-file-context.md). For local OpenAI-compatible models and offline skill installs, see [Local OpenAI-compatible providers and skills setup](./docs/local-openai-compatible-providers.md). Windows users can jump to the PowerShell-first [Windows install and release quickstart](./docs/windows-install-release.md). Make `brewcode doctor` your first health check after building, use [`rust/README.md`](./rust/README.md) for crate-level details, read [`PARITY.md`](./PARITY.md) for the current Rust-port checkpoint, and see [`docs/container.md`](./docs/container.md) for the container-first workflow.
 >
-> **ACP / Zed status:** `claw-code` does not ship an ACP/Zed daemon or JSON-RPC entrypoint yet. Run `claw acp` (or `claw --acp`) for the current status instead of guessing from source layout; `claw acp serve` is currently a discoverability alias only, returns status with exit code 0, and real ACP support remains tracked separately in `ROADMAP.md`. For the public JSON contract, see [`docs/g011-acp-json-rpc-status-contract.md`](./docs/g011-acp-json-rpc-status-contract.md).
+> **ACP / Zed status:** `brew-code` does not ship an ACP/Zed daemon or JSON-RPC entrypoint yet. Run `brewcode acp` (or `brewcode --acp`) for the current status instead of guessing from source layout; `brewcode acp serve` is currently a discoverability alias only, returns status with exit code 0, and real ACP support remains tracked separately in `ROADMAP.md`. For the public JSON contract, see [`docs/g011-acp-json-rpc-status-contract.md`](./docs/g011-acp-json-rpc-status-contract.md).
 
 ## Current repository shape
 
-- **`rust/`** — canonical Rust workspace and the `claw` CLI binary
+- **`rust/`** — canonical Rust workspace and the `brewcode` CLI binary
 - **`USAGE.md`** — task-oriented usage guide for the current product surface
 - **`PARITY.md`** — Rust-port parity status and migration notes
 - **`ROADMAP.md`** — active roadmap and cleanup backlog
@@ -53,7 +53,7 @@ The canonical implementation lives in [`rust/`](./rust), and the current source 
 
 > [!NOTE]
 > [!WARNING]
-> **`cargo install claw-code` installs the wrong thing.** The `claw-code` crate on crates.io is a deprecated stub that places `claw-code-deprecated.exe` — not `claw`. Running it only prints `"claw-code has been renamed to agent-code"`. **Do not use `cargo install claw-code`.** Either build from source (this repo) or install the upstream binary:
+> **`cargo install brew-code` installs the wrong thing.** The `brew-code` crate on crates.io is a deprecated stub that places `brew-code-deprecated.exe` — not `brewcode`. Running it only prints `"brew-code has been renamed to agent-code"`. **Do not use `cargo install brew-code`.** Either build from source (this repo) or install the upstream binary:
 > ```bash
 > cargo install agent-code   # upstream binary — installs 'agent.exe' (Windows) / 'agent' (Unix), NOT 'agent-code'
 > ```
@@ -62,21 +62,21 @@ The canonical implementation lives in [`rust/`](./rust), and the current source 
 ```bash
 # 1. Clone and build
 git clone https://github.com/ultraworkers/claw-code
-cd claw-code/rust
+cd brew-code/rust
 cargo build --workspace
 
 # 2. Set your API key (Anthropic API key — not a Claude subscription)
 export ANTHROPIC_API_KEY="sk-ant-..."
 
 # 3. Verify everything is wired correctly
-./target/debug/claw doctor
+./target/debug/brewcode doctor
 
 # 4. Run a prompt
-./target/debug/claw prompt "say hello"
+./target/debug/brewcode prompt "say hello"
 ```
 
 > [!NOTE]
-> **Windows (PowerShell):** the binary is `claw.exe`, not `claw`. Use `.\target\debug\claw.exe` or run `cargo run -- prompt "say hello"` to skip the path lookup.
+> **Windows (PowerShell):** the binary is `brewcode.exe`, not `brewcode`. Use `.\target\debug\brewcode.exe` or run `cargo run -- prompt "say hello"` to skip the path lookup.
 
 ### Windows setup
 
@@ -91,13 +91,13 @@ export ANTHROPIC_API_KEY="sk-ant-..."
 3. **Clone and build** (works in PowerShell, Git Bash, or WSL):
    ```powershell
    git clone https://github.com/ultraworkers/claw-code
-   cd claw-code/rust
+   cd brew-code/rust
    cargo build --workspace
    ```
 4. **Run** (PowerShell — note `.exe` and backslash):
    ```powershell
    $env:ANTHROPIC_API_KEY = "sk-ant-..."
-   .\target\debug\claw.exe prompt "say hello"
+   .\target\debug\brewcode.exe prompt "say hello"
    ```
 
 For release ZIPs, PATH setup, provider switching, and notification smoke checks, see [`docs/windows-install-release.md`](./docs/windows-install-release.md).
@@ -106,19 +106,19 @@ For release ZIPs, PATH setup, provider switching, and notification smoke checks,
 
 ## Post-build: locate the binary and verify
 
-After running `cargo build --workspace`, the `claw` binary is built but **not** automatically installed to your system. Here's where to find it and how to verify the build succeeded.
+After running `cargo build --workspace`, the `brewcode` binary is built but **not** automatically installed to your system. Here's where to find it and how to verify the build succeeded.
 
 ### Binary location
 
-After `cargo build --workspace` in `claw-code/rust/`:
+After `cargo build --workspace` in `brew-code/rust/`:
 
 **Debug build (default, faster compile):**
-- **macOS/Linux:** `rust/target/debug/claw`
-- **Windows:** `rust/target/debug/claw.exe`
+- **macOS/Linux:** `rust/target/debug/brewcode`
+- **Windows:** `rust/target/debug/brewcode.exe`
 
 **Release build (optimized, slower compile):**
-- **macOS/Linux:** `rust/target/release/claw`
-- **Windows:** `rust/target/release/claw.exe`
+- **macOS/Linux:** `rust/target/release/brewcode`
+- **Windows:** `rust/target/release/brewcode.exe`
 
 If you ran `cargo build` without `--release`, the binary is in the `debug/` folder.
 
@@ -128,50 +128,50 @@ Test the binary directly using its path:
 
 ```bash
 # macOS/Linux (debug build)
-./rust/target/debug/claw --help
-./rust/target/debug/claw doctor
+./rust/target/debug/brewcode --help
+./rust/target/debug/brewcode doctor
 
 # Windows PowerShell (debug build)
-.\rust\target\debug\claw.exe --help
-.\rust\target\debug\claw.exe doctor
+.\rust\target\debug\brewcode.exe --help
+.\rust\target\debug\brewcode.exe doctor
 ```
 
 PowerShell smoke commands that do not require live credentials:
 
 ```powershell
-$env:CLAW_CONFIG_HOME = Join-Path $env:TEMP "claw config home"
-New-Item -ItemType Directory -Force -Path $env:CLAW_CONFIG_HOME | Out-Null
+$env:BREWCODE_CONFIG_HOME = Join-Path $env:TEMP "brewcode config home"
+New-Item -ItemType Directory -Force -Path $env:BREWCODE_CONFIG_HOME | Out-Null
 Remove-Item Env:\ANTHROPIC_API_KEY, Env:\ANTHROPIC_AUTH_TOKEN, Env:\OPENAI_API_KEY -ErrorAction SilentlyContinue
-.\rust\target\debug\claw.exe help
-.\rust\target\debug\claw.exe status
-.\rust\target\debug\claw.exe config env
-.\rust\target\debug\claw.exe doctor
+.\rust\target\debug\brewcode.exe help
+.\rust\target\debug\brewcode.exe status
+.\rust\target\debug\brewcode.exe config env
+.\rust\target\debug\brewcode.exe doctor
 ```
 
-If these commands succeed, the build is working. `claw doctor` is your first health check — it validates your API key, model access, and tool configuration.
+If these commands succeed, the build is working. `brewcode doctor` is your first health check — it validates your API key, model access, and tool configuration.
 
 ### Optional: Add to PATH
 
-If you want to run `claw` from any directory without the full path, choose one of these approaches:
+If you want to run `brewcode` from any directory without the full path, choose one of these approaches:
 
 **Option 1: Symlink (macOS/Linux)**
 ```bash
-ln -s $(pwd)/rust/target/debug/claw /usr/local/bin/claw
+ln -s $(pwd)/rust/target/debug/brewcode /usr/local/bin/brewcode
 ```
 Then reload your shell and test:
 ```bash
-claw --help
+brewcode --help
 ```
 
 **Option 2: Use `cargo install` (all platforms)**
 
 Build and install to Cargo's default location (`~/.cargo/bin/`, which is usually on PATH):
 ```bash
-# From the claw-code/rust/ directory
+# From the brew-code/rust/ directory
 cargo install --path . --force
 
 # Then from anywhere
-claw --help
+brewcode --help
 ```
 
 **Option 3: Update shell profile (bash/zsh)**
@@ -184,17 +184,17 @@ export PATH="$(pwd)/rust/target/debug:$PATH"
 Reload your shell:
 ```bash
 source ~/.bashrc  # or source ~/.zshrc
-claw --help
+brewcode --help
 ```
 
 ### Troubleshooting
 
-- **"command not found: claw"** — The binary is in `rust/target/debug/claw`, but it's not on your PATH. Use the full path `./rust/target/debug/claw` or symlink/install as above.
-- **"permission denied"** — On macOS/Linux, you may need `chmod +x rust/target/debug/claw` if the executable bit isn't set (rare).
+- **"command not found: brewcode"** — The binary is in `rust/target/debug/brewcode`, but it's not on your PATH. Use the full path `./rust/target/debug/brewcode` or symlink/install as above.
+- **"permission denied"** — On macOS/Linux, you may need `chmod +x rust/target/debug/brewcode` if the executable bit isn't set (rare).
 - **Debug vs. release** — If the build is slow, you're in debug mode (default). Add `--release` to `cargo build` for faster runtime, but the build itself will take 5–10 minutes.
 
 > [!NOTE]
-> **Auth:** claw requires an **API key** (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, etc.) — Claude subscription login is not a supported auth path.
+> **Auth:** brewcode requires an **API key** (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, etc.) — Claude subscription login is not a supported auth path.
 
 Run the workspace test suite after verifying the binary works:
 
@@ -207,7 +207,7 @@ cargo test --workspace
 
 - [`USAGE.md`](./USAGE.md) — quick commands, auth, sessions, config, parity harness
 - [`docs/navigation-file-context.md`](./docs/navigation-file-context.md) — terminal navigation, scrollback, `@path` file context, attachments, and secret-safety guidance
-- [`docs/local-openai-compatible-providers.md`](./docs/local-openai-compatible-providers.md) — Ollama/llama.cpp/vLLM setup, Claw multi-provider positioning, and local skills install checks
+- [`docs/local-openai-compatible-providers.md`](./docs/local-openai-compatible-providers.md) — Ollama/llama.cpp/vLLM setup, Brewcode multi-provider positioning, and local skills install checks
 - [`docs/windows-install-release.md`](./docs/windows-install-release.md) — PowerShell-first install, release artifact, provider switching, and Windows/WSL notification smoke paths
 - [`rust/README.md`](./rust/README.md) — crate map, CLI surface, features, workspace layout
 - [`PARITY.md`](./PARITY.md) — parity status for the Rust port
@@ -220,9 +220,9 @@ cargo test --workspace
 
 ## Ecosystem
 
-Claw Code is built in the open alongside the broader UltraWorkers toolchain:
+Brew Code is built in the open alongside the broader UltraWorkers toolchain:
 
-- [clawhip](https://github.com/Yeachan-Heo/clawhip)
+- [brewcodehip](https://github.com/Yeachan-Heo/brewcodehip)
 - [oh-my-openagent](https://github.com/code-yeongyu/oh-my-openagent)
 - [oh-my-claudecode](https://github.com/Yeachan-Heo/oh-my-claudecode)
 - [oh-my-codex](https://github.com/Yeachan-Heo/oh-my-codex)

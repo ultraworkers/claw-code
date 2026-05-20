@@ -231,7 +231,7 @@ mod tests {
             objective: "Implement typed task packet format".to_string(),
             scope: TaskScope::Module,
             scope_path: Some("runtime/task system".to_string()),
-            repo: "claw-code-parity".to_string(),
+            repo: "brew-code-parity".to_string(),
             worktree: Some("/tmp/wt-1".to_string()),
             branch_policy: "origin/main only".to_string(),
             acceptance_tests: vec![
@@ -309,7 +309,7 @@ mod tests {
         let legacy = r#"{
             "objective": "Legacy packet",
             "scope": "workspace",
-            "repo": "claw-code",
+            "repo": "brew-code",
             "branch_policy": "origin/main only",
             "acceptance_tests": ["cargo test"],
             "commit_policy": "single commit",
@@ -364,7 +364,7 @@ mod tests {
             "objective": "Ship legacy task packet",
             "scope": "module",
             "scope_path": "runtime/task system",
-            "repo": "claw-code-parity",
+            "repo": "brew-code-parity",
             "worktree": "/tmp/wt-legacy",
             "branch_policy": "origin/main only",
             "acceptance_tests": ["cargo test --workspace"],

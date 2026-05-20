@@ -1,6 +1,6 @@
 # Navigation and file context guide
 
-This guide answers the common “how do I browse output?” and “how do I submit a file?” questions for Claw Code. Claw is an agent CLI, not a full file manager: terminal navigation comes from your shell or terminal, while file context is passed explicitly in prompts.
+This guide answers the common “how do I browse output?” and “how do I submit a file?” questions for Brew Code. Brewcode is an agent CLI, not a full file manager: terminal navigation comes from your shell or terminal, while file context is passed explicitly in prompts.
 
 ## Prompt and terminal navigation
 
@@ -9,13 +9,13 @@ Use your terminal’s normal controls for command history and long output:
 - `Up` / `Down` usually move through shell or REPL prompt history.
 - `Ctrl-r` searches shell history in most shells.
 - Long command output is viewed with your terminal scrollback. In tmux, enter copy mode with `Ctrl-b [` then use arrows, PageUp/PageDown, search, or your mouse depending on tmux config.
-- If output is too large to scroll comfortably, redirect it to a file and give that file to Claw as context:
+- If output is too large to scroll comfortably, redirect it to a file and give that file to Brewcode as context:
   ```bash
   cargo test --workspace 2>&1 | tee logs/test-output.txt
-  claw prompt "Use @logs/test-output.txt as context and summarize the failing tests."
+  brewcode prompt "Use @logs/test-output.txt as context and summarize the failing tests."
   ```
 
-Claw may provide slash commands that inspect workspace state, but those commands do not replace your terminal’s scrollback or shell history.
+Brewcode may provide slash commands that inspect workspace state, but those commands do not replace your terminal’s scrollback or shell history.
 
 ## Submit repository files with `@path`
 
@@ -33,11 +33,11 @@ Tips:
 - Prefer the smallest useful file set. Large directories or logs can consume context quickly.
 - Use exact paths when possible (`@rust/crates/runtime/src/lib.rs`) instead of vague descriptions.
 - For generated logs, save them under a temporary or ignored directory such as `logs/` and reference the file.
-- If the file is outside the repository, copy it into a safe workspace location first or use an app/UI attachment feature if your Claw surface supports attachments.
+- If the file is outside the repository, copy it into a safe workspace location first or use an app/UI attachment feature if your Brewcode surface supports attachments.
 
 ## Browse or inspect files
 
-Claw can answer questions about files you reference, and you can ask it to inspect likely locations:
+Brewcode can answer questions about files you reference, and you can ask it to inspect likely locations:
 
 ```text
 Find where provider routing is implemented and summarize the relevant files.

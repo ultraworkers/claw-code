@@ -355,7 +355,7 @@ mod tests {
     fn approval_token_blocks_until_owner_grants_policy_exception() {
         let mut ledger = ApprovalTokenLedger::new();
         let scope = ApprovalScope::new("main_push_forbidden", "git push")
-            .with_repository("sisyphus/claw-code")
+            .with_repository("sisyphus/brew-code")
             .with_branch("main");
         ledger.insert(ApprovalTokenGrant::pending(
             "tok-pending",
@@ -393,7 +393,7 @@ mod tests {
     fn approval_token_is_one_time_use_and_rejects_replay() {
         let mut ledger = ApprovalTokenLedger::new();
         let scope = ApprovalScope::new("release_requires_owner", "release publish")
-            .with_repository("sisyphus/claw-code");
+            .with_repository("sisyphus/brew-code");
         ledger.insert(ApprovalTokenGrant::granted(
             "tok-once",
             scope.clone(),
@@ -421,10 +421,10 @@ mod tests {
     fn approval_token_rejects_scope_expansion_expiry_and_revocation() {
         let mut ledger = ApprovalTokenLedger::new();
         let scope = ApprovalScope::new("main_push_forbidden", "git push")
-            .with_repository("sisyphus/claw-code")
+            .with_repository("sisyphus/brew-code")
             .with_branch("main");
         let dev_scope = ApprovalScope::new("main_push_forbidden", "git push")
-            .with_repository("sisyphus/claw-code")
+            .with_repository("sisyphus/brew-code")
             .with_branch("dev");
 
         ledger.insert(

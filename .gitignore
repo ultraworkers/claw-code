@@ -1,14 +1,19 @@
 __pycache__/
 archive/
 .omx/
-.clawd-agents/
+.brewcoded-agents/
 # Claude Code local artifacts
 .claude/settings.local.json
 .claude/sessions/
-# Claw Code local artifacts
-.claw/settings.local.json
-.claw/sessions/
-.clawhip/
+rust/.claude/sessions/
+# Brew Code local artifacts
+.brewcode/settings.local.json
+.brewcode/sessions/
+.brewcodehip/
 status-help.txt
 # Legacy Python port session scratch artifacts
 .port_sessions/
+# Local secrets — never commit
+.env
+.env.*
+!.env.example

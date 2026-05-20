@@ -6,6 +6,6 @@ Use that guide for:
 
 - workspace build and test commands
 - authentication setup
-- interactive and one-shot `claw` examples
+- interactive and one-shot `brewcode` examples
 - session resume workflows
 - mock parity harness commands

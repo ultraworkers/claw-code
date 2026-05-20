@@ -8,7 +8,7 @@ Use this checklist before spending engineering time on low-signal issues, genera
 | --- | --- | --- | --- |
 | `actionable-bug` | The report has a reproducible product failure. | Repro steps, failing test, logs with secrets removed, or matching roadmap item. | Fix, assign, or link to an existing fix. |
 | `actionable-docs` | The report identifies missing, stale, or confusing documentation. | Current doc path plus desired corrected source of truth. | Patch docs or link to the owning docs lane. |
-| `actionable-feature` | The request matches Claw Code direction and has a concrete acceptance shape. | Issue/PR link plus roadmap or maintainer rationale. | Defer to planning or implement if already scoped. |
+| `actionable-feature` | The request matches Brew Code direction and has a concrete acceptance shape. | Issue/PR link plus roadmap or maintainer rationale. | Defer to planning or implement if already scoped. |
 | `duplicate` | Another issue/PR already covers the same user-visible outcome. | Link the canonical issue/PR and note any extra evidence worth preserving. | Cross-link; close only with maintainer/owner policy. |
 | `spam-or-promotion` | The content is promotional, irrelevant, or abusive. | URL/title/body excerpt summary, not a full repost. | Label/close per repository policy. |
 | `generated-slop-or-hallucinated` | The change is broad, mechanically generated, unreviewable, or names APIs/files that do not exist. | Diff/path examples, missing symbols, or unverifiable claims. | Request a narrow repro or reject/defer with rationale. |

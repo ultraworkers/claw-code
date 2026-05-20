@@ -73,7 +73,7 @@ impl OpenAiCompatConfig {
 
     /// Alibaba `DashScope` compatible-mode endpoint (Qwen family models).
     /// Uses the OpenAI-compatible REST shape at /compatible-mode/v1.
-    /// Requested via Discord #clawcode-get-help: native Alibaba API for
+    /// Requested via Discord #brewcodecode-get-help: native Alibaba API for
     /// higher rate limits than going through `OpenRouter`.
     #[must_use]
     pub const fn dashscope() -> Self {
@@ -97,6 +97,96 @@ impl OpenAiCompatConfig {
     }
 }
 
+/// Concrete OpenAI-compatible gateway behind the user's `OPENAI_BASE_URL` /
+/// `XAI_BASE_URL` / `DASHSCOPE_BASE_URL`. Each variant owns the conventions
+/// that distinguish it from the others on the wire.
+///
+/// Detection is URL-driven so that downstream consumers do not have to
+/// re-discover which backend they are talking to. The mapping is intentionally
+/// explicit: a new backend ships as a new variant plus one URL pattern, never
+/// as another guess inside request-building code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Gateway {
+    /// `https://api.openai.com/v1` — bare model names.
+    OpenAi,
+    /// `https://openrouter.ai/api/v1` — slash-namespaced slugs
+    /// (for example `openai/gpt-4.1-mini`) MUST be preserved on the wire.
+    OpenRouter,
+    /// `https://ollama.com/v1` (Ollama Cloud) — bare model names.
+    OllamaCloud,
+    /// `http://127.0.0.1:11434/v1`, `http://localhost:11434/v1`,
+    /// `http://0.0.0.0:11434/v1` — bare model names.
+    OllamaLocal,
+    /// `https://api.x.ai/v1` — bare model names.
+    XAi,
+    /// `https://dashscope.aliyuncs.com/compatible-mode/v1` — bare model names.
+    DashScope,
+    /// Anything else with a custom `OPENAI_BASE_URL` (vLLM, llama.cpp,
+    /// LiteLLM, in-house proxies, ...). Conservative defaults: bare model
+    /// names, no slug preservation.
+    Generic,
+}
+
+impl Gateway {
+    /// Identify the gateway behind a given base URL. Matching is
+    /// case-insensitive and tolerates trailing slashes. Returns
+    /// [`Gateway::Generic`] when nothing else matches so that unknown
+    /// OpenAI-compatible backends still work with safe defaults.
+    #[must_use]
+    pub fn detect_from_base_url(url: &str) -> Self {
+        let lower = url.trim_end_matches('/').to_ascii_lowercase();
+        let default_openai = DEFAULT_OPENAI_BASE_URL
+            .trim_end_matches('/')
+            .to_ascii_lowercase();
+        if lower == default_openai {
+            return Self::OpenAi;
+        }
+        if lower.contains("openrouter.ai") {
+            return Self::OpenRouter;
+        }
+        if lower.contains("ollama.com") {
+            return Self::OllamaCloud;
+        }
+        if lower.contains("127.0.0.1:11434")
+            || lower.contains("localhost:11434")
+            || lower.contains("0.0.0.0:11434")
+        {
+            return Self::OllamaLocal;
+        }
+        if lower.contains("api.x.ai") {
+            return Self::XAi;
+        }
+        if lower.contains("dashscope.aliyuncs.com") {
+            return Self::DashScope;
+        }
+        Self::Generic
+    }
+
+    /// Whether the gateway expects `openai/<model>` slugs to be preserved
+    /// in the wire request body. Only OpenRouter's namespace convention
+    /// requires this; every other backend wants the bare model name and
+    /// will 404 on a leaked prefix.
+    #[must_use]
+    pub const fn preserves_slug_prefix(self) -> bool {
+        matches!(self, Self::OpenRouter)
+    }
+
+    /// Stable identifier suitable for diagnostics, logs, and the `brewcode
+    /// doctor` report. Does not leak into the wire protocol.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::OpenAi => "OpenAI",
+            Self::OpenRouter => "OpenRouter",
+            Self::OllamaCloud => "Ollama Cloud",
+            Self::OllamaLocal => "Ollama (local)",
+            Self::XAi => "xAI",
+            Self::DashScope => "DashScope",
+            Self::Generic => "Generic OpenAI-compatible",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct OpenAiCompatClient {
     http: reqwest::Client,
@@ -116,6 +206,16 @@ impl OpenAiCompatClient {
     #[must_use]
     pub fn base_url(&self) -> &str {
         &self.base_url
+    }
+
+    /// Concrete gateway this client is talking to, derived from its base
+    /// URL. Cheap (no env access, just substring matching) so callers are
+    /// free to use this in hot paths instead of re-detecting from a raw
+    /// URL string. Surfaces in diagnostics and is the single source of
+    /// truth for wire-level conventions.
+    #[must_use]
+    pub fn gateway(&self) -> Gateway {
+        Gateway::detect_from_base_url(&self.base_url)
     }
     #[must_use]
     pub fn new(api_key: impl Into<String>, config: OpenAiCompatConfig) -> Self {
@@ -926,14 +1026,16 @@ fn wire_model_for_base_url<'a>(
     let lowered_prefix = prefix.to_ascii_lowercase();
 
     if lowered_prefix == "openai" {
-        let trimmed_base_url = base_url.trim_end_matches('/');
-        let default_openai = DEFAULT_OPENAI_BASE_URL.trim_end_matches('/');
-        if config.provider_name == "OpenAI" && trimmed_base_url != default_openai {
-            // OpenAI-compatible gateways such as OpenRouter commonly use
-            // slash-containing model slugs (for example `openai/gpt-4.1-mini`).
-            // Preserve the slug when the user configured a non-default OpenAI
-            // base URL; the prefix still routed to the OpenAI-compatible client,
-            // but the gateway owns the final model namespace.
+        // Only OpenRouter-style gateways expect the `openai/<model>` slug
+        // preserved in the wire body. Every other OpenAI-compatible backend
+        // (default OpenAI, Ollama Cloud, local Ollama, llama.cpp, vLLM,
+        // generic proxies) wants the bare model name and 404s on a leaked
+        // prefix. The gateway identity is derived from the configured base
+        // URL so this stays correct even when the user points
+        // `OPENAI_BASE_URL` at a non-OpenRouter backend.
+        if config.provider_name == "OpenAI"
+            && Gateway::detect_from_base_url(base_url).preserves_slug_prefix()
+        {
             return Cow::Borrowed(model);
         }
         return Cow::Borrowed(&model[pos + 1..]);
@@ -1514,7 +1616,14 @@ pub fn has_api_key(key: &str) -> bool {
 
 #[must_use]
 pub fn read_base_url(config: OpenAiCompatConfig) -> String {
-    std::env::var(config.base_url_env).unwrap_or_else(|_| config.default_base_url.to_string())
+    // Resolve via the same process-env-then-`.env`-file path used for the API
+    // key. Reading only the process env here let a base URL configured solely
+    // in `.env` be silently dropped, sending requests to the provider default
+    // endpoint with a mismatched key.
+    read_env_non_empty(config.base_url_env)
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| config.default_base_url.to_string())
 }
 
 fn chat_completions_endpoint(base_url: &str) -> String {
@@ -2647,5 +2756,219 @@ mod tests {
         assert_eq!(super::strip_routing_prefix("kimi/kimi-k2.5"), "kimi-k2.5");
         assert_eq!(super::strip_routing_prefix("kimi-k2.5"), "kimi-k2.5"); // no prefix, unchanged
         assert_eq!(super::strip_routing_prefix("kimi/kimi-k1.5"), "kimi-k1.5");
+    }
+
+    // ----- Gateway identification ------------------------------------------
+    //
+    // These tests pin down which OpenAI-compatible backend a given base URL
+    // resolves to. The mapping is the single source of truth for wire-level
+    // conventions (slug preservation, future per-gateway tuning) and must
+    // stay stable: a regression here silently breaks every consumer.
+
+    #[test]
+    fn gateway_detects_default_openai() {
+        assert_eq!(
+            super::Gateway::detect_from_base_url("https://api.openai.com/v1"),
+            super::Gateway::OpenAi
+        );
+        // trailing slash tolerated
+        assert_eq!(
+            super::Gateway::detect_from_base_url("https://api.openai.com/v1/"),
+            super::Gateway::OpenAi
+        );
+    }
+
+    #[test]
+    fn gateway_detects_openrouter() {
+        assert_eq!(
+            super::Gateway::detect_from_base_url("https://openrouter.ai/api/v1"),
+            super::Gateway::OpenRouter
+        );
+        // case-insensitive
+        assert_eq!(
+            super::Gateway::detect_from_base_url("https://OPENROUTER.AI/api/v1"),
+            super::Gateway::OpenRouter
+        );
+    }
+
+    #[test]
+    fn gateway_detects_ollama_cloud() {
+        assert_eq!(
+            super::Gateway::detect_from_base_url("https://ollama.com/v1"),
+            super::Gateway::OllamaCloud
+        );
+    }
+
+    #[test]
+    fn gateway_detects_local_ollama_variants() {
+        assert_eq!(
+            super::Gateway::detect_from_base_url("http://127.0.0.1:11434/v1"),
+            super::Gateway::OllamaLocal
+        );
+        assert_eq!(
+            super::Gateway::detect_from_base_url("http://localhost:11434/v1"),
+            super::Gateway::OllamaLocal
+        );
+        assert_eq!(
+            super::Gateway::detect_from_base_url("http://0.0.0.0:11434/v1"),
+            super::Gateway::OllamaLocal
+        );
+    }
+
+    #[test]
+    fn gateway_detects_xai_and_dashscope() {
+        assert_eq!(
+            super::Gateway::detect_from_base_url("https://api.x.ai/v1"),
+            super::Gateway::XAi
+        );
+        assert_eq!(
+            super::Gateway::detect_from_base_url(
+                "https://dashscope.aliyuncs.com/compatible-mode/v1"
+            ),
+            super::Gateway::DashScope
+        );
+    }
+
+    #[test]
+    fn gateway_unknown_url_falls_back_to_generic() {
+        // vLLM / llama.cpp / LiteLLM / in-house proxies on arbitrary URLs.
+        assert_eq!(
+            super::Gateway::detect_from_base_url("http://127.0.0.1:8000/v1"),
+            super::Gateway::Generic
+        );
+        assert_eq!(
+            super::Gateway::detect_from_base_url("https://my-proxy.example.com/v1"),
+            super::Gateway::Generic
+        );
+    }
+
+    #[test]
+    fn only_openrouter_preserves_slug_prefix() {
+        // Contract: OpenRouter is the sole gateway that wants `openai/<model>`
+        // preserved on the wire. Everything else (including Generic) strips.
+        assert!(super::Gateway::OpenRouter.preserves_slug_prefix());
+        assert!(!super::Gateway::OpenAi.preserves_slug_prefix());
+        assert!(!super::Gateway::OllamaCloud.preserves_slug_prefix());
+        assert!(!super::Gateway::OllamaLocal.preserves_slug_prefix());
+        assert!(!super::Gateway::XAi.preserves_slug_prefix());
+        assert!(!super::Gateway::DashScope.preserves_slug_prefix());
+        assert!(!super::Gateway::Generic.preserves_slug_prefix());
+    }
+
+    // ----- wire_model_for_base_url across every gateway --------------------
+    //
+    // These tests directly drive the function that produces the `"model"`
+    // field of each chat-completion request. They are the regression net for
+    // the original Ollama Cloud bug (where `openai/gpt-oss:20b` leaked as-is
+    // and Ollama 404'd).
+
+    #[test]
+    fn wire_model_strips_openai_prefix_for_default_openai() {
+        let wire = super::wire_model_for_base_url(
+            "openai/gpt-4o-mini",
+            super::OpenAiCompatConfig::openai(),
+            "https://api.openai.com/v1",
+        );
+        assert_eq!(wire, "gpt-4o-mini");
+    }
+
+    #[test]
+    fn wire_model_preserves_slug_for_openrouter() {
+        let wire = super::wire_model_for_base_url(
+            "openai/gpt-4.1-mini",
+            super::OpenAiCompatConfig::openai(),
+            "https://openrouter.ai/api/v1",
+        );
+        assert_eq!(wire, "openai/gpt-4.1-mini");
+    }
+
+    #[test]
+    fn wire_model_strips_openai_prefix_for_ollama_cloud() {
+        // Regression: previously this left `openai/gpt-oss:20b` in the wire
+        // body and Ollama Cloud 404'd. Must produce the bare model name.
+        let wire = super::wire_model_for_base_url(
+            "openai/gpt-oss:20b",
+            super::OpenAiCompatConfig::openai(),
+            "https://ollama.com/v1",
+        );
+        assert_eq!(wire, "gpt-oss:20b");
+    }
+
+    #[test]
+    fn wire_model_strips_openai_prefix_for_local_ollama() {
+        let wire = super::wire_model_for_base_url(
+            "openai/qwen3:latest",
+            super::OpenAiCompatConfig::openai(),
+            "http://127.0.0.1:11434/v1",
+        );
+        assert_eq!(wire, "qwen3:latest");
+    }
+
+    #[test]
+    fn wire_model_strips_openai_prefix_for_generic_gateway() {
+        // vLLM / llama.cpp on a custom port: not OpenRouter, must strip.
+        let wire = super::wire_model_for_base_url(
+            "openai/Qwen2.5-Coder-7B-Instruct",
+            super::OpenAiCompatConfig::openai(),
+            "http://127.0.0.1:8000/v1",
+        );
+        assert_eq!(wire, "Qwen2.5-Coder-7B-Instruct");
+    }
+
+    // ----- OpenAiCompatClient::gateway() per-config integration ------------
+    //
+    // Verifies the client carries the right Gateway identity for every
+    // (config, base URL) combination. Tests use `with_base_url` to inject
+    // the URL directly rather than mutating process env, so they are pure
+    // unit tests and race-free in cargo's default parallel runner.
+
+    #[test]
+    fn client_gateway_follows_base_url_to_default_openai() {
+        let client = super::OpenAiCompatClient::new("test-key", super::OpenAiCompatConfig::openai())
+            .with_base_url("https://api.openai.com/v1");
+        assert_eq!(client.gateway(), super::Gateway::OpenAi);
+    }
+
+    #[test]
+    fn client_gateway_follows_base_url_to_ollama_cloud() {
+        let client = super::OpenAiCompatClient::new("test-key", super::OpenAiCompatConfig::openai())
+            .with_base_url("https://ollama.com/v1");
+        assert_eq!(client.gateway(), super::Gateway::OllamaCloud);
+    }
+
+    #[test]
+    fn client_gateway_follows_base_url_to_openrouter() {
+        let client = super::OpenAiCompatClient::new("test-key", super::OpenAiCompatConfig::openai())
+            .with_base_url("https://openrouter.ai/api/v1");
+        assert_eq!(client.gateway(), super::Gateway::OpenRouter);
+    }
+
+    #[test]
+    fn client_gateway_follows_base_url_to_local_ollama() {
+        let client = super::OpenAiCompatClient::new("test-key", super::OpenAiCompatConfig::openai())
+            .with_base_url("http://127.0.0.1:11434/v1");
+        assert_eq!(client.gateway(), super::Gateway::OllamaLocal);
+    }
+
+    #[test]
+    fn client_gateway_follows_base_url_to_xai() {
+        let client = super::OpenAiCompatClient::new("test-key", super::OpenAiCompatConfig::xai())
+            .with_base_url("https://api.x.ai/v1");
+        assert_eq!(client.gateway(), super::Gateway::XAi);
+    }
+
+    #[test]
+    fn client_gateway_follows_base_url_to_dashscope() {
+        let client =
+            super::OpenAiCompatClient::new("test-key", super::OpenAiCompatConfig::dashscope())
+                .with_base_url("https://dashscope.aliyuncs.com/compatible-mode/v1");
+        assert_eq!(client.gateway(), super::Gateway::DashScope);
+    }
+
+    #[test]
+    fn client_gateway_is_generic_for_unknown_proxy() {
+        let client = super::OpenAiCompatClient::new("test-key", super::OpenAiCompatConfig::openai())
+            .with_base_url("https://my-proxy.example.com/v1");
+        assert_eq!(client.gateway(), super::Gateway::Generic);
     }
 }

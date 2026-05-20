@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the canonical Claw Code 2.0 execution board from frozen roadmap evidence."""
+"""Generate the canonical Brew Code 2.0 execution board from frozen roadmap evidence."""
 from __future__ import annotations
 
 import argparse
@@ -32,22 +32,22 @@ STATUSES = {
     "stale_done",
     "superseded",
     "deferred_with_rationale",
-    "rejected_not_claw",
+    "rejected_not_brewcode",
 }
 RELEASE_BUCKETS = {
     "alpha_blocker",
     "beta_adoption",
     "ga_ecosystem",
     "post_2_0_research",
-    "rejected_not_claw",
+    "rejected_not_brewcode",
     "context",
     "2.x_intake",
 }
 
 STRUCTURAL_HEADINGS = {
-    "Clawable Coding Harness Roadmap",
+    "Brewcodeable Coding Harness Roadmap",
     "Goal",
-    'Definition of "clawable"',
+    'Definition of "brewcodeable"',
     "Current Pain Points",
     "Product Principles",
     "Roadmap",
@@ -66,10 +66,10 @@ CATEGORY_KEYWORDS = [
     ("docs_license", ["docs", "readme", "usage", "license", "help", "onboarding"]),
     ("ide_acp", ["zed", "acp", "editor", "daemon"]),
     ("plugin_mcp", ["plugin", "mcp", "marketplace", "server"]),
-    ("event_report", ["event", "report", "schema", "projection", "redaction", "clawhip", "lane"]),
+    ("event_report", ["event", "report", "schema", "projection", "redaction", "brewcodehip", "lane"]),
     ("branch_recovery", ["branch", "stale", "recovery", "green", "flake"]),
     ("boot", ["boot", "worker", "startup", "ready", "prompt"]),
-    ("task_policy", ["task", "policy", "claw-native", "dashboard", "lane board"]),
+    ("task_policy", ["task", "policy", "brewcode-native", "dashboard", "lane board"]),
     ("ux_tui", ["tui", "statusline", "keymap", "clickable", "copy", "paste"]),
     ("anti_slop", ["spam", "slop", "issue hygiene", "bot"]),
 ]
@@ -106,9 +106,9 @@ def find_source_omx(repo_root: Path) -> Path:
     candidates.append(repo_root / ".omx")
     candidates.extend(parent / ".omx" for parent in repo_root.parents)
     for candidate in candidates:
-        if (candidate / "plans" / "claw-code-2-0-adaptive-plan.md").exists() and (candidate / "research").exists():
+        if (candidate / "plans" / "brew-code-2-0-adaptive-plan.md").exists() and (candidate / "research").exists():
             return candidate
-    raise FileNotFoundError("could not locate source .omx with plans/claw-code-2-0-adaptive-plan.md and research/")
+    raise FileNotFoundError("could not locate source .omx with plans/brew-code-2-0-adaptive-plan.md and research/")
 
 
 def parse_roadmap(path: Path) -> tuple[list[RoadmapRecord], list[RoadmapRecord]]:
@@ -159,7 +159,7 @@ def stream_for(record: RoadmapRecord) -> str:
     if "phase 3" in combined or category_for(combined) == "branch_recovery":
         return "stream_3_branch_test_recovery"
     if "phase 4" in combined or category_for(combined) == "task_policy":
-        return "stream_4_claws_first_execution"
+        return "stream_4_brewcodes_first_execution"
     if "phase 5" in combined or category_for(combined) == "plugin_mcp":
         return "stream_5_plugin_mcp_lifecycle"
     if any(k in combined for k in ["windows", "install", "provider", "docs", "license", "session hygiene", "compact"]):
@@ -174,8 +174,8 @@ def release_bucket_for(record: RoadmapRecord, status: str) -> str:
     category = category_for(combined)
     if status == "context":
         return "context"
-    if status == "rejected_not_claw":
-        return "rejected_not_claw"
+    if status == "rejected_not_brewcode":
+        return "rejected_not_brewcode"
     if any(k in combined for k in ["phase 1", "phase 2", "phase 3", "phase 4", "p0", "p1", "security", "sandbox", "trust", "worker", "event", "branch freshness"]):
         return "alpha_blocker"
     if category in {"windows_install", "provider", "sessions", "docs_license", "anti_slop"}:
@@ -198,8 +198,8 @@ def status_for(record: RoadmapRecord) -> str:
             return "active"
         if "pinpoint" not in title.lower() and not any(word in combined for word in ["gap", "routing"]):
             return "context"
-    if any(word in combined for word in ["rejected_not_claw", "not claw", "outside claw"]):
-        return "rejected_not_claw"
+    if any(word in combined for word in ["rejected_not_brewcode", "not brewcode", "outside brewcode"]):
+        return "rejected_not_brewcode"
     if "superseded" in combined:
         return "superseded"
     if "deferred" in combined or "post-2.0" in combined or "post_2_0" in combined:
@@ -216,8 +216,8 @@ def status_for(record: RoadmapRecord) -> str:
 def deferral_for(record: RoadmapRecord, status: str) -> str:
     if status == "deferred_with_rationale":
         return "Deferred by roadmap/approved plan until prerequisite contracts or post-2.0 research admission gates are satisfied."
-    if status == "rejected_not_claw":
-        return "Rejected because the source describes clone-only breadth or behavior outside Claw's machine-truth/clawable-harness identity."
+    if status == "rejected_not_brewcode":
+        return "Rejected because the source describes clone-only breadth or behavior outside Brewcode's machine-truth/brewcodeable-harness identity."
     if status == "superseded":
         return "Superseded by a newer roadmap entry or canonical Rust/control-plane contract; keep only for audit traceability."
     if status == "stale_done":
@@ -356,7 +356,7 @@ def summarize_counts(items: list[dict[str, Any]], key: str) -> dict[str, int]:
 
 def render_markdown(board: dict[str, Any]) -> str:
     lines = [
-        "# Claw Code 2.0 Canonical Board",
+        "# Brew Code 2.0 Canonical Board",
         "",
         f"Generated: `{board['generated_at']}`",
         f"Roadmap SHA-256 prefix: `{board['sources']['roadmap']['sha256_prefix']}`",
@@ -423,19 +423,19 @@ def build_board(repo_root: Path) -> dict[str, Any]:
     roadmap_path = repo_root / "ROADMAP.md"
     source_omx = find_source_omx(repo_root)
     research = source_omx / "research"
-    plan_path = source_omx / "plans" / "claw-code-2-0-adaptive-plan.md"
+    plan_path = source_omx / "plans" / "brew-code-2-0-adaptive-plan.md"
     headings, actions = parse_roadmap(roadmap_path)
     items = [roadmap_item(record, i) for i, record in enumerate(headings, 1)]
     items.extend(roadmap_item(record, i) for i, record in enumerate(actions, 1))
 
-    latest_issues = load_json(research / "claw-open-latest.json")
-    all_issues = load_json(research / "claw-issues.json")
-    items.extend(issue_item(issue, "claw-open-latest", "latest_open_issue", "2.x_intake") for issue in latest_issues)
+    latest_issues = load_json(research / "brewcode-open-latest.json")
+    all_issues = load_json(research / "brewcode-issues.json")
+    items.extend(issue_item(issue, "brewcode-open-latest", "latest_open_issue", "2.x_intake") for issue in latest_issues)
     # Include a small real-issue sample from the full freeze to keep the board tied to the larger issue manifest without exploding scope.
     for issue in all_issues[:50]:
         title_body = f"{issue.get('title','')} {issue.get('body','')}".lower()
         if any(k in title_body for k in ["security", "windows", "install", "provider", "model", "session", "license", "zed", "spam", "plugin"]):
-            items.append(issue_item(issue, "claw-issues", "issue_theme", "beta_adoption"))
+            items.append(issue_item(issue, "brewcode-issues", "issue_theme", "beta_adoption"))
     for source_name in ["opencode", "codex"]:
         repo_meta = load_json(research / f"{source_name}-repo.json")
         items.append(repo_context_item(repo_meta, source_name))
@@ -462,13 +462,13 @@ def build_board(repo_root: Path) -> dict[str, Any]:
                 "ordered_action_count": len(actions),
             },
             "approved_plan": {
-                "path": ".omx/plans/claw-code-2-0-adaptive-plan.md",
+                "path": ".omx/plans/brew-code-2-0-adaptive-plan.md",
                 "sha256_prefix": sha256_prefix(plan_path),
             },
             "research": {
                 "root": str(source_omx / "research"),
-                "claw_open_latest_count": len(latest_issues),
-                "claw_issues_count": len(all_issues),
+                "brewcode_open_latest_count": len(latest_issues),
+                "brewcode_issues_count": len(all_issues),
                 "opencode_repo": ".omx/research/opencode-repo.json",
                 "codex_repo": ".omx/research/codex-repo.json",
             },

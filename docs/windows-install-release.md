@@ -6,31 +6,31 @@ This page is the PowerShell-first path for installing, verifying, and safely swi
 
 ### Option A: build from source in PowerShell
 
-Use this when you are developing Claw Code or testing a local checkout.
+Use this when you are developing Brew Code or testing a local checkout.
 
 ```powershell
 git clone https://github.com/ultraworkers/claw-code
-Set-Location .\claw-code\rust
+Set-Location .\brew-code\rust
 cargo build --workspace
-.\target\debug\claw.exe --help
-.\target\debug\claw.exe doctor
+.\target\debug\brewcode.exe --help
+.\target\debug\brewcode.exe doctor
 ```
 
 For an optimized local binary:
 
 ```powershell
-Set-Location .\claw-code\rust
+Set-Location .\brew-code\rust
 cargo build --workspace --release
-.\target\release\claw.exe --help
+.\target\release\brewcode.exe --help
 ```
 
 ### Option B: use a release artifact
 
-Use this when a GitHub release publishes a Windows artifact. The release workflow publishes `claw-windows-x64.exe` plus `claw-windows-x64.exe.sha256`; if a future release wraps the binary in a ZIP, prefer the `windows-x86_64` / `pc-windows-msvc` asset and its matching checksum file.
+Use this when a GitHub release publishes a Windows artifact. The release workflow publishes `brewcode-windows-x64.exe` plus `brewcode-windows-x64.exe.sha256`; if a future release wraps the binary in a ZIP, prefer the `windows-x86_64` / `pc-windows-msvc` asset and its matching checksum file.
 
 ```powershell
-$Asset = "claw-windows-x64.exe"
-$InstallRoot = "$env:LOCALAPPDATA\Programs\claw"
+$Asset = "brewcode-windows-x64.exe"
+$InstallRoot = "$env:LOCALAPPDATA\Programs\brewcode"
 New-Item -ItemType Directory -Force $InstallRoot | Out-Null
 
 # Download $Asset and $Asset.sha256 from the release page, then verify them:
@@ -38,15 +38,15 @@ $Actual = (Get-FileHash ".\$Asset" -Algorithm SHA256).Hash.ToLowerInvariant()
 $Expected = (Get-Content ".\$Asset.sha256" | Select-Object -First 1).Split()[0].ToLowerInvariant()
 if ($Actual -ne $Expected) { throw "checksum mismatch for $Asset" }
 
-Copy-Item ".\$Asset" "$InstallRoot\claw.exe" -Force
-& "$InstallRoot\claw.exe" --help
-& "$InstallRoot\claw.exe" doctor
+Copy-Item ".\$Asset" "$InstallRoot\brewcode.exe" -Force
+& "$InstallRoot\brewcode.exe" --help
+& "$InstallRoot\brewcode.exe" doctor
 ```
 
 To make that binary available in new PowerShell windows:
 
 ```powershell
-$InstallRoot = "$env:LOCALAPPDATA\Programs\claw"
+$InstallRoot = "$env:LOCALAPPDATA\Programs\brewcode"
 [Environment]::SetEnvironmentVariable(
   "Path",
   [Environment]::GetEnvironmentVariable("Path", "User") + ";$InstallRoot",
@@ -54,7 +54,7 @@ $InstallRoot = "$env:LOCALAPPDATA\Programs\claw"
 )
 ```
 
-Open a new terminal before running `claw --help` from another directory.
+Open a new terminal before running `brewcode --help` from another directory.
 
 ### Option C: WSL
 
@@ -69,7 +69,7 @@ Then inside WSL:
 
 ```bash
 git clone https://github.com/ultraworkers/claw-code
-cd claw-code
+cd brew-code
 ./install.sh
 ```
 
@@ -78,11 +78,11 @@ cd claw-code
 Run these before using live prompts:
 
 ```powershell
-Set-Location .\claw-code\rust
-.\target\debug\claw.exe --help
-.\target\debug\claw.exe doctor
-.\target\debug\claw.exe status --output-format json
-.\target\debug\claw.exe config --output-format json
+Set-Location .\brew-code\rust
+.\target\debug\brewcode.exe --help
+.\target\debug\brewcode.exe doctor
+.\target\debug\brewcode.exe status --output-format json
+.\target\debug\brewcode.exe config --output-format json
 ```
 
 `doctor`, `status`, `config`, and `version` support `--output-format json`; do not use a separate `--json` suffix.
@@ -111,7 +111,7 @@ Remove-Item Env:\ANTHROPIC_API_KEY -ErrorAction SilentlyContinue
 
 ## Safe provider switching examples
 
-Provider routing is model-prefix first. When multiple credentials exist, choose an explicit model prefix so `claw` does not infer the wrong backend.
+Provider routing is model-prefix first. When multiple credentials exist, choose an explicit model prefix so `brewcode` does not infer the wrong backend.
 
 ### Anthropic direct
 
@@ -120,7 +120,7 @@ $env:ANTHROPIC_API_KEY = "sk-ant-REPLACE_ME"
 Remove-Item Env:\OPENAI_BASE_URL -ErrorAction SilentlyContinue
 Remove-Item Env:\OPENAI_API_KEY -ErrorAction SilentlyContinue
 
-.\target\debug\claw.exe --model "sonnet" prompt "reply with ready"
+.\target\debug\brewcode.exe --model "sonnet" prompt "reply with ready"
 ```
 
 ### OpenAI-compatible gateway or OpenRouter
@@ -130,7 +130,7 @@ Remove-Item Env:\ANTHROPIC_API_KEY -ErrorAction SilentlyContinue
 $env:OPENAI_BASE_URL = "https://openrouter.ai/api/v1"
 $env:OPENAI_API_KEY = "sk-or-v1-REPLACE_ME"
 
-.\target\debug\claw.exe --model "openai/gpt-4.1-mini" prompt "reply with ready"
+.\target\debug\brewcode.exe --model "openai/gpt-4.1-mini" prompt "reply with ready"
 ```
 
 For the default OpenAI-compatible API, omit `OPENAI_BASE_URL` or set it to `https://api.openai.com/v1`, and keep the `openai/` or `gpt-` model prefix explicit.
@@ -144,7 +144,7 @@ Remove-Item Env:\ANTHROPIC_API_KEY -ErrorAction SilentlyContinue
 $env:OPENAI_BASE_URL = "http://127.0.0.1:11434/v1"
 $env:OPENAI_API_KEY = "local-dev-token"
 
-.\target\debug\claw.exe --model "llama3.2" prompt "reply with ready"
+.\target\debug\brewcode.exe --model "llama3.2" prompt "reply with ready"
 ```
 
 If the local server is authless, remove `OPENAI_API_KEY` instead of putting a real cloud key into local testing:
@@ -159,7 +159,7 @@ Remove-Item Env:\OPENAI_API_KEY -ErrorAction SilentlyContinue
 Remove-Item Env:\ANTHROPIC_API_KEY -ErrorAction SilentlyContinue
 $env:DASHSCOPE_API_KEY = "sk-REPLACE_ME"
 
-.\target\debug\claw.exe --model "qwen-plus" prompt "reply with ready"
+.\target\debug\brewcode.exe --model "qwen-plus" prompt "reply with ready"
 ```
 
 ## Windows and WSL notifications
@@ -169,8 +169,8 @@ Notification support is exposed through the `notifications` slash command in the
 Native PowerShell smoke path:
 
 ```powershell
-Set-Location .\claw-code\rust
-.\target\debug\claw.exe
+Set-Location .\brew-code\rust
+.\target\debug\brewcode.exe
 # inside the REPL:
 /notifications
 ```
@@ -178,18 +178,18 @@ Set-Location .\claw-code\rust
 WSL smoke path:
 
 ```bash
-cd claw-code/rust
-./target/debug/claw
+cd brew-code/rust
+./target/debug/brewcode
 # inside the REPL:
 /notifications
 ```
 
-When moving between PowerShell and WSL, keep provider keys in the environment where `claw` is actually running; Windows user env vars set with `setx` are not automatically the same as WSL shell exports.
+When moving between PowerShell and WSL, keep provider keys in the environment where `brewcode` is actually running; Windows user env vars set with `setx` are not automatically the same as WSL shell exports.
 
 ## Troubleshooting checklist
 
-- `claw` not found: use `claw.exe` on Windows or run the binary by full path (`.\target\debug\claw.exe`).
+- `brewcode` not found: use `brewcode.exe` on Windows or run the binary by full path (`.\target\debug\brewcode.exe`).
 - `cargo` not found: reopen PowerShell after installing Rust from <https://rustup.rs/>.
 - `401 Invalid bearer token`: put `sk-ant-*` values in `ANTHROPIC_API_KEY`, not `ANTHROPIC_AUTH_TOKEN`.
 - Wrong provider selected: add an explicit model prefix such as `openai/gpt-4.1-mini`, `qwen-plus`, or `grok`.
-- Release ZIP extracted but command still fails: open a new terminal after updating the user `Path`, or call `& "$env:LOCALAPPDATA\Programs\claw\claw.exe"` directly.
+- Release ZIP extracted but command still fails: open a new terminal after updating the user `Path`, or call `& "$env:LOCALAPPDATA\Programs\brewcode\brewcode.exe"` directly.

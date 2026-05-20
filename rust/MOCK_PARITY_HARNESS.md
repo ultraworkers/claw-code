@@ -1,6 +1,6 @@
 # Mock LLM parity harness
 
-This milestone adds a deterministic Anthropic-compatible mock service plus a reproducible CLI harness for the Rust `claw` binary.
+This milestone adds a deterministic Anthropic-compatible mock service plus a reproducible CLI harness for the Rust `brewcode` binary.
 
 ## Artifacts
 

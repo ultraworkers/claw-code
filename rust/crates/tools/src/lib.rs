@@ -2988,7 +2988,7 @@ fn build_http_client() -> Result<Client, String> {
     Client::builder()
         .timeout(Duration::from_secs(20))
         .redirect(reqwest::redirect::Policy::limited(10))
-        .user_agent("clawd-rust-tools/0.1")
+        .user_agent("brewcoded-rust-tools/0.1")
         .build()
         .map_err(|error| error.to_string())
 }
@@ -3009,7 +3009,7 @@ fn normalize_fetch_url(url: &str) -> Result<String, String> {
 }
 
 fn build_search_url(query: &str) -> Result<reqwest::Url, String> {
-    if let Ok(base) = std::env::var("CLAWD_WEB_SEARCH_BASE_URL") {
+    if let Ok(base) = std::env::var("BREWCODED_WEB_SEARCH_BASE_URL") {
         let mut url = reqwest::Url::parse(&base).map_err(|error| error.to_string())?;
         url.query_pairs_mut().append_pair("q", query);
         return Ok(url);
@@ -3360,11 +3360,11 @@ fn validate_todos(todos: &[TodoItem]) -> Result<(), String> {
 }
 
 fn todo_store_path() -> Result<std::path::PathBuf, String> {
-    if let Ok(path) = std::env::var("CLAWD_TODO_STORE") {
+    if let Ok(path) = std::env::var("BREWCODED_TODO_STORE") {
         return Ok(std::path::PathBuf::from(path));
     }
     let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
-    Ok(cwd.join(".clawd-todos.json"))
+    Ok(cwd.join(".brewcoded-todos.json"))
 }
 
 fn resolve_skill_path(skill: &str) -> Result<std::path::PathBuf, String> {
@@ -3409,8 +3409,8 @@ fn skill_lookup_roots() -> Vec<SkillLookupRoot> {
         push_project_skill_lookup_roots(&mut roots, &cwd);
     }
 
-    if let Ok(claw_config_home) = std::env::var("CLAW_CONFIG_HOME") {
-        push_prefixed_skill_lookup_roots(&mut roots, std::path::Path::new(&claw_config_home));
+    if let Ok(brewcode_config_home) = std::env::var("BREWCODE_CONFIG_HOME") {
+        push_prefixed_skill_lookup_roots(&mut roots, std::path::Path::new(&brewcode_config_home));
     }
     if let Ok(codex_home) = std::env::var("CODEX_HOME") {
         push_prefixed_skill_lookup_roots(&mut roots, std::path::Path::new(&codex_home));
@@ -3438,7 +3438,7 @@ fn skill_lookup_roots() -> Vec<SkillLookupRoot> {
     }
     push_skill_lookup_root(
         &mut roots,
-        std::path::PathBuf::from("/home/bellman/.claw/skills"),
+        std::path::PathBuf::from("/home/bellman/.brewcode/skills"),
         SkillLookupOrigin::SkillsDir,
     );
     push_skill_lookup_root(
@@ -3454,7 +3454,7 @@ fn push_project_skill_lookup_roots(roots: &mut Vec<SkillLookupRoot>, cwd: &std::
     for ancestor in cwd.ancestors() {
         push_prefixed_skill_lookup_roots(roots, &ancestor.join(".omc"));
         push_prefixed_skill_lookup_roots(roots, &ancestor.join(".agents"));
-        push_prefixed_skill_lookup_roots(roots, &ancestor.join(".claw"));
+        push_prefixed_skill_lookup_roots(roots, &ancestor.join(".brewcode"));
         push_prefixed_skill_lookup_roots(roots, &ancestor.join(".codex"));
         push_prefixed_skill_lookup_roots(roots, &ancestor.join(".claude"));
     }
@@ -3462,7 +3462,7 @@ fn push_project_skill_lookup_roots(roots: &mut Vec<SkillLookupRoot>, cwd: &std::
 
 fn push_home_skill_lookup_roots(roots: &mut Vec<SkillLookupRoot>, home: &std::path::Path) {
     push_prefixed_skill_lookup_roots(roots, &home.join(".omc"));
-    push_prefixed_skill_lookup_roots(roots, &home.join(".claw"));
+    push_prefixed_skill_lookup_roots(roots, &home.join(".brewcode"));
     push_prefixed_skill_lookup_roots(roots, &home.join(".codex"));
     push_prefixed_skill_lookup_roots(roots, &home.join(".claude"));
     push_skill_lookup_root(
@@ -3717,7 +3717,7 @@ where
 }
 
 fn spawn_agent_job(job: AgentJob) -> Result<(), String> {
-    let thread_name = format!("clawd-agent-{}", job.manifest.agent_id);
+    let thread_name = format!("brewcoded-agent-{}", job.manifest.agent_id);
     std::thread::Builder::new()
         .name(thread_name)
         .spawn(move || {
@@ -3835,7 +3835,7 @@ fn allowed_tools_for_subagent(subagent_type: &str) -> BTreeSet<String> {
             "SendUserMessage",
             "PowerShell",
         ],
-        "claw-guide" => vec![
+        "brewcode-guide" => vec![
             "read_file",
             "glob_search",
             "grep_search",
@@ -5205,14 +5205,14 @@ fn canonical_tool_token(value: &str) -> String {
 }
 
 fn agent_store_dir() -> Result<std::path::PathBuf, String> {
-    if let Ok(path) = std::env::var("CLAWD_AGENT_STORE") {
+    if let Ok(path) = std::env::var("BREWCODED_AGENT_STORE") {
         return Ok(std::path::PathBuf::from(path));
     }
     let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
     if let Some(workspace_root) = cwd.ancestors().nth(2) {
-        return Ok(workspace_root.join(".clawd-agents"));
+        return Ok(workspace_root.join(".brewcoded-agents"));
     }
-    Ok(cwd.join(".clawd-agents"))
+    Ok(cwd.join(".brewcoded-agents"))
 }
 
 fn make_agent_id() -> String {
@@ -5253,7 +5253,7 @@ fn normalize_subagent_type(subagent_type: Option<&str>) -> String {
         "verification" | "verificationagent" | "verify" | "verifier" => {
             String::from("Verification")
         }
-        "clawguide" | "clawguideagent" | "guide" => String::from("claw-guide"),
+        "brewcodeguide" | "brewcodeguideagent" | "guide" => String::from("brewcode-guide"),
         "statusline" | "statuslinesetup" => String::from("statusline-setup"),
         _ => trimmed.to_string(),
     }
@@ -5946,12 +5946,12 @@ fn config_file_for_scope(scope: ConfigScope) -> Result<PathBuf, String> {
     let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
     Ok(match scope {
         ConfigScope::Global => config_home_dir()?.join("settings.json"),
-        ConfigScope::Settings => cwd.join(".claw").join("settings.local.json"),
+        ConfigScope::Settings => cwd.join(".brewcode").join("settings.local.json"),
     })
 }
 
 fn config_home_dir() -> Result<PathBuf, String> {
-    if let Ok(path) = std::env::var("CLAW_CONFIG_HOME") {
+    if let Ok(path) = std::env::var("BREWCODE_CONFIG_HOME") {
         return Ok(PathBuf::from(path));
     }
     let home = std::env::var("HOME")
@@ -5959,10 +5959,10 @@ fn config_home_dir() -> Result<PathBuf, String> {
         .map_err(|_| {
             String::from(
                 "HOME is not set (on Windows, set USERPROFILE or HOME, \
-                 or use CLAW_CONFIG_HOME to point directly at the config directory)",
+                 or use BREWCODE_CONFIG_HOME to point directly at the config directory)",
             )
         })?;
-    Ok(PathBuf::from(home).join(".claw"))
+    Ok(PathBuf::from(home).join(".brewcode"))
 }
 
 fn read_json_object(path: &Path) -> Result<serde_json::Map<String, Value>, String> {
@@ -6421,7 +6421,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .expect("time")
             .as_nanos();
-        std::env::temp_dir().join(format!("clawd-tools-{unique}-{name}"))
+        std::env::temp_dir().join(format!("brewcoded-tools-{unique}-{name}"))
     }
 
     fn run_git(cwd: &Path, args: &[&str]) {
@@ -6583,14 +6583,14 @@ mod tests {
     #[test]
     fn worker_create_merges_config_trusted_roots_without_per_call_override() {
         use std::fs;
-        // Write a .claw/settings.json in a temp dir with trustedRoots
+        // Write a .brewcode/settings.json in a temp dir with trustedRoots
         let worktree = temp_path("config-trust-worktree");
-        let claw_dir = worktree.join(".claw");
-        fs::create_dir_all(&claw_dir).expect("create .claw dir");
+        let brewcode_dir = worktree.join(".brewcode");
+        fs::create_dir_all(&brewcode_dir).expect("create .brewcode dir");
         // Use the actual OS temp dir so the worktree path matches the allowlist
         let tmp_root = std::env::temp_dir().to_str().expect("utf-8").to_string();
         let settings = format!("{{\"trustedRoots\": [\"{tmp_root}\"]}}");
-        fs::write(claw_dir.join("settings.json"), settings).expect("write settings");
+        fs::write(brewcode_dir.join("settings.json"), settings).expect("write settings");
 
         // WorkerCreate with no per-call trusted_roots — config should supply them
         let cwd = worktree.to_str().expect("valid utf-8").to_string();
@@ -6618,10 +6618,10 @@ mod tests {
         use std::fs;
 
         let worktree = temp_path("config-and-call-trust-worktree");
-        let claw_dir = worktree.join(".claw");
-        fs::create_dir_all(&claw_dir).expect("create .claw dir");
+        let brewcode_dir = worktree.join(".brewcode");
+        fs::create_dir_all(&brewcode_dir).expect("create .brewcode dir");
         fs::write(
-            claw_dir.join("settings.json"),
+            brewcode_dir.join("settings.json"),
             r#"{"trustedRoots": ["/definitely/not/this/worktree"]}"#,
         )
         .expect("write settings");
@@ -6790,7 +6790,7 @@ mod tests {
 
     #[test]
     fn recovery_loop_state_file_reflects_transitions() {
-        // End-to-end proof: .claw/worker-state.json reflects every transition
+        // End-to-end proof: .brewcode/worker-state.json reflects every transition
         // through the stall-detect -> resolve-trust -> ready loop.
         use std::fs;
 
@@ -6798,7 +6798,7 @@ mod tests {
         let worktree = temp_path("recovery-loop-state");
         fs::create_dir_all(&worktree).expect("create worktree");
         let cwd = worktree.to_str().expect("utf-8").to_string();
-        let state_path = worktree.join(".claw").join("worker-state.json");
+        let state_path = worktree.join(".brewcode").join("worker-state.json");
 
         // 1. Create worker WITHOUT trusted_roots
         let created = execute_tool("WorkerCreate", &json!({"cwd": cwd}))
@@ -6900,7 +6900,7 @@ mod tests {
             "worker should stall at trust_required when trust prompt seen without allowlist"
         );
         assert_eq!(stalled_output["trust_gate_cleared"], false);
-        // 3. Clawhip calls WorkerResolveTrust to unblock
+        // 3. Brewcodehip calls WorkerResolveTrust to unblock
         let resolved = execute_tool("WorkerResolveTrust", &json!({"worker_id": worker_id}))
             .expect("WorkerResolveTrust should succeed");
         let resolved_output: serde_json::Value = serde_json::from_str(&resolved).expect("json");
@@ -6928,7 +6928,7 @@ mod tests {
 
     #[test]
     fn stall_detect_and_restart_recovery_end_to_end() {
-        // Worker stalls at trust_required, clawhip restarts instead of resolving
+        // Worker stalls at trust_required, brewcodehip restarts instead of resolving
         let created = execute_tool(
             "WorkerCreate",
             &json!({"cwd": "/no/trusted/root/restart-test"}),
@@ -7332,7 +7332,7 @@ mod tests {
     fn web_search_extracts_and_filters_results() {
         // Serialize env-var mutation so this test cannot race with the sibling
         // web_search_handles_generic_links_and_invalid_base_url test that also
-        // sets CLAWD_WEB_SEARCH_BASE_URL. Without the lock, parallel test
+        // sets BREWCODED_WEB_SEARCH_BASE_URL. Without the lock, parallel test
         // runners can interleave the set/remove calls and cause assertion
         // failures on the wrong port.
         let _guard = env_lock()
@@ -7353,7 +7353,7 @@ mod tests {
         }));
 
         std::env::set_var(
-            "CLAWD_WEB_SEARCH_BASE_URL",
+            "BREWCODED_WEB_SEARCH_BASE_URL",
             format!("http://{}/search", server.addr()),
         );
         let result = execute_tool(
@@ -7365,7 +7365,7 @@ mod tests {
             }),
         )
         .expect("WebSearch should succeed");
-        std::env::remove_var("CLAWD_WEB_SEARCH_BASE_URL");
+        std::env::remove_var("BREWCODED_WEB_SEARCH_BASE_URL");
 
         let output: serde_json::Value = serde_json::from_str(&result).expect("valid json");
         assert_eq!(output["query"], "rust web search");
@@ -7401,7 +7401,7 @@ mod tests {
         }));
 
         std::env::set_var(
-            "CLAWD_WEB_SEARCH_BASE_URL",
+            "BREWCODED_WEB_SEARCH_BASE_URL",
             format!("http://{}/fallback", server.addr()),
         );
         let result = execute_tool(
@@ -7411,7 +7411,7 @@ mod tests {
             }),
         )
         .expect("WebSearch fallback parsing should succeed");
-        std::env::remove_var("CLAWD_WEB_SEARCH_BASE_URL");
+        std::env::remove_var("BREWCODED_WEB_SEARCH_BASE_URL");
 
         let output: serde_json::Value = serde_json::from_str(&result).expect("valid json");
         let results = output["results"].as_array().expect("results array");
@@ -7424,10 +7424,10 @@ mod tests {
         assert_eq!(content[0]["url"], "https://example.com/one");
         assert_eq!(content[1]["url"], "https://docs.rs/tokio");
 
-        std::env::set_var("CLAWD_WEB_SEARCH_BASE_URL", "://bad-base-url");
+        std::env::set_var("BREWCODED_WEB_SEARCH_BASE_URL", "://bad-base-url");
         let error = execute_tool("WebSearch", &json!({ "query": "generic links" }))
             .expect_err("invalid base URL should fail");
-        std::env::remove_var("CLAWD_WEB_SEARCH_BASE_URL");
+        std::env::remove_var("BREWCODED_WEB_SEARCH_BASE_URL");
         assert!(error.contains("relative URL without a base") || error.contains("empty host"));
     }
 
@@ -7452,7 +7452,7 @@ mod tests {
 
         // when
         std::env::set_var(
-            "CLAWD_WEB_SEARCH_BASE_URL",
+            "BREWCODED_WEB_SEARCH_BASE_URL",
             format!("http://{}/search", server.addr()),
         );
         let result = execute_tool(
@@ -7462,7 +7462,7 @@ mod tests {
             }),
         )
         .expect("WebSearch should succeed");
-        std::env::remove_var("CLAWD_WEB_SEARCH_BASE_URL");
+        std::env::remove_var("BREWCODED_WEB_SEARCH_BASE_URL");
 
         // then
         let output: serde_json::Value = serde_json::from_str(&result).expect("valid json");
@@ -7498,7 +7498,7 @@ mod tests {
 
         // when
         std::env::set_var(
-            "CLAWD_WEB_SEARCH_BASE_URL",
+            "BREWCODED_WEB_SEARCH_BASE_URL",
             format!("http://{}/search", server.addr()),
         );
         let result = execute_tool(
@@ -7508,7 +7508,7 @@ mod tests {
             }),
         )
         .expect("WebSearch should succeed");
-        std::env::remove_var("CLAWD_WEB_SEARCH_BASE_URL");
+        std::env::remove_var("BREWCODED_WEB_SEARCH_BASE_URL");
 
         // then
         let output: serde_json::Value = serde_json::from_str(&result).expect("valid json");
@@ -7589,7 +7589,7 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let path = temp_path("todos.json");
-        std::env::set_var("CLAWD_TODO_STORE", &path);
+        std::env::set_var("BREWCODED_TODO_STORE", &path);
 
         let first = execute_tool(
             "TodoWrite",
@@ -7615,7 +7615,7 @@ mod tests {
             }),
         )
         .expect("TodoWrite should succeed");
-        std::env::remove_var("CLAWD_TODO_STORE");
+        std::env::remove_var("BREWCODED_TODO_STORE");
         let _ = std::fs::remove_file(path);
 
         let second_output: serde_json::Value = serde_json::from_str(&second).expect("valid json");
@@ -7636,7 +7636,7 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let path = temp_path("todos-errors.json");
-        std::env::set_var("CLAWD_TODO_STORE", &path);
+        std::env::set_var("BREWCODED_TODO_STORE", &path);
 
         let empty = execute_tool("TodoWrite", &json!({ "todos": [] }))
             .expect_err("empty todos should fail");
@@ -7676,7 +7676,7 @@ mod tests {
             }),
         )
         .expect("completed todos should succeed");
-        std::env::remove_var("CLAWD_TODO_STORE");
+        std::env::remove_var("BREWCODED_TODO_STORE");
         let _ = fs::remove_file(path);
 
         let output: serde_json::Value = serde_json::from_str(&nudge).expect("valid json");
@@ -7744,8 +7744,8 @@ mod tests {
     fn skill_resolves_project_local_skills_and_legacy_commands() {
         let _guard = env_guard();
         let root = temp_path("project-skills");
-        let skill_dir = root.join(".claw").join("skills").join("plan");
-        let command_dir = root.join(".claw").join("commands");
+        let skill_dir = root.join(".brewcode").join("skills").join("plan");
+        let command_dir = root.join(".brewcode").join("commands");
         fs::create_dir_all(&skill_dir).expect("skill dir should exist");
         fs::create_dir_all(&command_dir).expect("command dir should exist");
         fs::write(
@@ -7769,7 +7769,7 @@ mod tests {
         assert!(skill_output["path"]
             .as_str()
             .expect("path")
-            .ends_with(".claw/skills/plan/SKILL.md"));
+            .ends_with(".brewcode/skills/plan/SKILL.md"));
 
         let command_result = execute_tool("Skill", &json!({ "skill": "/handoff" }))
             .expect("legacy command should resolve");
@@ -7778,7 +7778,7 @@ mod tests {
         assert!(command_output["path"]
             .as_str()
             .expect("path")
-            .ends_with(".claw/commands/handoff.md"));
+            .ends_with(".brewcode/commands/handoff.md"));
 
         std::env::set_current_dir(&original_dir).expect("restore cwd");
         fs::remove_dir_all(root).expect("temp project should clean up");
@@ -7801,11 +7801,11 @@ mod tests {
         .expect("skill file should exist");
 
         let original_home = std::env::var("HOME").ok();
-        let original_config_home = std::env::var("CLAW_CONFIG_HOME").ok();
+        let original_config_home = std::env::var("BREWCODE_CONFIG_HOME").ok();
         let original_codex_home = std::env::var("CODEX_HOME").ok();
         let original_dir = std::env::current_dir().expect("cwd");
         std::env::set_var("HOME", &home);
-        std::env::remove_var("CLAW_CONFIG_HOME");
+        std::env::remove_var("BREWCODE_CONFIG_HOME");
         std::env::remove_var("CODEX_HOME");
         std::env::set_current_dir(&nested).expect("set cwd");
 
@@ -7825,8 +7825,8 @@ mod tests {
             None => std::env::remove_var("HOME"),
         }
         match original_config_home {
-            Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
-            None => std::env::remove_var("CLAW_CONFIG_HOME"),
+            Some(value) => std::env::set_var("BREWCODE_CONFIG_HOME", value),
+            None => std::env::remove_var("BREWCODE_CONFIG_HOME"),
         }
         match original_codex_home {
             Some(value) => std::env::set_var("CODEX_HOME", value),
@@ -7859,11 +7859,11 @@ mod tests {
         .expect("agents skill file should exist");
 
         let original_home = std::env::var("HOME").ok();
-        let original_config_home = std::env::var("CLAW_CONFIG_HOME").ok();
+        let original_config_home = std::env::var("BREWCODE_CONFIG_HOME").ok();
         let original_codex_home = std::env::var("CODEX_HOME").ok();
         let original_dir = std::env::current_dir().expect("cwd");
         std::env::set_var("HOME", &home);
-        std::env::remove_var("CLAW_CONFIG_HOME");
+        std::env::remove_var("BREWCODE_CONFIG_HOME");
         std::env::remove_var("CODEX_HOME");
         std::env::set_current_dir(&nested).expect("set cwd");
 
@@ -7895,8 +7895,8 @@ mod tests {
             None => std::env::remove_var("HOME"),
         }
         match original_config_home {
-            Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
-            None => std::env::remove_var("CLAW_CONFIG_HOME"),
+            Some(value) => std::env::set_var("BREWCODE_CONFIG_HOME", value),
+            None => std::env::remove_var("BREWCODE_CONFIG_HOME"),
         }
         match original_codex_home {
             Some(value) => std::env::set_var("CODEX_HOME", value),
@@ -7923,11 +7923,11 @@ mod tests {
         .expect("learned skill file should exist");
 
         let original_home = std::env::var("HOME").ok();
-        let original_config_home = std::env::var("CLAW_CONFIG_HOME").ok();
+        let original_config_home = std::env::var("BREWCODE_CONFIG_HOME").ok();
         let original_codex_home = std::env::var("CODEX_HOME").ok();
         let original_claude_config_dir = std::env::var("CLAUDE_CONFIG_DIR").ok();
         std::env::set_var("HOME", &home);
-        std::env::remove_var("CLAW_CONFIG_HOME");
+        std::env::remove_var("BREWCODE_CONFIG_HOME");
         std::env::remove_var("CODEX_HOME");
         std::env::set_var("CLAUDE_CONFIG_DIR", &claude_config_dir);
 
@@ -7946,8 +7946,8 @@ mod tests {
             None => std::env::remove_var("HOME"),
         }
         match original_config_home {
-            Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
-            None => std::env::remove_var("CLAW_CONFIG_HOME"),
+            Some(value) => std::env::set_var("BREWCODE_CONFIG_HOME", value),
+            None => std::env::remove_var("BREWCODE_CONFIG_HOME"),
         }
         match original_codex_home {
             Some(value) => std::env::set_var("CODEX_HOME", value),
@@ -7982,11 +7982,11 @@ mod tests {
         .expect("direct command file should exist");
 
         let original_home = std::env::var("HOME").ok();
-        let original_config_home = std::env::var("CLAW_CONFIG_HOME").ok();
+        let original_config_home = std::env::var("BREWCODE_CONFIG_HOME").ok();
         let original_codex_home = std::env::var("CODEX_HOME").ok();
         let original_claude_config_dir = std::env::var("CLAUDE_CONFIG_DIR").ok();
         std::env::set_var("HOME", &home);
-        std::env::remove_var("CLAW_CONFIG_HOME");
+        std::env::remove_var("BREWCODE_CONFIG_HOME");
         std::env::remove_var("CODEX_HOME");
         std::env::set_var("CLAUDE_CONFIG_DIR", &claude_config_dir);
 
@@ -8018,8 +8018,8 @@ mod tests {
             None => std::env::remove_var("HOME"),
         }
         match original_config_home {
-            Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
-            None => std::env::remove_var("CLAW_CONFIG_HOME"),
+            Some(value) => std::env::set_var("BREWCODE_CONFIG_HOME", value),
+            None => std::env::remove_var("BREWCODE_CONFIG_HOME"),
         }
         match original_codex_home {
             Some(value) => std::env::set_var("CODEX_HOME", value),
@@ -8049,11 +8049,11 @@ mod tests {
         .expect("legacy command file should exist");
 
         let original_home = std::env::var("HOME").ok();
-        let original_config_home = std::env::var("CLAW_CONFIG_HOME").ok();
+        let original_config_home = std::env::var("BREWCODE_CONFIG_HOME").ok();
         let original_codex_home = std::env::var("CODEX_HOME").ok();
         let original_dir = std::env::current_dir().expect("cwd");
         std::env::set_var("HOME", &home);
-        std::env::remove_var("CLAW_CONFIG_HOME");
+        std::env::remove_var("BREWCODE_CONFIG_HOME");
         std::env::remove_var("CODEX_HOME");
         std::env::set_current_dir(&nested).expect("set cwd");
 
@@ -8073,8 +8073,8 @@ mod tests {
             None => std::env::remove_var("HOME"),
         }
         match original_config_home {
-            Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
-            None => std::env::remove_var("CLAW_CONFIG_HOME"),
+            Some(value) => std::env::set_var("BREWCODE_CONFIG_HOME", value),
+            None => std::env::remove_var("BREWCODE_CONFIG_HOME"),
         }
         match original_codex_home {
             Some(value) => std::env::set_var("CODEX_HOME", value),
@@ -8122,7 +8122,7 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = temp_path("agent-store");
-        std::env::set_var("CLAWD_AGENT_STORE", &dir);
+        std::env::set_var("BREWCODED_AGENT_STORE", &dir);
         let captured = Arc::new(Mutex::new(None::<AgentJob>));
         let captured_for_spawn = Arc::clone(&captured);
 
@@ -8142,7 +8142,7 @@ mod tests {
             },
         )
         .expect("Agent should succeed");
-        std::env::remove_var("CLAWD_AGENT_STORE");
+        std::env::remove_var("BREWCODED_AGENT_STORE");
 
         assert_eq!(manifest.name, "ship-audit");
         assert_eq!(manifest.subagent_type.as_deref(), Some("Explore"));
@@ -8205,7 +8205,7 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = temp_path("agent-runner");
-        std::env::set_var("CLAWD_AGENT_STORE", &dir);
+        std::env::set_var("BREWCODED_AGENT_STORE", &dir);
 
         let completed = execute_agent_with_spawn(
             AgentInput {
@@ -8635,7 +8635,7 @@ mod tests {
         );
         assert_eq!(spawn_error_manifest_json["derivedState"], "truly_idle");
 
-        std::env::remove_var("CLAWD_AGENT_STORE");
+        std::env::remove_var("BREWCODED_AGENT_STORE");
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -9461,7 +9461,7 @@ mod tests {
     #[test]
     fn brief_returns_sent_message_and_attachment_metadata() {
         let attachment = std::env::temp_dir().join(format!(
-            "clawd-brief-{}.png",
+            "brewcoded-brief-{}.png",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .expect("time")
@@ -9492,7 +9492,7 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = std::env::temp_dir().join(format!(
-            "clawd-config-{}",
+            "brewcoded-config-{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .expect("time")
@@ -9500,19 +9500,19 @@ mod tests {
         ));
         let home = root.join("home");
         let cwd = root.join("cwd");
-        std::fs::create_dir_all(home.join(".claw")).expect("home dir");
-        std::fs::create_dir_all(cwd.join(".claw")).expect("cwd dir");
+        std::fs::create_dir_all(home.join(".brewcode")).expect("home dir");
+        std::fs::create_dir_all(cwd.join(".brewcode")).expect("cwd dir");
         std::fs::write(
-            home.join(".claw").join("settings.json"),
+            home.join(".brewcode").join("settings.json"),
             r#"{"verbose":false}"#,
         )
         .expect("write global settings");
 
         let original_home = std::env::var("HOME").ok();
-        let original_config_home = std::env::var("CLAW_CONFIG_HOME").ok();
+        let original_config_home = std::env::var("BREWCODE_CONFIG_HOME").ok();
         let original_dir = std::env::current_dir().expect("cwd");
         std::env::set_var("HOME", &home);
-        std::env::remove_var("CLAW_CONFIG_HOME");
+        std::env::remove_var("BREWCODE_CONFIG_HOME");
         std::env::set_current_dir(&cwd).expect("set cwd");
 
         let get = execute_tool("Config", &json!({"setting": "verbose"})).expect("get config");
@@ -9546,8 +9546,8 @@ mod tests {
             None => std::env::remove_var("HOME"),
         }
         match original_config_home {
-            Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
-            None => std::env::remove_var("CLAW_CONFIG_HOME"),
+            Some(value) => std::env::set_var("BREWCODE_CONFIG_HOME", value),
+            None => std::env::remove_var("BREWCODE_CONFIG_HOME"),
         }
         let _ = std::fs::remove_dir_all(root);
     }
@@ -9558,7 +9558,7 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = std::env::temp_dir().join(format!(
-            "clawd-plan-mode-{}",
+            "brewcoded-plan-mode-{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .expect("time")
@@ -9566,19 +9566,19 @@ mod tests {
         ));
         let home = root.join("home");
         let cwd = root.join("cwd");
-        std::fs::create_dir_all(home.join(".claw")).expect("home dir");
-        std::fs::create_dir_all(cwd.join(".claw")).expect("cwd dir");
+        std::fs::create_dir_all(home.join(".brewcode")).expect("home dir");
+        std::fs::create_dir_all(cwd.join(".brewcode")).expect("cwd dir");
         std::fs::write(
-            cwd.join(".claw").join("settings.local.json"),
+            cwd.join(".brewcode").join("settings.local.json"),
             r#"{"permissions":{"defaultMode":"acceptEdits"}}"#,
         )
         .expect("write local settings");
 
         let original_home = std::env::var("HOME").ok();
-        let original_config_home = std::env::var("CLAW_CONFIG_HOME").ok();
+        let original_config_home = std::env::var("BREWCODE_CONFIG_HOME").ok();
         let original_dir = std::env::current_dir().expect("cwd");
         std::env::set_var("HOME", &home);
-        std::env::remove_var("CLAW_CONFIG_HOME");
+        std::env::remove_var("BREWCODE_CONFIG_HOME");
         std::env::set_current_dir(&cwd).expect("set cwd");
 
         let enter = execute_tool("EnterPlanMode", &json!({})).expect("enter plan mode");
@@ -9588,11 +9588,11 @@ mod tests {
         assert_eq!(enter_output["previousLocalMode"], "acceptEdits");
         assert_eq!(enter_output["currentLocalMode"], "plan");
 
-        let local_settings = std::fs::read_to_string(cwd.join(".claw").join("settings.local.json"))
+        let local_settings = std::fs::read_to_string(cwd.join(".brewcode").join("settings.local.json"))
             .expect("local settings after enter");
         assert!(local_settings.contains(r#""defaultMode": "plan""#));
         let state =
-            std::fs::read_to_string(cwd.join(".claw").join("tool-state").join("plan-mode.json"))
+            std::fs::read_to_string(cwd.join(".brewcode").join("tool-state").join("plan-mode.json"))
                 .expect("plan mode state");
         assert!(state.contains(r#""hadLocalOverride": true"#));
         assert!(state.contains(r#""previousLocalMode": "acceptEdits""#));
@@ -9604,11 +9604,11 @@ mod tests {
         assert_eq!(exit_output["previousLocalMode"], "acceptEdits");
         assert_eq!(exit_output["currentLocalMode"], "acceptEdits");
 
-        let local_settings = std::fs::read_to_string(cwd.join(".claw").join("settings.local.json"))
+        let local_settings = std::fs::read_to_string(cwd.join(".brewcode").join("settings.local.json"))
             .expect("local settings after exit");
         assert!(local_settings.contains(r#""defaultMode": "acceptEdits""#));
         assert!(!cwd
-            .join(".claw")
+            .join(".brewcode")
             .join("tool-state")
             .join("plan-mode.json")
             .exists());
@@ -9619,8 +9619,8 @@ mod tests {
             None => std::env::remove_var("HOME"),
         }
         match original_config_home {
-            Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
-            None => std::env::remove_var("CLAW_CONFIG_HOME"),
+            Some(value) => std::env::set_var("BREWCODE_CONFIG_HOME", value),
+            None => std::env::remove_var("BREWCODE_CONFIG_HOME"),
         }
         let _ = std::fs::remove_dir_all(root);
     }
@@ -9631,7 +9631,7 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = std::env::temp_dir().join(format!(
-            "clawd-plan-mode-empty-{}",
+            "brewcoded-plan-mode-empty-{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .expect("time")
@@ -9639,14 +9639,14 @@ mod tests {
         ));
         let home = root.join("home");
         let cwd = root.join("cwd");
-        std::fs::create_dir_all(home.join(".claw")).expect("home dir");
-        std::fs::create_dir_all(cwd.join(".claw")).expect("cwd dir");
+        std::fs::create_dir_all(home.join(".brewcode")).expect("home dir");
+        std::fs::create_dir_all(cwd.join(".brewcode")).expect("cwd dir");
 
         let original_home = std::env::var("HOME").ok();
-        let original_config_home = std::env::var("CLAW_CONFIG_HOME").ok();
+        let original_config_home = std::env::var("BREWCODE_CONFIG_HOME").ok();
         let original_dir = std::env::current_dir().expect("cwd");
         std::env::set_var("HOME", &home);
-        std::env::remove_var("CLAW_CONFIG_HOME");
+        std::env::remove_var("BREWCODE_CONFIG_HOME");
         std::env::set_current_dir(&cwd).expect("set cwd");
 
         let enter = execute_tool("EnterPlanMode", &json!({})).expect("enter plan mode");
@@ -9659,7 +9659,7 @@ mod tests {
         assert_eq!(exit_output["changed"], true);
         assert_eq!(exit_output["currentLocalMode"], serde_json::Value::Null);
 
-        let local_settings = std::fs::read_to_string(cwd.join(".claw").join("settings.local.json"))
+        let local_settings = std::fs::read_to_string(cwd.join(".brewcode").join("settings.local.json"))
             .expect("local settings after exit");
         let local_settings_json: serde_json::Value =
             serde_json::from_str(&local_settings).expect("valid settings json");
@@ -9669,7 +9669,7 @@ mod tests {
             "permissions override should be removed on exit"
         );
         assert!(!cwd
-            .join(".claw")
+            .join(".brewcode")
             .join("tool-state")
             .join("plan-mode.json")
             .exists());
@@ -9680,8 +9680,8 @@ mod tests {
             None => std::env::remove_var("HOME"),
         }
         match original_config_home {
-            Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
-            None => std::env::remove_var("CLAW_CONFIG_HOME"),
+            Some(value) => std::env::set_var("BREWCODE_CONFIG_HOME", value),
+            None => std::env::remove_var("BREWCODE_CONFIG_HOME"),
         }
         let _ = std::fs::remove_dir_all(root);
     }
@@ -9753,7 +9753,7 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = std::env::temp_dir().join(format!(
-            "clawd-pwsh-bin-{}",
+            "brewcoded-pwsh-bin-{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .expect("time")
@@ -9810,7 +9810,7 @@ printf 'pwsh:%s' "$1"
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let original_path = std::env::var("PATH").unwrap_or_default();
         let empty_dir = std::env::temp_dir().join(format!(
-            "clawd-empty-bin-{}",
+            "brewcoded-empty-bin-{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .expect("time")
@@ -10150,7 +10150,7 @@ printf 'pwsh:%s' "$1"
             scope: TaskScope::Module,
             scope_path: Some("runtime/task system".to_string()),
             worktree: Some("/tmp/wt-packet".to_string()),
-            repo: "claw-code-parity".to_string(),
+            repo: "brew-code-parity".to_string(),
             branch_policy: "origin/main only".to_string(),
             acceptance_tests: vec![
                 "cargo build --workspace".to_string(),
@@ -10177,7 +10177,7 @@ printf 'pwsh:%s' "$1"
         assert_eq!(output["status"], "created");
         assert_eq!(output["prompt"], "Ship packetized runtime task");
         assert_eq!(output["description"], "runtime/task system");
-        assert_eq!(output["task_packet"]["repo"], "claw-code-parity");
+        assert_eq!(output["task_packet"]["repo"], "brew-code-parity");
         assert_eq!(output["task_packet"]["resources"][0]["kind"], "module");
         assert_eq!(
             output["task_packet"]["resources"][0]["value"],

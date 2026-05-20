@@ -1,6 +1,6 @@
 # G011 ACP/Zed and JSON-RPC status contract
 
-Claw Code 2.0 keeps ACP/Zed and JSON-RPC serving behind the stable task,
+Brew Code 2.0 keeps ACP/Zed and JSON-RPC serving behind the stable task,
 session-control, and event/report contracts from the roadmap. The current public
 surface is therefore a **truthful unsupported status**, not a hidden daemon.
 
@@ -9,12 +9,12 @@ surface is therefore a **truthful unsupported status**, not a hidden daemon.
 The following commands are status queries and exit with code `0`:
 
 ```bash
-claw acp
-claw acp serve
-claw --acp
-claw -acp
-claw acp --output-format json
-claw acp serve --output-format json
+brewcode acp
+brewcode acp serve
+brewcode --acp
+brewcode -acp
+brewcode acp --output-format json
+brewcode acp serve --output-format json
 ```
 
 `serve` is deliberately an alias for status today. It does not bind a socket,
@@ -22,7 +22,7 @@ start a daemon, or expose a JSON-RPC endpoint.
 
 ## JSON envelope
 
-`claw acp --output-format json` returns a stable envelope for editor probes and
+`brewcode acp --output-format json` returns a stable envelope for editor probes and
 CI checks:
 
 ```json
@@ -49,7 +49,7 @@ Consumers should check `kind == "acp"`, `supported == false`, and
 
 ## Unsupported invocations
 
-Malformed ACP invocations, such as `claw acp start`, exit with code `1`. With
+Malformed ACP invocations, such as `brewcode acp start`, exit with code `1`. With
 `--output-format json`, stderr uses the normal CLI error envelope and sets:
 
 ```json

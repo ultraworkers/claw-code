@@ -930,10 +930,10 @@ mod tests {
     fn renders_links_as_colored_markdown_labels() {
         let terminal_renderer = TerminalRenderer::new();
         let markdown_output =
-            terminal_renderer.render_markdown("See [Claw](https://example.com/docs) now.");
+            terminal_renderer.render_markdown("See [Brewcode](https://example.com/docs) now.");
         let plain_text = strip_ansi(&markdown_output);
 
-        assert!(plain_text.contains("[Claw](https://example.com/docs)"));
+        assert!(plain_text.contains("[Brewcode](https://example.com/docs)"));
         assert!(markdown_output.contains('\u{1b}'));
     }
 

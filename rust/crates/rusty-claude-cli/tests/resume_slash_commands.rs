@@ -29,7 +29,7 @@ fn resumed_binary_accepts_slash_commands_with_arguments() {
         .expect("session should persist");
 
     // when
-    let output = run_claw(
+    let output = run_brewcode(
         &temp_dir,
         &[
             "--resume",
@@ -56,7 +56,7 @@ fn resumed_binary_accepts_slash_commands_with_arguments() {
     assert!(stdout.contains("Session cleared"));
     assert!(stdout.contains("Mode             resumed session reset"));
     assert!(stdout.contains("Previous session"));
-    assert!(stdout.contains("Resume previous  claw --resume"));
+    assert!(stdout.contains("Resume previous  brewcode --resume"));
     assert!(stdout.contains("Backup           "));
     assert!(stdout.contains("Session file     "));
 
@@ -87,7 +87,7 @@ fn status_command_applies_cli_flags_end_to_end() {
     fs::create_dir_all(&temp_dir).expect("temp dir should exist");
 
     // when
-    let output = run_claw(
+    let output = run_brewcode(
         &temp_dir,
         &[
             "--model",
@@ -117,8 +117,8 @@ fn resumed_config_command_loads_settings_files_end_to_end() {
     // given
     let temp_dir = unique_temp_dir("resume-config");
     let project_dir = temp_dir.join("project");
-    let config_home = temp_dir.join("home").join(".claw");
-    fs::create_dir_all(project_dir.join(".claw")).expect("project config dir should exist");
+    let config_home = temp_dir.join("home").join(".brewcode");
+    fs::create_dir_all(project_dir.join(".brewcode")).expect("project config dir should exist");
     fs::create_dir_all(&config_home).expect("config home should exist");
 
     let session_path = project_dir.join("session.jsonl");
@@ -130,13 +130,13 @@ fn resumed_config_command_loads_settings_files_end_to_end() {
     fs::write(config_home.join("settings.json"), r#"{"model":"haiku"}"#)
         .expect("user config should write");
     fs::write(
-        project_dir.join(".claw").join("settings.local.json"),
+        project_dir.join(".brewcode").join("settings.local.json"),
         r#"{"model":"opus"}"#,
     )
     .expect("local config should write");
 
     // when
-    let output = run_claw_with_env(
+    let output = run_brewcode_with_env(
         &project_dir,
         &[
             "--resume",
@@ -144,7 +144,7 @@ fn resumed_config_command_loads_settings_files_end_to_end() {
             "/config",
             "model",
         ],
-        &[("CLAW_CONFIG_HOME", config_home.to_str().expect("utf8 path"))],
+        &[("BREWCODE_CONFIG_HOME", config_home.to_str().expect("utf8 path"))],
     );
 
     // then
@@ -166,7 +166,7 @@ fn resumed_config_command_loads_settings_files_end_to_end() {
     ));
     assert!(stdout.contains(
         project_dir
-            .join(".claw")
+            .join(".brewcode")
             .join("settings.local.json")
             .to_str()
             .expect("utf8 path")
@@ -206,7 +206,7 @@ fn resume_latest_restores_the_most_recent_managed_session() {
         .expect("newer session should persist");
 
     // when
-    let output = run_claw(&project_dir, &["--resume", "latest", "/status"]);
+    let output = run_brewcode(&project_dir, &["--resume", "latest", "/status"]);
 
     // then
     assert!(
@@ -240,9 +240,9 @@ fn resumed_status_command_emits_structured_json_when_requested() {
         .expect("session should persist");
 
     // when
-    // Use an isolated CLAW_CONFIG_HOME so ~/.claw/settings.json is not loaded,
+    // Use an isolated BREWCODE_CONFIG_HOME so ~/.brewcode/settings.json is not loaded,
     // which would cause loaded_config_files to be non-zero (#65).
-    let output = run_claw_with_env(
+    let output = run_brewcode_with_env(
         &temp_dir,
         &[
             "--output-format",
@@ -251,7 +251,7 @@ fn resumed_status_command_emits_structured_json_when_requested() {
             session_path.to_str().expect("utf8 path"),
             "/status",
         ],
-        &[("CLAW_CONFIG_HOME", config_home.to_str().expect("utf8 path"))],
+        &[("BREWCODE_CONFIG_HOME", config_home.to_str().expect("utf8 path"))],
     );
 
     // then
@@ -296,7 +296,7 @@ fn resumed_status_surfaces_persisted_model() {
     session.save_to_path(&session_path).expect("persist ok");
 
     // when
-    let output = run_claw(
+    let output = run_brewcode(
         &temp_dir,
         &[
             "--output-format",
@@ -334,7 +334,7 @@ fn resumed_sandbox_command_emits_structured_json_when_requested() {
         .expect("session should persist");
 
     // when
-    let output = run_claw(
+    let output = run_brewcode(
         &temp_dir,
         &[
             "--output-format",
@@ -374,7 +374,7 @@ fn resumed_version_command_emits_structured_json() {
         .save_to_path(&session_path)
         .expect("session should persist");
 
-    let output = run_claw(
+    let output = run_brewcode(
         &temp_dir,
         &[
             "--output-format",
@@ -409,7 +409,7 @@ fn resumed_export_command_emits_structured_json() {
         .expect("write ok");
     session.save_to_path(&session_path).expect("persist ok");
 
-    let output = run_claw(
+    let output = run_brewcode(
         &temp_dir,
         &[
             "--output-format",
@@ -441,7 +441,7 @@ fn resumed_help_command_emits_structured_json() {
         .save_to_path(&session_path)
         .expect("persist ok");
 
-    let output = run_claw(
+    let output = run_brewcode(
         &temp_dir,
         &[
             "--output-format",
@@ -476,7 +476,7 @@ fn resumed_no_command_emits_restored_json() {
         .expect("write ok");
     session.save_to_path(&session_path).expect("persist ok");
 
-    let output = run_claw(
+    let output = run_brewcode(
         &temp_dir,
         &[
             "--output-format",
@@ -508,7 +508,7 @@ fn resumed_stub_command_emits_not_implemented_json() {
         .save_to_path(&session_path)
         .expect("persist ok");
 
-    let output = run_claw(
+    let output = run_brewcode(
         &temp_dir,
         &[
             "--output-format",
@@ -534,21 +534,21 @@ fn resumed_stub_command_emits_not_implemented_json() {
     );
 }
 
-fn run_claw(current_dir: &Path, args: &[&str]) -> Output {
-    run_claw_with_env(current_dir, args, &[])
+fn run_brewcode(current_dir: &Path, args: &[&str]) -> Output {
+    run_brewcode_with_env(current_dir, args, &[])
 }
 
 fn workspace_session(root: &Path) -> Session {
     Session::new().with_workspace_root(root.to_path_buf())
 }
 
-fn run_claw_with_env(current_dir: &Path, args: &[&str], envs: &[(&str, &str)]) -> Output {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_claw"));
+fn run_brewcode_with_env(current_dir: &Path, args: &[&str], envs: &[(&str, &str)]) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_brewcode"));
     command.current_dir(current_dir).args(args);
     for (key, value) in envs {
         command.env(key, value);
     }
-    command.output().expect("claw should launch")
+    command.output().expect("brewcode should launch")
 }
 
 fn unique_temp_dir(label: &str) -> PathBuf {
@@ -558,7 +558,7 @@ fn unique_temp_dir(label: &str) -> PathBuf {
         .as_millis();
     let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
     std::env::temp_dir().join(format!(
-        "claw-{label}-{}-{millis}-{counter}",
+        "brewcode-{label}-{}-{millis}-{counter}",
         std::process::id()
     ))
 }

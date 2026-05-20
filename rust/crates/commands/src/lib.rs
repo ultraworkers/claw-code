@@ -230,7 +230,7 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "plugin",
         aliases: &["plugins", "marketplace"],
-        summary: "Manage Claw Code plugins",
+        summary: "Manage Brew Code plugins",
         argument_hint: Some(
             "[list|install <path>|enable <name>|disable <name>|uninstall <id>|update <id>]",
         ),
@@ -2090,12 +2090,12 @@ pub struct PluginsCommandResult {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum DefinitionSource {
-    ProjectClaw,
+    ProjectBrewcode,
     ProjectCodex,
     ProjectClaude,
-    UserClawConfigHome,
+    UserBrewcodeConfigHome,
     UserCodexHome,
-    UserClaw,
+    UserBrewcode,
     UserCodex,
     UserClaude,
 }
@@ -2120,11 +2120,11 @@ impl DefinitionScope {
 impl DefinitionSource {
     fn report_scope(self) -> DefinitionScope {
         match self {
-            Self::ProjectClaw | Self::ProjectCodex | Self::ProjectClaude => {
+            Self::ProjectBrewcode | Self::ProjectCodex | Self::ProjectClaude => {
                 DefinitionScope::Project
             }
-            Self::UserClawConfigHome | Self::UserCodexHome => DefinitionScope::UserConfigHome,
-            Self::UserClaw | Self::UserCodex | Self::UserClaude => DefinitionScope::UserHome,
+            Self::UserBrewcodeConfigHome | Self::UserCodexHome => DefinitionScope::UserConfigHome,
+            Self::UserBrewcode | Self::UserCodex | Self::UserClaude => DefinitionScope::UserHome,
         }
     }
 
@@ -2661,7 +2661,7 @@ fn render_mcp_report_for(
                 Err(err) => {
                     let empty = std::collections::BTreeMap::new();
                     Ok(format!(
-                        "Config load error\n  Status           fail\n  Summary          runtime config failed to load; reporting partial MCP view\n  Details          {err}\n  Hint             `claw doctor` classifies config parse errors; fix the listed field and rerun\n\n{}",
+                        "Config load error\n  Status           fail\n  Summary          runtime config failed to load; reporting partial MCP view\n  Details          {err}\n  Hint             `brewcode doctor` classifies config parse errors; fix the listed field and rerun\n\n{}",
                         render_mcp_summary_report(cwd, &empty)
                     ))
                 }
@@ -2688,7 +2688,7 @@ fn render_mcp_report_for(
                     runtime_config.mcp().get(server_name),
                 )),
                 Err(err) => Ok(format!(
-                    "Config load error\n  Status           fail\n  Summary          runtime config failed to load; cannot resolve `{server_name}`\n  Details          {err}\n  Hint             `claw doctor` classifies config parse errors; fix the listed field and rerun"
+                    "Config load error\n  Status           fail\n  Summary          runtime config failed to load; cannot resolve `{server_name}`\n  Details          {err}\n  Hint             `brewcode doctor` classifies config parse errors; fix the listed field and rerun"
                 )),
             }
         }
@@ -2696,13 +2696,13 @@ fn render_mcp_report_for(
             // `mcp list <filter>` — list does not accept arguments; treat as unsupported action.
             Ok(render_mcp_unsupported_action_text(
                 args,
-                "list accepts no filter argument; use `claw mcp list`",
+                "list accepts no filter argument; use `brewcode mcp list`",
             ))
         }
         Some(args) if matches!(args.split_whitespace().next(), Some("info" | "describe")) => {
             Ok(render_mcp_unsupported_action_text(
                 args,
-                "use `claw mcp show <server>` to inspect a server",
+                "use `brewcode mcp show <server>` to inspect a server",
             ))
         }
         Some(args) => Ok(render_mcp_usage(Some(args))),
@@ -2725,7 +2725,7 @@ fn render_mcp_unsupported_action_json(action: &str, hint: &str) -> Value {
         "hint": hint,
         "usage": {
             "slash_command": "/mcp [list|show <server>|help]",
-            "direct_cli": "claw mcp [list|show <server>|help]",
+            "direct_cli": "brewcode mcp [list|show <server>|help]",
         },
     })
 }
@@ -2814,13 +2814,13 @@ fn render_mcp_report_json_for(
         Some(args) if args.split_whitespace().next() == Some("list") && args.contains(' ') => {
             Ok(render_mcp_unsupported_action_json(
                 args,
-                "list accepts no filter argument; use `claw mcp list`",
+                "list accepts no filter argument; use `brewcode mcp list`",
             ))
         }
         Some(args) if matches!(args.split_whitespace().next(), Some("info" | "describe")) => {
             Ok(render_mcp_unsupported_action_json(
                 args,
-                "use `claw mcp show <server>` to inspect a server",
+                "use `brewcode mcp show <server>` to inspect a server",
             ))
         }
         Some(args) => Ok(render_mcp_usage_json(Some(args))),
@@ -2927,8 +2927,8 @@ fn discover_definition_roots(cwd: &Path, leaf: &str) -> Vec<(DefinitionSource, P
     for ancestor in cwd.ancestors() {
         push_unique_root(
             &mut roots,
-            DefinitionSource::ProjectClaw,
-            ancestor.join(".claw").join(leaf),
+            DefinitionSource::ProjectBrewcode,
+            ancestor.join(".brewcode").join(leaf),
         );
         push_unique_root(
             &mut roots,
@@ -2942,11 +2942,11 @@ fn discover_definition_roots(cwd: &Path, leaf: &str) -> Vec<(DefinitionSource, P
         );
     }
 
-    if let Ok(claw_config_home) = env::var("CLAW_CONFIG_HOME") {
+    if let Ok(brewcode_config_home) = env::var("BREWCODE_CONFIG_HOME") {
         push_unique_root(
             &mut roots,
-            DefinitionSource::UserClawConfigHome,
-            PathBuf::from(claw_config_home).join(leaf),
+            DefinitionSource::UserBrewcodeConfigHome,
+            PathBuf::from(brewcode_config_home).join(leaf),
         );
     }
 
@@ -2970,8 +2970,8 @@ fn discover_definition_roots(cwd: &Path, leaf: &str) -> Vec<(DefinitionSource, P
         let home = PathBuf::from(home);
         push_unique_root(
             &mut roots,
-            DefinitionSource::UserClaw,
-            home.join(".claw").join(leaf),
+            DefinitionSource::UserBrewcode,
+            home.join(".brewcode").join(leaf),
         );
         push_unique_root(
             &mut roots,
@@ -2995,19 +2995,19 @@ fn discover_skill_roots(cwd: &Path) -> Vec<SkillRoot> {
     for ancestor in cwd.ancestors() {
         push_unique_skill_root(
             &mut roots,
-            DefinitionSource::ProjectClaw,
-            ancestor.join(".claw").join("skills"),
+            DefinitionSource::ProjectBrewcode,
+            ancestor.join(".brewcode").join("skills"),
             SkillOrigin::SkillsDir,
         );
         push_unique_skill_root(
             &mut roots,
-            DefinitionSource::ProjectClaw,
+            DefinitionSource::ProjectBrewcode,
             ancestor.join(".omc").join("skills"),
             SkillOrigin::SkillsDir,
         );
         push_unique_skill_root(
             &mut roots,
-            DefinitionSource::ProjectClaw,
+            DefinitionSource::ProjectBrewcode,
             ancestor.join(".agents").join("skills"),
             SkillOrigin::SkillsDir,
         );
@@ -3025,8 +3025,8 @@ fn discover_skill_roots(cwd: &Path) -> Vec<SkillRoot> {
         );
         push_unique_skill_root(
             &mut roots,
-            DefinitionSource::ProjectClaw,
-            ancestor.join(".claw").join("commands"),
+            DefinitionSource::ProjectBrewcode,
+            ancestor.join(".brewcode").join("commands"),
             SkillOrigin::LegacyCommandsDir,
         );
         push_unique_skill_root(
@@ -3043,18 +3043,18 @@ fn discover_skill_roots(cwd: &Path) -> Vec<SkillRoot> {
         );
     }
 
-    if let Ok(claw_config_home) = env::var("CLAW_CONFIG_HOME") {
-        let claw_config_home = PathBuf::from(claw_config_home);
+    if let Ok(brewcode_config_home) = env::var("BREWCODE_CONFIG_HOME") {
+        let brewcode_config_home = PathBuf::from(brewcode_config_home);
         push_unique_skill_root(
             &mut roots,
-            DefinitionSource::UserClawConfigHome,
-            claw_config_home.join("skills"),
+            DefinitionSource::UserBrewcodeConfigHome,
+            brewcode_config_home.join("skills"),
             SkillOrigin::SkillsDir,
         );
         push_unique_skill_root(
             &mut roots,
-            DefinitionSource::UserClawConfigHome,
-            claw_config_home.join("commands"),
+            DefinitionSource::UserBrewcodeConfigHome,
+            brewcode_config_home.join("commands"),
             SkillOrigin::LegacyCommandsDir,
         );
     }
@@ -3079,20 +3079,20 @@ fn discover_skill_roots(cwd: &Path) -> Vec<SkillRoot> {
         let home = PathBuf::from(home);
         push_unique_skill_root(
             &mut roots,
-            DefinitionSource::UserClaw,
-            home.join(".claw").join("skills"),
+            DefinitionSource::UserBrewcode,
+            home.join(".brewcode").join("skills"),
             SkillOrigin::SkillsDir,
         );
         push_unique_skill_root(
             &mut roots,
-            DefinitionSource::UserClaw,
+            DefinitionSource::UserBrewcode,
             home.join(".omc").join("skills"),
             SkillOrigin::SkillsDir,
         );
         push_unique_skill_root(
             &mut roots,
-            DefinitionSource::UserClaw,
-            home.join(".claw").join("commands"),
+            DefinitionSource::UserBrewcode,
+            home.join(".brewcode").join("commands"),
             SkillOrigin::LegacyCommandsDir,
         );
         push_unique_skill_root(
@@ -3204,18 +3204,18 @@ fn install_skill_into(
 }
 
 fn default_skill_install_root() -> std::io::Result<PathBuf> {
-    if let Ok(claw_config_home) = env::var("CLAW_CONFIG_HOME") {
-        return Ok(PathBuf::from(claw_config_home).join("skills"));
+    if let Ok(brewcode_config_home) = env::var("BREWCODE_CONFIG_HOME") {
+        return Ok(PathBuf::from(brewcode_config_home).join("skills"));
     }
     if let Ok(codex_home) = env::var("CODEX_HOME") {
         return Ok(PathBuf::from(codex_home).join("skills"));
     }
     if let Some(home) = env::var_os("HOME") {
-        return Ok(PathBuf::from(home).join(".claw").join("skills"));
+        return Ok(PathBuf::from(home).join(".brewcode").join("skills"));
     }
     Err(std::io::Error::new(
         std::io::ErrorKind::NotFound,
-        "unable to resolve a skills install root; set CLAW_CONFIG_HOME or HOME",
+        "unable to resolve a skills install root; set BREWCODE_CONFIG_HOME or HOME",
     ))
 }
 
@@ -3907,8 +3907,8 @@ fn render_agents_usage(unexpected: Option<&str>) -> String {
     let mut lines = vec![
         "Agents".to_string(),
         "  Usage            /agents [list|help]".to_string(),
-        "  Direct CLI       claw agents".to_string(),
-        "  Sources          .claw/agents, ~/.claw/agents, $CLAW_CONFIG_HOME/agents".to_string(),
+        "  Direct CLI       brewcode agents".to_string(),
+        "  Sources          .brewcode/agents, ~/.brewcode/agents, $BREWCODE_CONFIG_HOME/agents".to_string(),
     ];
     if let Some(args) = unexpected {
         lines.push(format!("  Unexpected       {args}"));
@@ -3922,8 +3922,8 @@ fn render_agents_usage_json(unexpected: Option<&str>) -> Value {
         "action": "help",
         "usage": {
             "slash_command": "/agents [list|help]",
-            "direct_cli": "claw agents [list|help]",
-            "sources": [".claw/agents", "~/.claw/agents", "$CLAW_CONFIG_HOME/agents"],
+            "direct_cli": "brewcode agents [list|help]",
+            "sources": [".brewcode/agents", "~/.brewcode/agents", "$BREWCODE_CONFIG_HOME/agents"],
         },
         "unexpected": unexpected,
     })
@@ -3934,10 +3934,10 @@ fn render_skills_usage(unexpected: Option<&str>) -> String {
         "Skills".to_string(),
         "  Usage            /skills [list|install <path>|help|<skill> [args]]".to_string(),
         "  Alias            /skill".to_string(),
-        "  Direct CLI       claw skills [list|install <path>|help|<skill> [args]]".to_string(),
+        "  Direct CLI       brewcode skills [list|install <path>|help|<skill> [args]]".to_string(),
         "  Invoke           /skills help overview -> $help overview".to_string(),
-        "  Install root     $CLAW_CONFIG_HOME/skills or ~/.claw/skills".to_string(),
-        "  Sources          .claw/skills, .omc/skills, .agents/skills, .codex/skills, .claude/skills, ~/.claw/skills, ~/.omc/skills, ~/.claude/skills/omc-learned, ~/.codex/skills, ~/.claude/skills, legacy /commands".to_string(),
+        "  Install root     $BREWCODE_CONFIG_HOME/skills or ~/.brewcode/skills".to_string(),
+        "  Sources          .brewcode/skills, .omc/skills, .agents/skills, .codex/skills, .claude/skills, ~/.brewcode/skills, ~/.omc/skills, ~/.claude/skills/omc-learned, ~/.codex/skills, ~/.claude/skills, legacy /commands".to_string(),
     ];
     if let Some(args) = unexpected {
         lines.push(format!("  Unexpected       {args}"));
@@ -3952,16 +3952,16 @@ fn render_skills_usage_json(unexpected: Option<&str>) -> Value {
         "usage": {
             "slash_command": "/skills [list|install <path>|help|<skill> [args]]",
             "aliases": ["/skill"],
-            "direct_cli": "claw skills [list|install <path>|help|<skill> [args]]",
+            "direct_cli": "brewcode skills [list|install <path>|help|<skill> [args]]",
             "invoke": "/skills help overview -> $help overview",
-            "install_root": "$CLAW_CONFIG_HOME/skills or ~/.claw/skills",
+            "install_root": "$BREWCODE_CONFIG_HOME/skills or ~/.brewcode/skills",
             "sources": [
-                ".claw/skills",
+                ".brewcode/skills",
                 ".omc/skills",
                 ".agents/skills",
                 ".codex/skills",
                 ".claude/skills",
-                "~/.claw/skills",
+                "~/.brewcode/skills",
                 "~/.omc/skills",
                 "~/.claude/skills/omc-learned",
                 "~/.codex/skills",
@@ -3978,8 +3978,8 @@ fn render_mcp_usage(unexpected: Option<&str>) -> String {
     let mut lines = vec![
         "MCP".to_string(),
         "  Usage            /mcp [list|show <server>|help]".to_string(),
-        "  Direct CLI       claw mcp [list|show <server>|help]".to_string(),
-        "  Sources          .claw/settings.json, .claw/settings.local.json".to_string(),
+        "  Direct CLI       brewcode mcp [list|show <server>|help]".to_string(),
+        "  Sources          .brewcode/settings.json, .brewcode/settings.local.json".to_string(),
     ];
     if let Some(args) = unexpected {
         lines.push(format!("  Unexpected       {args}"));
@@ -3993,8 +3993,8 @@ fn render_mcp_usage_json(unexpected: Option<&str>) -> Value {
         "action": "help",
         "usage": {
             "slash_command": "/mcp [list|show <server>|help]",
-            "direct_cli": "claw mcp [list|show <server>|help]",
-            "sources": [".claw/settings.json", ".claw/settings.local.json"],
+            "direct_cli": "brewcode mcp [list|show <server>|help]",
+            "sources": [".brewcode/settings.json", ".brewcode/settings.local.json"],
         },
         "unexpected": unexpected,
     })
@@ -4078,14 +4078,14 @@ fn format_mcp_oauth(oauth: Option<&McpOAuthConfig>) -> String {
 
 fn definition_source_id(source: DefinitionSource) -> &'static str {
     match source {
-        DefinitionSource::ProjectClaw
+        DefinitionSource::ProjectBrewcode
         | DefinitionSource::ProjectCodex
-        | DefinitionSource::ProjectClaude => "project_claw",
-        DefinitionSource::UserClawConfigHome | DefinitionSource::UserCodexHome => {
-            "user_claw_config_home"
+        | DefinitionSource::ProjectClaude => "project_brewcode",
+        DefinitionSource::UserBrewcodeConfigHome | DefinitionSource::UserCodexHome => {
+            "user_brewcode_config_home"
         }
-        DefinitionSource::UserClaw | DefinitionSource::UserCodex | DefinitionSource::UserClaude => {
-            "user_claw"
+        DefinitionSource::UserBrewcode | DefinitionSource::UserCodex | DefinitionSource::UserClaude => {
+            "user_brewcode"
         }
     }
 }
@@ -4774,7 +4774,7 @@ mod tests {
     #[test]
     fn skills_show_and_list_filter_do_not_invoke_model() {
         // `show`, `info`, `list <filter>` must route to Local, not Invoke.
-        // Regression for: `claw skills show plan` unexpectedly spawned a model session.
+        // Regression for: `brewcode skills show plan` unexpectedly spawned a model session.
         for token in &["show", "info", "describe"] {
             assert_eq!(
                 classify_skills_slash_command(Some(token)),
@@ -4975,7 +4975,7 @@ mod tests {
 
         // then
         assert!(help.contains("/plugin"));
-        assert!(help.contains("Summary          Manage Claw Code plugins"));
+        assert!(help.contains("Summary          Manage Brew Code plugins"));
         assert!(help.contains("Aliases          /plugins, /marketplace"));
         assert!(help.contains("Category         Tools"));
     }
@@ -5303,12 +5303,12 @@ mod tests {
         assert_eq!(report["agents"][1]["name"], "verifier");
         assert_eq!(report["agents"][2]["name"], "planner");
         assert_eq!(report["agents"][2]["active"], false);
-        assert_eq!(report["agents"][2]["shadowed_by"]["id"], "project_claw");
+        assert_eq!(report["agents"][2]["shadowed_by"]["id"], "project_brewcode");
 
         let help = handle_agents_slash_command_json(Some("help"), &workspace).expect("agents help");
         assert_eq!(help["kind"], "agents");
         assert_eq!(help["action"], "help");
-        assert_eq!(help["usage"]["direct_cli"], "claw agents [list|help]");
+        assert_eq!(help["usage"]["direct_cli"], "brewcode agents [list|help]");
 
         let unexpected = handle_agents_slash_command_json(Some("show planner"), &workspace)
             .expect("agents usage");
@@ -5368,8 +5368,8 @@ mod tests {
     #[test]
     fn resolves_project_skills_and_legacy_commands_from_shared_registry() {
         let workspace = temp_dir("resolve-project-skills");
-        let project_skills = workspace.join(".claw").join("skills");
-        let legacy_commands = workspace.join(".claw").join("commands");
+        let project_skills = workspace.join(".brewcode").join("skills");
+        let legacy_commands = workspace.join(".brewcode").join("commands");
 
         write_skill(&project_skills, "plan", "Project planning guidance");
         write_legacy_command(&legacy_commands, "handoff", "Legacy handoff guidance");
@@ -5422,10 +5422,10 @@ mod tests {
         assert_eq!(report["summary"]["active"], 3);
         assert_eq!(report["summary"]["shadowed"], 1);
         assert_eq!(report["skills"][0]["name"], "plan");
-        assert_eq!(report["skills"][0]["source"]["id"], "project_claw");
+        assert_eq!(report["skills"][0]["source"]["id"], "project_brewcode");
         assert_eq!(report["skills"][1]["name"], "deploy");
         assert_eq!(report["skills"][1]["origin"]["id"], "legacy_commands_dir");
-        assert_eq!(report["skills"][3]["shadowed_by"]["id"], "project_claw");
+        assert_eq!(report["skills"][3]["shadowed_by"]["id"], "project_brewcode");
 
         let help = handle_skills_slash_command_json(Some("help"), &workspace).expect("skills help");
         assert_eq!(help["kind"], "skills");
@@ -5433,7 +5433,7 @@ mod tests {
         assert_eq!(help["usage"]["aliases"][0], "/skill");
         assert_eq!(
             help["usage"]["direct_cli"],
-            "claw skills [list|install <path>|help|<skill> [args]]"
+            "brewcode skills [list|install <path>|help|<skill> [args]]"
         );
 
         let _ = fs::remove_dir_all(workspace);
@@ -5447,9 +5447,9 @@ mod tests {
         let agents_help =
             super::handle_agents_slash_command(Some("help"), &cwd).expect("agents help");
         assert!(agents_help.contains("Usage            /agents [list|help]"));
-        assert!(agents_help.contains("Direct CLI       claw agents"));
+        assert!(agents_help.contains("Direct CLI       brewcode agents"));
         assert!(agents_help
-            .contains("Sources          .claw/agents, ~/.claw/agents, $CLAW_CONFIG_HOME/agents"));
+            .contains("Sources          .brewcode/agents, ~/.brewcode/agents, $BREWCODE_CONFIG_HOME/agents"));
 
         let agents_unexpected =
             super::handle_agents_slash_command(Some("show planner"), &cwd).expect("agents usage");
@@ -5461,7 +5461,7 @@ mod tests {
             .contains("Usage            /skills [list|install <path>|help|<skill> [args]]"));
         assert!(skills_help.contains("Alias            /skill"));
         assert!(skills_help.contains("Invoke           /skills help overview -> $help overview"));
-        assert!(skills_help.contains("Install root     $CLAW_CONFIG_HOME/skills or ~/.claw/skills"));
+        assert!(skills_help.contains("Install root     $BREWCODE_CONFIG_HOME/skills or ~/.brewcode/skills"));
         assert!(skills_help.contains(".omc/skills"));
         assert!(skills_help.contains(".agents/skills"));
         assert!(skills_help.contains("~/.claude/skills/omc-learned"));
@@ -5571,7 +5571,7 @@ mod tests {
 
         let help = super::handle_mcp_slash_command(Some("help"), &cwd).expect("mcp help");
         assert!(help.contains("Usage            /mcp [list|show <server>|help]"));
-        assert!(help.contains("Direct CLI       claw mcp [list|show <server>|help]"));
+        assert!(help.contains("Direct CLI       brewcode mcp [list|show <server>|help]"));
 
         let unexpected =
             super::handle_mcp_slash_command(Some("show alpha beta"), &cwd).expect("mcp usage");
@@ -5594,10 +5594,10 @@ mod tests {
     fn renders_mcp_reports_from_loaded_config() {
         let workspace = temp_dir("mcp-config-workspace");
         let config_home = temp_dir("mcp-config-home");
-        fs::create_dir_all(workspace.join(".claw")).expect("workspace config dir");
+        fs::create_dir_all(workspace.join(".brewcode")).expect("workspace config dir");
         fs::create_dir_all(&config_home).expect("config home");
         fs::write(
-            workspace.join(".claw").join("settings.json"),
+            workspace.join(".brewcode").join("settings.json"),
             r#"{
               "mcpServers": {
                 "alpha": {
@@ -5622,7 +5622,7 @@ mod tests {
         )
         .expect("write settings");
         fs::write(
-            workspace.join(".claw").join("settings.local.json"),
+            workspace.join(".brewcode").join("settings.local.json"),
             r#"{
               "mcpServers": {
                 "remote": {
@@ -5673,10 +5673,10 @@ mod tests {
     fn renders_mcp_reports_as_json() {
         let workspace = temp_dir("mcp-json-workspace");
         let config_home = temp_dir("mcp-json-home");
-        fs::create_dir_all(workspace.join(".claw")).expect("workspace config dir");
+        fs::create_dir_all(workspace.join(".brewcode")).expect("workspace config dir");
         fs::create_dir_all(&config_home).expect("config home");
         fs::write(
-            workspace.join(".claw").join("settings.json"),
+            workspace.join(".brewcode").join("settings.json"),
             r#"{
               "mcpServers": {
                 "alpha": {
@@ -5701,7 +5701,7 @@ mod tests {
         )
         .expect("write settings");
         fs::write(
-            workspace.join(".claw").join("settings.local.json"),
+            workspace.join(".brewcode").join("settings.local.json"),
             r#"{
               "mcpServers": {
                 "remote": {
@@ -5748,7 +5748,7 @@ mod tests {
         let help =
             render_mcp_report_json_for(&loader, &workspace, Some("help")).expect("mcp help json");
         assert_eq!(help["action"], "help");
-        assert_eq!(help["usage"]["sources"][0], ".claw/settings.json");
+        assert_eq!(help["usage"]["sources"][0], ".brewcode/settings.json");
 
         let _ = fs::remove_dir_all(workspace);
         let _ = fs::remove_dir_all(config_home);
@@ -5756,19 +5756,19 @@ mod tests {
 
     #[test]
     fn mcp_degrades_gracefully_on_malformed_mcp_config_144() {
-        // #144: mirror of #143's partial-success contract for `claw mcp`.
+        // #144: mirror of #143's partial-success contract for `brewcode mcp`.
         // Previously `mcp` hard-failed on any config parse error, hiding
-        // well-formed servers and forcing claws to fall back to `doctor`.
+        // well-formed servers and forcing brewcodes to fall back to `doctor`.
         // Now `mcp` emits a degraded envelope instead: exit 0, status:
         // "degraded", config_load_error populated, servers[] empty.
         let _guard = env_guard();
         let workspace = temp_dir("mcp-degrades-144");
         let config_home = temp_dir("mcp-degrades-144-cfg");
-        fs::create_dir_all(workspace.join(".claw")).expect("create workspace .claw dir");
+        fs::create_dir_all(workspace.join(".brewcode")).expect("create workspace .brewcode dir");
         fs::create_dir_all(&config_home).expect("create config home");
         // One valid server + one malformed entry missing `command`.
         fs::write(
-            workspace.join(".claw.json"),
+            workspace.join(".brewcode.json"),
             r#"{
   "mcpServers": {
     "everything": {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-everything"]},
@@ -5777,7 +5777,7 @@ mod tests {
 }
 "#,
         )
-        .expect("write malformed .claw.json");
+        .expect("write malformed .brewcode.json");
 
         let loader = ConfigLoader::new(&workspace, &config_home);
         // list action: must return Ok (not Err) with degraded envelope.

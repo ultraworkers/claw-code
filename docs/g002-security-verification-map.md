@@ -180,6 +180,6 @@ FAIL / integration blockers observed on this worktree:
   - `rust/crates/runtime/src/policy_engine.rs:5`: `clippy::duration-suboptimal-units`.
   - `rust/crates/runtime/src/sandbox.rs:295-302`: `clippy::map_unwrap_or`.
 - `(cd rust && cargo test --workspace)` failed after broad success in API/commands/plugins/runtime tests because `rusty-claude-cli` unit test `tests::session_lifecycle_prefers_running_process_over_idle_shell` asserted `RunningProcess` but observed `IdleShell`.
-- Rerun of the specific failing test confirmed deterministic failure: `(cd rust && cargo test -p rusty-claude-cli --bin claw tests::session_lifecycle_prefers_running_process_over_idle_shell -- --exact --nocapture)` → 0 passed, 1 failed with the same `IdleShell` vs `RunningProcess` assertion.
+- Rerun of the specific failing test confirmed deterministic failure: `(cd rust && cargo test -p rusty-claude-cli --bin brewcode tests::session_lifecycle_prefers_running_process_over_idle_shell -- --exact --nocapture)` → 0 passed, 1 failed with the same `IdleShell` vs `RunningProcess` assertion.
 
 Recommended owner for failures: not `worker-4` unless re-scoped. These failures are outside the docs/report artifact and touch shared runtime/CLI implementation files.

@@ -17,7 +17,7 @@ Scope: worker-2 follow-up map for W4 mock integration and regression verificatio
 | Area | Artifact/evidence |
 | --- | --- |
 | Deterministic model server | `rust/crates/mock-anthropic-service/src/lib.rs` implements the Anthropic-compatible mock server and scenario router used by CLI parity tests. |
-| End-to-end CLI mock harness | `rust/crates/rusty-claude-cli/tests/mock_parity_harness.rs` starts the mock server, runs clean-environment `claw` commands, asserts JSON output, and optionally writes a machine-readable report via `MOCK_PARITY_REPORT_PATH`. |
+| End-to-end CLI mock harness | `rust/crates/rusty-claude-cli/tests/mock_parity_harness.rs` starts the mock server, runs clean-environment `brewcode` commands, asserts JSON output, and optionally writes a machine-readable report via `MOCK_PARITY_REPORT_PATH`. |
 | Scenario manifest / docs parity guard | `rust/mock_parity_scenarios.json` is required to stay ordered with harness cases; `rust/scripts/run_mock_parity_diff.py --no-run` verifies every manifest `parity_refs[]` string exists in `PARITY.md`. |
 | Convenience runner | `rust/scripts/run_mock_parity_harness.sh` runs `cargo test -p rusty-claude-cli --test mock_parity_harness -- --nocapture`. |
 | Plugin-path regression | `plugin_tool_roundtrip` loads an external plugin fixture from isolated settings and executes `plugin_echo` through the runtime tool registry. |

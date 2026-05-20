@@ -12,7 +12,7 @@ Goal: `G006-task-policy-board` — Stream 4 task packets, executable policy engi
 | Policy decisions explainable and typed-event logged/emittable | `PolicyDecisionEvent` serializable typed event with `rule_name`, `priority`, `kind`, `explanation`, `approval_token_id`; `evaluate_with_events` emits event per flattened action. |
 | Active lane board/dashboard/status JSON over canonical state | `rust/crates/runtime/src/task_registry.rs` adds `LaneBoard`, `LaneBoardEntry`, `LaneFreshness`, `lane_board_at`, and `lane_status_json_at`; CLI status JSON advertises lane board contract in `rust/crates/rusty-claude-cli/src/main.rs`. |
 | Heartbeats independent of terminal rendering with healthy/stalled/transport-dead cases | `rust/crates/runtime/src/session.rs` adds `SessionHeartbeat`/`SessionLiveness` from persisted session health state; `task_registry.rs` heartbeat freshness is computed from canonical heartbeat timestamps and transport state. |
-| Task/lane status JSON shows active/blocked/finished lanes with heartbeat freshness | `task_registry::tests::lane_board_groups_active_blocked_finished_and_reports_freshness`; `status_json_surfaces_session_lifecycle_for_clawhip`/status JSON surfaces lane board metadata. |
+| Task/lane status JSON shows active/blocked/finished lanes with heartbeat freshness | `task_registry::tests::lane_board_groups_active_blocked_finished_and_reports_freshness`; `status_json_surfaces_session_lifecycle_for_brewcodehip`/status JSON surfaces lane board metadata. |
 | Leader-owned ultragoal audit remains separate from workers | No worker changed `.omx/ultragoal`; leader will checkpoint with fresh `get_goal` only after terminal verification. |
 
 ## Verification run

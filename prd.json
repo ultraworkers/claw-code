@@ -1,6 +1,6 @@
 {
   "version": "1.0",
-  "description": "Clawable Coding Harness - Clear roadmap stories and commit each",
+  "description": "Brewcodeable Coding Harness - Clear roadmap stories and commit each",
   "stories": [
     {
       "id": "US-001",
@@ -27,7 +27,7 @@
         "Duplicate terminal-event suppression with fingerprinting",
         "Lane ownership/scope binding in events",
         "Nudge acknowledgment with dedupe contract",
-        "clawhip consumes typed lane events instead of pane scraping"
+        "brewcodehip consumes typed lane events instead of pane scraping"
       ],
       "passes": true,
       "priority": "P0"
@@ -194,7 +194,7 @@
     {
       "id": "US-014",
       "title": "Phase 2 - Event provenance / environment labeling",
-      "description": "Every emitted event should declare its source (live_lane, test, healthcheck, replay, transport) so claws do not mistake test noise for production truth. Include environment/channel label, emitter identity, and confidence/trust level.",
+      "description": "Every emitted event should declare its source (live_lane, test, healthcheck, replay, transport) so brewcodes do not mistake test noise for production truth. Include environment/channel label, emitter identity, and confidence/trust level.",
       "acceptanceCriteria": [
         "EventProvenance enum with live_lane, test, healthcheck, replay, transport variants",
         "Environment/channel label attached to all events",
@@ -235,10 +235,10 @@
     {
       "id": "US-017",
       "title": "Phase 2 - Lane ownership / scope binding",
-      "description": "Each session and lane event should declare who owns it and what workflow scope it belongs to. Attach owner/assignee identity, workflow scope (claw-code-dogfood, external-git-maintenance, infra-health, manual-operator), and mark whether watcher is expected to act, observe only, or ignore.",
+      "description": "Each session and lane event should declare who owns it and what workflow scope it belongs to. Attach owner/assignee identity, workflow scope (brew-code-dogfood, external-git-maintenance, infra-health, manual-operator), and mark whether watcher is expected to act, observe only, or ignore.",
       "acceptanceCriteria": [
         "Owner/assignee identity attached to sessions and lane events",
-        "Workflow scope field (claw-code-dogfood, external-git-maintenance, etc.)",
+        "Workflow scope field (brew-code-dogfood, external-git-maintenance, etc.)",
         "Watcher action expectation field (act, observe-only, ignore)",
         "Preserve scope through session restarts, resumes, and late terminal events",
         "Tests verify ownership and scope binding"
@@ -249,7 +249,7 @@
     {
       "id": "US-018",
       "title": "Phase 2 - Nudge acknowledgment / dedupe contract",
-      "description": "Periodic clawhip nudges should carry nudge id/cycle id and delivery timestamp. Expose whether claw has already acknowledged or responded for that cycle. Distinguish new nudge, retry nudge, and stale duplicate.",
+      "description": "Periodic brewcodehip nudges should carry nudge id/cycle id and delivery timestamp. Expose whether brewcode has already acknowledged or responded for that cycle. Distinguish new nudge, retry nudge, and stale duplicate.",
       "acceptanceCriteria": [
         "Nudge id / cycle id and delivery timestamp attached",
         "Acknowledgment state exposed (already acknowledged or not)",
@@ -263,7 +263,7 @@
     {
       "id": "US-019",
       "title": "Phase 2 - Stable roadmap-id assignment for newly filed pinpoints",
-      "description": "When a claw records a new pinpoint/follow-up, assign or expose a stable tracking id immediately. Expose that id in structured event/report payload and preserve across edits, reorderings, and summary compression.",
+      "description": "When a brewcode records a new pinpoint/follow-up, assign or expose a stable tracking id immediately. Expose that id in structured event/report payload and preserve across edits, reorderings, and summary compression.",
       "acceptanceCriteria": [
         "Canonical roadmap id assigned at filing time",
         "Roadmap id exposed in structured event/report payload",

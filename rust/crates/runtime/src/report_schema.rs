@@ -4,8 +4,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-pub const REPORT_SCHEMA_V1: &str = "claw.report.v1";
-pub const DEFAULT_PROJECTION_POLICY_V1: &str = "claw.report.projection.v1";
+pub const REPORT_SCHEMA_V1: &str = "brewcode.report.v1";
+pub const DEFAULT_PROJECTION_POLICY_V1: &str = "brewcode.report.projection.v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -459,7 +459,7 @@ mod tests {
 
     fn capabilities(families: &[&str], max_sensitivity: SensitivityClass) -> ConsumerCapabilities {
         ConsumerCapabilities {
-            consumer: "clawhip".to_string(),
+            consumer: "brewcodehip".to_string(),
             schema_versions: [REPORT_SCHEMA_V1.to_string()].into_iter().collect(),
             field_families: families
                 .iter()
@@ -538,7 +538,7 @@ mod tests {
     fn capability_negotiation_omits_unsupported_field_families() {
         let report = fixture_report();
         let capabilities = capabilities(&["claims"], SensitivityClass::Internal);
-        let projection = project_report(&report, &capabilities, "legacy_clawhip");
+        let projection = project_report(&report, &capabilities, "legacy_brewcodehip");
 
         assert!(projection.provenance.downgraded);
         assert_eq!(

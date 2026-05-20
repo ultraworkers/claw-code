@@ -4,14 +4,14 @@ Scope: worker-2 task 5 for `G010-session-hygiene` / Stream 9 session hygiene, lo
 
 ## Contract summary
 
-Claw session state is intentionally scoped to the current workspace clone/worktree. Operators and automation should treat the **session partition**, not a bare session id or the flat `.claw/sessions/` directory, as the identity boundary.
+Brewcode session state is intentionally scoped to the current workspace clone/worktree. Operators and automation should treat the **session partition**, not a bare session id or the flat `.brewcode/sessions/` directory, as the identity boundary.
 
 Required metadata and behaviors:
 
-- **Workspace-bound partition**: managed sessions live under `.claw/sessions/<workspace_fingerprint>/`, where the fingerprint is a stable 16-character FNV-1a digest of the canonical workspace path.
+- **Workspace-bound partition**: managed sessions live under `.brewcode/sessions/<workspace_fingerprint>/`, where the fingerprint is a stable 16-character FNV-1a digest of the canonical workspace path.
 - **Canonical path input**: `SessionStore::from_cwd` and `SessionStore::from_data_dir` canonicalize their workspace path before computing the partition, preventing `/tmp/foo` vs `/private/tmp/foo` and relative-vs-absolute spelling from creating two stores for the same clone.
 - **Clone/worktree isolation**: two distinct clones or worktrees must get different session partitions, even if session ids collide.
-- **Legacy safety**: flat legacy sessions under `.claw/sessions/` remain readable only when they are bound to the same workspace or are unbound but physically inside the current workspace; sessions whose persisted `workspace_root` points at another clone are rejected as `WorkspaceMismatch`.
+- **Legacy safety**: flat legacy sessions under `.brewcode/sessions/` remain readable only when they are bound to the same workspace or are unbound but physically inside the current workspace; sessions whose persisted `workspace_root` points at another clone are rejected as `WorkspaceMismatch`.
 - **Fork lineage stays local**: `/session fork` / managed session forking keeps the forked session in the same workspace partition and records parent id plus optional branch name.
 - **User-facing disambiguation**: empty-session copy names the actual fingerprint directory and explains that sessions from other CWDs are intentionally invisible.
 
@@ -19,11 +19,11 @@ Required metadata and behaviors:
 
 | Contract area | Repo anchor | Evidence role |
 | --- | --- | --- |
-| Partition layout and canonical workspace root | `rust/crates/runtime/src/session_control.rs:10-18`, `:32-47`, `:54-71` | Documents and implements `.claw/sessions/<workspace_hash>/` for `from_cwd` and explicit data-dir stores. |
+| Partition layout and canonical workspace root | `rust/crates/runtime/src/session_control.rs:10-18`, `:32-47`, `:54-71` | Documents and implements `.brewcode/sessions/<workspace_hash>/` for `from_cwd` and explicit data-dir stores. |
 | Fingerprint algorithm | `rust/crates/runtime/src/session_control.rs:300-312` | Defines the 16-character FNV-1a workspace fingerprint used as the clone disambiguator. |
 | Managed create/resolve/list/load/fork APIs | `rust/crates/runtime/src/session_control.rs:86-204` | Ensures handles, `latest`, load, and fork resolve inside the active partition. |
 | Legacy/cross-workspace guard | `rust/crates/runtime/src/session_control.rs:213-233`, `:557-567` | Rejects mismatched persisted `workspace_root` and allows only same-workspace legacy files. |
-| Empty partition copy | `rust/crates/runtime/src/session_control.rs:535-543` | Reports `.claw/sessions/<fingerprint>/` plus the workspace-partition note. |
+| Empty partition copy | `rust/crates/runtime/src/session_control.rs:535-543` | Reports `.brewcode/sessions/<fingerprint>/` plus the workspace-partition note. |
 | CLI wrapper | `rust/crates/rusty-claude-cli/src/main.rs:5952-6040` | Routes session CLI helpers through `current_session_store()`, so CLI list/latest/load uses the same partition. |
 | CLI session-list lifecycle context | `rust/crates/rusty-claude-cli/src/main.rs:5991-6027`, `:12960-12990` | Renders saved-only/dirty/abandoned lifecycle context for the current partition. |
 | CLI session resolution regression | `rust/crates/rusty-claude-cli/src/main.rs:13470-13579` | Covers JSONL default, legacy flat resolution, latest selection, and workspace mismatch rejection from CLI wrappers. |
@@ -31,7 +31,7 @@ Required metadata and behaviors:
 ## Covered roadmap and dogfood anchors
 
 - `ROADMAP.md:1125-1129` — session files are namespaced by workspace fingerprint, and wrong-workspace session access is rejected.
-- `ROADMAP.md:1419-1441` — empty/missing session messages must expose the fingerprint directory instead of implying a flat `.claw/sessions/` search.
+- `ROADMAP.md:1419-1441` — empty/missing session messages must expose the fingerprint directory instead of implying a flat `.brewcode/sessions/` search.
 - `ROADMAP.md:1453-1476` — the session partition boundary must be visible or shared deliberately; current contract is visible CWD/workspace partitioning.
 - `ROADMAP.md:5797-5902` — canonicalization closes the symlink/path-equivalence split in workspace fingerprints.
 - `ROADMAP.md:6342-6366` and `ROADMAP.md:6384-6411` — remaining Stream 9 risks around reported CWD form, failed-resume filesystem side effects, and broad-CWD resume guards are related UX/recovery lanes, not clone identity itself.

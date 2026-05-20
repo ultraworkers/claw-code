@@ -1807,7 +1807,7 @@ mod tests {
 /// Per-worktree session isolation: returns a session directory namespaced
 /// by the workspace fingerprint of the given working directory.
 /// This prevents parallel `opencode serve` instances from colliding.
-/// Called by external consumers (e.g. clawhip) to enumerate sessions for a CWD.
+/// Called by external consumers (e.g. brewcodehip) to enumerate sessions for a CWD.
 #[allow(dead_code)]
 pub fn workspace_sessions_dir(cwd: &std::path::Path) -> Result<std::path::PathBuf, SessionError> {
     let store = crate::session_control::SessionStore::from_cwd(cwd)
@@ -1822,7 +1822,7 @@ mod workspace_sessions_dir_tests {
 
     #[test]
     fn workspace_sessions_dir_returns_fingerprinted_path_for_valid_cwd() {
-        let tmp = std::env::temp_dir().join("claw-session-dir-test");
+        let tmp = std::env::temp_dir().join("brewcode-session-dir-test");
         fs::create_dir_all(&tmp).expect("create temp dir");
 
         let result = workspace_sessions_dir(&tmp);
@@ -1842,8 +1842,8 @@ mod workspace_sessions_dir_tests {
 
     #[test]
     fn workspace_sessions_dir_differs_for_different_cwds() {
-        let tmp_a = std::env::temp_dir().join("claw-session-dir-a");
-        let tmp_b = std::env::temp_dir().join("claw-session-dir-b");
+        let tmp_a = std::env::temp_dir().join("brewcode-session-dir-a");
+        let tmp_b = std::env::temp_dir().join("brewcode-session-dir-b");
         fs::create_dir_all(&tmp_a).expect("create dir a");
         fs::create_dir_all(&tmp_b).expect("create dir b");
 

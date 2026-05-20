@@ -39,7 +39,7 @@ Out of scope:
 - social engineering;
 - denial-of-service without a practical security impact;
 - issues that require already-compromised local developer credentials;
-- reports against third-party providers or upstream tools without a Claw Code
+- reports against third-party providers or upstream tools without a Brew Code
   integration issue.
 
 ## Handling expectations
