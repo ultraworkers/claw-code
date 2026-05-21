@@ -291,13 +291,11 @@ fn merge_compact_summaries(existing_summary: Option<&str>, new_summary: &str) ->
 
     let mut lines = vec!["<summary>".to_string(), "Conversation summary:".to_string()];
 
+    // Flatten prior highlights directly — do NOT re-nest them under
+    // "- Previously compacted context:" or the nesting compounds with each
+    // compaction cycle, inflating the summary by ~depth * overhead per turn.
     if !previous_highlights.is_empty() {
-        lines.push("- Previously compacted context:".to_string());
-        lines.extend(
-            previous_highlights
-                .into_iter()
-                .map(|line| format!("  {line}")),
-        );
+        lines.extend(previous_highlights.into_iter().map(|line| format!("- {line}")));
     }
 
     if !new_highlights.is_empty() {
