@@ -9,7 +9,11 @@ const STARTER_BREWCODE_JSON: &str = concat!(
     "}\n",
 );
 const GITIGNORE_COMMENT: &str = "# Brew Code local artifacts";
-const GITIGNORE_ENTRIES: [&str; 3] = [".brewcode/settings.local.json", ".brewcode/sessions/", ".brewcodehip/"];
+const GITIGNORE_ENTRIES: [&str; 3] = [
+    ".brewcode/settings.local.json",
+    ".brewcode/sessions/",
+    ".brewcodehip/",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum InitStatus {
@@ -430,7 +434,8 @@ mod tests {
         let root = temp_dir();
         fs::create_dir_all(&root).expect("create root");
         fs::write(root.join("CLAUDE.md"), "custom guidance\n").expect("write existing claude md");
-        fs::write(root.join(".gitignore"), ".brewcode/settings.local.json\n").expect("write gitignore");
+        fs::write(root.join(".gitignore"), ".brewcode/settings.local.json\n")
+            .expect("write gitignore");
 
         let first = initialize_repo(&root).expect("first init should succeed");
         assert!(first
@@ -448,7 +453,10 @@ mod tests {
             "custom guidance\n"
         );
         let gitignore = fs::read_to_string(root.join(".gitignore")).expect("read gitignore");
-        assert_eq!(gitignore.matches(".brewcode/settings.local.json").count(), 1);
+        assert_eq!(
+            gitignore.matches(".brewcode/settings.local.json").count(),
+            1
+        );
         assert_eq!(gitignore.matches(".brewcode/sessions/").count(), 1);
         assert_eq!(gitignore.matches(".brewcodehip/").count(), 1);
 

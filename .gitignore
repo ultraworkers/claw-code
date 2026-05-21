@@ -7,8 +7,7 @@ archive/
 .claude/sessions/
 rust/.claude/sessions/
 # Brew Code local artifacts
-.brewcode/settings.local.json
-.brewcode/sessions/
+.brewcode/
 .brewcodehip/
 status-help.txt
 # Legacy Python port session scratch artifacts

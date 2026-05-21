@@ -35,12 +35,30 @@ fn is_binary_file(path: &Path) -> io::Result<bool> {
     Ok(buffer[..bytes_read].contains(&0))
 }
 
+/// Strip the Windows verbatim path prefix (`\\?\`) so workspace-boundary
+/// comparisons stay correct when one path is canonicalized — which yields a
+/// verbatim path on Windows — and the other (e.g. `std::env::current_dir`)
+/// is not. `Path::starts_with` treats `\\?\C:\x` and `C:\x` as different
+/// roots, which would otherwise reject paths that are inside the workspace.
+fn strip_verbatim_prefix(path: &Path) -> PathBuf {
+    let text = path.to_string_lossy();
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        PathBuf::from(format!(r"\\{rest}"))
+    } else if let Some(rest) = text.strip_prefix(r"\\?\") {
+        PathBuf::from(rest)
+    } else {
+        path.to_path_buf()
+    }
+}
+
 /// Validate that a resolved path stays within the given workspace root.
 /// Returns the canonical path on success, or an error if the path escapes
 /// the workspace boundary (e.g. via `../` traversal or symlink).
 #[allow(dead_code)]
 fn validate_workspace_boundary(resolved: &Path, workspace_root: &Path) -> io::Result<()> {
-    if !resolved.starts_with(workspace_root) {
+    let resolved = strip_verbatim_prefix(resolved);
+    let workspace_root = strip_verbatim_prefix(workspace_root);
+    if !resolved.starts_with(&workspace_root) {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!(
@@ -772,13 +790,13 @@ fn expand_braces(pattern: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
         component_contains_glob, derive_glob_walk_root, edit_file, expand_braces, glob_search,
-        grep_search, is_symlink_escape, read_file, read_file_in_workspace, write_file,
-        write_file_in_workspace, GrepSearchInput, MAX_WRITE_SIZE,
+        grep_search, is_symlink_escape, read_file, read_file_in_workspace, strip_verbatim_prefix,
+        write_file, write_file_in_workspace, GrepSearchInput, MAX_WRITE_SIZE,
     };
 
     fn temp_path(name: &str) -> std::path::PathBuf {
@@ -856,6 +874,24 @@ mod tests {
         let error = result.unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
         assert!(error.to_string().contains("escapes workspace"));
+    }
+
+    #[test]
+    fn strip_verbatim_prefix_normalizes_windows_paths() {
+        // Windows `canonicalize()` returns `\\?\` verbatim paths; the boundary
+        // check strips this prefix so a verbatim workspace root still matches
+        // a non-verbatim path such as the one from `current_dir()`.
+        assert_eq!(
+            strip_verbatim_prefix(Path::new(r"\\?\C:\Users\dev\project")),
+            PathBuf::from(r"C:\Users\dev\project"),
+        );
+        assert_eq!(
+            strip_verbatim_prefix(Path::new(r"\\?\UNC\server\share\dir")),
+            PathBuf::from(r"\\server\share\dir"),
+        );
+        // Paths without the verbatim prefix are returned unchanged.
+        let plain = Path::new("relative/path");
+        assert_eq!(strip_verbatim_prefix(plain), plain.to_path_buf());
     }
 
     #[test]

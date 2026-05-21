@@ -3908,7 +3908,8 @@ fn render_agents_usage(unexpected: Option<&str>) -> String {
         "Agents".to_string(),
         "  Usage            /agents [list|help]".to_string(),
         "  Direct CLI       brewcode agents".to_string(),
-        "  Sources          .brewcode/agents, ~/.brewcode/agents, $BREWCODE_CONFIG_HOME/agents".to_string(),
+        "  Sources          .brewcode/agents, ~/.brewcode/agents, $BREWCODE_CONFIG_HOME/agents"
+            .to_string(),
     ];
     if let Some(args) = unexpected {
         lines.push(format!("  Unexpected       {args}"));
@@ -4084,9 +4085,9 @@ fn definition_source_id(source: DefinitionSource) -> &'static str {
         DefinitionSource::UserBrewcodeConfigHome | DefinitionSource::UserCodexHome => {
             "user_brewcode_config_home"
         }
-        DefinitionSource::UserBrewcode | DefinitionSource::UserCodex | DefinitionSource::UserClaude => {
-            "user_brewcode"
-        }
+        DefinitionSource::UserBrewcode
+        | DefinitionSource::UserCodex
+        | DefinitionSource::UserClaude => "user_brewcode",
     }
 }
 
@@ -5448,8 +5449,9 @@ mod tests {
             super::handle_agents_slash_command(Some("help"), &cwd).expect("agents help");
         assert!(agents_help.contains("Usage            /agents [list|help]"));
         assert!(agents_help.contains("Direct CLI       brewcode agents"));
-        assert!(agents_help
-            .contains("Sources          .brewcode/agents, ~/.brewcode/agents, $BREWCODE_CONFIG_HOME/agents"));
+        assert!(agents_help.contains(
+            "Sources          .brewcode/agents, ~/.brewcode/agents, $BREWCODE_CONFIG_HOME/agents"
+        ));
 
         let agents_unexpected =
             super::handle_agents_slash_command(Some("show planner"), &cwd).expect("agents usage");
@@ -5461,7 +5463,8 @@ mod tests {
             .contains("Usage            /skills [list|install <path>|help|<skill> [args]]"));
         assert!(skills_help.contains("Alias            /skill"));
         assert!(skills_help.contains("Invoke           /skills help overview -> $help overview"));
-        assert!(skills_help.contains("Install root     $BREWCODE_CONFIG_HOME/skills or ~/.brewcode/skills"));
+        assert!(skills_help
+            .contains("Install root     $BREWCODE_CONFIG_HOME/skills or ~/.brewcode/skills"));
         assert!(skills_help.contains(".omc/skills"));
         assert!(skills_help.contains(".agents/skills"));
         assert!(skills_help.contains("~/.claude/skills/omc-learned"));

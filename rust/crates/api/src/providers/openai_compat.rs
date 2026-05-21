@@ -2924,29 +2924,33 @@ mod tests {
 
     #[test]
     fn client_gateway_follows_base_url_to_default_openai() {
-        let client = super::OpenAiCompatClient::new("test-key", super::OpenAiCompatConfig::openai())
-            .with_base_url("https://api.openai.com/v1");
+        let client =
+            super::OpenAiCompatClient::new("test-key", super::OpenAiCompatConfig::openai())
+                .with_base_url("https://api.openai.com/v1");
         assert_eq!(client.gateway(), super::Gateway::OpenAi);
     }
 
     #[test]
     fn client_gateway_follows_base_url_to_ollama_cloud() {
-        let client = super::OpenAiCompatClient::new("test-key", super::OpenAiCompatConfig::openai())
-            .with_base_url("https://ollama.com/v1");
+        let client =
+            super::OpenAiCompatClient::new("test-key", super::OpenAiCompatConfig::openai())
+                .with_base_url("https://ollama.com/v1");
         assert_eq!(client.gateway(), super::Gateway::OllamaCloud);
     }
 
     #[test]
     fn client_gateway_follows_base_url_to_openrouter() {
-        let client = super::OpenAiCompatClient::new("test-key", super::OpenAiCompatConfig::openai())
-            .with_base_url("https://openrouter.ai/api/v1");
+        let client =
+            super::OpenAiCompatClient::new("test-key", super::OpenAiCompatConfig::openai())
+                .with_base_url("https://openrouter.ai/api/v1");
         assert_eq!(client.gateway(), super::Gateway::OpenRouter);
     }
 
     #[test]
     fn client_gateway_follows_base_url_to_local_ollama() {
-        let client = super::OpenAiCompatClient::new("test-key", super::OpenAiCompatConfig::openai())
-            .with_base_url("http://127.0.0.1:11434/v1");
+        let client =
+            super::OpenAiCompatClient::new("test-key", super::OpenAiCompatConfig::openai())
+                .with_base_url("http://127.0.0.1:11434/v1");
         assert_eq!(client.gateway(), super::Gateway::OllamaLocal);
     }
 
@@ -2967,8 +2971,9 @@ mod tests {
 
     #[test]
     fn client_gateway_is_generic_for_unknown_proxy() {
-        let client = super::OpenAiCompatClient::new("test-key", super::OpenAiCompatConfig::openai())
-            .with_base_url("https://my-proxy.example.com/v1");
+        let client =
+            super::OpenAiCompatClient::new("test-key", super::OpenAiCompatConfig::openai())
+                .with_base_url("https://my-proxy.example.com/v1");
         assert_eq!(client.gateway(), super::Gateway::Generic);
     }
 }

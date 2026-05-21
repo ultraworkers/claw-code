@@ -1,0 +1,10 @@
+# Cloudflare Worker config for the brewcode gateway.
+# Deploy from this directory with:  npx wrangler deploy   (see README.md)
+
+name = "brewcode-gateway"
+main = "src/worker.js"
+compatibility_date = "2025-01-01"
+
+# Secrets are intentionally NOT stored in this file. Set them once with:
+#   npx wrangler secret put OLLAMA_API_KEY
+#   npx wrangler secret put GATEWAY_TOKEN

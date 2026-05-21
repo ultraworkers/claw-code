@@ -50,7 +50,10 @@ pub struct Spinner {
 }
 
 impl Spinner {
-    const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    /// `‹ 🔥 ›` — the code-bracket mark hugging a brew flame. Frames breathe the
+    /// brackets outward and back (the CodeIcon spread), keeping the flame
+    /// centered. All frames are the same display width so the label never jumps.
+    const FRAMES: [&str; 4] = [" ‹ 🔥 › ", "‹  🔥  ›", " ‹ 🔥 › ", "  ‹🔥›  "];
 
     #[must_use]
     pub fn new() -> Self {
@@ -63,16 +66,20 @@ impl Spinner {
         theme: &ColorTheme,
         out: &mut impl Write,
     ) -> io::Result<()> {
-        let frame = Self::FRAMES[self.frame_index % Self::FRAMES.len()];
-        self.frame_index += 1;
+        // Brackets breathe slower than the colour wave: the bracket frame
+        // advances every few ticks, the heat shimmer recomputes every tick.
+        let frame = Self::FRAMES[(self.frame_index / 3) % Self::FRAMES.len()];
+        let shimmer = shimmer_label(label, self.frame_index);
+        self.frame_index = self.frame_index.wrapping_add(1);
         queue!(
             out,
             SavePosition,
             MoveToColumn(0),
             Clear(ClearType::CurrentLine),
             SetForegroundColor(theme.spinner_active),
-            Print(format!("{frame} {label}")),
+            Print(frame),
             ResetColor,
+            Print(format!(" {shimmer}")),
             RestorePosition
         )?;
         out.flush()
@@ -113,6 +120,27 @@ impl Spinner {
         )?;
         out.flush()
     }
+}
+
+/// Render `label` with a warm amber→gold "heat wave" that drifts with `phase`,
+/// so a bright band sweeps left→right through the word as the spinner ticks.
+#[allow(clippy::cast_precision_loss)]
+fn shimmer_label(label: &str, phase: usize) -> String {
+    let mut rendered = String::new();
+    for (index, ch) in label.chars().enumerate() {
+        let wave = ((index as f32) * 0.8 - (phase as f32) * 0.45).sin() * 0.5 + 0.5;
+        let (r, g, b) = warm_gradient(wave);
+        rendered.push_str(&format!("\u{1b}[38;2;{r};{g};{b}m{ch}"));
+    }
+    rendered.push_str("\u{1b}[0m");
+    rendered
+}
+
+/// Warm gradient: deep amber at `t = 0`, bright gold at `t = 1`.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn warm_gradient(t: f32) -> (u8, u8, u8) {
+    let mix = |from: f32, to: f32| (from + (to - from) * t) as u8;
+    (mix(198.0, 255.0), mix(108.0, 226.0), mix(36.0, 150.0))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1065,6 +1093,6 @@ mod tests {
             .expect("tick succeeds");
 
         let output = String::from_utf8_lossy(&out);
-        assert!(output.contains("Working"));
+        assert!(strip_ansi(&output).contains("Working"));
     }
 }

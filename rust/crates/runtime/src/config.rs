@@ -700,7 +700,8 @@ struct ParsedConfigFile {
 }
 
 fn read_optional_json_object(path: &Path) -> Result<Option<ParsedConfigFile>, ConfigError> {
-    let is_legacy_config = path.file_name().and_then(|name| name.to_str()) == Some(".brewcode.json");
+    let is_legacy_config =
+        path.file_name().and_then(|name| name.to_str()) == Some(".brewcode.json");
     let contents = match fs::read_to_string(path) {
         Ok(contents) => contents,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),

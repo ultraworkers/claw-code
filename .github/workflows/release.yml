@@ -26,16 +26,16 @@ jobs:
         include:
           - name: linux-x64
             os: ubuntu-latest
-            bin: claw
-            artifact_name: claw-linux-x64
+            bin: brewcode
+            artifact_name: brewcode-linux-x64
           - name: macos-arm64
             os: macos-14
-            bin: claw
-            artifact_name: claw-macos-arm64
+            bin: brewcode
+            artifact_name: brewcode-macos-arm64
           - name: windows-x64
             os: windows-latest
-            bin: claw.exe
-            artifact_name: claw-windows-x64.exe
+            bin: brewcode.exe
+            artifact_name: brewcode-windows-x64.exe
     defaults:
       run:
         working-directory: rust

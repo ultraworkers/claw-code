@@ -137,17 +137,17 @@ jobs:
           DASHSCOPE_API_KEY: ""
         run: |
           $ErrorActionPreference = "Stop"
-          $env:CLAW_CONFIG_HOME = Join-Path $env:RUNNER_TEMP "claw config home"
-          New-Item -ItemType Directory -Force -Path $env:CLAW_CONFIG_HOME | Out-Null
-          $workspace = Join-Path $env:RUNNER_TEMP "claw path smoke"
+          $env:BREWCODE_CONFIG_HOME = Join-Path $env:RUNNER_TEMP "brewcode config home"
+          New-Item -ItemType Directory -Force -Path $env:BREWCODE_CONFIG_HOME | Out-Null
+          $workspace = Join-Path $env:RUNNER_TEMP "brewcode path smoke"
           New-Item -ItemType Directory -Force -Path $workspace | Out-Null
-          $claw = Join-Path $env:GITHUB_WORKSPACE "rust\target\debug\claw.exe"
+          $brewcode = Join-Path $env:GITHUB_WORKSPACE "rust\target\debug\brewcode.exe"
           Push-Location $workspace
           try {
-            & $claw help
-            & $claw status
-            & $claw config env
-            & $claw doctor
+            & $brewcode help
+            & $brewcode status
+            & $brewcode config env
+            & $brewcode doctor
           } finally {
             Pop-Location
           }

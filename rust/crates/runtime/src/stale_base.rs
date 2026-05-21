@@ -408,7 +408,8 @@ mod tests {
         let root = temp_dir();
         init_repo(&root);
         let old_sha = head_sha(&root);
-        fs::write(root.join(".brewcode-base"), format!("{old_sha}\n")).expect("write .brewcode-base");
+        fs::write(root.join(".brewcode-base"), format!("{old_sha}\n"))
+            .expect("write .brewcode-base");
         commit_file(&root, "new.txt", "advance head");
         let new_sha = head_sha(&root);
         let source = resolve_expected_base(None, &root);

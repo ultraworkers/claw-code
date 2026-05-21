@@ -4932,13 +4932,11 @@ impl LiveCli {
             |path| path.display().to_string(),
         );
         format!(
-            "\x1b[38;5;196m\
- ██████╗██╗      █████╗ ██╗    ██╗\n\
-██╔════╝██║     ██╔══██╗██║    ██║\n\
-██║     ██║     ███████║██║ █╗ ██║\n\
-██║     ██║     ██╔══██║██║███╗██║\n\
-╚██████╗███████╗██║  ██║╚███╔███╔╝\n\
- ╚═════╝╚══════╝╚═╝  ╚═╝ ╚══╝╚══╝\x1b[0m \x1b[38;5;208mCode\x1b[0m 🦞\n\n\
+            "\x1b[38;5;130m\
+╭────────────────────────────────╮\n\
+│   ☕  \x1b[1;38;5;214mB R E W   C O D E\x1b[0m\x1b[38;5;130m        │\n\
+│   \x1b[2ma terminal coding agent\x1b[22m      │\n\
+╰────────────────────────────────╯\x1b[0m\n\n\
   \x1b[2mModel\x1b[0m            {}\n\
   \x1b[2mPermissions\x1b[0m      {}\n\
   \x1b[2mBranch\x1b[0m           {}\n\
@@ -4998,16 +4996,32 @@ impl LiveCli {
 
     fn run_turn(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
         let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(true)?;
-        let mut spinner = Spinner::new();
         let mut stdout = io::stdout();
-        spinner.tick(
-            "🦀 Thinking...",
-            TerminalRenderer::new().color_theme(),
-            &mut stdout,
-        )?;
+
+        // Animate the brew spinner on a background thread so it keeps moving
+        // while the (blocking) turn runs. It is stopped and joined before any
+        // finish/fail line is drawn, so the closing draw never races it.
+        let spinner_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let spinner_thread = {
+            let stop = std::sync::Arc::clone(&spinner_stop);
+            std::thread::spawn(move || {
+                let renderer = TerminalRenderer::new();
+                let mut spinner = Spinner::new();
+                let mut out = io::stdout();
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let _ = spinner.tick("Brewing…", renderer.color_theme(), &mut out);
+                    std::thread::sleep(std::time::Duration::from_millis(110));
+                }
+            })
+        };
+
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
         let result = runtime.run_turn(input, Some(&mut permission_prompter));
+
+        spinner_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = spinner_thread.join();
         hook_abort_monitor.stop();
+        let mut spinner = Spinner::new();
         match result {
             Ok(summary) => {
                 self.replace_runtime(runtime)?;
@@ -10075,7 +10089,10 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(out, "  brewcode agents")?;
     writeln!(out, "  brewcode mcp")?;
     writeln!(out, "  brewcode skills")?;
-    writeln!(out, "  brewcode system-prompt [--cwd PATH] [--date YYYY-MM-DD]")?;
+    writeln!(
+        out,
+        "  brewcode system-prompt [--cwd PATH] [--date YYYY-MM-DD]"
+    )?;
     writeln!(out, "  brewcode init")?;
     writeln!(
         out,
@@ -10141,7 +10158,10 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
         "  Use /session list in the REPL to browse managed sessions"
     )?;
     writeln!(out, "Examples:")?;
-    writeln!(out, "  brewcode --model claude-opus \"summarize this repo\"")?;
+    writeln!(
+        out,
+        "  brewcode --model claude-opus \"summarize this repo\""
+    )?;
     writeln!(
         out,
         "  brewcode --output-format json prompt \"explain src/main.rs\""
@@ -13369,8 +13389,11 @@ mod tests {
         git(&["config", "user.email", "tests@example.com"], &workspace);
         git(&["config", "user.name", "Rusty Claude Tests"], &workspace);
         fs::write(workspace.join("tracked.txt"), "hello\n").expect("write tracked");
-        fs::write(workspace.join(".brewcode.json"), r#"{"trustedRoots": ["."]}"#)
-            .expect("write config");
+        fs::write(
+            workspace.join(".brewcode.json"),
+            r#"{"trustedRoots": ["."]}"#,
+        )
+        .expect("write config");
         git(&["add", "tracked.txt"], &workspace);
         git(&["commit", "-m", "init", "--quiet"], &workspace);
 

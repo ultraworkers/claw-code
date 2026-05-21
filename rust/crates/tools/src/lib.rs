@@ -6128,12 +6128,25 @@ fn detect_powershell_shell() -> std::io::Result<&'static str> {
     }
 }
 
+/// Returns true when `command` resolves to a file on `PATH`. Implemented as a
+/// direct PATH scan: the previous `sh -lc "command -v"` form silently failed
+/// on Windows (which has no POSIX `sh`), so every shell tool — including
+/// `powershell` itself — was reported as missing.
 fn command_exists(command: &str) -> bool {
-    std::process::Command::new("sh")
-        .arg("-lc")
-        .arg(format!("command -v {command} >/dev/null 2>&1"))
-        .status()
-        .is_ok_and(|status| status.success())
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+    // Bare names resolve against these suffixes. Windows needs the executable
+    // extensions appended; other platforms check the name as given.
+    #[cfg(windows)]
+    let extensions: &[&str] = &["", ".exe", ".cmd", ".bat", ".com"];
+    #[cfg(not(windows))]
+    let extensions: &[&str] = &[""];
+    std::env::split_paths(&path).any(|dir| {
+        extensions
+            .iter()
+            .any(|ext| dir.join(format!("{command}{ext}")).is_file())
+    })
 }
 
 #[allow(clippy::too_many_lines)]
@@ -9588,12 +9601,16 @@ mod tests {
         assert_eq!(enter_output["previousLocalMode"], "acceptEdits");
         assert_eq!(enter_output["currentLocalMode"], "plan");
 
-        let local_settings = std::fs::read_to_string(cwd.join(".brewcode").join("settings.local.json"))
-            .expect("local settings after enter");
+        let local_settings =
+            std::fs::read_to_string(cwd.join(".brewcode").join("settings.local.json"))
+                .expect("local settings after enter");
         assert!(local_settings.contains(r#""defaultMode": "plan""#));
-        let state =
-            std::fs::read_to_string(cwd.join(".brewcode").join("tool-state").join("plan-mode.json"))
-                .expect("plan mode state");
+        let state = std::fs::read_to_string(
+            cwd.join(".brewcode")
+                .join("tool-state")
+                .join("plan-mode.json"),
+        )
+        .expect("plan mode state");
         assert!(state.contains(r#""hadLocalOverride": true"#));
         assert!(state.contains(r#""previousLocalMode": "acceptEdits""#));
 
@@ -9604,8 +9621,9 @@ mod tests {
         assert_eq!(exit_output["previousLocalMode"], "acceptEdits");
         assert_eq!(exit_output["currentLocalMode"], "acceptEdits");
 
-        let local_settings = std::fs::read_to_string(cwd.join(".brewcode").join("settings.local.json"))
-            .expect("local settings after exit");
+        let local_settings =
+            std::fs::read_to_string(cwd.join(".brewcode").join("settings.local.json"))
+                .expect("local settings after exit");
         assert!(local_settings.contains(r#""defaultMode": "acceptEdits""#));
         assert!(!cwd
             .join(".brewcode")
@@ -9659,8 +9677,9 @@ mod tests {
         assert_eq!(exit_output["changed"], true);
         assert_eq!(exit_output["currentLocalMode"], serde_json::Value::Null);
 
-        let local_settings = std::fs::read_to_string(cwd.join(".brewcode").join("settings.local.json"))
-            .expect("local settings after exit");
+        let local_settings =
+            std::fs::read_to_string(cwd.join(".brewcode").join("settings.local.json"))
+                .expect("local settings after exit");
         let local_settings_json: serde_json::Value =
             serde_json::from_str(&local_settings).expect("valid settings json");
         assert_eq!(
@@ -9826,6 +9845,17 @@ printf 'pwsh:%s' "$1"
         let _ = std::fs::remove_dir_all(empty_dir);
 
         assert!(err.contains("PowerShell executable not found"));
+    }
+
+    #[test]
+    fn command_exists_resolves_real_shell_and_rejects_fake() {
+        // A shell that is always present for the platform must resolve.
+        #[cfg(windows)]
+        assert!(super::command_exists("cmd"));
+        #[cfg(not(windows))]
+        assert!(super::command_exists("sh"));
+        // A name that cannot exist must not resolve.
+        assert!(!super::command_exists("brewcode-no-such-command-zzz"));
     }
 
     fn read_only_registry() -> super::GlobalToolRegistry {

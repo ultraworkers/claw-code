@@ -1,7 +1,7 @@
 target/
 .omx/
-.clawd-agents/
-# Claw Code local artifacts
-.claw/settings.local.json
-.claw/sessions/
-.clawhip/
+.brewcoded-agents/
+# Brew Code local artifacts
+.brewcode/settings.local.json
+.brewcode/sessions/
+.brewcodehip/
