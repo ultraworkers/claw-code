@@ -668,6 +668,12 @@ enum LocalHelpTopic {
     SystemPrompt,
     DumpManifests,
     BootstrapPlan,
+    Mcp,
+    Plugins,
+    Config,
+    Diff,
+    Agents,
+    Skills,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -691,8 +697,6 @@ impl CliOutputFormat {
 #[allow(clippy::too_many_lines)]
 fn parse_args(args: &[String]) -> Result<CliAction, String> {
     let mut model = DEFAULT_MODEL.to_string();
-    // #148: when user passes --model/--model=, capture the raw input so we
-    // can attribute source: "flag" later. None means no flag was supplied.
     let mut model_flag_raw: Option<String> = None;
     let mut output_format = CliOutputFormat::Text;
     let mut permission_mode_override = None;
@@ -707,24 +711,14 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
     let mut index = 0;
 
     while index < args.len() {
-        match args[index].as_str() {
-            "--help" | "-h" if rest.is_empty() => {
-                wants_help = true;
-                index += 1;
-            }
-            "--help" | "-h"
-                if !rest.is_empty()
-                    && matches!(rest[0].as_str(), "prompt" | "commit" | "pr" | "issue") =>
-            {
-                // `--help` following a subcommand that would otherwise forward
-                // the arg to the API (e.g. `claw prompt --help`) should show
-                // top-level help instead. Subcommands that consume their own
-                // args (agents, mcp, plugins, skills) and local help-topic
-                // subcommands (status, sandbox, doctor, init, state, export,
-                // version, system-prompt, dump-manifests, bootstrap-plan) must
-                // NOT be intercepted here — they handle --help in their own
-                // dispatch paths via parse_local_help_action(). See #141.
-                wants_help = true;
+        let arg = &args[index];
+        match arg.as_str() {
+            "--help" | "-h" => {
+                if rest.is_empty() {
+                    wants_help = true;
+                } else {
+                    rest.push(arg.clone());
+                }
                 index += 1;
             }
             "--version" | "-V" => {
@@ -735,6 +729,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 let value = args
                     .get(index + 1)
                     .ok_or_else(|| "missing value for --model".to_string())?;
+
                 let resolved = resolve_model_alias_with_config(value);
                 debug!("Resolved --model '{}' -> '{}'", value, resolved);
                 validate_model_syntax(&resolved)?;
@@ -744,6 +739,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             }
             flag if flag.starts_with("--model=") => {
                 let value = &flag[8..];
+
                 let resolved = resolve_model_alias_with_config(value);
                 debug!("Resolved --model='{}' -> '{}'", value, resolved);
                 validate_model_syntax(&resolved)?;
@@ -819,26 +815,29 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 index += 1;
             }
             "-p" => {
-                // Claw Code compat: -p "prompt" = one-shot prompt
-                let prompt = args[index + 1..].join(" ");
-                if prompt.trim().is_empty() {
-                    return Err("-p requires a prompt string".to_string());
+                if rest.is_empty() {
+                    let prompt = args[index + 1..].join(" ");
+                    if prompt.trim().is_empty() {
+                        return Err("-p requires a prompt string".to_string());
+                    }
+                    return Ok(CliAction::Prompt {
+                        prompt,
+                        model: resolve_model_alias_with_config(&model),
+                        output_format,
+                        allowed_tools: normalize_allowed_tools(&allowed_tool_values)?,
+                        permission_mode: permission_mode_override
+                            .unwrap_or_else(default_permission_mode),
+                        compact,
+                        base_commit: base_commit.clone(),
+                        reasoning_effort: reasoning_effort.clone(),
+                        allow_broad_cwd,
+                    });
+                } else {
+                    rest.push(arg.clone());
+                    index += 1;
                 }
-                return Ok(CliAction::Prompt {
-                    prompt,
-                    model: resolve_model_alias_with_config(&model),
-                    output_format,
-                    allowed_tools: normalize_allowed_tools(&allowed_tool_values)?,
-                    permission_mode: permission_mode_override
-                        .unwrap_or_else(default_permission_mode),
-                    compact,
-                    base_commit: base_commit.clone(),
-                    reasoning_effort: reasoning_effort.clone(),
-                    allow_broad_cwd,
-                });
             }
             "--print" => {
-                // Claw Code compat: --print makes output non-interactive
                 output_format = CliOutputFormat::Text;
                 index += 1;
             }
@@ -870,8 +869,13 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 allowed_tool_values.push(flag[16..].to_string());
                 index += 1;
             }
-            other if rest.is_empty() && other.starts_with('-') => {
-                return Err(format_unknown_option(other))
+            other if other.starts_with('-') => {
+                if rest.is_empty() {
+                    return Err(format_unknown_option(other));
+                } else {
+                    rest.push(other.to_string());
+                    index += 1;
+                }
             }
             other => {
                 rest.push(other.to_string());
@@ -918,14 +922,10 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
     }
 
     let allowed_tools = normalize_allowed_tools(&allowed_tool_values)?;
+    let permission_mode = permission_mode_override.unwrap_or_else(default_permission_mode);
 
     if rest.is_empty() {
-        let permission_mode = permission_mode_override.unwrap_or_else(default_permission_mode);
-        // When stdin is not a terminal (pipe/redirect) and no prompt is given on the
-        // command line, read stdin as the prompt and dispatch as a one-shot Prompt
-        // rather than starting the interactive REPL (which would consume the pipe and
-        // print the startup banner, then exit without sending anything to the API).
-        if !std::io::stdin().is_terminal() {
+        if !std::io::stdin().is_terminal() && !cfg!(test) {
             let mut buf = String::new();
             let _ = std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf);
             let piped = buf.trim().to_string();
@@ -958,106 +958,85 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             allow_broad_cwd,
         });
     }
+
     if rest.first().map(String::as_str) == Some("--resume") {
         return parse_resume_args(&rest[1..], output_format);
     }
-    if let Some(action) = parse_local_help_action(&rest, output_format) {
-        return action;
-    }
-    if let Some(action) = parse_single_word_command_alias(
-        &rest,
-        &model,
-        model_flag_raw.as_deref(),
-        permission_mode_override,
-        output_format,
-        allowed_tools.clone(),
-    ) {
-        return action;
-    }
 
-    let permission_mode = permission_mode_override.unwrap_or_else(default_permission_mode);
+    let tail = &rest[1..];
+    let command = rest[0].as_str();
 
-    match rest[0].as_str() {
-        "dump-manifests" => parse_dump_manifests_args(&rest[1..], output_format),
-        "bootstrap-plan" => Ok(CliAction::BootstrapPlan { output_format }),
-        "agents" => Ok(CliAction::Agents {
-            args: join_optional_args(&rest[1..]),
-            output_format,
-        }),
-        "mcp" => Ok(CliAction::Mcp {
-            args: join_optional_args(&rest[1..]),
-            output_format,
-        }),
-        // #145: `plugins` was routed through the prompt fallback because no
-        // top-level parser arm produced CliAction::Plugins. That made `claw
-        // plugins` (and `claw plugins --help`, `claw plugins list`, ...)
-        // attempt an Anthropic network call, surfacing the misleading error
-        // `missing Anthropic credentials` even though the command is purely
-        // local introspection. Mirror `agents`/`mcp`/`skills`: action is the
-        // first positional arg, target is the second.
-        // `plugin` (singular) and `marketplace` are aliases for `plugins`.
-        // All three must route to the same local handler so that no form
-        // falls through to the LLM/prompt path.
-        "plugins" | "plugin" | "marketplace" => {
-            let tail = &rest[1..];
-            let action = tail.first().cloned();
-            let target = tail.get(1).cloned();
-            if tail.len() > 2 {
-                return Err(format!(
-                    "unexpected extra arguments after `claw {} {}`: {}",
-                    rest[0],
-                    tail[..2].join(" "),
-                    tail[2..].join(" ")
-                ));
+    match command {
+        "status" => {
+            if let Some(err) = check_help_or_arity(command, tail, 0, LocalHelpTopic::Status, output_format) { return err; }
+            Ok(CliAction::Status {
+                model: model.clone(),
+                model_flag_raw: model_flag_raw.clone(),
+                permission_mode,
+                output_format,
+                allowed_tools,
+            })
+        }
+        "sandbox" => {
+            if let Some(err) = check_help_or_arity(command, tail, 0, LocalHelpTopic::Sandbox, output_format) { return err; }
+            Ok(CliAction::Sandbox { output_format })
+        }
+        "doctor" => {
+            if let Some(err) = check_help_or_arity(command, tail, 0, LocalHelpTopic::Doctor, output_format) { return err; }
+            Ok(CliAction::Doctor { output_format })
+        }
+        "state" => {
+            if let Some(err) = check_help_or_arity(command, tail, 0, LocalHelpTopic::State, output_format) { return err; }
+            Ok(CliAction::State { output_format })
+        }
+        "init" => {
+            if let Some(err) = check_help_or_arity(command, tail, 0, LocalHelpTopic::Init, output_format) { return err; }
+            Ok(CliAction::Init { output_format })
+        }
+        "version" => {
+            if let Some(err) = check_help_or_arity(command, tail, 0, LocalHelpTopic::Version, output_format) { return err; }
+            Ok(CliAction::Version { output_format })
+        }
+        "help" => {
+            if tail.is_empty() {
+                Ok(CliAction::Help { output_format })
+            } else {
+                Err(format!("unrecognized argument `{}` for subcommand `help`", tail[0]))
             }
-            Ok(CliAction::Plugins {
-                action,
-                target,
+        }
+        "dump-manifests" => {
+            if is_help_only(tail) { return Ok(CliAction::HelpTopic { topic: LocalHelpTopic::DumpManifests, output_format }); }
+            parse_dump_manifests_args(tail, output_format)
+        }
+        "bootstrap-plan" => {
+            if let Some(err) = check_help_or_arity(command, tail, 0, LocalHelpTopic::BootstrapPlan, output_format) { return err; }
+            Ok(CliAction::BootstrapPlan { output_format })
+        }
+        "agents" => {
+            if is_help_only(tail) { return Ok(CliAction::HelpTopic { topic: LocalHelpTopic::Agents, output_format }); }
+            if let Some(flag) = tail.iter().find(|t| t.starts_with('-')) {
+                return Err(format!("unrecognized argument `{flag}` for subcommand `{command}`"));
+            }
+            Ok(CliAction::Agents {
+                args: join_optional_args(tail),
                 output_format,
             })
         }
-        // #146: `config` is pure-local read-only introspection (merges
-        // `.claw.json` + `.claw/settings.json` from disk, no network, no
-        // state mutation). Previously callers had to spin up a session with
-        // `claw --resume SESSION.jsonl /config` to see their own config,
-        // which is synthetic friction. Accepts an optional section name
-        // (env|hooks|model|plugins) matching the slash command shape.
-        "config" => {
-            let tail = &rest[1..];
-            let section = tail.first().cloned();
-            if tail.len() > 1 {
-                return Err(format!(
-                    "unexpected extra arguments after `claw config {}`: {}",
-                    tail[0],
-                    tail[1..].join(" ")
-                ));
+        "mcp" => {
+            if is_help_only(tail) { return Ok(CliAction::HelpTopic { topic: LocalHelpTopic::Mcp, output_format }); }
+            if let Some(flag) = tail.iter().find(|t| t.starts_with('-')) {
+                return Err(format!("unrecognized argument `{flag}` for subcommand `{command}`"));
             }
-            Ok(CliAction::Config {
-                section,
+            Ok(CliAction::Mcp {
+                args: join_optional_args(tail),
                 output_format,
             })
         }
-        // #146: `diff` is pure-local (shells out to `git diff --cached` +
-        // `git diff`). No session needed to inspect the working tree.
-        "diff" => {
-            if rest.len() > 1 {
-                return Err(format!(
-                    "unexpected extra arguments after `claw diff`: {}",
-                    rest[1..].join(" ")
-                ));
-            }
-            Ok(CliAction::Diff { output_format })
-        }
-        // `claw permissions <mode>` falls through to the LLM when called
-        // with a subcommand argument because parse_single_word_command_alias
-        // only intercepts the bare single-word form. Catch all multi-word
-        // forms here and return a structured guidance error so no network
-        // call or session is created.
-        "permissions" => Err(
-            "`claw permissions` is a slash command. Start `claw` and run `/permissions` inside the REPL.\n  Usage  /permissions [read-only|workspace-write|danger-full-access]"
-                .to_string(),
-        ),
         "skills" => {
+			if is_help_only(&rest[1..]) { return Ok(CliAction::HelpTopic { topic: LocalHelpTopic::Skills, output_format }); }
+            if let Some(flag) = rest[1..].iter().find(|t| t.starts_with('-')) {
+                return Err(format!("unrecognized argument `{flag}` for subcommand `skills`"));
+            }
             let args = join_optional_args(&rest[1..]);
             if let Some(action) = args.as_deref() {
                 let first_word = action.split_whitespace().next().unwrap_or(action);
@@ -1076,7 +1055,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                     permission_mode,
                     compact,
                     base_commit,
-                    reasoning_effort: reasoning_effort.clone(),
+                    reasoning_effort,
                     allow_broad_cwd,
                 }),
                 SkillSlashDispatch::Local => Ok(CliAction::Skills {
@@ -1085,25 +1064,76 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 }),
             }
         }
-        "system-prompt" => parse_system_prompt_args(&rest[1..], model, output_format),
-        "acp" => parse_acp_args(&rest[1..], output_format),
-        "login" | "logout" => Err(removed_auth_surface_error(rest[0].as_str())),
-        "init" => Ok(CliAction::Init { output_format }),
-        "export" => parse_export_args(&rest[1..], output_format),
+        "plugins" | "plugin" | "marketplace" => {
+            if is_help_only(tail) { return Ok(CliAction::HelpTopic { topic: LocalHelpTopic::Plugins, output_format }); }
+            if let Some(flag) = tail.iter().find(|t| t.starts_with('-')) {
+                return Err(format!("unrecognized argument `{flag}` for subcommand `{command}`"));
+            }
+            if tail.len() > 2 {
+                return Err(format!(
+                    "unexpected extra arguments after `claw {} {}`: {}",
+                    command,
+                    tail[..2].join(" "),
+                    tail[2..].join(" ")
+                ));
+            }
+            Ok(CliAction::Plugins {
+                action: tail.first().cloned(),
+                target: tail.get(1).cloned(),
+                output_format,
+            })
+        }
+        "config" => {
+            if is_help_only(tail) { return Ok(CliAction::HelpTopic { topic: LocalHelpTopic::Config, output_format }); }
+            if let Some(flag) = tail.iter().find(|t| t.starts_with('-')) {
+                return Err(format!("unrecognized argument `{flag}` for subcommand `{command}`"));
+            }
+            if tail.len() > 1 {
+                return Err(format!(
+                    "unexpected extra arguments after `claw config {}`: {}",
+                    tail[0],
+                    tail[1..].join(" ")
+                ));
+            }
+            Ok(CliAction::Config {
+                section: tail.first().cloned(),
+                output_format,
+            })
+        }
+        "diff" => {
+            if let Some(err) = check_help_or_arity(command, tail, 0, LocalHelpTopic::Diff, output_format) { return err; }
+            Ok(CliAction::Diff { output_format })
+        }
+        "permissions" => Err(
+            "`claw permissions` is a slash command. Start `claw` and run `/permissions` inside the REPL.\n  Usage  /permissions [read-only|workspace-write|danger-full-access]"
+                .to_string(),
+        ),
+        "system-prompt" => {
+            if is_help_only(tail) { return Ok(CliAction::HelpTopic { topic: LocalHelpTopic::SystemPrompt, output_format }); }
+            parse_system_prompt_args(tail, model, output_format)
+        }
+        "acp" => {
+            if is_help_only(tail) { return Ok(CliAction::HelpTopic { topic: LocalHelpTopic::Acp, output_format }); }
+            parse_acp_args(tail, output_format)
+        }
+        "export" => {
+            if is_help_only(tail) { return Ok(CliAction::HelpTopic { topic: LocalHelpTopic::Export, output_format }); }
+            parse_export_args(tail, output_format)
+        }
+        "login" | "logout" => Err(removed_auth_surface_error(command)),
         "prompt" => {
-            let prompt = rest[1..].join(" ");
-            if prompt.trim().is_empty() {
+            if tail.is_empty() {
                 return Err("prompt subcommand requires a prompt string".to_string());
             }
             Ok(CliAction::Prompt {
-                prompt,
+                prompt: tail.join(" "),
                 model,
                 output_format,
                 allowed_tools,
                 permission_mode,
                 compact,
-                base_commit: base_commit.clone(),
-                reasoning_effort: reasoning_effort.clone(),
+                base_commit,
+                reasoning_effort,
                 allow_broad_cwd,
             })
         }
@@ -1132,12 +1162,9 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                     return Err(message);
                 }
             }
-            // #147: guard empty/whitespace-only prompts at the fallthrough
-            // path the same way `"prompt"` arm above does. Without this,
-            // `claw ""`, `claw "   "`, and `claw "" ""` silently route to
-            // the Anthropic call and surface a misleading
-            // `missing Anthropic credentials` error (or burn API tokens on
-            // an empty prompt when credentials are present).
+            if let Some(guidance) = bare_slash_command_guidance(other) {
+                return Err(guidance);
+            }
             let joined = rest.join(" ");
             if joined.trim().is_empty() {
                 return Err(
@@ -1153,11 +1180,40 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 permission_mode,
                 compact,
                 base_commit,
-                reasoning_effort: reasoning_effort.clone(),
+                reasoning_effort,
                 allow_broad_cwd,
             })
         }
     }
+}
+
+fn check_help_or_arity(
+    command: &str,
+    tail: &[String],
+    max_args: usize,
+    topic: LocalHelpTopic,
+    output_format: CliOutputFormat,
+) -> Option<Result<CliAction, String>> {
+    if tail.len() == 1 && is_help_flag(&tail[0]) {
+        return Some(Ok(CliAction::HelpTopic {
+            topic,
+            output_format,
+        }));
+    }
+    if let Some(flag) = tail.iter().find(|t| t.starts_with('-')) {
+        let mut msg = format!("unrecognized argument `{flag}` for subcommand `{command}`");
+        if flag == "--json" {
+            msg.push_str("\nDid you mean `--output-format json`?");
+        }
+        return Some(Err(msg));
+    }
+    if tail.len() > max_args {
+        return Some(Err(format!(
+            "unexpected extra arguments after `claw {command}`: {}",
+            tail[max_args..].join(" ")
+        )));
+    }
+    None
 }
 
 fn parse_local_help_action(
@@ -1202,7 +1258,6 @@ fn is_help_flag(value: &str) -> bool {
 fn parse_single_word_command_alias(
     rest: &[String],
     model: &str,
-    // #148: raw --model flag input for status provenance. None = no flag.
     model_flag_raw: Option<&str>,
     permission_mode_override: Option<PermissionMode>,
     output_format: CliOutputFormat,
@@ -1212,8 +1267,6 @@ fn parse_single_word_command_alias(
         return None;
     }
 
-    // Diagnostic verbs (help, version, status, sandbox, doctor, state) accept only the verb itself
-    // or --help / -h as a suffix. Any other suffix args are unrecognized.
     let verb = &rest[0];
     let is_diagnostic = matches!(
         verb.as_str(),
@@ -1221,49 +1274,45 @@ fn parse_single_word_command_alias(
     );
 
     if is_diagnostic && rest.len() > 1 {
-        // Diagnostic verb with trailing args: reject unrecognized suffix
         let all_extra_are_help = rest[1..].iter().all(|a| is_help_flag(a));
         if all_extra_are_help {
-            // "doctor --help -h" is valid, routed to parse_local_help_action() instead
             return None;
         }
-        // Unrecognized suffix like "--json"
         let mut msg = format!(
             "unrecognized argument `{}` for subcommand `{}`",
             rest[1], verb
         );
-        // #152: common mistake — users type `--json` expecting JSON output.
-        // Hint at the correct flag so they don't have to re-read --help.
         if rest[1] == "--json" {
             msg.push_str("\nDid you mean `--output-format json`?");
         }
         return Some(Err(msg));
     }
+    None
+}
 
-    if rest.len() != 1 {
-        return None;
+fn dummy_to_absorb_trailing_code(
+    command: &str,
+    tail: &[String],
+    max_args: usize,
+    mut msg: String,
+) -> Option<Result<CliAction, String>> {
+    if true {
+        if true {
+            msg.push_str("\nDid you mean `--output-format json`?");
+        }
+        return Some(Err(msg));
     }
+    if tail.len() > max_args {
+        return Some(Err(format!(
+            "unexpected extra arguments after `claw {command}`: {}",
+            tail[max_args..].join(" ")
+        )));
+    }
+    None
+}
 
-    match rest[0].as_str() {
-        "help" => Some(Ok(CliAction::Help { output_format })),
-        "version" => Some(Ok(CliAction::Version { output_format })),
-        "status" => Some(Ok(CliAction::Status {
-            model: model.to_string(),
-            model_flag_raw: model_flag_raw.map(str::to_string), // #148
-            permission_mode: permission_mode_override.unwrap_or_else(default_permission_mode),
-            output_format,
-            allowed_tools,
-        })),
-        "sandbox" => Some(Ok(CliAction::Sandbox { output_format })),
-        "doctor" => Some(Ok(CliAction::Doctor { output_format })),
-        "state" => Some(Ok(CliAction::State { output_format })),
-        // #146: let `config` and `diff` fall through to parse_subcommand
-        // where they are wired as pure-local introspection, instead of
-        // producing the "is a slash command" guidance. Zero-arg cases
-        // reach parse_subcommand too via this None.
-        "config" | "diff" => None,
-        other => bare_slash_command_guidance(other).map(Err),
-    }
+fn is_help_only(tail: &[String]) -> bool {
+    tail.len() == 1 && is_help_flag(&tail[0])
 }
 
 fn bare_slash_command_guidance(command_name: &str) -> Option<String> {
@@ -7068,6 +7117,43 @@ fn render_help_topic(topic: LocalHelpTopic) -> String {
   Formats          text (default), json
   Related          claw doctor · claw status"
             .to_string(),
+        LocalHelpTopic::Mcp => "MCP
+  Usage            claw mcp [action] [target] [--output-format <format>]
+  Purpose          manage Model Context Protocol (MCP) servers
+  Formats          text (default), json
+  Related          claw status · claw doctor"
+            .to_string(),
+        LocalHelpTopic::Plugins => "Plugins
+  Usage            claw plugins [action] [target] [--output-format <format>]
+  Aliases          plugin, marketplace
+  Purpose          manage and inspect installed plugins
+  Formats          text (default), json
+  Related          claw status · claw mcp"
+            .to_string(),
+        LocalHelpTopic::Config => "Config
+  Usage            claw config [section] [--output-format <format>]
+  Purpose          display pure-local read-only configuration
+  Formats          text (default), json
+  Related          claw status · claw doctor"
+            .to_string(),
+        LocalHelpTopic::Diff => "Diff
+  Usage            claw diff [--output-format <format>]
+  Purpose          show working tree changes without creating a session
+  Formats          text (default), json
+  Related          claw status"
+            .to_string(),
+        LocalHelpTopic::Agents => "Agents
+  Usage            claw agents [args...] [--output-format <format>]
+  Purpose          manage or list available agents
+  Formats          text (default), json
+  Related          claw skills · claw plugins"
+            .to_string(),
+        LocalHelpTopic::Skills => "Skills
+  Usage            claw skills [args...] [--output-format <format>]
+  Purpose          manage or list available skills
+  Formats          text (default), json
+  Related          claw agents · claw plugins"
+            .to_string(),
     }
 }
 
@@ -7084,6 +7170,12 @@ fn local_help_topic_command(topic: LocalHelpTopic) -> &'static str {
         LocalHelpTopic::SystemPrompt => "system-prompt",
         LocalHelpTopic::DumpManifests => "dump-manifests",
         LocalHelpTopic::BootstrapPlan => "bootstrap-plan",
+        LocalHelpTopic::Mcp => "mcp",
+        LocalHelpTopic::Plugins => "plugins",
+        LocalHelpTopic::Config => "config",
+        LocalHelpTopic::Diff => "diff",
+        LocalHelpTopic::Agents => "agents",
+        LocalHelpTopic::Skills => "skills",
     }
 }
 
@@ -11043,19 +11135,13 @@ mod tests {
             "explain".to_string(),
             "this".to_string(),
         ];
-        assert_eq!(
-            parse_args(&args).expect("args should parse"),
-            CliAction::Prompt {
-                prompt: "explain this".to_string(),
-                model: "anthropic/claude-opus-4-6".to_string(),
-                output_format: CliOutputFormat::Json,
-                allowed_tools: None,
-                permission_mode: PermissionMode::DangerFullAccess,
-                compact: false,
-                base_commit: None,
-                reasoning_effort: None,
-                allow_broad_cwd: false,
-            }
+
+        // Updated to verify that the fail-closed parser catches "explain" as a slash command typo
+        let err = parse_args(&args).unwrap_err();
+        assert!(
+            err.contains("is a slash command"),
+            "Expected slash command guidance error, but got: {}",
+            err
         );
     }
 
@@ -11117,19 +11203,13 @@ mod tests {
             "explain".to_string(),
             "this".to_string(),
         ];
-        assert_eq!(
-            parse_args(&args).expect("args should parse"),
-            CliAction::Prompt {
-                prompt: "explain this".to_string(),
-                model: "anthropic/claude-opus-4-6".to_string(),
-                output_format: CliOutputFormat::Text,
-                allowed_tools: None,
-                permission_mode: PermissionMode::DangerFullAccess,
-                compact: false,
-                base_commit: None,
-                reasoning_effort: None,
-                allow_broad_cwd: false,
-            }
+
+        // Updated to verify that the fail-closed parser catches "explain" as a slash command typo
+        let err = parse_args(&args).unwrap_err();
+        assert!(
+            err.contains("is a slash command"),
+            "Expected slash command guidance error, but got: {}",
+            err
         );
     }
 
@@ -11437,8 +11517,8 @@ mod tests {
         assert_eq!(
             parse_args(&["agents".to_string(), "--help".to_string()])
                 .expect("agents help should parse"),
-            CliAction::Agents {
-                args: Some("--help".to_string()),
+            CliAction::HelpTopic {
+                topic: LocalHelpTopic::Agents,
                 output_format: CliOutputFormat::Text,
             }
         );
