@@ -8767,6 +8767,8 @@ impl AnthropicRuntimeClient {
         let mut markdown_stream = MarkdownStreamState::default();
         let mut events = Vec::new();
         let mut pending_tool: Option<(String, String, String)> = None;
+        // 累积 reasoning_content 到 Thinking 块（修复 DeepSeek V4 reasoning_content 协议 bug）
+        let mut pending_thinking: Option<(String, Option<String>)> = None;
         let mut block_has_thinking_summary = false;
         let mut saw_stop = false;
         let mut received_any_event = false;
@@ -8808,6 +8810,10 @@ impl AnthropicRuntimeClient {
                     }
                 }
                 ApiStreamEvent::ContentBlockStart(start) => {
+                    // 特判 Thinking 块：初始化 pending_thinking（用于累积后续 ThinkingDelta）
+                    if let OutputContentBlock::Thinking { thinking, signature } = &start.content_block {
+                        pending_thinking = Some((thinking.clone(), signature.clone()));
+                    }
                     push_output_block(
                         start.content_block,
                         out,
@@ -8836,13 +8842,22 @@ impl AnthropicRuntimeClient {
                             input.push_str(&partial_json);
                         }
                     }
-                    ContentBlockDelta::ThinkingDelta { .. } => {
+                    ContentBlockDelta::ThinkingDelta { thinking } => {
                         if !block_has_thinking_summary {
                             render_thinking_block_summary(out, None, false)?;
                             block_has_thinking_summary = true;
                         }
+                        // 累积 thinking 文本到 pending_thinking（让 session 持久化能拿到）
+                        if let Some((t, _)) = &mut pending_thinking {
+                            t.push_str(&thinking);
+                        }
                     }
-                    ContentBlockDelta::SignatureDelta { .. } => {}
+                    ContentBlockDelta::SignatureDelta { signature } => {
+                        // 累积 signature 到 pending_thinking
+                        if let Some((_, sig)) = &mut pending_thinking {
+                            sig.get_or_insert_with(String::new).push_str(&signature);
+                        }
+                    }
                 },
                 ApiStreamEvent::ContentBlockStop(_) => {
                     block_has_thinking_summary = false;
@@ -8850,6 +8865,10 @@ impl AnthropicRuntimeClient {
                         write!(out, "{rendered}")
                             .and_then(|()| out.flush())
                             .map_err(|error| RuntimeError::new(error.to_string()))?;
+                    }
+                    // 把累积的 thinking 转成 AssistantEvent::Thinking（让 build_assistant_message 写入 session）
+                    if let Some((thinking, signature)) = pending_thinking.take() {
+                        events.push(AssistantEvent::Thinking { thinking, signature });
                     }
                     if let Some((id, name, input)) = pending_tool.take() {
                         if let Some(progress_reporter) = &self.progress_reporter {
@@ -9987,7 +10006,14 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
                     ContentBlock::Text { text } => {
                         Some(InputContentBlock::Text { text: text.clone() })
                     }
-                    ContentBlock::Thinking { .. } => None,
+                    ContentBlock::Thinking { thinking, signature } => {
+                        // 保留 Thinking 块：OpenAI 兼容协议会把它转成 reasoning_content 字段
+                        // 回传给 DeepSeek V4（避免 400 "reasoning_content must be passed back" 错误）
+                        Some(InputContentBlock::Thinking {
+                            thinking: thinking.clone(),
+                            signature: signature.clone(),
+                        })
+                    }
                     ContentBlock::ToolUse { id, name, input } => Some(InputContentBlock::ToolUse {
                         id: id.clone(),
                         name: name.clone(),
