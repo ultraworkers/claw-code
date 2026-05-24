@@ -640,7 +640,14 @@ pub fn model_token_limit(model: &str) -> Option<ModelTokenLimit> {
             max_output_tokens: 16_384,
             context_window_tokens: 256_000,
         }),
-        _ => None,
+        // Hotfix: Unknown models get conservative defaults to avoid crashes.
+        // Uses the minimum of known supported models: max_output_tokens: 16_384,
+        // context_window_tokens: 131_072. This may under-utilize the model's
+        // actual capabilities but hopefully ensures safer operation.
+        _ => Some(ModelTokenLimit {
+            max_output_tokens: 16_384,
+            context_window_tokens: 131_072,
+        }),
     }
 }
 
