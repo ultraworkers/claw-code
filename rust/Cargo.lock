@@ -1453,6 +1453,7 @@ dependencies = [
  "commands",
  "compat-harness",
  "crossterm",
+ "log",
  "mock-anthropic-service",
  "plugins",
  "pulldown-cmark",

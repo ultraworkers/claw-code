@@ -108,7 +108,7 @@ fn status_command_applies_cli_flags_end_to_end() {
 
     let stdout = String::from_utf8(output.stdout).expect("stdout should be utf8");
     assert!(stdout.contains("Status"));
-    assert!(stdout.contains("Model            claude-sonnet-4-6"));
+    assert!(stdout.contains("Model            anthropic/claude-sonnet-4-6"));
     assert!(stdout.contains("Permission mode  read-only"));
 }
 
@@ -289,7 +289,7 @@ fn resumed_status_surfaces_persisted_model() {
     let session_path = temp_dir.join("session.jsonl");
 
     let mut session = workspace_session(&temp_dir);
-    session.model = Some("claude-sonnet-4-6".to_string());
+    session.model = Some("anthropic/claude-sonnet-4-6".to_string());
     session
         .push_user_text("model persistence fixture")
         .expect("write ok");
@@ -317,7 +317,7 @@ fn resumed_status_surfaces_persisted_model() {
     let parsed: Value = serde_json::from_str(stdout.trim()).expect("should be json");
     assert_eq!(parsed["kind"], "status");
     assert_eq!(
-        parsed["model"], "claude-sonnet-4-6",
+        parsed["model"], "anthropic/claude-sonnet-4-6",
         "model should round-trip through session metadata"
     );
 }

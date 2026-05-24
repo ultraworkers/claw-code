@@ -239,7 +239,7 @@ stderr:
         "Mock streaming says hello from the parity harness."
     );
     assert_eq!(parsed["compact"], true);
-    assert_eq!(parsed["model"], "claude-sonnet-4-6");
+    assert_eq!(parsed["model"], "anthropic/claude-sonnet-4-6");
     assert!(parsed["usage"].is_object());
 
     fs::remove_dir_all(&workspace).expect("workspace cleanup should succeed");

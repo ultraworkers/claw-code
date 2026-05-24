@@ -31,7 +31,7 @@ fn status_command_applies_model_and_permission_mode_flags() {
     assert_success(&output);
     let stdout = String::from_utf8(output.stdout).expect("stdout should be utf8");
     assert!(stdout.contains("Status"));
-    assert!(stdout.contains("Model            claude-sonnet-4-6"));
+    assert!(stdout.contains("Model            anthropic/claude-sonnet-4-6"));
     assert!(stdout.contains("Permission mode  read-only"));
 
     fs::remove_dir_all(temp_dir).expect("cleanup temp dir");
