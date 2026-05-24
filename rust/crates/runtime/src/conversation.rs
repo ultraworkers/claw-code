@@ -342,6 +342,7 @@ where
         let mut tool_results = Vec::new();
         let mut prompt_cache_events = Vec::new();
         let mut iterations = 0;
+        let mut auto_compaction = None;
 
         loop {
             iterations += 1;
@@ -501,9 +502,12 @@ where
                 self.record_tool_finished(iterations, &result_message);
                 tool_results.push(result_message);
             }
-        }
 
-        let auto_compaction = self.maybe_auto_compact();
+            // Check for auto compaction after each iteration, before the next API call
+            if let Some(compaction) = self.maybe_auto_compact() {
+                auto_compaction = Some(compaction);
+            }
+        }
 
         let summary = TurnSummary {
             assistant_messages,
