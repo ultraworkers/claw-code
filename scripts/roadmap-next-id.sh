@@ -12,8 +12,9 @@
 #
 # The script reads the highest numeric id prefix from ROADMAP.md and
 # prints highest+1.  It does not lock the file; callers working in
-# parallel should git-pull immediately before appending and resolve
-# any append collision at git-push time.
+# parallel should git-pull immediately before appending, run
+# scripts/roadmap-check-ids.sh before push, and resolve any append
+# collision at git-push time.
 set -euo pipefail
 
 ROADMAP="${1:-ROADMAP.md}"

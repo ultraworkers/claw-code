@@ -21,6 +21,7 @@ on:
       - PARITY.md
       - PHILOSOPHY.md
       - ROADMAP.md
+      - scripts/roadmap-*.sh
       - docs/**
       - rust/**
   pull_request:
@@ -41,6 +42,7 @@ on:
       - PARITY.md
       - PHILOSOPHY.md
       - ROADMAP.md
+      - scripts/roadmap-*.sh
       - docs/**
       - rust/**
   workflow_dispatch:
@@ -72,6 +74,8 @@ jobs:
         run: python .github/scripts/check_doc_source_of_truth.py
       - name: Check release policy docs and local links
         run: python .github/scripts/check_release_readiness.py
+      - name: Check ROADMAP ids
+        run: scripts/roadmap-check-ids.sh
 
   fmt:
     name: cargo fmt
