@@ -267,6 +267,8 @@ fn classify_error_kind(message: &str) -> &'static str {
         "no_managed_sessions"
     } else if message.contains("unsupported ACP invocation") {
         "unsupported_acp_invocation"
+    } else if message.contains("unsupported skills action") {
+        "unsupported_skills_action"
     } else if message.contains("unrecognized argument") || message.contains("unknown option") {
         "cli_parse"
     } else if message.contains("invalid model syntax") {
@@ -866,6 +868,32 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
     }
 
     if wants_help {
+        // #684: --help before subcommand should still route to subcommand-specific
+        // help when the subcommand is one of the local-help-topic commands.
+        if let Some(action) = parse_local_help_action(&rest, output_format) {
+            return action?;
+        }
+        // When --help was consumed before the subcommand, rest has no help flag.
+        // If rest is a simple local-help subcommand with no extra args, route there.
+        if !rest.is_empty() && rest[1..].iter().all(|a| is_help_flag(a)) {
+            let topic = match rest[0].as_str() {
+                "status" => Some(LocalHelpTopic::Status),
+                "sandbox" => Some(LocalHelpTopic::Sandbox),
+                "doctor" => Some(LocalHelpTopic::Doctor),
+                "acp" => Some(LocalHelpTopic::Acp),
+                "init" => Some(LocalHelpTopic::Init),
+                "state" => Some(LocalHelpTopic::State),
+                "export" => Some(LocalHelpTopic::Export),
+                "version" => Some(LocalHelpTopic::Version),
+                "system-prompt" => Some(LocalHelpTopic::SystemPrompt),
+                "dump-manifests" => Some(LocalHelpTopic::DumpManifests),
+                "bootstrap-plan" => Some(LocalHelpTopic::BootstrapPlan),
+                _ => None,
+            };
+            if let Some(topic) = topic {
+                return Ok(CliAction::HelpTopic { topic, output_format });
+            }
+        }
         return Ok(CliAction::Help { output_format });
     }
 
@@ -1009,6 +1037,14 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         ),
         "skills" => {
             let args = join_optional_args(&rest[1..]);
+            if let Some(action) = args.as_deref() {
+                let first_word = action.split_whitespace().next().unwrap_or(action);
+                if matches!(first_word, "remove" | "add" | "uninstall" | "delete") {
+                    return Err(format!(
+                        "unsupported skills action: {first_word}. Supported actions: list, install <path>, help, or <skill> [args]"
+                    ));
+                }
+            }
             match classify_skills_slash_command(args.as_deref()) {
                 SkillSlashDispatch::Invoke(prompt) => Ok(CliAction::Prompt {
                     prompt,
@@ -1106,7 +1142,10 @@ fn parse_local_help_action(
     rest: &[String],
     output_format: CliOutputFormat,
 ) -> Option<Result<CliAction, String>> {
-    if rest.len() != 2 || !is_help_flag(&rest[1]) {
+    if rest.is_empty() {
+        return None;
+    }
+    if !rest.iter().any(|a| is_help_flag(a)) {
         return None;
     }
 
@@ -1115,10 +1154,6 @@ fn parse_local_help_action(
         "sandbox" => LocalHelpTopic::Sandbox,
         "doctor" => LocalHelpTopic::Doctor,
         "acp" => LocalHelpTopic::Acp,
-        // #141: add the subcommands that were previously falling back
-        // to global help (init/state/export/version) or erroring out
-        // (system-prompt/dump-manifests) or printing their primary
-        // output instead of help text (bootstrap-plan).
         "init" => LocalHelpTopic::Init,
         "state" => LocalHelpTopic::State,
         "export" => LocalHelpTopic::Export,
@@ -1128,6 +1163,10 @@ fn parse_local_help_action(
         "bootstrap-plan" => LocalHelpTopic::BootstrapPlan,
         _ => return None,
     };
+    let has_non_help = rest[1..].iter().any(|a| !is_help_flag(a));
+    if has_non_help {
+        return None;
+    }
     Some(Ok(CliAction::HelpTopic {
         topic,
         output_format,
@@ -1161,8 +1200,9 @@ fn parse_single_word_command_alias(
 
     if is_diagnostic && rest.len() > 1 {
         // Diagnostic verb with trailing args: reject unrecognized suffix
-        if is_help_flag(&rest[1]) && rest.len() == 2 {
-            // "doctor --help" is valid, routed to parse_local_help_action() instead
+        let all_extra_are_help = rest[1..].iter().all(|a| is_help_flag(a));
+        if all_extra_are_help {
+            // "doctor --help -h" is valid, routed to parse_local_help_action() instead
             return None;
         }
         // Unrecognized suffix like "--json"
@@ -4183,7 +4223,8 @@ fn run_resume_command(
         | SlashCommand::Ide { .. }
         | SlashCommand::Tag { .. }
         | SlashCommand::OutputStyle { .. }
-        | SlashCommand::AddDir { .. } => Err("unsupported resumed slash command".into()),
+        | SlashCommand::AddDir { .. }
+        | SlashCommand::Team { .. } => Err("unsupported resumed slash command".into()),
     }
 }
 
@@ -5295,7 +5336,8 @@ impl LiveCli {
             | SlashCommand::Ide { .. }
             | SlashCommand::Tag { .. }
             | SlashCommand::OutputStyle { .. }
-            | SlashCommand::AddDir { .. } => {
+            | SlashCommand::AddDir { .. }
+            | SlashCommand::Team { .. } => {
                 let cmd_name = command.slash_name();
                 eprintln!("{cmd_name} is not yet implemented in this build.");
                 false
@@ -12502,6 +12544,23 @@ mod tests {
         let error = parse_args(&["skilsl".to_string()]).expect_err("skilsl should error");
         assert!(error.contains("unknown subcommand: skilsl."));
         assert!(error.contains("skills"));
+    }
+
+    #[test]
+    fn unsupported_skills_actions_return_typed_error_683() {
+        for action in ["remove", "add", "uninstall", "delete"] {
+            let error = parse_args(&["skills".to_string(), action.to_string()])
+                .expect_err(&format!("skills {action} should error"));
+            assert!(
+                error.contains("unsupported skills action"),
+                "skills {action} should contain 'unsupported skills action', got: {error}"
+            );
+            assert_eq!(
+                classify_error_kind(&error),
+                "unsupported_skills_action",
+                "skills {action} should classify as unsupported_skills_action, got: {error}"
+            );
+        }
     }
 
     #[test]

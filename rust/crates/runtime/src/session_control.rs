@@ -1085,4 +1085,35 @@ mod tests {
         );
         fs::remove_dir_all(base).expect("temp dir should clean up");
     }
+
+    /// #160 regression: store-level list_sessions/session_exists/delete_session
+    /// lifecycle works end-to-end.
+    #[test]
+    fn session_store_lifecycle_regression_160() {
+        // given
+        let base = temp_dir();
+        fs::create_dir_all(&base).expect("base dir should exist");
+        let store = SessionStore::from_cwd(&base).expect("store should build");
+        let session = persist_session_via_store(&store, "160 regression test");
+
+        // when/then — session exists and is listed before deletion
+        assert!(!store.list_sessions().expect("list").is_empty(),
+            "store should have at least one session");
+        assert!(store.session_exists(&session.session_id),
+            "session should exist before deletion");
+
+        // when — delete the session
+        let deleted = store.delete_session(&session.session_id)
+            .expect("delete should succeed");
+
+        // then — session is gone
+        assert_eq!(deleted.id, session.session_id);
+        assert!(!deleted.path.exists(), "session file should be removed");
+        assert!(!store.session_exists(&session.session_id),
+            "session should not exist after deletion");
+        assert!(store.list_sessions().expect("list").is_empty(),
+            "store should have no sessions after deletion");
+
+        fs::remove_dir_all(base).expect("temp dir should clean up");
+    }
 }

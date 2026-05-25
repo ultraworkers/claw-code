@@ -1496,7 +1496,7 @@ fn parse_sse_frame(
                     body: trimmed.chars().take(500).collect(),
                     retryable: false,
                     suggested_action: suggested_action_for_status(status),
-                    retry_after: None,
+
                 });
             }
         }
@@ -1510,7 +1510,7 @@ fn parse_sse_frame(
                 body: trimmed.chars().take(200).collect(),
                 retryable: false,
                 suggested_action: Some("verify the API endpoint URL is correct".to_string()),
-                retry_after: None,
+
             });
         }
         return Ok(None);
@@ -1560,7 +1560,7 @@ fn parse_sse_frame(
             body: payload.chars().take(200).collect(),
             retryable: false,
             suggested_action: Some("verify the API endpoint URL is correct".to_string()),
-            retry_after: None,
+
         });
     }
     serde_json::from_str::<ChatCompletionChunk>(&payload)
