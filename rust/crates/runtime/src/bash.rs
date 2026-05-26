@@ -330,20 +330,21 @@ fn prepare_tokio_command(
         prepare_sandbox_dirs(cwd);
     }
 
-    let mut prepared = if let Some(launcher) = build_linux_sandbox_command(command, cwd, sandbox_status) {
-        let mut cmd = TokioCommand::new(launcher.program);
-        cmd.args(launcher.args);
-        cmd.envs(launcher.env);
-        cmd
-    } else {
-        let mut cmd = TokioCommand::new("sh");
-        cmd.arg("-lc").arg(command);
-        if sandbox_status.filesystem_active {
-            cmd.env("HOME", cwd.join(".sandbox-home"));
-            cmd.env("TMPDIR", cwd.join(".sandbox-tmp"));
-        }
-        cmd
-    };
+    let mut prepared =
+        if let Some(launcher) = build_linux_sandbox_command(command, cwd, sandbox_status) {
+            let mut cmd = TokioCommand::new(launcher.program);
+            cmd.args(launcher.args);
+            cmd.envs(launcher.env);
+            cmd
+        } else {
+            let mut cmd = TokioCommand::new("sh");
+            cmd.arg("-lc").arg(command);
+            if sandbox_status.filesystem_active {
+                cmd.env("HOME", cwd.join(".sandbox-home"));
+                cmd.env("TMPDIR", cwd.join(".sandbox-tmp"));
+            }
+            cmd
+        };
 
     prepared.current_dir(cwd);
     // Guard against hanging on stdin
@@ -439,7 +440,10 @@ mod tests {
         })
         .expect("bash command should execute cleanly");
 
-        assert!(!output.interrupted, "Command hung and was cut off by the timeout!");
+        assert!(
+            !output.interrupted,
+            "Command hung and was cut off by the timeout!"
+        );
     }
 }
 
