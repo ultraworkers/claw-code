@@ -3,6 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "kebab-case")]
@@ -80,6 +81,12 @@ pub struct LinuxSandboxCommand {
     pub program: String,
     pub args: Vec<String>,
     pub env: Vec<(String, String)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SandboxRuntimePaths {
+    pub home: PathBuf,
+    pub tmp: PathBuf,
 }
 
 impl SandboxConfig {
@@ -236,11 +243,13 @@ pub fn build_linux_sandbox_command(
     args.push("-lc".to_string());
     args.push(command.to_string());
 
-    let sandbox_home = cwd.join(".sandbox-home");
-    let sandbox_tmp = cwd.join(".sandbox-tmp");
+    let runtime_paths = sandbox_runtime_paths(cwd);
     let mut env = vec![
-        ("HOME".to_string(), sandbox_home.display().to_string()),
-        ("TMPDIR".to_string(), sandbox_tmp.display().to_string()),
+        ("HOME".to_string(), runtime_paths.home.display().to_string()),
+        (
+            "TMPDIR".to_string(),
+            runtime_paths.tmp.display().to_string(),
+        ),
         (
             "CLAWD_SANDBOX_FILESYSTEM_MODE".to_string(),
             status.filesystem_mode.as_str().to_string(),
@@ -259,6 +268,33 @@ pub fn build_linux_sandbox_command(
         args,
         env,
     })
+}
+
+#[must_use]
+pub fn sandbox_runtime_paths(cwd: &Path) -> SandboxRuntimePaths {
+    let workspace_key = sandbox_workspace_key(cwd);
+    let root = env::temp_dir().join("claw-sandbox").join(workspace_key);
+    SandboxRuntimePaths {
+        home: root.join("home"),
+        tmp: root.join("tmp"),
+    }
+}
+
+#[must_use]
+pub fn get_sandbox_home(cwd: &Path) -> PathBuf {
+    sandbox_runtime_paths(cwd).home
+}
+
+#[must_use]
+pub fn get_sandbox_tmp(cwd: &Path) -> PathBuf {
+    sandbox_runtime_paths(cwd).tmp
+}
+
+fn sandbox_workspace_key(cwd: &Path) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(cwd.to_string_lossy().as_bytes());
+    let digest = hasher.finalize();
+    format!("{:x}", digest)[..16].to_string()
 }
 
 fn normalize_mounts(mounts: &[String], cwd: &Path) -> Vec<String> {
@@ -380,5 +416,17 @@ mod tests {
             assert!(launcher.args.iter().any(|arg| arg == "--mount"));
             assert!(launcher.args.iter().any(|arg| arg == "--net") == status.network_active);
         }
+    }
+
+    #[test]
+    fn sandbox_runtime_paths_live_outside_workspace() {
+        let cwd = Path::new("/workspace/project");
+        let paths = super::sandbox_runtime_paths(cwd);
+
+        assert!(!paths.home.starts_with(cwd));
+        assert!(!paths.tmp.starts_with(cwd));
+        assert!(paths.home.ends_with("home"));
+        assert!(paths.tmp.ends_with("tmp"));
+        assert_eq!(paths.home.parent(), paths.tmp.parent());
     }
 }

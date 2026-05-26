@@ -11,8 +11,8 @@ use tokio::time::timeout;
 
 use crate::lane_events::{LaneEvent, ShipMergeMethod, ShipProvenance};
 use crate::sandbox::{
-    build_linux_sandbox_command, resolve_sandbox_status_for_request, FilesystemIsolationMode,
-    SandboxConfig, SandboxStatus,
+    build_linux_sandbox_command, get_sandbox_home, get_sandbox_tmp,
+    resolve_sandbox_status_for_request, FilesystemIsolationMode, SandboxConfig, SandboxStatus,
 };
 use crate::ConfigLoader;
 
@@ -314,8 +314,8 @@ fn prepare_command(
     let mut prepared = Command::new("sh");
     prepared.arg("-lc").arg(command).current_dir(cwd);
     if sandbox_status.filesystem_active {
-        prepared.env("HOME", cwd.join(".sandbox-home"));
-        prepared.env("TMPDIR", cwd.join(".sandbox-tmp"));
+        prepared.env("HOME", get_sandbox_home(cwd));
+        prepared.env("TMPDIR", get_sandbox_tmp(cwd));
     }
     prepared
 }
@@ -341,21 +341,22 @@ fn prepare_tokio_command(
     let mut prepared = TokioCommand::new("sh");
     prepared.arg("-lc").arg(command).current_dir(cwd);
     if sandbox_status.filesystem_active {
-        prepared.env("HOME", cwd.join(".sandbox-home"));
-        prepared.env("TMPDIR", cwd.join(".sandbox-tmp"));
+        prepared.env("HOME", get_sandbox_home(cwd));
+        prepared.env("TMPDIR", get_sandbox_tmp(cwd));
     }
     prepared
 }
 
 fn prepare_sandbox_dirs(cwd: &std::path::Path) {
-    let _ = std::fs::create_dir_all(cwd.join(".sandbox-home"));
-    let _ = std::fs::create_dir_all(cwd.join(".sandbox-tmp"));
+    let _ = std::fs::create_dir_all(get_sandbox_home(cwd));
+    let _ = std::fs::create_dir_all(get_sandbox_tmp(cwd));
 }
 
 #[cfg(test)]
 mod tests {
     use super::{execute_bash, BashCommandInput};
     use crate::sandbox::FilesystemIsolationMode;
+    use std::env;
 
     #[test]
     fn executes_simple_command() {
@@ -418,6 +419,36 @@ mod tests {
         let structured = output.structured_content.expect("structured content");
         assert_eq!(structured[0]["event"], "test.hung");
         assert_eq!(structured[0]["data"]["provenance"], "bash.timeout");
+    }
+
+    #[test]
+    fn sandbox_dirs_are_created_outside_current_working_directory() {
+        let _guard = crate::test_env_lock();
+        let original_cwd = env::current_dir().expect("current dir");
+        let workspace = tempfile::tempdir().expect("temp workspace");
+        env::set_current_dir(workspace.path()).expect("set current dir");
+
+        let output = execute_bash(BashCommandInput {
+            command: String::from("printf '%s\\n%s' \"$HOME\" \"$TMPDIR\""),
+            timeout: Some(1_000),
+            description: None,
+            run_in_background: Some(false),
+            dangerously_disable_sandbox: Some(false),
+            namespace_restrictions: Some(false),
+            isolate_network: Some(false),
+            filesystem_mode: Some(FilesystemIsolationMode::WorkspaceOnly),
+            allowed_mounts: None,
+        })
+        .expect("bash command should execute");
+
+        env::set_current_dir(original_cwd).expect("restore current dir");
+
+        assert!(!workspace.path().join(".sandbox-home").exists());
+        assert!(!workspace.path().join(".sandbox-tmp").exists());
+        let paths: Vec<_> = output.stdout.lines().collect();
+        assert_eq!(paths.len(), 2);
+        assert!(!std::path::Path::new(paths[0]).starts_with(workspace.path()));
+        assert!(!std::path::Path::new(paths[1]).starts_with(workspace.path()));
     }
 }
 
