@@ -10,24 +10,47 @@
 #   ${NEXT}. **...description...**
 #   EOF
 #
-# The script reads the highest numeric id prefix from ROADMAP.md and
-# prints highest+1.  It does not lock the file; callers working in
-# parallel should git-pull immediately before appending, run
-# scripts/roadmap-check-ids.sh before push, and resolve any append
-# collision at git-push time.
+# The script first validates helper-era ids with roadmap-check-ids.sh, then
+# reads the highest numeric id prefix from ROADMAP.md and prints highest+1. It
+# does not lock the file; callers working in parallel should git-pull
+# immediately before appending, run scripts/roadmap-check-ids.sh before push,
+# and resolve any append collision at git-push time.
 set -euo pipefail
 
 ROADMAP="${1:-ROADMAP.md}"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+CHECKER="$SCRIPT_DIR/roadmap-check-ids.sh"
 
 if [[ ! -f "$ROADMAP" ]]; then
   echo "error: ROADMAP not found at $ROADMAP" >&2
   exit 1
 fi
 
-# Find the highest leading integer from lines that start with a number + '.'.
-highest=$(grep -E '^[0-9]+\.' "$ROADMAP" | grep -Eo '^[0-9]+' | sort -n | tail -1)
+if [[ ! -f "$CHECKER" || ! -r "$CHECKER" ]]; then
+  echo "error: required ROADMAP id checker not found or not readable at $CHECKER" >&2
+  echo "error: refusing to print a next id without duplicate-id validation" >&2
+  exit 1
+fi
 
-if [[ -z "$highest" ]]; then
+if ! checker_output="$(bash "$CHECKER" "$ROADMAP" 2>&1)"; then
+  printf '%s\n' "$checker_output" >&2
+  exit 1
+fi
+
+# Find the highest leading integer from lines that start with a number + '.'.
+highest=$(awk '
+  /^[0-9]+\./ {
+    id = $0
+    sub(/\..*/, "", id)
+    id += 0
+    if (id > highest) {
+      highest = id
+    }
+  }
+  END { print highest + 0 }
+' "$ROADMAP")
+
+if [[ "$highest" -eq 0 ]]; then
   echo 1
 else
   echo $(( highest + 1 ))

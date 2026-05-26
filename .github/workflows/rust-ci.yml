@@ -22,6 +22,7 @@ on:
       - PHILOSOPHY.md
       - ROADMAP.md
       - scripts/roadmap-*.sh
+      - tests/test_roadmap_helpers.py
       - docs/**
       - rust/**
   pull_request:
@@ -43,6 +44,7 @@ on:
       - PHILOSOPHY.md
       - ROADMAP.md
       - scripts/roadmap-*.sh
+      - tests/test_roadmap_helpers.py
       - docs/**
       - rust/**
   workflow_dispatch:
@@ -76,6 +78,8 @@ jobs:
         run: python .github/scripts/check_release_readiness.py
       - name: Check ROADMAP ids
         run: scripts/roadmap-check-ids.sh
+      - name: Check ROADMAP helper behavior
+        run: python -m unittest discover -s tests -p test_roadmap_helpers.py
 
   fmt:
     name: cargo fmt
