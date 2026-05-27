@@ -349,6 +349,8 @@ These are the models registered in the built-in alias table with known token lim
 | `grok-mini` / `grok-3-mini` | `grok-3-mini` | xAI | 64 000 | 131 072 |
 | `grok-2` | `grok-2` | xAI | — | — |
 | `kimi` | `kimi-k2.5` | DashScope | 16 384 | 256 000 |
+| `qwen-max` | `qwen-max` | DashScope | 8 192 | 131 072 |
+| `qwen-plus` | `qwen-plus` | DashScope | 8 192 | 131 072 |
 | `gpt-4.1` / `gpt-4.1-mini` / `gpt-4.1-nano` | same | OpenAI-compatible | 32 768 | 1 047 576 |
 | `gpt-5.4` / `gpt-5.4-mini` / `gpt-5.4-nano` | same | OpenAI-compatible | 128 000 | 1 000 000 / 400 000 |
 
