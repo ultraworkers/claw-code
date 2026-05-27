@@ -915,14 +915,17 @@ pub fn model_requires_reasoning_content_in_history(model: &str) -> bool {
 
 /// Strip routing prefix (e.g., "openai/gpt-4" → "gpt-4") for the wire.
 /// The prefix is used only to select transport; the backend expects the
-/// bare model id.
+/// bare model id. Use `"local/"` as an escape hatch when the server's model
+/// ID itself contains a slash (e.g., `local/Qwen/Qwen3.6-27B-FP8`).
 #[allow(dead_code)]
 fn strip_routing_prefix(model: &str) -> &str {
     if let Some(pos) = model.find('/') {
         let prefix = &model[..pos];
         // Only strip if the prefix before "/" is a known routing prefix,
         // not if "/" appears in the middle of the model name for other reasons.
-        if matches!(prefix, "openai" | "xai" | "grok" | "qwen" | "kimi") {
+        // "local" is an escape hatch: strips just "local/" and sends everything
+        // after it verbatim (including embedded slashes) on the wire.
+        if matches!(prefix, "openai" | "xai" | "grok" | "qwen" | "kimi" | "local") {
             &model[pos + 1..]
         } else {
             model
@@ -962,6 +965,12 @@ fn wire_model_for_base_url<'a>(
     }
 
     if matches!(lowered_prefix.as_str(), "xai" | "grok" | "qwen" | "kimi") {
+        return Cow::Borrowed(&model[pos + 1..]);
+    }
+
+    // "local/" escape hatch: strips just the prefix and sends everything after it
+    // verbatim on the wire (including embedded slashes in model IDs).
+    if lowered_prefix == "local" {
         return Cow::Borrowed(&model[pos + 1..]);
     }
 
@@ -2729,5 +2738,25 @@ mod tests {
         assert_eq!(super::strip_routing_prefix("kimi/kimi-k2.5"), "kimi-k2.5");
         assert_eq!(super::strip_routing_prefix("kimi-k2.5"), "kimi-k2.5"); // no prefix, unchanged
         assert_eq!(super::strip_routing_prefix("kimi/kimi-k1.5"), "kimi-k1.5");
+    }
+
+    #[test]
+    fn strip_routing_prefix_preserves_embedded_slash_with_local_prefix() {
+        // "local/" escape hatch: strips just the prefix, preserves everything after it verbatim
+        assert_eq!(
+            super::strip_routing_prefix("local/Qwen/Qwen3.6-27B-FP8"),
+            "Qwen/Qwen3.6-27B-FP8"
+        );
+        assert_eq!(super::strip_routing_prefix("local/mistralai/Mistral-Large-3"), "mistralai/Mistral-Large-3");
+    }
+
+    #[test]
+    fn wire_model_preserves_embedded_slash_with_local_prefix() {
+        let config = OpenAiCompatConfig::openai();
+        // "local/" prefix: strips just "local/", sends rest verbatim on the wire
+        assert_eq!(
+            super::wire_model_for_base_url("local/Qwen/Qwen3.6-27B-FP8", config.clone(), ""),
+            "Qwen/Qwen3.6-27B-FP8"
+        );
     }
 }

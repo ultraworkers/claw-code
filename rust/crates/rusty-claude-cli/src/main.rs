@@ -1943,7 +1943,10 @@ fn validate_model_syntax(model: &str) -> Result<(), String> {
     }
     // Check provider/model format: provider_id/model_id
     let parts: Vec<&str> = trimmed.split('/').collect();
-    if parts.len() != 2 || parts[0].is_empty() || parts[1].is_empty() {
+    if (parts.len() != 2 && !trimmed.starts_with("local/"))
+        || parts[0].is_empty()
+        || parts[1].is_empty()
+    {
         // #154: hint if the model looks like it belongs to a different provider
         let mut err_msg = format!(
             "invalid model syntax: '{}'.\nExpected provider/model (e.g., anthropic/claude-opus-4-7)",
