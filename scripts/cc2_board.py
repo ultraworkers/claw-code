@@ -26,11 +26,13 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     repo_root = args.repo_root.resolve()
+    script_root = Path(__file__).resolve().parent
+    tool_root = script_root.parent
     board_json = repo_root / args.board_json
     board_md = repo_root / args.board_md
-    generator = repo_root / "scripts" / "generate_cc2_board.py"
-    validator = repo_root / "scripts" / "validate_cc2_board.py"
-    renderer = repo_root / ".omx" / "cc2" / "render_board_md.py"
+    generator = script_root / "generate_cc2_board.py"
+    validator = script_root / "validate_cc2_board.py"
+    renderer = tool_root / ".omx" / "cc2" / "render_board_md.py"
 
     if args.command == "generate":
         rc = run([sys.executable, str(generator), "--repo-root", str(repo_root), "--out-dir", str(board_json.parent)], repo_root)
