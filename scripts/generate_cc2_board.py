@@ -504,7 +504,11 @@ def main() -> int:
     repo_root = args.repo_root.resolve()
     out_dir = args.out_dir or (repo_root / ".omx" / "cc2")
     out_dir.mkdir(parents=True, exist_ok=True)
-    board = build_board(repo_root)
+    try:
+        board = build_board(repo_root)
+    except FileNotFoundError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
     board_json = out_dir / "board.json"
     board_md = out_dir / "board.md"
     board_json.write_text(json.dumps(board, indent=2, sort_keys=True) + "\n", encoding="utf-8")
