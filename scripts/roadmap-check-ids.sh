@@ -11,6 +11,7 @@ set -euo pipefail
 
 MIN_ID=723
 ROADMAP="ROADMAP.md"
+ROADMAP_PATH_SEEN=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -31,7 +32,12 @@ while [[ $# -gt 0 ]]; do
       exit 2
       ;;
     *)
+      if [[ "$ROADMAP_PATH_SEEN" -ne 0 ]]; then
+        echo "error: unexpected extra ROADMAP path: $1" >&2
+        exit 2
+      fi
       ROADMAP="$1"
+      ROADMAP_PATH_SEEN=1
       shift
       ;;
   esac
