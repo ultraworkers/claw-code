@@ -1185,8 +1185,9 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             let action = tail.first().cloned();
             let target = tail.get(1).cloned();
             if tail.len() > 2 {
+                // #797: append \n usage hint so split_error_hint extracts it (parity with #791 config fix)
                 return Err(format!(
-                    "unexpected extra arguments after `claw {} {}`: {}",
+                    "unexpected extra arguments after `claw {} {}`: {}\nUsage: claw plugins [list|show <id>|install <id>|enable <id>|disable <id>|uninstall <id>|update <id>|help]",
                     rest[0],
                     tail[..2].join(" "),
                     tail[2..].join(" ")
@@ -1377,8 +1378,9 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             // an empty prompt when credentials are present).
             let joined = rest.join(" ");
             if joined.trim().is_empty() {
+                // #798: add \n hint so split_error_hint extracts it (was empty_prompt + null)
                 return Err(
-                    "empty prompt: provide a subcommand (run `claw --help`) or a non-empty prompt string"
+                    "empty prompt: provide a subcommand or a non-empty prompt string.\nUsage: claw <subcommand> or claw -p <prompt>. Run `claw --help` for the full list."
                         .to_string(),
                 );
             }
