@@ -71,7 +71,12 @@ pub fn build_http_client() -> Result<reqwest::Client, ApiError> {
 /// first outbound request instead of at construction time.
 #[must_use]
 pub fn build_http_client_or_default() -> reqwest::Client {
-    build_http_client().unwrap_or_else(|_| reqwest::Client::new())
+    build_http_client().unwrap_or_else(|_| {
+        reqwest::Client::builder()
+            .user_agent("clawd-rust-tools/0.1")
+            .build()
+            .expect("default client with user_agent should always succeed")
+    })
 }
 
 /// Build a `reqwest::Client` from an explicit [`ProxyConfig`]. Used by tests
@@ -81,7 +86,9 @@ pub fn build_http_client_or_default() -> reqwest::Client {
 /// and `https_proxy` fields and is registered as both an HTTP and HTTPS
 /// proxy so a single value can route every outbound request.
 pub fn build_http_client_with(config: &ProxyConfig) -> Result<reqwest::Client, ApiError> {
-    let mut builder = reqwest::Client::builder().no_proxy();
+    let mut builder = reqwest::Client::builder()
+        .no_proxy()
+        .user_agent("clawd-rust-tools/0.1");
 
     let no_proxy = config
         .no_proxy

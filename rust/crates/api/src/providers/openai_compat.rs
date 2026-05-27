@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -146,6 +147,12 @@ impl OpenAiCompatClient {
     }
 
     #[must_use]
+    pub fn with_http_client(mut self, http: reqwest::Client) -> Self {
+        self.http = http;
+        self
+    }
+
+    #[must_use]
     pub fn with_retry_policy(
         mut self,
         max_retries: u32,
@@ -267,14 +274,18 @@ impl OpenAiCompatClient {
         request: &MessageRequest,
     ) -> Result<reqwest::Response, ApiError> {
         // Pre-flight check: verify request body size against provider limits
-        check_request_body_size(request, self.config())?;
+        check_request_body_size_for_base_url(request, self.config(), &self.base_url)?;
 
         let request_url = chat_completions_endpoint(&self.base_url);
         self.http
             .post(&request_url)
             .header("content-type", "application/json")
             .bearer_auth(&self.api_key)
-            .json(&build_chat_completion_request(request, self.config()))
+            .json(&build_chat_completion_request_for_base_url(
+                request,
+                self.config(),
+                &self.base_url,
+            ))
             .send()
             .await
             .map_err(ApiError::from)
@@ -327,8 +338,9 @@ fn jitter_for_base(base: Duration) -> Duration {
     }
     let raw_nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|elapsed| u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX))
-        .unwrap_or(0);
+        .map_or(0, |elapsed| {
+            u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX)
+        });
     let tick = JITTER_COUNTER.fetch_add(1, Ordering::Relaxed);
     let mut mixed = raw_nanos
         .wrapping_add(tick)
@@ -463,6 +475,7 @@ impl StreamState {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn ingest_chunk(&mut self, chunk: ChatCompletionChunk) -> Result<Vec<StreamEvent>, ApiError> {
         let mut events = Vec::new();
         if !self.message_started {
@@ -488,19 +501,20 @@ impl StreamState {
         }
 
         if let Some(usage) = chunk.usage {
-            self.usage = Some(Usage {
-                input_tokens: usage.prompt_tokens,
-                cache_creation_input_tokens: 0,
-                cache_read_input_tokens: 0,
-                output_tokens: usage.completion_tokens,
-            });
+            self.usage = Some(usage.normalized());
         }
 
         for choice in chunk.choices {
+            // Handle reasoning/thinking from various provider fields
             if let Some(reasoning) = choice
                 .delta
                 .reasoning_content
                 .filter(|value| !value.is_empty())
+                .or(choice
+                    .delta
+                    .thinking
+                    .and_then(|t| t.content)
+                    .filter(|value| !value.is_empty()))
             {
                 if !self.thinking_started {
                     self.thinking_started = true;
@@ -728,6 +742,7 @@ impl ToolCallState {
 
 #[derive(Debug, Deserialize)]
 struct ChatCompletionResponse {
+    #[serde(default)]
     id: String,
     model: String,
     choices: Vec<ChatChoice>,
@@ -771,10 +786,34 @@ struct OpenAiUsage {
     prompt_tokens: u32,
     #[serde(default)]
     completion_tokens: u32,
+    #[serde(default)]
+    prompt_tokens_details: Option<OpenAiPromptTokensDetails>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiPromptTokensDetails {
+    #[serde(default)]
+    cached_tokens: u32,
+}
+
+impl OpenAiUsage {
+    fn normalized(&self) -> Usage {
+        let cached_tokens = self
+            .prompt_tokens_details
+            .as_ref()
+            .map_or(0, |details| details.cached_tokens);
+        Usage {
+            input_tokens: self.prompt_tokens.saturating_sub(cached_tokens),
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: cached_tokens,
+            output_tokens: self.completion_tokens,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
 struct ChatCompletionChunk {
+    #[serde(default)]
     id: String,
     #[serde(default)]
     model: Option<String>,
@@ -786,6 +825,7 @@ struct ChatCompletionChunk {
 
 #[derive(Debug, Deserialize)]
 struct ChunkChoice {
+    #[serde(default)]
     delta: ChunkDelta,
     #[serde(default)]
     finish_reason: Option<String>,
@@ -795,10 +835,19 @@ struct ChunkChoice {
 struct ChunkDelta {
     #[serde(default)]
     content: Option<String>,
+    /// Some providers (GLM, DeepSeek) emit reasoning in `reasoning_content`
     #[serde(default)]
     reasoning_content: Option<String>,
+    #[serde(default)]
+    thinking: Option<ThinkingDelta>,
     #[serde(default, deserialize_with = "deserialize_null_as_empty_vec")]
     tool_calls: Vec<DeltaToolCall>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ThinkingDelta {
+    #[serde(default)]
+    content: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -855,7 +904,7 @@ pub fn is_reasoning_model(model: &str) -> bool {
         || canonical.contains("thinking")
 }
 
-/// Returns true for OpenAI-compatible DeepSeek V4 models that require prior
+/// Returns true for OpenAI-compatible `DeepSeek` V4 models that require prior
 /// assistant reasoning to be echoed back as `reasoning_content` in history.
 #[must_use]
 pub fn model_requires_reasoning_content_in_history(model: &str) -> bool {
@@ -867,6 +916,7 @@ pub fn model_requires_reasoning_content_in_history(model: &str) -> bool {
 /// Strip routing prefix (e.g., "openai/gpt-4" → "gpt-4") for the wire.
 /// The prefix is used only to select transport; the backend expects the
 /// bare model id.
+#[allow(dead_code)]
 fn strip_routing_prefix(model: &str) -> &str {
     if let Some(pos) = model.find('/') {
         let prefix = &model[..pos];
@@ -882,10 +932,55 @@ fn strip_routing_prefix(model: &str) -> &str {
     }
 }
 
+fn wire_model_for_base_url<'a>(
+    model: &'a str,
+    config: OpenAiCompatConfig,
+    base_url: &str,
+) -> Cow<'a, str> {
+    let Some(pos) = model.find('/') else {
+        return Cow::Borrowed(model);
+    };
+    let prefix = &model[..pos];
+    let lowered_prefix = prefix.to_ascii_lowercase();
+
+    if lowered_prefix == "openai" {
+        let trimmed_base_url = base_url.trim_end_matches('/');
+        let default_openai = DEFAULT_OPENAI_BASE_URL.trim_end_matches('/');
+        if matches!(
+            lowered_prefix.as_str(),
+            "xai" | "grok" | "kimi" | "gemini" | "gemma"
+        ) {
+            return Cow::Borrowed(&model[pos + 1..]);
+        }
+        if config.provider_name == "OpenAI" && trimmed_base_url != default_openai {
+            // Only preserve the full slug if it's NOT a model we want to strip
+            if !model.contains("gemini") && !model.contains("gemma") {
+                return Cow::Borrowed(model);
+            }
+        }
+        return Cow::Borrowed(&model[pos + 1..]);
+    }
+
+    if matches!(lowered_prefix.as_str(), "xai" | "grok" | "qwen" | "kimi") {
+        return Cow::Borrowed(&model[pos + 1..]);
+    }
+
+    Cow::Borrowed(model)
+}
+
 /// Estimate the serialized JSON size of a request payload in bytes.
 /// This is a pre-flight check to avoid hitting provider-specific size limits.
+#[must_use]
 pub fn estimate_request_body_size(request: &MessageRequest, config: OpenAiCompatConfig) -> usize {
-    let payload = build_chat_completion_request(request, config);
+    estimate_request_body_size_for_base_url(request, config, &read_base_url(config))
+}
+
+fn estimate_request_body_size_for_base_url(
+    request: &MessageRequest,
+    config: OpenAiCompatConfig,
+    base_url: &str,
+) -> usize {
+    let payload = build_chat_completion_request_for_base_url(request, config, base_url);
     // serde_json::to_vec gives us the exact byte size of the serialized JSON
     serde_json::to_vec(&payload).map_or(0, |v| v.len())
 }
@@ -897,7 +992,15 @@ pub fn check_request_body_size(
     request: &MessageRequest,
     config: OpenAiCompatConfig,
 ) -> Result<(), ApiError> {
-    let estimated_bytes = estimate_request_body_size(request, config);
+    check_request_body_size_for_base_url(request, config, &read_base_url(config))
+}
+
+fn check_request_body_size_for_base_url(
+    request: &MessageRequest,
+    config: OpenAiCompatConfig,
+    base_url: &str,
+) -> Result<(), ApiError> {
+    let estimated_bytes = estimate_request_body_size_for_base_url(request, config, base_url);
     let max_bytes = config.max_request_body_bytes;
 
     if estimated_bytes > max_bytes {
@@ -913,9 +1016,18 @@ pub fn check_request_body_size(
 
 /// Builds a chat completion request payload from a `MessageRequest`.
 /// Public for benchmarking purposes.
+#[must_use]
 pub fn build_chat_completion_request(
     request: &MessageRequest,
     config: OpenAiCompatConfig,
+) -> Value {
+    build_chat_completion_request_for_base_url(request, config, &read_base_url(config))
+}
+
+fn build_chat_completion_request_for_base_url(
+    request: &MessageRequest,
+    config: OpenAiCompatConfig,
+    base_url: &str,
 ) -> Value {
     let mut messages = Vec::new();
     if let Some(system) = request.system.as_ref().filter(|value| !value.is_empty()) {
@@ -924,8 +1036,10 @@ pub fn build_chat_completion_request(
             "content": system,
         }));
     }
-    // Strip routing prefix (e.g., "openai/gpt-4" → "gpt-4") for the wire.
-    let wire_model = strip_routing_prefix(&request.model);
+    // Resolve the transport routing prefix into the wire model. Custom
+    // OpenAI-compatible gateways may require slash-containing slugs intact.
+    let wire_model = wire_model_for_base_url(&request.model, config, base_url);
+    let wire_model = wire_model.as_ref();
     for message in &request.messages {
         messages.extend(translate_message(message, wire_model));
     }
@@ -994,7 +1108,27 @@ pub fn build_chat_completion_request(
         payload["reasoning_effort"] = json!(effort);
     }
 
+    for (key, value) in &request.extra_body {
+        if is_protected_extra_body_key(key) {
+            continue;
+        }
+        payload[key] = value.clone();
+    }
+
     payload
+}
+
+fn is_protected_extra_body_key(key: &str) -> bool {
+    matches!(
+        key,
+        "model"
+            | "messages"
+            | "stream"
+            | "tools"
+            | "tool_choice"
+            | "max_tokens"
+            | "max_completion_tokens"
+    )
 }
 
 /// Returns true for models that do NOT support the `is_error` field in tool results.
@@ -1083,8 +1217,7 @@ pub fn translate_message(message: &InputMessage, model: &str) -> Vec<Value> {
                     }
                     Some(msg)
                 }
-                InputContentBlock::Thinking { .. } => None,
-                InputContentBlock::ToolUse { .. } => None,
+                InputContentBlock::Thinking { .. } | InputContentBlock::ToolUse { .. } => None,
             })
             .collect(),
     }
@@ -1294,18 +1427,10 @@ fn normalize_response(
             .finish_reason
             .map(|value| normalize_finish_reason(&value)),
         stop_sequence: None,
-        usage: Usage {
-            input_tokens: response
-                .usage
-                .as_ref()
-                .map_or(0, |usage| usage.prompt_tokens),
-            cache_creation_input_tokens: 0,
-            cache_read_input_tokens: 0,
-            output_tokens: response
-                .usage
-                .as_ref()
-                .map_or(0, |usage| usage.completion_tokens),
-        },
+        usage: response
+            .usage
+            .as_ref()
+            .map_or_else(Usage::default, OpenAiUsage::normalized),
         request_id: None,
     })
 }
@@ -1351,7 +1476,50 @@ fn parse_sse_frame(
             data_lines.push(data.trim_start());
         }
     }
+    // If no SSE data lines found, check if the entire frame is raw JSON (error or otherwise)
     if data_lines.is_empty() {
+        // Detect raw JSON error response (not SSE-framed)
+        if let Ok(raw) = serde_json::from_str::<serde_json::Value>(trimmed) {
+            if let Some(err_obj) = raw.get("error") {
+                let msg = err_obj
+                    .get("message")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("provider returned an error")
+                    .to_string();
+                let code = err_obj
+                    .get("code")
+                    .and_then(serde_json::Value::as_u64)
+                    .map(|c| c as u16);
+                let status = reqwest::StatusCode::from_u16(code.unwrap_or(500))
+                    .unwrap_or(reqwest::StatusCode::INTERNAL_SERVER_ERROR);
+                return Err(ApiError::Api {
+                    status,
+                    error_type: err_obj
+                        .get("type")
+                        .and_then(|t| t.as_str())
+                        .map(str::to_owned),
+                    message: Some(msg),
+                    request_id: None,
+                    body: trimmed.chars().take(500).collect(),
+                    retryable: false,
+                    suggested_action: suggested_action_for_status(status),
+                });
+            }
+        }
+        // Detect HTML responses
+        if trimmed.starts_with('<') || trimmed.starts_with("<!") {
+            return Err(ApiError::Api {
+                status: reqwest::StatusCode::BAD_REQUEST,
+                error_type: Some("invalid_response".to_string()),
+                message: Some(
+                    "provider returned HTML instead of JSON (check endpoint URL)".to_string(),
+                ),
+                request_id: None,
+                body: trimmed.chars().take(200).collect(),
+                retryable: false,
+                suggested_action: Some("verify the API endpoint URL is correct".to_string()),
+            });
+        }
         return Ok(None);
     }
     let payload = data_lines.join("\n");
@@ -1387,6 +1555,21 @@ fn parse_sse_frame(
                 suggested_action: suggested_action_for_status(status),
             });
         }
+    }
+    // Detect HTML or other non-JSON responses early for better error messages
+    let trimmed_payload = payload.trim();
+    if trimmed_payload.starts_with('<') || trimmed_payload.starts_with("<!") {
+        return Err(ApiError::Api {
+            status: reqwest::StatusCode::BAD_REQUEST,
+            error_type: Some("invalid_response".to_string()),
+            message: Some(
+                "provider returned HTML instead of JSON (check endpoint URL)".to_string(),
+            ),
+            request_id: None,
+            body: payload.chars().take(200).collect(),
+            retryable: false,
+            suggested_action: Some("verify the API endpoint URL is correct".to_string()),
+        });
     }
     serde_json::from_str::<ChatCompletionChunk>(&payload)
         .map(Some)
@@ -1515,6 +1698,7 @@ mod tests {
         ToolChoice, ToolDefinition, ToolResultContentBlock,
     };
     use serde_json::json;
+    use std::collections::BTreeMap;
     use std::sync::{Mutex, OnceLock};
 
     #[test]
@@ -1673,6 +1857,7 @@ mod tests {
                     delta: super::ChunkDelta {
                         content: None,
                         reasoning_content: Some("think".to_string()),
+                        thinking: None,
                         tool_calls: Vec::new(),
                     },
                     finish_reason: None,
@@ -1689,6 +1874,7 @@ mod tests {
                         delta: super::ChunkDelta {
                             content: Some(" answer".to_string()),
                             reasoning_content: None,
+                            thinking: None,
                             tool_calls: Vec::new(),
                         },
                         finish_reason: Some("stop".to_string()),
@@ -1949,6 +2135,7 @@ mod tests {
             presence_penalty: Some(0.3),
             stop: Some(vec!["\n".to_string()]),
             reasoning_effort: None,
+            extra_body: BTreeMap::new(),
         };
         let payload = build_chat_completion_request(&request, OpenAiCompatConfig::openai());
         assert_eq!(payload["temperature"], 0.7);
@@ -1956,6 +2143,39 @@ mod tests {
         assert_eq!(payload["frequency_penalty"], 0.5);
         assert_eq!(payload["presence_penalty"], 0.3);
         assert_eq!(payload["stop"], json!(["\n"]));
+    }
+
+    #[test]
+    fn extra_body_params_are_passed_through_without_overriding_core_fields() {
+        let mut extra_body = BTreeMap::new();
+        extra_body.insert(
+            "web_search_options".to_string(),
+            json!({"search_context_size": "medium"}),
+        );
+        extra_body.insert("parallel_tool_calls".to_string(), json!(false));
+        extra_body.insert("model".to_string(), json!("bad-override"));
+        extra_body.insert("messages".to_string(), json!([]));
+        extra_body.insert("max_tokens".to_string(), json!(1));
+
+        let payload = build_chat_completion_request(
+            &MessageRequest {
+                model: "gpt-4o".to_string(),
+                max_tokens: 1024,
+                messages: vec![InputMessage::user_text("hello")],
+                extra_body,
+                ..Default::default()
+            },
+            OpenAiCompatConfig::openai(),
+        );
+
+        assert_eq!(payload["model"], json!("gpt-4o"));
+        assert_eq!(payload["max_tokens"], json!(1024));
+        assert_eq!(payload["messages"].as_array().map(Vec::len), Some(1));
+        assert_eq!(
+            payload["web_search_options"],
+            json!({"search_context_size": "medium"})
+        );
+        assert_eq!(payload["parallel_tool_calls"], json!(false));
     }
 
     #[test]

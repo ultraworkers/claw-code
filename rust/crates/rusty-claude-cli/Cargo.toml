@@ -23,6 +23,8 @@ serde_json.workspace = true
 syntect = "5"
 tokio = { version = "1", features = ["rt-multi-thread", "signal", "time"] }
 tools = { path = "../tools" }
+log = "0.4"
+
 
 [lints]
 workspace = true

@@ -108,10 +108,18 @@ pub fn compact_session(session: &Session, config: CompactionConfig) -> Compactio
         .first()
         .and_then(extract_existing_compacted_summary);
     let compacted_prefix_len = usize::from(existing_summary.is_some());
-    let raw_keep_from = session
-        .messages
-        .len()
-        .saturating_sub(config.preserve_recent_messages);
+    // When preserve_recent_messages is 0, the caller wants maximum compaction
+    // (no recent messages preserved). Without this guard, saturating_sub(0)
+    // returns messages.len(), which later indexes past the end of the array
+    // at session.messages[k] because keep_from == messages.len() is out of bounds.
+    let raw_keep_from = if config.preserve_recent_messages == 0 {
+        session.messages.len()
+    } else {
+        session
+            .messages
+            .len()
+            .saturating_sub(config.preserve_recent_messages)
+    };
     // Ensure we do not split a tool-use / tool-result pair at the compaction
     // boundary. If the first preserved message is a user message whose first
     // block is a ToolResult, the assistant message with the matching ToolUse
@@ -128,7 +136,7 @@ pub fn compact_session(session: &Session, config: CompactionConfig) -> Compactio
         // is NOT an assistant message that contains a ToolUse block (i.e. the
         // pair is actually broken at the boundary).
         loop {
-            if k == 0 || k <= compacted_prefix_len {
+            if k == 0 || k <= compacted_prefix_len || k >= session.messages.len() {
                 break;
             }
             let first_preserved = &session.messages[k];
@@ -212,8 +220,7 @@ fn summarize_messages(messages: &[ConversationMessage]) -> String {
         .filter_map(|block| match block {
             ContentBlock::ToolUse { name, .. } => Some(name.as_str()),
             ContentBlock::ToolResult { tool_name, .. } => Some(tool_name.as_str()),
-            ContentBlock::Text { .. } => None,
-            ContentBlock::Thinking { .. } => None,
+            ContentBlock::Text { .. } | ContentBlock::Thinking { .. } => None,
         })
         .collect::<Vec<_>>();
     tool_names.sort_unstable();
@@ -292,12 +299,14 @@ fn merge_compact_summaries(existing_summary: Option<&str>, new_summary: &str) ->
 
     let mut lines = vec!["<summary>".to_string(), "Conversation summary:".to_string()];
 
+    // Flatten prior highlights directly — do NOT re-nest them under
+    // "- Previously compacted context:" or the nesting compounds with each
+    // compaction cycle, inflating the summary by ~depth * overhead per turn.
     if !previous_highlights.is_empty() {
-        lines.push("- Previously compacted context:".to_string());
         lines.extend(
             previous_highlights
                 .into_iter()
-                .map(|line| format!("  {line}")),
+                .map(|line| format!("- {line}")),
         );
     }
 
@@ -679,7 +688,9 @@ mod tests {
         second_session.messages = follow_up_messages;
         let second = compact_session(&second_session, config);
 
-        assert!(second
+        // "Previously compacted context:" header is intentionally flattened
+        // (no re-nesting) to avoid summary inflation on repeated compaction.
+        assert!(!second
             .formatted_summary
             .contains("Previously compacted context:"));
         assert!(second
@@ -694,7 +705,7 @@ mod tests {
         assert!(matches!(
             &second.compacted_session.messages[0].blocks[0],
             ContentBlock::Text { text }
-                if text.contains("Previously compacted context:")
+                if !text.contains("Previously compacted context:")
                     && text.contains("Newly compacted context:")
         ));
         assert!(matches!(

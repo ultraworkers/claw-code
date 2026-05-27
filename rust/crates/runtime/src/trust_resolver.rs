@@ -438,13 +438,24 @@ fn normalize_path(path: &Path) -> PathBuf {
 /// Extract repository name from a path for event context.
 fn extract_repo_name(cwd: &str) -> Option<String> {
     let path = Path::new(cwd);
-    // Try to find a .git directory to identify repo root
-    let mut current = Some(path);
-    while let Some(p) = current {
-        if p.join(".git").is_dir() {
-            return p.file_name().map(|n| n.to_string_lossy().to_string());
+    // Ask git from the cwd itself. Walking ancestors manually can accidentally
+    // classify synthetic/nonexistent paths as an unrelated parent repo (for
+    // example `/tmp/.git`), which makes trust events point at the wrong repo.
+    if path.is_dir() {
+        if let Ok(output) = std::process::Command::new("git")
+            .args(["rev-parse", "--show-toplevel"])
+            .current_dir(path)
+            .output()
+        {
+            if output.status.success() {
+                let root = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if !root.is_empty() {
+                    return Path::new(&root)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string());
+                }
+            }
         }
-        current = p.parent();
     }
     // Fallback: use the last component of the path
     path.file_name().map(|n| n.to_string_lossy().to_string())

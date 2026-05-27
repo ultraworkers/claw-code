@@ -1,7 +1,22 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fmt::{Display, Formatter};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+
+/// Process-lifetime set of already-emitted config deprecation warning strings.
+/// Prevents duplicate warnings when `ConfigLoader::load()` is called multiple
+/// times within a single CLI invocation. (ROADMAP #698)
+static EMITTED_CONFIG_WARNINGS: std::sync::OnceLock<Mutex<HashSet<String>>> =
+    std::sync::OnceLock::new();
+
+fn emit_config_warning_once(warning: &str) {
+    let set = EMITTED_CONFIG_WARNINGS.get_or_init(|| Mutex::new(HashSet::new()));
+    let mut guard = set.lock().unwrap_or_else(|e| e.into_inner());
+    if guard.insert(warning.to_string()) {
+        eprintln!("warning: {warning}");
+    }
+}
 
 use crate::json::JsonValue;
 use crate::sandbox::{FilesystemIsolationMode, SandboxConfig};
@@ -90,6 +105,10 @@ pub struct RuntimePermissionRuleConfig {
     allow: Vec<String>,
     deny: Vec<String>,
     ask: Vec<String>,
+    /// #159: simple tool-name denials parsed from the `deniedTools` config field.
+    /// Unlike the `deny` rules (pattern-based), `denied_tools` is a flat list of
+    /// tool names that are unconditionally denied regardless of permission mode.
+    denied_tools: Vec<String>,
 }
 
 /// Collection of configured MCP servers after scope-aware merging.
@@ -101,6 +120,7 @@ pub struct McpConfigCollection {
 /// MCP server config paired with the scope that defined it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScopedMcpServerConfig {
+    pub required: bool,
     pub scope: ConfigSource,
     pub config: McpServerConfig,
 }
@@ -197,7 +217,10 @@ impl Display for ConfigError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Io(error) => write!(f, "{error}"),
-            Self::Parse(error) => write!(f, "{error}"),
+            Self::Parse(error) => write!(
+                f,
+                "{error}\nFix: open the file shown above and correct the JSON syntax, then retry."
+            ),
         }
     }
 }
@@ -296,7 +319,7 @@ impl ConfigLoader {
         }
 
         for warning in &all_warnings {
-            eprintln!("warning: {warning}");
+            emit_config_warning_once(&warning.to_string());
         }
 
         let merged_value = JsonValue::Object(merged.clone());
@@ -322,6 +345,70 @@ impl ConfigLoader {
             loaded_entries,
             feature_config,
         })
+    }
+
+    /// Like [`load`] but also returns the list of validation warnings collected during
+    /// loading, without emitting them to stderr. Callers that want to surface warnings
+    /// through a structured channel (e.g. the JSON config envelope) should use this.
+    /// #773: enables JSON-mode callers to include `warnings` in their output envelope
+    /// instead of receiving unstructured text on stderr.
+    pub fn load_collecting_warnings(&self) -> Result<(RuntimeConfig, Vec<String>), ConfigError> {
+        let mut merged = BTreeMap::new();
+        let mut loaded_entries = Vec::new();
+        let mut mcp_servers = BTreeMap::new();
+        let mut all_warnings: Vec<String> = Vec::new();
+
+        for entry in self.discover() {
+            crate::config_validate::check_unsupported_format(&entry.path)?;
+            let Some(parsed) = read_optional_json_object(&entry.path)? else {
+                continue;
+            };
+            let validation = crate::config_validate::validate_config_file(
+                &parsed.object,
+                &parsed.source,
+                &entry.path,
+            );
+            if !validation.is_ok() {
+                let first_error = &validation.errors[0];
+                return Err(ConfigError::Parse(first_error.to_string()));
+            }
+            all_warnings.extend(validation.warnings.iter().map(|w| w.to_string()));
+            validate_optional_hooks_config(&parsed.object, &entry.path)?;
+            merge_mcp_servers(&mut mcp_servers, entry.source, &parsed.object, &entry.path)?;
+            deep_merge_objects(&mut merged, &parsed.object);
+            loaded_entries.push(entry);
+        }
+
+        // Still emit to stderr for non-JSON callers that go through the normal load() path;
+        // here we just *also* return them so callers can surface them structurally.
+        for warning in &all_warnings {
+            emit_config_warning_once(warning);
+        }
+
+        let merged_value = JsonValue::Object(merged.clone());
+
+        let feature_config = RuntimeFeatureConfig {
+            hooks: parse_optional_hooks_config(&merged_value)?,
+            plugins: parse_optional_plugin_config(&merged_value)?,
+            mcp: McpConfigCollection {
+                servers: mcp_servers,
+            },
+            oauth: parse_optional_oauth_config(&merged_value, "merged settings.oauth")?,
+            model: parse_optional_model(&merged_value),
+            aliases: parse_optional_aliases(&merged_value)?,
+            permission_mode: parse_optional_permission_mode(&merged_value)?,
+            permission_rules: parse_optional_permission_rules(&merged_value)?,
+            sandbox: parse_optional_sandbox_config(&merged_value)?,
+            provider_fallbacks: parse_optional_provider_fallbacks(&merged_value)?,
+            trusted_roots: parse_optional_trusted_roots(&merged_value)?,
+        };
+
+        let config = RuntimeConfig {
+            merged,
+            loaded_entries,
+            feature_config,
+        };
+        Ok((config, all_warnings))
     }
 }
 
@@ -414,6 +501,17 @@ impl RuntimeConfig {
     pub fn trusted_roots(&self) -> &[String] {
         &self.feature_config.trusted_roots
     }
+
+    /// Merge config-level default trusted roots with per-call roots.
+    ///
+    /// Config roots are defaults and are kept first; per-call roots extend the
+    /// allowlist for a specific worker/session creation request. Duplicates are
+    /// removed without reordering the first occurrence so evidence remains
+    /// deterministic while avoiding repeated trust checks.
+    #[must_use]
+    pub fn trusted_roots_with_overrides(&self, per_call_roots: &[String]) -> Vec<String> {
+        merge_trusted_roots(self.trusted_roots(), per_call_roots)
+    }
 }
 
 impl RuntimeFeatureConfig {
@@ -483,6 +581,22 @@ impl RuntimeFeatureConfig {
     pub fn trusted_roots(&self) -> &[String] {
         &self.trusted_roots
     }
+
+    /// Merge this config's default trusted roots with per-call roots.
+    #[must_use]
+    pub fn trusted_roots_with_overrides(&self, per_call_roots: &[String]) -> Vec<String> {
+        merge_trusted_roots(self.trusted_roots(), per_call_roots)
+    }
+}
+
+fn merge_trusted_roots(config_roots: &[String], per_call_roots: &[String]) -> Vec<String> {
+    let mut merged = Vec::with_capacity(config_roots.len() + per_call_roots.len());
+    for root in config_roots.iter().chain(per_call_roots.iter()) {
+        if !merged.contains(root) {
+            merged.push(root.clone());
+        }
+    }
+    merged
 }
 
 impl ProviderFallbackConfig {
@@ -564,6 +678,104 @@ pub fn default_config_home() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(".claw"))
 }
 
+/// Save provider settings to the user-level `~/.claw/settings.json`.
+/// Creates the file and directory if they don't exist. Sets file permissions
+/// to `0o600` (owner read/write only) to protect stored API keys.
+pub fn save_user_provider_settings(
+    kind: &str,
+    api_key: &str,
+    base_url: Option<&str>,
+    model: Option<&str>,
+) -> Result<(), ConfigError> {
+    let config_home = default_config_home();
+    fs::create_dir_all(&config_home).map_err(ConfigError::Io)?;
+    let settings_path = config_home.join("settings.json");
+
+    let mut root = read_settings_root(&settings_path);
+
+    let mut provider = serde_json::Map::new();
+    provider.insert(
+        "kind".to_string(),
+        serde_json::Value::String(kind.to_string()),
+    );
+    provider.insert(
+        "apiKey".to_string(),
+        serde_json::Value::String(api_key.to_string()),
+    );
+    if let Some(base_url) = base_url {
+        provider.insert(
+            "baseUrl".to_string(),
+            serde_json::Value::String(base_url.to_string()),
+        );
+    } else {
+        provider.remove("baseUrl");
+    }
+    root.insert("provider".to_string(), serde_json::Value::Object(provider));
+    if let Some(model) = model {
+        root.insert(
+            "model".to_string(),
+            serde_json::Value::String(model.to_string()),
+        );
+    } else {
+        root.remove("model");
+    }
+
+    write_settings_root(&settings_path, &root)?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o600);
+        fs::set_permissions(&settings_path, perms).map_err(ConfigError::Io)?;
+    }
+
+    Ok(())
+}
+
+/// Remove the `provider` section from the user-level `~/.claw/settings.json`.
+pub fn clear_user_provider_settings() -> Result<(), ConfigError> {
+    let config_home = default_config_home();
+    let settings_path = config_home.join("settings.json");
+
+    if !settings_path.exists() {
+        return Ok(());
+    }
+
+    let mut root = read_settings_root(&settings_path);
+    if root.remove("provider").is_none() {
+        return Ok(());
+    }
+    root.remove("model");
+
+    write_settings_root(&settings_path, &root)?;
+
+    Ok(())
+}
+
+fn read_settings_root(path: &Path) -> serde_json::Map<String, serde_json::Value> {
+    match fs::read_to_string(path) {
+        Ok(contents) if !contents.trim().is_empty() => {
+            serde_json::from_str::<serde_json::Value>(&contents)
+                .ok()
+                .and_then(|v| v.as_object().cloned())
+                .unwrap_or_default()
+        }
+        _ => serde_json::Map::new(),
+    }
+}
+
+fn write_settings_root(
+    path: &Path,
+    root: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), ConfigError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(ConfigError::Io)?;
+    }
+    let rendered = serde_json::to_string_pretty(&serde_json::Value::Object(root.clone()))
+        .map_err(|e| ConfigError::Parse(e.to_string()))?;
+    fs::write(path, format!("{rendered}\n")).map_err(ConfigError::Io)
+}
+
 impl RuntimeHookConfig {
     #[must_use]
     pub fn new(
@@ -612,8 +824,18 @@ impl RuntimeHookConfig {
 
 impl RuntimePermissionRuleConfig {
     #[must_use]
-    pub fn new(allow: Vec<String>, deny: Vec<String>, ask: Vec<String>) -> Self {
-        Self { allow, deny, ask }
+    pub fn new(
+        allow: Vec<String>,
+        deny: Vec<String>,
+        ask: Vec<String>,
+        denied_tools: Vec<String>,
+    ) -> Self {
+        Self {
+            allow,
+            deny,
+            ask,
+            denied_tools,
+        }
     }
 
     #[must_use]
@@ -629,6 +851,11 @@ impl RuntimePermissionRuleConfig {
     #[must_use]
     pub fn ask(&self) -> &[String] {
         &self.ask
+    }
+
+    #[must_use]
+    pub fn denied_tools(&self) -> &[String] {
+        &self.denied_tools
     }
 }
 
@@ -725,6 +952,12 @@ fn merge_mcp_servers(
         target.insert(
             name.clone(),
             ScopedMcpServerConfig {
+                required: optional_bool(
+                    expect_object(value, &format!("{}: mcpServers.{name}", path.display()))?,
+                    "required",
+                    &format!("{}: mcpServers.{name}", path.display()),
+                )?
+                .unwrap_or(false),
                 scope: source,
                 config: parsed,
             },
@@ -794,6 +1027,12 @@ fn parse_optional_permission_rules(
             .unwrap_or_default(),
         ask: optional_string_array(permissions, "ask", "merged settings.permissions")?
             .unwrap_or_default(),
+        denied_tools: optional_string_array(
+            permissions,
+            "deniedTools",
+            "merged settings.permissions",
+        )?
+        .unwrap_or_default(),
     })
 }
 
@@ -1245,8 +1484,8 @@ fn push_unique(target: &mut Vec<String>, value: String) {
 mod tests {
     use super::{
         deep_merge_objects, parse_permission_mode_label, ConfigLoader, ConfigSource,
-        McpServerConfig, McpTransport, ResolvedPermissionMode, RuntimeHookConfig,
-        RuntimePluginConfig, CLAW_SETTINGS_SCHEMA_NAME,
+        McpServerConfig, McpTransport, ResolvedPermissionMode, RuntimeFeatureConfig,
+        RuntimeHookConfig, RuntimePluginConfig, CLAW_SETTINGS_SCHEMA_NAME,
     };
     use crate::json::JsonValue;
     use crate::sandbox::FilesystemIsolationMode;
@@ -1503,6 +1742,51 @@ mod tests {
     }
 
     #[test]
+    fn trusted_roots_with_overrides_preserves_config_defaults_and_adds_per_call_roots() {
+        // given
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&cwd).expect("project dir");
+        fs::write(
+            home.join("settings.json"),
+            r#"{"trustedRoots": ["/tmp/config-default", "/tmp/shared"]}"#,
+        )
+        .expect("write settings");
+
+        // when
+        let loaded = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("config should load");
+        let merged = loaded.trusted_roots_with_overrides(&[
+            "/tmp/per-call".to_string(),
+            "/tmp/shared".to_string(),
+        ]);
+
+        // then
+        assert_eq!(
+            merged,
+            ["/tmp/config-default", "/tmp/shared", "/tmp/per-call"]
+        );
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn runtime_feature_trusted_roots_with_overrides_matches_runtime_config_merge() {
+        let config = RuntimeFeatureConfig {
+            trusted_roots: vec!["/tmp/config".to_string()],
+            ..RuntimeFeatureConfig::default()
+        };
+
+        assert_eq!(
+            config.trusted_roots_with_overrides(&["/tmp/per-call".to_string()]),
+            ["/tmp/config", "/tmp/per-call"]
+        );
+    }
+
+    #[test]
     fn trusted_roots_default_is_empty_when_unset() {
         // given
         let root = temp_dir();
@@ -1538,7 +1822,8 @@ mod tests {
                 "stdio-server": {
                   "command": "uvx",
                   "args": ["mcp-server"],
-                  "env": {"TOKEN": "secret"}
+                  "env": {"TOKEN": "secret"},
+                  "required": true
                 },
                 "remote-server": {
                   "type": "http",
@@ -1587,6 +1872,7 @@ mod tests {
             .get("stdio-server")
             .expect("stdio server should exist");
         assert_eq!(stdio_server.scope, ConfigSource::User);
+        assert!(stdio_server.required);
         assert_eq!(stdio_server.transport(), McpTransport::Stdio);
 
         let remote_server = loaded
@@ -1594,6 +1880,7 @@ mod tests {
             .get("remote-server")
             .expect("remote server should exist");
         assert_eq!(remote_server.scope, ConfigSource::Local);
+        assert!(!remote_server.required);
         assert_eq!(remote_server.transport(), McpTransport::Ws);
         match &remote_server.config {
             McpServerConfig::Ws(config) => {

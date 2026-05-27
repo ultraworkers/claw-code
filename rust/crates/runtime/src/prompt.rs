@@ -42,6 +42,7 @@ pub const SYSTEM_PROMPT_DYNAMIC_BOUNDARY: &str = "__SYSTEM_PROMPT_DYNAMIC_BOUNDA
 pub const FRONTIER_MODEL_NAME: &str = "Claude Opus 4.6";
 const MAX_INSTRUCTION_FILE_CHARS: usize = 4_000;
 const MAX_TOTAL_INSTRUCTION_CHARS: usize = 12_000;
+const MAX_GIT_DIFF_CHARS: usize = 50_000;
 
 /// Neutral identity for the model family line in generated prompts.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -295,8 +296,20 @@ fn read_git_diff(cwd: &Path) -> Option<String> {
     if sections.is_empty() {
         None
     } else {
-        Some(sections.join("\n\n"))
+        Some(truncate_diff(sections.join("\n\n")))
     }
+}
+
+fn truncate_diff(mut diff: String) -> String {
+    if diff.len() > MAX_GIT_DIFF_CHARS {
+        let mut end = MAX_GIT_DIFF_CHARS;
+        while !diff.is_char_boundary(end) {
+            end -= 1;
+        }
+        diff.truncate(end);
+        diff.push_str("\n\n... [diff truncated — too large for system prompt]");
+    }
+    diff
 }
 
 fn read_git_output(cwd: &Path, args: &[&str]) -> Option<String> {
@@ -549,9 +562,9 @@ fn get_actions_section() -> String {
 mod tests {
     use super::{
         collapse_blank_lines, display_context_path, normalize_instruction_content,
-        render_instruction_content, render_instruction_files, truncate_instruction_content,
-        ContextFile, ModelFamilyIdentity, ProjectContext, SystemPromptBuilder,
-        SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
+        render_instruction_content, render_instruction_files, truncate_diff,
+        truncate_instruction_content, ContextFile, ModelFamilyIdentity, ProjectContext,
+        SystemPromptBuilder, MAX_GIT_DIFF_CHARS, SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
     };
     use crate::config::ConfigLoader;
     use std::fs;
@@ -980,5 +993,47 @@ mod tests {
         assert!(rendered.contains("# Claude instructions"));
         assert!(rendered.contains("scope: /tmp/project"));
         assert!(rendered.contains("Project rules"));
+    }
+
+    #[test]
+    fn truncate_diff_preserves_short_content() {
+        let short = "a".repeat(1_000);
+        let result = truncate_diff(short.clone());
+        assert_eq!(result, short);
+        assert!(!result.contains("[diff truncated"));
+    }
+
+    #[test]
+    fn truncate_diff_caps_oversized_content() {
+        let large = "x".repeat(MAX_GIT_DIFF_CHARS + 5_000);
+        let result = truncate_diff(large);
+        assert!(result.contains("... [diff truncated — too large for system prompt]"));
+        // The body before the marker must be at most MAX_GIT_DIFF_CHARS bytes
+        let marker = "\n\n... [diff truncated — too large for system prompt]";
+        let body_len = result.len() - marker.len();
+        assert!(body_len <= MAX_GIT_DIFF_CHARS);
+    }
+
+    #[test]
+    fn truncate_diff_respects_utf8_char_boundaries() {
+        // Build a string where MAX_GIT_DIFF_CHARS falls in the middle of a
+        // multi-byte character (U+1F600 = 4 bytes in UTF-8).
+        let prefix_len = MAX_GIT_DIFF_CHARS - 2;
+        let mut input = "a".repeat(prefix_len);
+        // Append a 4-byte emoji so bytes [prefix_len..prefix_len+4] are the
+        // emoji.  MAX_GIT_DIFF_CHARS lands at prefix_len+2, inside the emoji.
+        input.push('\u{1F600}');
+        input.push_str(&"b".repeat(10_000));
+
+        let result = truncate_diff(input);
+        // Must be valid UTF-8 (the fact that we have a String proves this, but
+        // let's also verify the truncation marker is present).
+        assert!(result.contains("[diff truncated"));
+        // The body (before marker) should end before the emoji since cutting
+        // inside it would be invalid UTF-8.
+        let marker = "\n\n... [diff truncated — too large for system prompt]";
+        let body = &result[..result.len() - marker.len()];
+        assert!(body.len() <= MAX_GIT_DIFF_CHARS);
+        assert!(body.is_char_boundary(body.len()));
     }
 }
