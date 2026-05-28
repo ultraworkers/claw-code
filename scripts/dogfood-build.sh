@@ -13,6 +13,24 @@
 #
 set -euo pipefail
 
+usage() {
+    sed -n '2,12p' "$0" | sed 's/^# //; s/^#//'
+}
+
+if [[ $# -gt 0 ]]; then
+    case "$1" in
+        --help|-h)
+            usage
+            exit 0
+            ;;
+        *)
+            echo "error: unknown argument: $1" >&2
+            usage >&2
+            exit 2
+            ;;
+    esac
+fi
+
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RUST_DIR="$REPO_ROOT/rust"
 BINARY="$RUST_DIR/target/debug/claw"
