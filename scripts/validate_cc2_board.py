@@ -49,6 +49,9 @@ def main() -> int:
     except FileNotFoundError:
         print(f"error: board not found at {board_path}")
         return 1
+    except IsADirectoryError:
+        print(f"error: board path is a directory: {board_path}")
+        return 1
     except json.JSONDecodeError as exc:
         print(f"error: invalid board JSON at {board_path}: {exc}")
         return 1
