@@ -55,8 +55,15 @@ REQUIRED_ITEM_FIELDS = [
 
 
 def load_board(path: Path) -> dict[str, Any]:
-    with path.open() as f:
-        board = json.load(f)
+    try:
+        with path.open() as f:
+            board = json.load(f)
+    except FileNotFoundError:
+        raise ValueError(f"board not found at {path}") from None
+    except IsADirectoryError:
+        raise ValueError(f"board path is a directory: {path}") from None
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"invalid board JSON at {path}: {exc}") from None
     if not isinstance(board, dict):
         raise ValueError("board JSON root must be an object")
     items = board.get("items")
@@ -226,7 +233,11 @@ def main() -> int:
     parser.add_argument("--check", action="store_true", help="fail if board_md is not up to date")
     args = parser.parse_args()
 
-    board = load_board(args.board_json)
+    try:
+        board = load_board(args.board_json)
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
     errors = validate_board(board)
     if errors:
         for error in errors:
@@ -234,14 +245,22 @@ def main() -> int:
         return 1
     rendered = render(board)
     if args.check:
-        existing = args.board_md.read_text() if args.board_md.exists() else ""
+        try:
+            existing = args.board_md.read_text() if args.board_md.exists() else ""
+        except IsADirectoryError:
+            print(f"ERROR: board markdown path is a directory: {args.board_md}", file=sys.stderr)
+            return 1
         if existing != rendered:
             print(f"ERROR: {args.board_md} is not up to date", file=sys.stderr)
             return 1
         print(f"PASS: {args.board_md} is up to date and roadmap coverage is complete")
         return 0
     args.board_md.parent.mkdir(parents=True, exist_ok=True)
-    args.board_md.write_text(rendered)
+    try:
+        args.board_md.write_text(rendered)
+    except IsADirectoryError:
+        print(f"ERROR: board markdown path is a directory: {args.board_md}", file=sys.stderr)
+        return 1
     print(f"wrote {args.board_md}")
     return 0
 
