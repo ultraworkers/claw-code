@@ -78,7 +78,7 @@ echo "  export CLAW=$BINARY" >&2
 echo "" >&2
 echo "  Dogfood with isolated config (no real user config on stderr):" >&2
 echo "    CLAW_ISOLATED=\$(mktemp -d)" >&2
-echo "    trap 'rm -rf "\$CLAW_ISOLATED"' EXIT" >&2
+echo "    trap 'rm -rf \"\$CLAW_ISOLATED\"' EXIT" >&2
 echo "    CLAW_CONFIG_HOME=\$CLAW_ISOLATED \$CLAW plugins list --output-format json" >&2
 echo "" >&2
 echo "  cargo run overhead: ~1s/invocation vs 7ms for pre-built binary." >&2
