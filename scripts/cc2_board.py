@@ -16,6 +16,16 @@ def run(cmd: list[str], cwd: Path) -> int:
     return subprocess.run(cmd, cwd=str(cwd)).returncode
 
 
+def run_quiet_until_failure(cmd: list[str], cwd: Path) -> int:
+    result = subprocess.run(cmd, cwd=str(cwd), text=True, capture_output=True)
+    if result.returncode:
+        if result.stdout:
+            print(result.stdout, end="")
+        if result.stderr:
+            print(result.stderr, end="", file=sys.stderr)
+    return result.returncode
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=["generate", "validate"])
@@ -45,7 +55,7 @@ def main(argv: list[str] | None = None) -> int:
         [sys.executable, str(renderer), str(board_json), str(board_md), "--check"],
     ]
     for cmd in checks:
-        rc = run(cmd, repo_root)
+        rc = run_quiet_until_failure(cmd, repo_root)
         if rc:
             return rc
     print(f"CC2 board validation PASS: {board_json} and {board_md} are canonical and in sync")
