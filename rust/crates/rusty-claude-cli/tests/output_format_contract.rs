@@ -1751,8 +1751,9 @@ fn flag_value_errors_have_error_kind_and_hint_756() {
         .filter(|l| l.starts_with('{'))
         .collect::<Vec<_>>()
         .join("");
-    let parsed: serde_json::Value = serde_json::from_str(&raw)
-        .unwrap_or_else(|_| panic!("invalid --reasoning-effort must emit JSON to stdout; got: {raw}"));
+    let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap_or_else(|_| {
+        panic!("invalid --reasoning-effort must emit JSON to stdout; got: {raw}")
+    });
     assert_eq!(
         parsed["error_kind"], "invalid_flag_value",
         "invalid --reasoning-effort must be invalid_flag_value (#756): {parsed}"
@@ -2074,7 +2075,7 @@ fn config_parse_error_has_typed_error_kind_and_hint_764() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     let stdout = String::from_utf8_lossy(&output.stdout);
-        let json_line = stdout
+    let json_line = stdout
         .lines()
         .find(|l| l.trim_start().starts_with('{'))
         .expect("stdout should contain a JSON error envelope (#819/#820/#823: abort envelopes route to stdout in JSON mode)");
@@ -2108,8 +2109,8 @@ fn login_logout_removed_subcommands_have_error_kind_and_hint_765() {
         );
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-                let json_line = stdout
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let json_line = stdout
             .lines()
             .find(|l| l.trim_start().starts_with('{'))
             .unwrap_or_else(|| panic!("claw {subcmd} stdout should contain a JSON envelope (#819/#820/#823: abort envelopes route to stdout in JSON mode)"));
@@ -2249,7 +2250,7 @@ fn resume_non_slash_trailing_arg_has_typed_error_kind_and_hint_768() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     let stdout = String::from_utf8_lossy(&output.stdout);
-        let json_line = stdout
+    let json_line = stdout
         .lines()
         .find(|l| l.trim_start().starts_with('{'))
         .expect("stdout should contain a JSON error envelope (#819/#820/#823: abort envelopes route to stdout in JSON mode)");
@@ -2288,8 +2289,8 @@ fn session_with_unknown_subcommand_returns_interactive_only_not_credentials_767(
         );
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-                let json_line = stdout
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let json_line = stdout
             .lines()
             .find(|l| l.trim_start().starts_with('{'))
             .unwrap_or_else(|| panic!("claw session {sub} stderr should contain JSON"));
@@ -2343,8 +2344,8 @@ fn slash_only_verbs_with_args_return_interactive_only_not_credentials_770() {
         );
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-                let json_line = stdout
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let json_line = stdout
             .lines()
             .find(|l| l.trim_start().starts_with('{'))
             .unwrap_or_else(|| {
@@ -2385,8 +2386,8 @@ fn agents_plugins_mcp_unknown_subcommand_have_hint_774() {
         assert!(!output.status.success(), "agents bogus should fail");
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-                let json_line = stdout
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let json_line = stdout
             .lines()
             .find(|l| l.trim_start().starts_with('{'))
             .expect("agents bogus should emit JSON error");
@@ -2409,8 +2410,8 @@ fn agents_plugins_mcp_unknown_subcommand_have_hint_774() {
         assert!(!output.status.success(), "plugins bogus should fail");
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-                let json_line = stdout
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let json_line = stdout
             .lines()
             .find(|l| l.trim_start().starts_with('{'))
             .expect("plugins bogus should emit JSON error");
@@ -2429,7 +2430,7 @@ fn agents_plugins_mcp_unknown_subcommand_have_hint_774() {
         assert!(!output.status.success(), "mcp bogus should fail");
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
-    let stdout = String::from_utf8_lossy(&output.stdout);
+        let stdout = String::from_utf8_lossy(&output.stdout);
         let json_str = if stdout.trim().starts_with('{') {
             stdout.to_string()
         } else {
@@ -2490,8 +2491,8 @@ fn interactive_only_guard_batch_769_to_771() {
         );
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-                let json_line = stdout
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let json_line = stdout
             .lines()
             .find(|l| l.trim_start().starts_with('{'))
             .unwrap_or_else(|| {
@@ -2554,8 +2555,8 @@ fn resume_plugin_mutations_are_typed_interactive_only_777() {
         );
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-                let json_line = stdout
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let json_line = stdout
             .lines()
             .find(|l| l.trim_start().starts_with('{'))
             .unwrap_or_else(|| {
@@ -2612,7 +2613,7 @@ fn resume_skills_invocation_is_typed_interactive_only_779() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     let stdout = String::from_utf8_lossy(&output.stdout);
-        let json_line = stdout
+    let json_line = stdout
         .lines()
         .find(|l| l.trim_start().starts_with('{'))
         .unwrap_or_else(|| {
@@ -2653,7 +2654,7 @@ fn acp_unsupported_invocation_has_hint_782() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     let stdout = String::from_utf8_lossy(&output.stdout);
-        let json_line = stdout
+    let json_line = stdout
         .lines()
         .find(|l| l.trim_start().starts_with('{'))
         .expect("should emit JSON error");

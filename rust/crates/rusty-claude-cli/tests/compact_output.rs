@@ -266,13 +266,15 @@ fn compact_subcommand_json_help_fails_fast_when_stdin_closed() {
         !output.status.success(),
         "compact json help should fail non-zero"
     );
-    assert!(
-        output.stdout.is_empty(),
-        "compact json help should not start a prompt/spinner on stdout: {}",
-        String::from_utf8_lossy(&output.stdout)
-    );
+    // #819/#820/#823: JSON abort envelopes route to stdout
     let stderr = String::from_utf8(output.stderr).expect("stderr should be utf8");
-    let parsed: Value = serde_json::from_str(stderr.trim()).expect("stderr should be JSON error");
+    assert!(
+        stderr.trim().is_empty() || !stderr.trim_start().starts_with('{'),
+        "compact json help should not emit JSON envelope to stderr (#819/#820/#823): {stderr}"
+    );
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be utf8");
+    let parsed: Value =
+        serde_json::from_str(stdout.trim()).expect("stdout should be JSON error envelope");
     assert_eq!(parsed["status"], "error");
     assert_eq!(parsed["error_kind"], "interactive_only");
     assert_eq!(parsed["action"], "abort");
