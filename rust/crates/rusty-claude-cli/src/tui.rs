@@ -1,9 +1,10 @@
 use std::io;
+use std::io::Write;
 use std::sync::{Arc, RwLock};
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    disable_raw_mode, enable_raw_mode, Clear, ClearType,
 };
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
@@ -65,9 +66,7 @@ pub struct AgentInfo {
 }
 
 impl Default for DashboardState {
-    fn default() -> Self {
-        Self::new()
-    }
+    fn default() -> Self { Self::new() }
 }
 
 impl DashboardState {
@@ -81,9 +80,7 @@ impl DashboardState {
             .and_then(|o| {
                 if o.status.success() {
                     Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
-                } else {
-                    None
-                }
+                } else { None }
             });
 
         Self {
@@ -113,7 +110,7 @@ impl DashboardState {
 pub type SharedDashboardState = Arc<RwLock<DashboardState>>;
 
 // ---------------------------------------------------------------------------
-// Banner line for startup banner
+// Banner / Conversation wrappers
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
@@ -121,10 +118,6 @@ pub struct BannerLine {
     pub text: String,
     pub color: Color,
 }
-
-// ---------------------------------------------------------------------------
-// Conversation line
-// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
 pub struct ConversationLine {
@@ -154,12 +147,20 @@ pub struct TuiApp {
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 impl TuiApp {
+    /// Enter alternate screen, enable raw mode, create Terminal.
     pub fn init(state: SharedDashboardState) -> Result<Self, Box<dyn std::error::Error>> {
+        // Step 1 — swap to alternate screen BEFORE anything else
+        crossterm::execute!(
+            io::stdout(),
+            crossterm::terminal::EnterAlternateScreen,
+            crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
+            crossterm::cursor::MoveTo(0, 0)
+        )?;
         enable_raw_mode()?;
-        let mut stdout = io::stdout();
-        crossterm::execute!(stdout, EnterAlternateScreen)?;
+
         let backend = ratatui::backend::CrosstermBackend::new(io::stdout());
-        let terminal = ratatui::Terminal::new(backend)?;
+        let mut terminal = ratatui::Terminal::new(backend)?;
+        terminal.hide_cursor()?;
 
         let mut input = TextArea::new(vec![String::new()]);
         input.set_block(
@@ -169,9 +170,11 @@ impl TuiApp {
                 .title(" > "),
         );
         input.set_style(Style::default().fg(Color::White));
-        input.set_cursor_style(Style::default().fg(Color::Cyan));
+        input.set_cursor_style(
+            Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
+        );
 
-        Ok(Self {
+        let mut me = Self {
             dashboard: state,
             conversation: Vec::new(),
             conversation_scroll: 0,
@@ -183,28 +186,43 @@ impl TuiApp {
             showing_completions: false,
             spinner_frame: 0,
             needs_redraw: true,
-        })
+        };
+        me.draw_screen()?;
+        Ok(me)
     }
 
-    /// Suspend TUI: restore normal terminal so stdout works.
+    /// Suspend TUI for a blocking stdout operation.
+    ///
+    /// We stay in the alternate screen the ENTIRE session.  Instead of leaving
+    /// it (which causes terminal-dependent buffer swap failures), we simply
+    /// disable raw mode so stdin echoes normally, show the cursor for
+    /// interactive prompts, and clear the screen so stdout output lands on a
+    /// blank canvas.  After the operation completes, `resume()` clears the
+    /// screen again (wiping stdout debris) and redraws the full TUI frame.
     pub fn suspend(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         let _ = self.terminal.show_cursor();
-        let _ = disable_raw_mode();
-        let _ = crossterm::execute!(self.terminal.backend_mut(), LeaveAlternateScreen);
+        disable_raw_mode()?;
         let _ = crossterm::execute!(
             io::stdout(),
-            crossterm::terminal::Clear(crossterm::terminal::ClearType::All)
+            Clear(ClearType::All),
+            crossterm::cursor::MoveTo(0, 0)
         );
-        let _ = crossterm::execute!(io::stdout(), crossterm::cursor::MoveTo(0, 0));
+        let _ = io::stdout().flush();
         Ok(())
     }
 
     /// Resume TUI after suspend.
     pub fn resume(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         enable_raw_mode()?;
-        let mut out = io::stdout();
-        crossterm::execute!(out, EnterAlternateScreen)?;
-        let _ = self.terminal.hide_cursor();
+        // Wipe any stdout debris that may have been written while suspended
+        let _ = crossterm::execute!(
+            io::stdout(),
+            Clear(ClearType::All),
+            crossterm::cursor::MoveTo(0, 0)
+        );
+        let _ = io::stdout().flush();
+        self.terminal.hide_cursor()?;
+        self.terminal.clear()?;
         self.needs_redraw = true;
         self.draw_screen()?;
         Ok(())
@@ -214,14 +232,25 @@ impl TuiApp {
     pub fn restore_terminal(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         let _ = self.terminal.show_cursor();
         let _ = disable_raw_mode();
-        let _ = crossterm::execute!(self.terminal.backend_mut(), LeaveAlternateScreen);
+        let _ = crossterm::execute!(
+            io::stdout(),
+            crossterm::terminal::LeaveAlternateScreen,
+            crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
+            crossterm::cursor::MoveTo(0, 0),
+            crossterm::cursor::Show
+        );
+        let _ = io::stdout().flush();
         Ok(())
     }
 
-    pub fn push_banner(&mut self, lines: Vec<BannerLine>) {
+    // -------------------------------------------------------------------
+    // Conversation helpers
+    // -------------------------------------------------------------------
+
+    pub fn push_banner(&mut self, lines: &[BannerLine]) {
         for bl in lines {
             self.conversation.push(ConversationLine {
-                text: bl.text,
+                text: bl.text.clone(),
                 color: bl.color,
                 bold: true,
             });
@@ -248,9 +277,7 @@ impl TuiApp {
     }
 
     pub fn push_output(&mut self, text: &str, is_error: bool) {
-        if text.is_empty() {
-            return;
-        }
+        if text.is_empty() { return; }
         for raw_line in text.lines() {
             self.conversation.push(ConversationLine {
                 text: raw_line.to_string(),
@@ -273,8 +300,7 @@ impl TuiApp {
     }
 
     fn auto_scroll(&mut self) {
-        let line_count = self.conversation.len() as u16;
-        self.conversation_scroll = line_count.saturating_sub(20);
+        self.conversation_scroll = 0;
         self.needs_redraw = true;
     }
 
@@ -283,7 +309,6 @@ impl TuiApp {
     // -----------------------------------------------------------------------
 
     pub fn read_line(&mut self) -> io::Result<TuiReadOutcome> {
-        // Fast 16ms poll
         if event::poll(std::time::Duration::from_millis(16))? {
             if let Event::Key(key) = event::read()? {
                 self.needs_redraw = true;
@@ -291,13 +316,11 @@ impl TuiApp {
             }
         }
 
-        // Redraw on dirty or every ~80ms for spinner
         self.spinner_frame = (self.spinner_frame + 1) % SPINNER_FRAMES.len();
         if self.needs_redraw || self.spinner_frame % 5 == 0 {
             self.draw_screen()?;
             self.needs_redraw = false;
         }
-
         Ok(TuiReadOutcome::Pending)
     }
 
@@ -310,7 +333,6 @@ impl TuiApp {
         let showing_completions = self.showing_completions;
         let spinner_frame = self.spinner_frame;
         let input_lines: Vec<String> = self.input.lines().iter().cloned().collect();
-        let input_text = input_lines.join("\n");
 
         self.terminal.draw(|f| {
             draw_frame(
@@ -318,7 +340,7 @@ impl TuiApp {
                 &dashboard,
                 &conversation,
                 conversation_scroll,
-                &input_text,
+                &self.input,
                 &input_lines,
                 &slash_completions,
                 completion_index,
@@ -326,6 +348,7 @@ impl TuiApp {
                 spinner_frame,
             );
         })?;
+        self.terminal.backend_mut().flush()?;
         Ok(())
     }
 
@@ -365,25 +388,17 @@ impl TuiApp {
                 let text = lines.join("\n");
                 self.input.select_all();
                 self.input.cut();
-                if text.trim().is_empty() {
-                    return Ok(TuiReadOutcome::Pending);
-                }
+                if text.trim().is_empty() { return Ok(TuiReadOutcome::Pending); }
                 Ok(TuiReadOutcome::Submit(text))
             }
-            KeyCode::Tab => {
-                self.handle_tab();
-                Ok(TuiReadOutcome::Pending)
-            }
-            KeyCode::Esc => {
-                self.showing_completions = false;
-                Ok(TuiReadOutcome::Cancel)
-            }
+            KeyCode::Tab => { self.handle_tab(); Ok(TuiReadOutcome::Pending) }
+            KeyCode::Esc => { self.showing_completions = false; Ok(TuiReadOutcome::Cancel) }
             KeyCode::PageUp => {
-                self.conversation_scroll = self.conversation_scroll.saturating_sub(5);
+                self.conversation_scroll = self.conversation_scroll.saturating_add(5);
                 Ok(TuiReadOutcome::Pending)
             }
             KeyCode::PageDown => {
-                self.conversation_scroll = self.conversation_scroll.saturating_add(5);
+                self.conversation_scroll = self.conversation_scroll.saturating_sub(5);
                 Ok(TuiReadOutcome::Pending)
             }
             _ => {
@@ -398,18 +413,14 @@ impl TuiApp {
         if !self.showing_completions {
             let current_text: String = self.input.lines().join("");
             if current_text.starts_with('/') {
-                let prefix = current_text.as_str();
-                let matches: Vec<&String> = self
-                    .slash_completions
-                    .iter()
+                let prefix = &current_text;
+                let matches: Vec<&String> = self.slash_completions.iter()
                     .filter(|c| c.starts_with(prefix))
                     .collect();
                 if matches.len() == 1 {
                     self.input.select_all();
                     self.input.cut();
-                    for ch in matches[0].chars() {
-                        self.input.insert_char(ch);
-                    }
+                    for ch in matches[0].chars() { self.input.insert_char(ch); }
                     self.showing_completions = false;
                 } else if !matches.is_empty() {
                     self.showing_completions = true;
@@ -437,7 +448,7 @@ pub enum TuiReadOutcome {
 }
 
 // ---------------------------------------------------------------------------
-// Standalone draw function
+// Standalone draw functions
 // ---------------------------------------------------------------------------
 
 #[allow(clippy::too_many_arguments)]
@@ -446,7 +457,7 @@ fn draw_frame(
     dashboard: &SharedDashboardState,
     conversation: &[ConversationLine],
     conversation_scroll: u16,
-    input_text: &str,
+    input: &TextArea,
     input_lines: &[String],
     slash_completions: &[String],
     completion_index: usize,
@@ -454,23 +465,16 @@ fn draw_frame(
     spinner_frame: usize,
 ) {
     let size = f.area();
-    let main_layout = Layout::default()
+    let main = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Min(40), Constraint::Length(36)])
         .split(size);
 
     draw_left_pane(
-        f,
-        main_layout[0],
-        conversation,
-        conversation_scroll,
-        input_text,
-        input_lines,
-        slash_completions,
-        completion_index,
-        showing_completions,
+        f, main[0], conversation, conversation_scroll,
+        input, input_lines, slash_completions, completion_index, showing_completions,
     );
-    draw_right_pane(f, main_layout[1], dashboard, spinner_frame);
+    draw_right_pane(f, main[1], dashboard, spinner_frame);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -479,87 +483,71 @@ fn draw_left_pane(
     area: Rect,
     conversation: &[ConversationLine],
     conversation_scroll: u16,
-    input_text: &str,
+    input: &TextArea,
     input_lines: &[String],
     slash_completions: &[String],
     completion_index: usize,
     showing_completions: bool,
 ) {
-    let left_layout = Layout::default()
+    let left = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(5), Constraint::Length(7)])
         .split(area);
 
-    let conv_lines: Vec<Line> = conversation
-        .iter()
-        .map(|line| {
-            let mut style = Style::default().fg(line.color);
-            if line.bold {
-                style = style.add_modifier(Modifier::BOLD);
-            }
-            Line::from(Span::styled(&line.text, style))
-        })
-        .collect();
+    // --- conversation ---
+    let conv_lines: Vec<Line> = conversation.iter().map(|line| {
+        let mut style = Style::default().fg(line.color);
+        if line.bold { style = style.add_modifier(Modifier::BOLD); }
+        Line::from(Span::styled(&line.text, style))
+    }).collect();
 
-    let conversation_widget = Paragraph::new(conv_lines)
+    // FIFO viewport: newest content at the bottom, older above.
+    let pane_rows = (left[0].height.saturating_sub(1) as usize).max(1);
+    let scroll = conversation_scroll as usize;
+    let total = conv_lines.len();
+    let max_offset = total.saturating_sub(pane_rows);
+    let offset = scroll.min(max_offset);
+    let start = total.saturating_sub(pane_rows + offset);
+    let visible: Vec<Line> = conv_lines.into_iter().skip(start).take(pane_rows).collect();
+
+    let conversation_widget = Paragraph::new(visible)
         .block(
             Block::default()
                 .borders(Borders::TOP)
                 .border_style(Style::default().fg(Color::DarkGray))
-                .title(Span::styled(
-                    " Conversation ",
-                    Style::default().fg(Color::DarkGray),
-                )),
-        )
-        .wrap(Wrap { trim: true })
-        .scroll((conversation_scroll, 0));
+                .title(Span::styled(" Conversation ", Style::default().fg(Color::DarkGray))),
+        );
+    f.render_widget(conversation_widget, left[0]);
 
-    f.render_widget(conversation_widget, left_layout[0]);
+    // --- input (real TextArea widget) ---
+    let input_widget = input.clone();
+    f.render_widget(&input_widget, left[1]);
 
-    // Input area with cursor indicator
-    let input_block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
-        .title(Span::styled(
-            " > ",
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-        ));
-    let display_text = format!("{input_text}\u{2588}");
-    let input_para = Paragraph::new(display_text).block(input_block);
-    f.render_widget(input_para, left_layout[1]);
-
-    // Completion popup
+    // --- completions popup ---
     if showing_completions {
         let current_text: String = input_lines.join("");
-        let matches: Vec<&String> = slash_completions
-            .iter()
+        let matches: Vec<&String> = slash_completions.iter()
             .filter(|c| c.starts_with(current_text.as_str()))
             .collect();
         if !matches.is_empty() {
-            let items: Vec<ListItem> = matches
-                .iter()
-                .enumerate()
-                .map(|(i, m)| {
-                    let style = if i == completion_index % matches.len() {
-                        Style::default().bg(Color::DarkGray).fg(Color::White)
-                    } else {
-                        Style::default().fg(Color::Gray)
-                    };
-                    ListItem::new(Line::from(Span::styled(m.as_str(), style)))
-                })
-                .collect();
-            let list = List::new(items).block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::DarkGray)),
-            );
-            let popup_area = Rect {
-                x: left_layout[1].x,
-                y: left_layout[1].y.saturating_sub(matches.len().min(8) as u16 + 2),
-                width: left_layout[1].width.min(40),
+            let items: Vec<ListItem> = matches.iter().enumerate().map(|(i, m)| {
+                let style = if i == completion_index % matches.len() {
+                    Style::default().bg(Color::DarkGray).fg(Color::White)
+                } else {
+                    Style::default().fg(Color::Gray)
+                };
+                ListItem::new(Line::from(Span::styled(m.as_str(), style)))
+            }).collect();
+            let list = List::new(items)
+                .block(Block::default().borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::DarkGray)));
+            let popup = Rect {
+                x: left[1].x,
+                y: left[1].y.saturating_sub(matches.len().min(8) as u16 + 2),
+                width: left[1].width.min(40),
                 height: (matches.len() as u16 + 2).min(10),
             };
-            f.render_widget(list, popup_area);
+            f.render_widget(list, popup);
         }
     }
 }
@@ -573,7 +561,6 @@ fn draw_right_pane(
     let state = dashboard.read().unwrap_or_else(|e| e.into_inner());
     let mut lines: Vec<Line> = Vec::new();
 
-    // Connection
     lines.push(section("Connection"));
     lines.push(kv("Model", &state.model, Color::White));
     lines.push(kv("Provider", &state.provider, Color::Gray));
@@ -584,7 +571,6 @@ fn draw_right_pane(
     }
     lines.push(Line::from(""));
 
-    // Tokens
     lines.push(section("Tokens"));
     lines.push(kv("Turns", &state.turn_count.to_string(), Color::White));
     lines.push(kv("Input", &state.input_tokens.to_string(), Color::White));
@@ -594,149 +580,91 @@ fn draw_right_pane(
     lines.push(kv("Cost", &format!("${:.4}", state.cost_usd), Color::Yellow));
     lines.push(Line::from(""));
 
-    // Context
     let pct = state.context_percent;
-    let gauge_color = if pct > 80.0 {
-        Color::Red
-    } else if pct > 50.0 {
-        Color::Yellow
-    } else {
-        Color::Green
+    let gauge_color = match () {
+        _ if pct > 80.0 => Color::Red,
+        _ if pct > 50.0 => Color::Yellow,
+        _ => Color::Green,
     };
     lines.push(section("Context"));
-    lines.push(kv(
-        "Used",
-        &format!("{:.1}% of {}", pct, state.context_window),
-        Color::White,
-    ));
-    lines.push(Line::from("")); // gauge placeholder
-    lines.push(kv(
-        "Compactions",
-        &state.compaction_count.to_string(),
-        Color::Gray,
-    ));
+    lines.push(kv("Used", &format!("{:.1}% of {}", pct, state.context_window), Color::White));
+    lines.push(Line::from(""));
+    lines.push(kv("Compactions", &state.compaction_count.to_string(), Color::Gray));
     lines.push(Line::from(""));
 
-    // LSP
     if !state.lsp_servers.is_empty() {
         lines.push(section("LSP"));
         for lsp in &state.lsp_servers {
-            let status_color = match lsp.status.as_str() {
+            let c = match lsp.status.as_str() {
                 "connected" => Color::Green,
                 "starting" => Color::Yellow,
                 _ => Color::Red,
             };
             lines.push(Line::from(vec![
                 Span::styled(format!("  {} ", lsp.language), Style::default().fg(Color::White)),
-                Span::styled(lsp.status.clone(), Style::default().fg(status_color)),
+                Span::styled(lsp.status.clone(), Style::default().fg(c)),
             ]));
         }
         lines.push(Line::from(""));
     }
 
-    // Team
     if let Some(ref team) = state.team {
         lines.push(section("Team"));
         lines.push(kv("Name", &team.team_name, Color::White));
         lines.push(Line::from(vec![
             Span::styled("  Progress ", Style::default().fg(Color::Gray)),
-            Span::styled(
-                format!("{}/{} done", team.completed_agents, team.total_agents),
-                Style::default().fg(Color::Green),
-            ),
-            Span::styled(
-                format!(", {} fail", team.failed_agents),
-                Style::default().fg(Color::Red),
-            ),
-            Span::styled(
-                format!(", {} run", team.running_agents),
-                Style::default().fg(Color::Cyan),
-            ),
+            Span::styled(format!("{}/{} done", team.completed_agents, team.total_agents), Style::default().fg(Color::Green)),
+            Span::styled(format!(", {} fail", team.failed_agents), Style::default().fg(Color::Red)),
+            Span::styled(format!(", {} run", team.running_agents), Style::default().fg(Color::Cyan)),
         ]));
         for agent in &team.agents {
-            let st_color = match agent.status.as_str() {
-                "completed" => Color::Green,
-                "failed" => Color::Red,
-                _ => Color::Cyan,
+            let c = match agent.status.as_str() {
+                "completed" => Color::Green, "failed" => Color::Red, _ => Color::Cyan,
             };
             lines.push(Line::from(vec![
-                Span::styled("  ● ", Style::default().fg(st_color)),
+                Span::styled("  ● ", Style::default().fg(c)),
                 Span::styled(&agent.name, Style::default().fg(Color::White)),
-                Span::styled(
-                    format!(" ({})", agent.subagent_type.as_deref().unwrap_or("?")),
-                    Style::default().fg(Color::Gray),
-                ),
+                Span::styled(format!(" ({})", agent.subagent_type.as_deref().unwrap_or("?")), Style::default().fg(Color::Gray)),
             ]));
         }
         lines.push(Line::from(""));
     }
 
-    // Session
     lines.push(section("Session"));
-    lines.push(kv(
-        "ID",
-        state.session_id.as_deref().unwrap_or("-"),
-        Color::Gray,
-    ));
+    lines.push(kv("ID", state.session_id.as_deref().unwrap_or("-"), Color::Gray));
 
-    // Spinner
     if !state.status_message.is_empty() {
         let frame = SPINNER_FRAMES[spinner_frame];
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            format!("{frame} {}", state.status_message),
-            Style::default().fg(Color::Blue),
+            format!("{frame} {}", state.status_message), Style::default().fg(Color::Blue),
         )));
     }
 
-    // Keys
     lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "─ Keys ─",
-        Style::default().fg(Color::DarkGray),
-    )));
-    lines.push(Line::from(Span::styled(
-        "  Enter Submit  Shift+Enter Newline",
-        Style::default().fg(Color::DarkGray),
-    )));
-    lines.push(Line::from(Span::styled(
-        "  ^P Swap  ^T Team  ^C Cancel  ^D Exit",
-        Style::default().fg(Color::DarkGray),
-    )));
+    lines.push(Line::from(Span::styled("─ Keys ─", Style::default().fg(Color::DarkGray))));
+    lines.push(Line::from(Span::styled("  Enter Submit  Shift+Enter Newline", Style::default().fg(Color::DarkGray))));
+    lines.push(Line::from(Span::styled("  ^P Swap  ^T Team  ^C Cancel  ^D Exit", Style::default().fg(Color::DarkGray))));
 
-    let dashboard_widget = Paragraph::new(lines)
+    let widget = Paragraph::new(lines)
         .block(
             Block::default()
                 .borders(Borders::LEFT)
                 .border_style(Style::default().fg(Color::DarkGray))
-                .title(Span::styled(
-                    " Dashboard ",
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                )),
+                .title(Span::styled(" Dashboard ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))),
         )
         .wrap(Wrap { trim: true });
+    f.render_widget(widget, area);
 
-    f.render_widget(dashboard_widget, area);
-
-    // Context gauge overlay
-    let gauge_y = area.y + 16;
     let gauge_area = Rect {
-        x: area.x + 2,
-        y: gauge_y,
-        width: area.width.saturating_sub(4),
-        height: 1,
+        x: area.x + 2, y: area.y + 16,
+        width: area.width.saturating_sub(4), height: 1,
     };
     let gauge = Gauge::default()
         .gauge_style(Style::default().fg(gauge_color).bg(Color::DarkGray))
         .ratio(if pct > 0.0 { (pct / 100.0).min(1.0) } else { 0.0 });
     f.render_widget(gauge, gauge_area);
 }
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
 
 fn section<'a>(label: &str) -> Line<'a> {
     Line::from(Span::styled(
