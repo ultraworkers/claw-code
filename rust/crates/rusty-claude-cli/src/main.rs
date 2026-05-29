@@ -1739,7 +1739,20 @@ fn parse_direct_slash_cli_action(
                 }),
             }
         }
-        Ok(Some(SlashCommand::Unknown(name))) => Err(format_unknown_direct_slash_command(&name)),
+        Ok(Some(SlashCommand::Unknown(name))) => {
+            // #828: /approve and /deny are valid REPL-only slash commands that
+            // are not SlashCommand enum variants (they require an active tool
+            // call in the REPL to be meaningful). Emit interactive_only so
+            // machine consumers see the correct error_kind instead of
+            // unknown_slash_command.
+            if matches!(name.as_str(), "approve" | "yes" | "y" | "deny" | "no" | "n") {
+                Err(format!(
+                    "interactive_only: /{name} requires an active tool call in the REPL.\nStart `claw` and use /{name} to approve or deny a pending tool execution."
+                ))
+            } else {
+                Err(format_unknown_direct_slash_command(&name))
+            }
+        }
         Ok(Some(command)) => Err({
             let _ = command;
             format!(

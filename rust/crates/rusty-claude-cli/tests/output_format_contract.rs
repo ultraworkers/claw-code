@@ -3993,3 +3993,25 @@ fn direct_unknown_slash_command_emits_typed_error_kind() {
         "direct unknown slash JSON must have empty stderr (#827)"
     );
 }
+
+// #828: /approve and /deny outside REPL must emit interactive_only, not unknown_slash_command
+#[test]
+fn approve_deny_outside_repl_emits_interactive_only() {
+    let root = unique_temp_dir("approve-deny-828");
+    std::fs::create_dir_all(&root).expect("create temp dir");
+    for cmd in &["/approve", "/yes", "/deny", "/no"] {
+        let output = run_claw(&root, &["--output-format", "json", cmd], &[]);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let j: serde_json::Value = serde_json::from_str(stdout.trim())
+            .unwrap_or_else(|_| panic!("{cmd} must emit JSON (#828), got: {stdout:?}"));
+        assert_eq!(
+            j["error_kind"], "interactive_only",
+            "{cmd} outside REPL must emit interactive_only (#828): {j}"
+        );
+        assert!(
+            stderr.is_empty(),
+            "{cmd} JSON must have empty stderr (#828): {stderr:?}"
+        );
+    }
+}

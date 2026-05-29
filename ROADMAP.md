@@ -7888,3 +7888,9 @@ Original filing (2026-04-18): the session emitted `SessionStart hook (completed)
     **Required fix shape.** Introduce a typed `error_kind` for unrecognized slash commands (e.g. `unknown_slash_command` or `command_not_found`). Update the JSON emit in the `--resume` unknown-command handler to use the typed kind. Add regression coverage asserting the typed kind.
 
     **Acceptance.** `claw --resume latest --output-format json /bogus` exits rc=2, stdout `error_kind:"unknown_slash_command"` (or similar typed constant), stderr empty. [SCOPE: claw-code]
+
+828. **`/approve` and `/deny` outside REPL emit `unknown_slash_command` instead of `interactive_only`** — dogfooded 2026-05-29 16:05 on `main` `9d05573f`. `claw --output-format json /approve` exited rc=1 with `error_kind:"unknown_slash_command"` — these are valid REPL-only slash commands but are not `SlashCommand` enum variants, so they fell through to `format_unknown_direct_slash_command`. Machine consumers saw the wrong error class.
+
+    **Fix applied.** `SlashCommand::Unknown` arm now special-cases `approve | yes | y | deny | no | n` and emits `interactive_only:` prefix before falling through to `format_unknown_direct_slash_command`. Both `error_kind` and hint are correct.
+
+    **Acceptance.** `claw --output-format json /approve` exits rc=1, stdout `error_kind:"interactive_only"`, stderr empty. [SCOPE: claw-code]
