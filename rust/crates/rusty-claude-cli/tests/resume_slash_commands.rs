@@ -521,8 +521,9 @@ fn resumed_stub_command_emits_not_implemented_json() {
 
     // Stub commands exit with code 2
     assert!(!output.status.success());
-    let stderr = String::from_utf8(output.stderr).expect("utf8");
-    let parsed: Value = serde_json::from_str(stderr.trim()).expect("should be json");
+    // #819/#820/#823: JSON abort envelopes route to stdout
+    let stdout = String::from_utf8(output.stdout).expect("utf8");
+    let parsed: Value = serde_json::from_str(stdout.trim()).expect("should be json");
     assert_eq!(
         parsed["status"], "error",
         "stub command should emit status:error"
