@@ -10,7 +10,22 @@ use std::sync::Mutex;
 static EMITTED_CONFIG_WARNINGS: std::sync::OnceLock<Mutex<HashSet<String>>> =
     std::sync::OnceLock::new();
 
+/// When set to `true`, `emit_config_warning_once` silently drops all prose
+/// deprecation warnings instead of writing them to stderr.  Set this flag
+/// before any settings load when `--output-format json` is active so that
+/// JSON-mode machine consumers see empty stderr on success.  (#824)
+static SUPPRESS_CONFIG_WARNINGS_STDERR: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Call this once at startup when `--output-format json` is active.
+pub fn suppress_config_warnings_for_json_mode() {
+    SUPPRESS_CONFIG_WARNINGS_STDERR.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
 fn emit_config_warning_once(warning: &str) {
+    if SUPPRESS_CONFIG_WARNINGS_STDERR.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
     let set = EMITTED_CONFIG_WARNINGS.get_or_init(|| Mutex::new(HashSet::new()));
     let mut guard = set.lock().unwrap_or_else(|e| e.into_inner());
     if guard.insert(warning.to_string()) {

@@ -532,6 +532,16 @@ fn plugin_load_failure_json(failure: &plugins::PluginLoadFailure) -> Value {
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().skip(1).collect();
+    // #824: suppress config deprecation prose warnings to stderr when JSON
+    // output mode is active.  Scan the raw argv before parse_args so the
+    // suppression is in place before any settings file is loaded.
+    let json_mode = args
+        .windows(2)
+        .any(|w| w[0] == "--output-format" && w[1] == "json")
+        || args.iter().any(|a| a == "--output-format=json");
+    if json_mode {
+        runtime::suppress_config_warnings_for_json_mode();
+    }
     match parse_args(&args)? {
         CliAction::DumpManifests {
             output_format,
