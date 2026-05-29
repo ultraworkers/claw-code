@@ -3465,8 +3465,8 @@ fn resume_session(session_path: &Path, commands: &[String], output_format: CliOu
             if STUB_COMMANDS.contains(&cmd_root) {
                 if output_format == CliOutputFormat::Json {
                     println!(
-                "{}",
-                serde_json::json!({
+                        "{}",
+                        serde_json::json!({
                             "kind": "unsupported_command",
                             "action": "resume",
                             "status": "error",
@@ -3488,8 +3488,8 @@ fn resume_session(session_path: &Path, commands: &[String], output_format: CliOu
             Ok(None) => {
                 if output_format == CliOutputFormat::Json {
                     println!(
-                "{}",
-                serde_json::json!({
+                        "{}",
+                        serde_json::json!({
                             "kind": "unsupported_resumed_command",
                             "action": "resume",
                             "status": "error",
@@ -3508,8 +3508,8 @@ fn resume_session(session_path: &Path, commands: &[String], output_format: CliOu
             Err(error) => {
                 if output_format == CliOutputFormat::Json {
                     println!(
-                "{}",
-                serde_json::json!({
+                        "{}",
+                        serde_json::json!({
                             "kind": "cli_parse",
                             "action": "resume",
                             "status": "error",
@@ -3558,8 +3558,8 @@ fn resume_session(session_path: &Path, commands: &[String], output_format: CliOu
                     let hint = inline_hint
                         .or_else(|| fallback_hint_for_error_kind(error_kind).map(String::from));
                     println!(
-                "{}",
-                serde_json::json!({
+                        "{}",
+                        serde_json::json!({
                             "kind": error_kind,
                             "action": "resume",
                             "status": "error",
