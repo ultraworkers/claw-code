@@ -1381,9 +1381,9 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 // #825: always emit a command_not_found error for
                 // single-word all-alpha/dash tokens that don't match any
                 // known subcommand — with or without close suggestions.
-                // Previously, no-suggestion cases fell through silently to
-                // CliAction::Prompt and triggered a misleading
-                // `missing_credentials` error after provider startup.
+                // Multi-word cases fall through to CliAction::Prompt so
+                // natural language prompts like `claw explain this` work.
+                // (#826 documents the multi-word gap as a known limitation.)
                 let mut message = format!("command_not_found: unknown subcommand: {other}.");
                 if let Some(suggestions) = suggest_similar_subcommand(other) {
                     if let Some(line) = render_suggestion_line("Did you mean", &suggestions) {
