@@ -1755,12 +1755,26 @@ fn parse_direct_slash_cli_action(
         }
         Ok(Some(command)) => Err({
             let _ = command;
-            format!(
-                // #738: newline before remediation so split_error_hint populates hint field
-                "slash command {command_name} is interactive-only.\nStart `claw` and run it there, or use `claw --resume SESSION.jsonl {command_name}` / `claw --resume {latest} {command_name}` when the command is marked [resume] in /help.",
-                command_name = rest[0],
-                latest = LATEST_SESSION_REFERENCE,
-            )
+            let command_name = &rest[0];
+            // #829: only suggest --resume when the command is actually
+            // resume-safe. Non-resume-safe commands (e.g. /commit, /pr)
+            // previously suggested --resume, which just re-triggered
+            // interactive_only on a second invocation.
+            let bare_name = command_name.trim_start_matches('/');
+            let is_resume_safe = commands::resume_supported_slash_commands()
+                .iter()
+                .any(|spec| spec.name == bare_name);
+            if is_resume_safe {
+                format!(
+                    // #738: newline before remediation so split_error_hint populates hint field
+                    "interactive_only: slash command {command_name} requires a live session.\nStart `claw` and run it there, or use `claw --resume SESSION.jsonl {command_name}` / `claw --resume {latest} {command_name}`.",
+                    latest = LATEST_SESSION_REFERENCE,
+                )
+            } else {
+                format!(
+                    "interactive_only: slash command {command_name} requires a live REPL session.\nStart `claw` and run it there."
+                )
+            }
         }),
         Ok(None) => Err(format!("unknown subcommand: {}", rest[0])),
         Err(error) => Err(error.to_string()),
@@ -13906,8 +13920,15 @@ mod tests {
         );
         let error = parse_args(&["/status".to_string()])
             .expect_err("/status should remain REPL-only when invoked directly");
-        assert!(error.contains("interactive-only"));
-        assert!(error.contains("claw --resume SESSION.jsonl /status"));
+        // #829: prefix changed from "interactive-only" to "interactive_only:"
+        assert!(
+            error.contains("interactive_only:"),
+            "expected interactive_only: prefix, got: {error}"
+        );
+        assert!(
+            error.contains("claw --resume SESSION.jsonl /status"),
+            "expected --resume suggestion for resume-safe /status, got: {error}"
+        );
     }
 
     #[test]
@@ -13929,8 +13950,9 @@ mod tests {
         for alias in ["/plugin", "/plugins", "/marketplace"] {
             let error = parse_args(&[alias.to_string()])
                 .expect_err("valid plugin slash aliases are local/interactive, never prompts");
+            // #829: prefix changed from "interactive-only" to "interactive_only:"
             assert!(
-                error.contains("interactive-only"),
+                error.contains("interactive_only:") || error.contains("interactive-only"),
                 "{alias} should reject as an interactive plugin command outside the REPL, got: {error}"
             );
         }

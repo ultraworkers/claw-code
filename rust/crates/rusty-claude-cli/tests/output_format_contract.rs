@@ -4015,3 +4015,42 @@ fn approve_deny_outside_repl_emits_interactive_only() {
         );
     }
 }
+
+// #829: interactive_only hint must NOT suggest --resume for non-resume-safe commands
+#[test]
+fn non_resume_safe_interactive_only_hint_omits_resume_suggestion() {
+    let root = unique_temp_dir("non-resume-hint-829");
+    std::fs::create_dir_all(&root).expect("create temp dir");
+    // /commit, /pr, /issue, /bughunter, /ultraplan are not resume-safe
+    for cmd in &["/commit", "/pr", "/issue", "/bughunter", "/ultraplan"] {
+        let output = run_claw(&root, &["--output-format", "json", cmd], &[]);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let j: serde_json::Value = serde_json::from_str(stdout.trim())
+            .unwrap_or_else(|_| panic!("{cmd} must emit JSON (#829), got: {stdout:?}"));
+        assert_eq!(
+            j["error_kind"], "interactive_only",
+            "{cmd} must emit interactive_only (#829): {j}"
+        );
+        let hint = j["hint"].as_str().unwrap_or("");
+        assert!(
+            !hint.contains("--resume"),
+            "{cmd} hint must not suggest --resume for non-resume-safe command (#829): hint={hint:?}"
+        );
+    }
+}
+
+// #829: resume-safe commands should still suggest --resume in the hint
+#[test]
+fn resume_safe_interactive_only_hint_includes_resume_suggestion() {
+    let root = unique_temp_dir("resume-hint-829");
+    std::fs::create_dir_all(&root).expect("create temp dir");
+    let output = run_claw(&root, &["--output-format", "json", "/diff"], &[]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let j: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|_| panic!("/diff must emit JSON (#829), got: {stdout:?}"));
+    let hint = j["hint"].as_str().unwrap_or("");
+    assert!(
+        hint.contains("--resume"),
+        "/diff hint must suggest --resume (it is resume-safe) (#829): hint={hint:?}"
+    );
+}
