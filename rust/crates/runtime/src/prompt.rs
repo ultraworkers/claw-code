@@ -241,7 +241,9 @@ fn discover_instruction_files(cwd: &Path) -> std::io::Result<Vec<ContextFile>> {
         for candidate in [
             dir.join("CLAUDE.md"),
             dir.join("CLAUDE.local.md"),
+            dir.join("AGENTS.md"),
             dir.join(".claw").join("CLAUDE.md"),
+            dir.join(".claude").join("CLAUDE.md"),
             dir.join(".claw").join("instructions.md"),
         ] {
             push_context_file(&mut files, candidate)?;
@@ -595,20 +597,35 @@ mod tests {
         let root = temp_dir();
         let nested = root.join("apps").join("api");
         fs::create_dir_all(nested.join(".claw")).expect("nested claw dir");
+        fs::create_dir_all(nested.join(".claude")).expect("nested claude dir");
         fs::write(root.join("CLAUDE.md"), "root instructions").expect("write root instructions");
         fs::write(root.join("CLAUDE.local.md"), "local instructions")
             .expect("write local instructions");
+        fs::write(root.join("AGENTS.md"), "root agents").expect("write root agents");
         fs::create_dir_all(root.join("apps")).expect("apps dir");
         fs::create_dir_all(root.join("apps").join(".claw")).expect("apps claw dir");
+        fs::create_dir_all(root.join("apps").join(".claude")).expect("apps claude dir");
         fs::write(root.join("apps").join("CLAUDE.md"), "apps instructions")
             .expect("write apps instructions");
+        fs::write(root.join("apps").join("AGENTS.md"), "apps agents")
+            .expect("write apps agents");
         fs::write(
             root.join("apps").join(".claw").join("instructions.md"),
             "apps dot claude instructions",
         )
         .expect("write apps dot claude instructions");
+        fs::write(
+            root.join("apps").join(".claude").join("CLAUDE.md"),
+            "apps claude dir instructions",
+        )
+        .expect("write apps claude dir instructions");
         fs::write(nested.join(".claw").join("CLAUDE.md"), "nested rules")
             .expect("write nested rules");
+        fs::write(
+            nested.join(".claude").join("CLAUDE.md"),
+            "nested claude dir rules",
+        )
+        .expect("write nested claude dir rules");
         fs::write(
             nested.join(".claw").join("instructions.md"),
             "nested instructions",
@@ -627,9 +644,13 @@ mod tests {
             vec![
                 "root instructions",
                 "local instructions",
+                "root agents",
                 "apps instructions",
+                "apps agents",
+                "apps claude dir instructions",
                 "apps dot claude instructions",
                 "nested rules",
+                "nested claude dir rules",
                 "nested instructions"
             ]
         );
