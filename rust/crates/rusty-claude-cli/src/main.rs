@@ -271,7 +271,9 @@ Run `claw --help` for usage."
 /// matching against the error messages produced throughout the CLI surface.
 fn classify_error_kind(message: &str) -> &'static str {
     // Check specific patterns first (more specific before generic)
-    if message.contains("missing Anthropic credentials") {
+    if message.starts_with("command_not_found:") {
+        "command_not_found"
+    } else if message.contains("missing Anthropic credentials") {
         "missing_credentials"
     } else if message.contains("Manifest source files are missing") {
         "missing_manifests"
@@ -359,8 +361,9 @@ fn classify_error_kind(message: &str) -> &'static str {
         // #765: removed subcommands (login, logout) — hint contains migration guidance
         "removed_subcommand"
     } else if message.starts_with("unknown subcommand:") {
-        // #785: typo/unknown top-level subcommand (e.g. `claw dump` → did you mean dump-manifests?)
-        "unknown_subcommand"
+        // #785/#825: typo/unknown top-level subcommand (e.g. `claw dump` → did you mean dump-manifests?)
+        // Unified under command_not_found in #825.
+        "command_not_found"
     } else if message.starts_with("unexpected extra arguments")
         || message.starts_with("unexpected_extra_args:")
     {
@@ -1375,17 +1378,23 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         ),
         other => {
             if rest.len() == 1 && looks_like_subcommand_typo(other) {
+                // #825: always emit a command_not_found error for
+                // single-word all-alpha/dash tokens that don't match any
+                // known subcommand — with or without close suggestions.
+                // Previously, no-suggestion cases fell through silently to
+                // CliAction::Prompt and triggered a misleading
+                // `missing_credentials` error after provider startup.
+                let mut message = format!("command_not_found: unknown subcommand: {other}.");
                 if let Some(suggestions) = suggest_similar_subcommand(other) {
-                    let mut message = format!("unknown subcommand: {other}.");
                     if let Some(line) = render_suggestion_line("Did you mean", &suggestions) {
                         message.push('\n');
                         message.push_str(&line);
                     }
-                    message.push_str(
-                        "\nRun `claw --help` for the full list. If you meant to send a prompt literally, use `claw prompt <text>`.",
-                    );
-                    return Err(message);
                 }
+                message.push_str(
+                    "\nRun `claw --help` for the full list. If you meant to send a prompt literally, use `claw prompt <text>`.",
+                );
+                return Err(message);
             }
             // #147: guard empty/whitespace-only prompts at the fallthrough
             // path the same way `"prompt"` arm above does. Without this,
@@ -12585,7 +12594,7 @@ mod tests {
         let typo_err = parse_args(&["sttaus".to_string()])
             .expect_err("typo'd subcommand should be caught by #108 guard");
         assert!(
-            typo_err.starts_with("unknown subcommand:"),
+            typo_err.contains("unknown subcommand:"),
             "typo guard should fire for 'sttaus', got: {typo_err}"
         );
         // #148: `--model` flag must be captured as model_flag_raw so status
@@ -13240,10 +13249,10 @@ mod tests {
             classify_error_kind("unrecognized argument `--foo` for subcommand `doctor`"),
             "cli_parse"
         );
-        // #785: unknown top-level subcommand (typo or unrecognised command)
+        // #785/#825: unknown top-level subcommand (typo or unrecognised command)
         assert_eq!(
             classify_error_kind("unknown subcommand: dump.\nDid you mean     dump-manifests"),
-            "unknown_subcommand"
+            "command_not_found" // #825: unified from unknown_subcommand
         );
         assert_eq!(
             classify_error_kind("unsupported ACP invocation. Use `claw acp`."),

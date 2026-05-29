@@ -2838,9 +2838,10 @@ fn unknown_subcommand_returns_typed_kind_785() {
         .find(|l| l.trim_start().starts_with('{'))
         .and_then(|l| serde_json::from_str(l).ok())
         .expect("unknown subcommand should emit JSON error");
+    // #825: unified under command_not_found (previously unknown_subcommand)
     assert_eq!(
-        j["error_kind"], "unknown_subcommand",
-        "unknown subcommand should return unknown_subcommand kind, got {:?}",
+        j["error_kind"], "command_not_found",
+        "unknown subcommand should return command_not_found kind (#825), got {:?}",
         j["error_kind"]
     );
     // hint should point at the suggestion and/or --help
@@ -3864,4 +3865,77 @@ fn diff_non_git_dir_has_error_kind_and_hint_801() {
         j["message"].as_str().is_some(),
         "diff non-git must have message field (#801)"
     );
+}
+
+// #825: unknown single-word subcommand must return command_not_found, not
+// fall through to missing_credentials after provider startup.
+#[test]
+fn unknown_subcommand_json_emits_command_not_found() {
+    let root = unique_temp_dir("unknown-cmd-json-825");
+    std::fs::create_dir_all(&root).expect("create temp dir");
+    let output = run_claw(&root, &["--output-format", "json", "foobar"], &[]);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "unknown subcommand should exit 1"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stdout.trim().is_empty(),
+        "unknown subcommand JSON envelope must be on stdout"
+    );
+    let j: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("stdout must be parseable JSON (#825)");
+    assert_eq!(
+        j["error_kind"], "command_not_found",
+        "unknown subcommand must emit command_not_found, not missing_credentials (#825): {j}"
+    );
+    assert_eq!(j["status"], "error");
+    assert!(
+        stderr.is_empty(),
+        "unknown subcommand in JSON mode must have empty stderr (#825), got: {stderr:?}"
+    );
+}
+
+#[test]
+fn unknown_subcommand_text_emits_command_not_found_on_stderr() {
+    let root = unique_temp_dir("unknown-cmd-text-825");
+    std::fs::create_dir_all(&root).expect("create temp dir");
+    let output = run_claw(&root, &["foobar"], &[]);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "unknown subcommand should exit 1"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let _ = stdout;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("command_not_found"),
+        "text mode unknown subcommand must mention command_not_found on stderr (#825), got: {stderr:?}"
+    );
+    assert!(
+        !stderr.contains("missing_credentials"),
+        "text mode unknown subcommand must not show missing_credentials (#825)"
+    );
+}
+
+#[test]
+fn unknown_subcommand_typo_with_suggestions_json_emits_command_not_found() {
+    let root = unique_temp_dir("unknown-cmd-typo-825");
+    std::fs::create_dir_all(&root).expect("create temp dir");
+    let output = run_claw(&root, &["--output-format", "json", "statuz"], &[]);
+    assert_eq!(output.status.code(), Some(1));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let j: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("typo envelope must be valid JSON (#825)");
+    assert_eq!(j["error_kind"], "command_not_found", "#825 typo: {j}");
+    let hint = j["hint"].as_str().unwrap_or("");
+    assert!(
+        hint.contains("status") || hint.contains("state"),
+        "typo hint should suggest status/state, got: {hint:?}"
+    );
+    assert!(stderr.is_empty(), "typo JSON must have empty stderr (#825)");
 }
