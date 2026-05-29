@@ -3967,3 +3967,29 @@ fn multi_word_unknown_subcommand_falls_through_to_prompt_826() {
         "multi-word fallthrough JSON must have empty stderr: {stderr:?}"
     );
 }
+
+// #827: direct /unknown-slash-command must emit typed error_kind, not "unknown"
+// Uses the direct-slash CLI path (no session load needed; reproducible on CI).
+#[test]
+fn direct_unknown_slash_command_emits_typed_error_kind() {
+    let root = unique_temp_dir("direct-unknown-slash-827");
+    std::fs::create_dir_all(&root).expect("create temp dir");
+    let output = run_claw(&root, &["--output-format", "json", "/boguscommand"], &[]);
+    assert_eq!(output.status.code(), Some(1), "unknown slash should exit 1");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let j: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("unknown slash must emit JSON (#827)");
+    assert_ne!(
+        j["error_kind"], "unknown",
+        "direct unknown slash must not emit opaque \'unknown\' error_kind (#827): {j}"
+    );
+    assert_eq!(
+        j["error_kind"], "unknown_slash_command",
+        "direct unknown slash must emit unknown_slash_command (#827): {j}"
+    );
+    assert!(
+        stderr.is_empty(),
+        "direct unknown slash JSON must have empty stderr (#827)"
+    );
+}

@@ -271,7 +271,9 @@ Run `claw --help` for usage."
 /// matching against the error messages produced throughout the CLI surface.
 fn classify_error_kind(message: &str) -> &'static str {
     // Check specific patterns first (more specific before generic)
-    if message.starts_with("command_not_found:") {
+    if message.starts_with("unknown_slash_command:") {
+        "unknown_slash_command"
+    } else if message.starts_with("command_not_found:") {
         "command_not_found"
     } else if message.contains("missing Anthropic credentials") {
         "missing_credentials"
@@ -1764,7 +1766,10 @@ fn format_unknown_option(option: &str) -> String {
 }
 
 fn format_unknown_direct_slash_command(name: &str) -> String {
-    let mut message = format!("unknown slash command outside the REPL: /{name}");
+    // #827: prefix with classifier-friendly token so classify_error_kind
+    // returns "unknown_slash_command" instead of the opaque fallback.
+    let mut message =
+        format!("unknown_slash_command: unknown slash command outside the REPL: /{name}");
     if let Some(suggestions) = render_suggestion_line("Did you mean", &suggest_slash_commands(name))
     {
         message.push('\n');
@@ -1779,7 +1784,9 @@ fn format_unknown_direct_slash_command(name: &str) -> String {
 }
 
 fn format_unknown_slash_command(name: &str) -> String {
-    let mut message = format!("Unknown slash command: /{name}");
+    // #827: prefix with classifier-friendly token so classify_error_kind
+    // can return "unknown_slash_command" instead of the opaque fallback.
+    let mut message = format!("unknown_slash_command: Unknown slash command: /{name}");
     if let Some(suggestions) = render_suggestion_line("Did you mean", &suggest_slash_commands(name))
     {
         message.push('\n');
