@@ -12474,7 +12474,7 @@ mod tests {
                 allow_broad_cwd: false,
             }
         );
-        assert_eq!(
+       assert_eq!(
             parse_args(&["agents".to_string(), "--help".to_string()])
                 .expect("agents help should parse"),
             CliAction::HelpTopic {
