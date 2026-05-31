@@ -1,6 +1,6 @@
 # Claw Code 2.0 Canonical Board
 
-Generated from board schema: `2026-05-14T08:13:45+00:00`
+Generated from board schema: `2026-05-25T04:30:33+00:00`
 Schema version: `cc2.board.v1`
 Ultragoal mutation policy: `.omx/ultragoal` is leader-owned and was not modified by this rendering task.
 
@@ -8,7 +8,7 @@ Ultragoal mutation policy: `.omx/ultragoal` is leader-owned and was not modified
 
 | Source | Frozen evidence |
 | --- | --- |
-| Roadmap | `ROADMAP.md` sha256 prefix `2aba3315e52f3079`; 124 headings; 542 ordered actions |
+| Roadmap | `ROADMAP.md` sha256 prefix `2aba3315e52f3079`; 127 headings; 542 ordered actions |
 | Approved plan | `.omx/plans/claw-code-2-0-adaptive-plan.md` sha256 prefix `e7ef6faf23bfc16b` |
 | Research bundle | root `/Users/bellman/Documents/Workspace/claw-code/.omx/research`; latest open issues 30; issue corpus 1000; codex/opencode clone metadata included |
 
@@ -16,11 +16,11 @@ Ultragoal mutation policy: `.omx/ultragoal` is leader-owned and was not modified
 
 | Coverage gate | Mapped | Total | Status |
 | --- | --- | --- | --- |
-| ROADMAP headings | 124 | 124 | PASS |
+| ROADMAP headings | 127 | 127 | PASS |
 | ROADMAP ordered actions | 542 | 542 | PASS |
 | Duplicate heading lines | 0 | 0 | PASS |
 
-Total canonical board items: **729**
+Total canonical board items: **732**
 
 ## Lifecycle Enum Reference
 
@@ -29,7 +29,7 @@ Total canonical board items: **729**
 | `active` | 73 | Current Claw Code 2.0 implementation surface that should remain visible on the board. |
 | `context` | 15 | Context-only heading or evidence anchor; not an implementation work item. |
 | `deferred_with_rationale` | 9 | Intentionally deferred; rationale must be present in the board item. |
-| `done_verify` | 313 | Marked as done upstream but retained for verification against current CC2 behavior. |
+| `done_verify` | 316 | Marked as done upstream but retained for verification against current CC2 behavior. |
 | `open` | 285 | Actionable unresolved work that needs implementation or acceptance evidence. |
 | `rejected_not_claw` | 2 | Excluded because it is not Claw Code product work. |
 | `stale_done` | 31 | Historically completed or merged work that may be stale and needs freshness checks before relying on it. |
@@ -40,7 +40,7 @@ Total canonical board items: **729**
 | Bucket | Count | Meaning |
 | --- | --- | --- |
 | `2.x_intake` | 30 | Post-2.0 intake or follow-up candidate retained for sequencing. |
-| `alpha_blocker` | 240 | Must be resolved before alpha-quality autonomous coding lanes are dependable. |
+| `alpha_blocker` | 243 | Must be resolved before alpha-quality autonomous coding lanes are dependable. |
 | `beta_adoption` | 417 | Important for broader dogfood/adoption once alpha blockers are controlled. |
 | `context` | 15 | Non-actionable roadmap context. |
 | `ga_ecosystem` | 22 | Required for mature plugin/MCP/provider ecosystem behavior. |
@@ -54,9 +54,9 @@ Total canonical board items: **729**
 | Adoption overlay — user-visible parity and release polish | 357 | 329 | `deferred_with_rationale` 3, `done_verify` 237, `open` 92, `rejected_not_claw` 2, `stale_done` 23 |
 | Parity overlay — opencode/codex comparison context | 20 | 16 | `context` 2, `deferred_with_rationale` 1, `done_verify` 5, `open` 11, `stale_done` 1 |
 | Stream 0 — Governance, intake, and cross-cutting roadmap triage | 221 | 198 | `active` 6, `context` 13, `deferred_with_rationale` 4, `done_verify` 45, `open` 147, `stale_done` 5, `superseded` 1 |
-| Stream 1 — Worker boot and session control | 15 | 14 | `active` 8, `deferred_with_rationale` 1, `open` 6 |
+| Stream 1 — Worker boot and session control | 17 | 16 | `active` 8, `deferred_with_rationale` 1, `done_verify` 2, `open` 6 |
 | Stream 2 — Event/reporting contracts | 73 | 73 | `active` 45, `done_verify` 20, `open` 8 |
-| Stream 3 — Branch/test recovery | 16 | 14 | `active` 6, `done_verify` 1, `open` 7, `stale_done` 2 |
+| Stream 3 — Branch/test recovery | 17 | 15 | `active` 6, `done_verify` 2, `open` 7, `stale_done` 2 |
 | Stream 4 — Claws-first task execution | 5 | 5 | `active` 4, `done_verify` 1 |
 | Stream 5 — Plugin/MCP lifecycle | 22 | 22 | `active` 4, `done_verify` 4, `open` 14 |
 
@@ -68,7 +68,7 @@ Total canonical board items: **729**
 | `latest_open_issue` | 30 |
 | `parity_repo_context` | 2 |
 | `roadmap_action` | 542 |
-| `roadmap_heading` | 124 |
+| `roadmap_heading` | 127 |
 
 ## Board Items by Stream
 
@@ -704,6 +704,8 @@ Total canonical board items: **729**
 | `CC2-RM-A0363-surface-inconsistency-cluster-of-3-after` | **Surface inconsistency (cluster of 3)**: after #143 Phase 1, the behavior matrix is: | `ROADMAP.md:L5515` / `roadmap_action` | `alpha_blocker` | `open` | `plugin_mcp_lifecycle_contract_test` | `stream_1_worker_boot_session_control` | — |
 | `CC2-RM-A0391-remove-the-error-prefix-from-format-unkn` | Remove the "error:" prefix from format_unknown_verb_option (already added by top-level handler) | `ROADMAP.md:L5916` / `roadmap_action` | `alpha_blocker` | `open` | `worker_boot_state_machine_or_cli_json_contract_test` | none | — |
 | `CC2-RM-A0512-system-prompt-output-format-json-exposes` | **`system-prompt --output-format json` exposes `"__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__"` as a literal element in the `sections` array — an internal split delimiter leaked into the public structured output** — dogfooded 2026-04-30 by Jobdori on `e939777f`. Running `claw system-prompt --output-format json` returns `{"kind":"system-prompt","message":"<full prose>","sections":["You are an interactive agent...", "# System\n...", "# Doing tasks\n...", "# Executing actions with care\n...", "__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__", "# Environment context\n...", "# Project context\n...", "# Claude instructions\n...", "# Runtime config\n..."]}`. The `sections` array has 9 elements; element index 4 is the raw string `"__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__"`. This internal sentinel marks the boundary between the static and dynamic sections of the compiled system prompt, used during assembly to split the prompt at injection time. It appears in the public JSON output verbatim as a first-class section, indistinguishable from real sections by type alone. Automation that iterates `sections[]` must special-case this sentinel or it will process an internal implementation string as if it were a real system prompt section. **Required fix shape:** (a) strip `"__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__"` and any similar internal delimiters from the `sections` array before serializing to JSON; (b) if the static/dynamic boundary is semantically meaningful for callers, expose it as a structured metadata field such as `boundary_index:4` or as a `section_type:"static"\|"dynamic"` field on each section entry, not as a raw sentinel string in the array; (c) rename the `sections` type from `string[]` to `[{id, type, content}]` to enable this without breaking the boundary signal; (d) add regression coverage proving the `system-prompt --output-format json` output's `sections` array contains no elements whose value equals `"__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__"` or matches `/__[A-Z_]+__/`. **Why this matters:** internal sentinel strings in public JSON are a contract liability — they couple the wire format to internal implementation details. Any refactor that renames or removes the sentinel breaks callers that don't special-case it, and automation that doesn't know to filter it will miscount, misparse, or misrender the system prompt. Source: Jobdori live dogfood, `e939777f`, 2026-04-30. | `ROADMAP.md:L6333` / `roadmap_action` | `beta_adoption` | `open` | `worker_boot_state_machine_or_cli_json_contract_test` | none | — |
+| `CC2-RM-H0125-pinpoint-693-claw-analog-bootstrap-plan` | Pinpoint #693. `claw-analog` bootstrap-plan phase parser silently falls back to `"unknown"` — `lib.rs:1114` uses `.unwrap_or("unknown")` for phase field; unrecognized phases emit opaque kind instead of typed error | `ROADMAP.md:L7528` / `roadmap_heading` | `alpha_blocker` | `done_verify` | `targeted_regression_or_acceptance_test_required` | `stream_0_governance` | — |
+| `CC2-RM-H0127-pinpoint-695-agent-starts-in-stale-wrong` | Pinpoint #695. Agent starts in stale/wrong worktree and burns a full turn before noticing — no pre-flight check for "file exists on current branch" or "this .git is writable from sandbox" | `ROADMAP.md:L7548` / `roadmap_heading` | `alpha_blocker` | `done_verify` | `worker_boot_state_machine_or_cli_json_contract_test` | `stream_0_governance` | — |
 
 ### Stream 2 — Event/reporting contracts
 
@@ -803,6 +805,7 @@ Total canonical board items: **729**
 | `CC2-RM-A0410-remediation-registry-a-function-remediat` | **Remediation registry:** A function `remediation_for(kind: &str, operation: &str) -> Remediation` that maps `(error_kind, operation_context)` pairs to stable remediation structs: | `ROADMAP.md:L6041` / `roadmap_action` | `alpha_blocker` | `open` | `targeted_regression_or_acceptance_test_required` | `stream_2_event_reporting_contracts` | — |
 | `CC2-RM-A0411-stable-hint-outputs-per-class-each-error` | **Stable hint outputs per class:** Each `error_kind` maps to exactly one remediation shape. No more prose splitting. | `ROADMAP.md:L6049` / `roadmap_action` | `alpha_blocker` | `open` | `targeted_regression_or_acceptance_test_required` | `stream_2_event_reporting_contracts` | — |
 | `CC2-RM-A0412-golden-fixture-tests-test-each-kind-oper` | **Golden fixture tests:** Test each `(kind, operation)` pair against expected remediation output as golden fixtures instead of the current `split_error_hint()` string hacks. | `ROADMAP.md:L6050` / `roadmap_action` | `alpha_blocker` | `open` | `targeted_regression_or_acceptance_test_required` | `stream_2_event_reporting_contracts` | — |
+| `CC2-RM-H0126-pinpoint-694-no-pre-push-cargo-build-gat` | Pinpoint #694. No pre-push `cargo build` gate — stale field refs (`retry_after`, `Team` variant, `config_load_error_kind`) broke main build undetected until CI | `ROADMAP.md:L7538` / `roadmap_heading` | `alpha_blocker` | `done_verify` | `git_fixture_or_recovery_recipe_test` | `stream_0_governance` | — |
 
 ### Stream 4 — Claws-first task execution
 

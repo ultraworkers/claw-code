@@ -5,7 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-use crate::session::{Session, SessionError};
+use crate::session::{parse_created_at_ms_from_session_id, Session, SessionError};
 
 /// Per-worktree session store that namespaces on-disk session files by
 /// workspace fingerprint so that parallel `opencode serve` instances never
@@ -345,6 +345,9 @@ impl SessionStore {
                 .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
                 .map(|duration| duration.as_millis())
                 .unwrap_or_default();
+            let fallback_id = session_id_from_path(&path).unwrap_or_else(|| "unknown".to_string());
+            let fallback_created_at_ms =
+                parse_created_at_ms_from_session_id(&fallback_id).unwrap_or(0);
             let summary = match Session::load_from_path(&path) {
                 Ok(session) => {
                     if self.validate_loaded_session(&path, &session).is_err() {
@@ -353,6 +356,7 @@ impl SessionStore {
                     ManagedSessionSummary {
                         id: session.session_id,
                         path,
+                        created_at_ms: session.created_at_ms,
                         updated_at_ms: session.updated_at_ms,
                         modified_epoch_millis,
                         message_count: session.messages.len(),
@@ -367,12 +371,9 @@ impl SessionStore {
                     }
                 }
                 Err(_) => ManagedSessionSummary {
-                    id: path
-                        .file_stem()
-                        .and_then(|value| value.to_str())
-                        .unwrap_or("unknown")
-                        .to_string(),
+                    id: fallback_id,
                     path,
+                    created_at_ms: fallback_created_at_ms,
                     updated_at_ms: 0,
                     modified_epoch_millis,
                     message_count: 0,
@@ -409,10 +410,14 @@ impl SessionStore {
                 .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
                 .map(|duration| duration.as_millis())
                 .unwrap_or_default();
+            let fallback_id = session_id_from_path(&path).unwrap_or_else(|| "unknown".to_string());
+            let fallback_created_at_ms =
+                parse_created_at_ms_from_session_id(&fallback_id).unwrap_or(0);
             let summary = match Session::load_from_path(&path) {
                 Ok(session) => ManagedSessionSummary {
                     id: session.session_id,
                     path,
+                    created_at_ms: session.created_at_ms,
                     updated_at_ms: session.updated_at_ms,
                     modified_epoch_millis,
                     message_count: session.messages.len(),
@@ -426,12 +431,9 @@ impl SessionStore {
                         .and_then(|fork| fork.branch_name.clone()),
                 },
                 Err(_) => ManagedSessionSummary {
-                    id: path
-                        .file_stem()
-                        .and_then(|value| value.to_str())
-                        .unwrap_or("unknown")
-                        .to_string(),
+                    id: fallback_id,
                     path,
+                    created_at_ms: fallback_created_at_ms,
                     updated_at_ms: 0,
                     modified_epoch_millis,
                     message_count: 0,
@@ -483,6 +485,7 @@ pub struct SessionHandle {
 pub struct ManagedSessionSummary {
     pub id: String,
     pub path: PathBuf,
+    pub created_at_ms: u64,
     pub updated_at_ms: u64,
     pub modified_epoch_millis: u128,
     pub message_count: usize,
@@ -810,6 +813,7 @@ mod tests {
             ManagedSessionSummary {
                 id: "older-file-newer-session".to_string(),
                 path: PathBuf::from("/tmp/older"),
+                created_at_ms: 100,
                 updated_at_ms: 200,
                 modified_epoch_millis: 100,
                 message_count: 2,
@@ -819,6 +823,7 @@ mod tests {
             ManagedSessionSummary {
                 id: "newer-file-older-session".to_string(),
                 path: PathBuf::from("/tmp/newer"),
+                created_at_ms: 50,
                 updated_at_ms: 100,
                 modified_epoch_millis: 200,
                 message_count: 1,

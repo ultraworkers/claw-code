@@ -2124,6 +2124,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "telemetry",
+ "tempfile",
  "tokio",
  "walkdir",
 ]

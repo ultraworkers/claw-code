@@ -21,6 +21,8 @@ on:
       - PARITY.md
       - PHILOSOPHY.md
       - ROADMAP.md
+      - scripts/roadmap-*.sh
+      - tests/test_roadmap_helpers.py
       - docs/**
       - rust/**
   pull_request:
@@ -41,6 +43,8 @@ on:
       - PARITY.md
       - PHILOSOPHY.md
       - ROADMAP.md
+      - scripts/roadmap-*.sh
+      - tests/test_roadmap_helpers.py
       - docs/**
       - rust/**
   workflow_dispatch:
@@ -72,6 +76,10 @@ jobs:
         run: python .github/scripts/check_doc_source_of_truth.py
       - name: Check release policy docs and local links
         run: python .github/scripts/check_release_readiness.py
+      - name: Check ROADMAP ids
+        run: scripts/roadmap-check-ids.sh
+      - name: Check ROADMAP helper behavior
+        run: python -m unittest discover -s tests -p test_roadmap_helpers.py
 
   fmt:
     name: cargo fmt

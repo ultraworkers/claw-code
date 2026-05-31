@@ -1,7 +1,7 @@
 {
   "version": 1,
   "createdAt": "2026-05-14T07:53:46.061Z",
-  "updatedAt": "2026-05-15T04:38:54.887Z",
+  "updatedAt": "2026-05-25T04:18:52.711Z",
   "briefPath": ".omx/ultragoal/brief.md",
   "goalsPath": ".omx/ultragoal/goals.json",
   "ledgerPath": ".omx/ultragoal/ledger.jsonl",
@@ -148,7 +148,19 @@
       "updatedAt": "2026-05-15T04:38:54.887Z",
       "evidence": "G012-final-gate complete: team g012-final-gate-ultra-e61d2271 8/8 tasks complete; final gate log /tmp/g012-final-quality-gate-pass4.log; commit 04c2abb pushed; docs/pr-triage-g012-final-gate.json docs/pr-issue-resolution-gate.md docs/g012-final-release-readiness-report.md; .omx/ultragoal/goals.json and ledger.jsonl updated; aiSlopCleaner and codeReview evidence included in quality gate JSON.",
       "completedAt": "2026-05-15T04:38:54.887Z"
+    },
+    {
+      "id": "G013-implement-roadmap-pinpoints-693-695",
+      "title": "Implement ROADMAP pinpoints #693-#695",
+      "objective": "Map and implement the newly appended ROADMAP.md pinpoints #693, #694, and #695 after reset to origin/main: typed claw-analog bootstrap phase errors, a local pre-push cargo build gate, and startup/worktree preflight diagnostics; update CC2 board/coverage and verify with targeted and workspace checks.",
+      "status": "in_progress",
+      "attempt": 1,
+      "createdAt": "2026-05-25T04:18:43.420Z",
+      "updatedAt": "2026-05-25T04:18:52.711Z",
+      "evidence": "Current-head verification after reset: python3 scripts/validate_cc2_board.py --board .omx/cc2/board.json failed with unmapped ROADMAP headings [7528,7538,7548], corresponding to Pinpoints #693-#695.",
+      "startedAt": "2026-05-25T04:18:52.711Z"
     }
   ],
-  "codexObjective": "Complete the approved Claw Code 2.0 ultragoal delivery: implement all classified ROADMAP.md backlog work through execution-sized stream goals G001-G012, using .omx/ultragoal/ledger.jsonl as the durable audit trail and .omx/plans/claw-code-2-0-adaptive-plan.md as the source plan."
+  "codexObjective": "Complete the approved Claw Code 2.0 ultragoal delivery: implement all classified ROADMAP.md backlog work through execution-sized stream goals G001-G012, using .omx/ultragoal/ledger.jsonl as the durable audit trail and .omx/plans/claw-code-2-0-adaptive-plan.md as the source plan.",
+  "activeGoalId": "G013-implement-roadmap-pinpoints-693-695"
 }

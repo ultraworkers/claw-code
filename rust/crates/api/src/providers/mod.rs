@@ -1649,9 +1649,14 @@ NO_EQUALS_LINE
             rendered.starts_with("missing Anthropic credentials;"),
             "canonical base message should still lead the rendered error: {rendered}"
         );
+        // #754: hint delimiter changed from " — hint: " to "\n" so split_error_hint works
         assert!(
-            rendered.contains(" — hint: I see OPENAI_API_KEY is set"),
+            rendered.contains("I see OPENAI_API_KEY is set"),
             "rendered error should carry the env-driven hint: {rendered}"
+        );
+        assert!(
+            rendered.contains('\n'),
+            "rendered error must use newline separator (#754): {rendered}"
         );
     }
 

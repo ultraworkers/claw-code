@@ -33,6 +33,41 @@ cargo build --workspace
 .\target\debug\claw.exe --help
 ```
 
+## Local pre-push build gate
+
+Install the repository-local hook to catch stale compile errors before pushing:
+
+```bash
+git config core.hooksPath .github/hooks
+```
+
+This sets the repo's Git hook directory to `.github/hooks`; if you already use a
+custom `core.hooksPath`, copy or chain `.github/hooks/pre-push` instead. The hook
+runs the ROADMAP id guard, then runs
+`cargo build --manifest-path rust/Cargo.toml --workspace --locked` from the
+repository root. If you must bypass the cargo build for a docs-only push, set
+`SKIP_CLAW_PRE_PUSH_BUILD=1`; the hook still runs the ROADMAP guard and prints
+when the cargo-build escape hatch is used.
+
+## ROADMAP id allocation
+
+Before appending a new numeric ROADMAP entry, pull/rebase onto the latest
+`main`, allocate the id from the file you are about to edit, and run the duplicate
+id guard before pushing:
+
+```bash
+git pull --rebase
+NEXT=$(scripts/roadmap-next-id.sh)
+# append "${NEXT}. **...**" to ROADMAP.md
+scripts/roadmap-check-ids.sh
+```
+
+The duplicate guard currently checks helper-era ids (`>=723`) by default so it
+catches new optimistic-append collisions without failing on legacy numbered lists
+already present in the historical roadmap. Use `scripts/roadmap-check-ids.sh
+--min-id 1` for a strict whole-file audit after those legacy collisions are
+cleaned up.
+
 ## Checks before opening a pull request
 
 Run the smallest relevant tests for your change, then the broader checks when

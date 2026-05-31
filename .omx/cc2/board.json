@@ -3,11 +3,11 @@
     "duplicate_roadmap_heading_lines": [],
     "roadmap_actions_mapped": 542,
     "roadmap_actions_total": 542,
-    "roadmap_headings_mapped": 124,
-    "roadmap_headings_total": 124,
+    "roadmap_headings_mapped": 127,
+    "roadmap_headings_total": 127,
     "unmapped_roadmap_heading_lines": []
   },
-  "generated_at": "2026-05-14T08:13:45+00:00",
+  "generated_at": "2026-05-25T04:30:33+00:00",
   "generation_policy": {
     "release_buckets": [
       "2.x_intake",
@@ -14823,6 +14823,69 @@
       "status": "context",
       "title": "Parity source metadata: openai/codex",
       "verification_required": "none_context_only"
+    },
+    {
+      "category": "boot",
+      "deferral_rationale": "",
+      "dependencies": [
+        "stream_0_governance"
+      ],
+      "id": "CC2-RM-H0125-pinpoint-693-claw-analog-bootstrap-plan",
+      "lifecycle_status": "done_verify",
+      "owner_lane": "stream_1_worker_boot_session_control",
+      "release_bucket": "alpha_blocker",
+      "source_anchor": "ROADMAP.md:L7528",
+      "source_context": "Clawable Coding Harness Roadmap > Pinpoint follow-up intake",
+      "source_level": 2,
+      "source_line": 7528,
+      "source_ordinal": null,
+      "source_path": "ROADMAP.md",
+      "source_type": "roadmap_heading",
+      "status": "done_verify",
+      "title": "Pinpoint #693. `claw-analog` bootstrap-plan phase parser silently falls back to `\"unknown\"` \u2014 `lib.rs:1114` uses `.unwrap_or(\"unknown\")` for phase field; unrecognized phases emit opaque kind instead of typed error",
+      "verification_required": "targeted_regression_or_acceptance_test_required"
+    },
+    {
+      "category": "branch_recovery",
+      "deferral_rationale": "",
+      "dependencies": [
+        "stream_0_governance"
+      ],
+      "id": "CC2-RM-H0126-pinpoint-694-no-pre-push-cargo-build-gat",
+      "lifecycle_status": "done_verify",
+      "owner_lane": "stream_3_branch_test_recovery",
+      "release_bucket": "alpha_blocker",
+      "source_anchor": "ROADMAP.md:L7538",
+      "source_context": "Clawable Coding Harness Roadmap > Pinpoint follow-up intake",
+      "source_level": 2,
+      "source_line": 7538,
+      "source_ordinal": null,
+      "source_path": "ROADMAP.md",
+      "source_type": "roadmap_heading",
+      "status": "done_verify",
+      "title": "Pinpoint #694. No pre-push `cargo build` gate \u2014 stale field refs (`retry_after`, `Team` variant, `config_load_error_kind`) broke main build undetected until CI",
+      "verification_required": "git_fixture_or_recovery_recipe_test"
+    },
+    {
+      "category": "boot",
+      "deferral_rationale": "",
+      "dependencies": [
+        "stream_0_governance"
+      ],
+      "id": "CC2-RM-H0127-pinpoint-695-agent-starts-in-stale-wrong",
+      "lifecycle_status": "done_verify",
+      "owner_lane": "stream_1_worker_boot_session_control",
+      "release_bucket": "alpha_blocker",
+      "source_anchor": "ROADMAP.md:L7548",
+      "source_context": "Clawable Coding Harness Roadmap > Pinpoint follow-up intake",
+      "source_level": 2,
+      "source_line": 7548,
+      "source_ordinal": null,
+      "source_path": "ROADMAP.md",
+      "source_type": "roadmap_heading",
+      "status": "done_verify",
+      "title": "Pinpoint #695. Agent starts in stale/wrong worktree and burns a full turn before noticing \u2014 no pre-flight check for \"file exists on current branch\" or \"this .git is writable from sandbox\"",
+      "verification_required": "worker_boot_state_machine_or_cli_json_contract_test"
     }
   ],
   "schema_version": "cc2.board.v1",
@@ -14839,7 +14902,7 @@
       "root": "/Users/bellman/Documents/Workspace/claw-code/.omx/research"
     },
     "roadmap": {
-      "heading_count": 124,
+      "heading_count": 127,
       "ordered_action_count": 542,
       "path": "ROADMAP.md",
       "sha256_prefix": "2aba3315e52f3079"
@@ -14850,15 +14913,15 @@
       "adoption_overlay": 357,
       "parity_overlay": 20,
       "stream_0_governance": 221,
-      "stream_1_worker_boot_session_control": 15,
+      "stream_1_worker_boot_session_control": 17,
       "stream_2_event_reporting_contracts": 73,
-      "stream_3_branch_test_recovery": 16,
+      "stream_3_branch_test_recovery": 17,
       "stream_4_claws_first_execution": 5,
       "stream_5_plugin_mcp_lifecycle": 22
     },
     "by_release_bucket": {
       "2.x_intake": 30,
-      "alpha_blocker": 240,
+      "alpha_blocker": 243,
       "beta_adoption": 417,
       "context": 15,
       "ga_ecosystem": 22,
@@ -14870,13 +14933,13 @@
       "latest_open_issue": 30,
       "parity_repo_context": 2,
       "roadmap_action": 542,
-      "roadmap_heading": 124
+      "roadmap_heading": 127
     },
     "by_status": {
       "active": 73,
       "context": 15,
       "deferred_with_rationale": 9,
-      "done_verify": 313,
+      "done_verify": 316,
       "open": 285,
       "rejected_not_claw": 2,
       "stale_done": 31,

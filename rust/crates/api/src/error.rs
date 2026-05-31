@@ -273,7 +273,10 @@ impl Display for ApiError {
                     }
                 }
                 if let Some(hint) = hint {
-                    write!(f, " — hint: {hint}")?;
+                    // #754: newline-delimited so split_error_hint() can extract the hint
+                    // into the JSON envelope's `hint` field. The em-dash form was a
+                    // single-line string that left hint:null in --output-format json.
+                    write!(f, "\n{hint}")?;
                 }
                 Ok(())
             }
@@ -608,10 +611,15 @@ mod tests {
             rendered.starts_with("missing Anthropic credentials;"),
             "hint should be appended, not replace the base message: {rendered}"
         );
-        let hint_marker = " — hint: I see OPENAI_API_KEY is set — if you meant to use the OpenAI-compat provider, prefix your model name with `openai/` so prefix routing selects it.";
+        // #754: hint is now newline-delimited so split_error_hint() can extract it
+        let hint_text = "I see OPENAI_API_KEY is set — if you meant to use the OpenAI-compat provider, prefix your model name with `openai/` so prefix routing selects it.";
         assert!(
-            rendered.ends_with(hint_marker),
+            rendered.ends_with(hint_text),
             "rendered error should end with the hint: {rendered}"
+        );
+        assert!(
+            rendered.contains('\n'),
+            "rendered error must contain newline separator so split_error_hint works: {rendered}"
         );
         // Classification semantics are unaffected by the presence of a hint.
         assert_eq!(error.safe_failure_class(), "provider_auth");

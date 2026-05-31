@@ -13,6 +13,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -73,6 +74,7 @@ pub struct WorkerFailure {
 #[serde(rename_all = "snake_case")]
 pub enum WorkerEventKind {
     Spawning,
+    StartupPreflightWarning,
     TrustRequired,
     ToolPermissionRequired,
     TrustResolved,
@@ -100,6 +102,21 @@ pub enum WorkerPromptTarget {
     WrongTarget,
     WrongTask,
     Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerStartupPreflightWarningKind {
+    FileAbsentOnBranch,
+    GitMetadataNotWritable,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkerStartupPreflightWarning {
+    pub kind: WorkerStartupPreflightWarningKind,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
 }
 
 /// Classification of startup failure when no evidence is available.
@@ -211,6 +228,12 @@ pub enum WorkerEventPayload {
     StartupNoEvidence {
         evidence: StartupEvidenceBundle,
         classification: StartupFailureClassification,
+    },
+    StartupPreflightWarning {
+        kind: WorkerStartupPreflightWarningKind,
+        message: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
     },
 }
 
@@ -327,6 +350,34 @@ impl WorkerRegistry {
     pub fn get(&self, worker_id: &str) -> Option<Worker> {
         let inner = self.inner.lock().expect("worker registry lock poisoned");
         inner.workers.get(worker_id).cloned()
+    }
+
+    pub fn observe_startup_preflight(
+        &self,
+        worker_id: &str,
+        task_prompt: &str,
+    ) -> Result<Worker, String> {
+        let mut inner = self.inner.lock().expect("worker registry lock poisoned");
+        let worker = inner
+            .workers
+            .get_mut(worker_id)
+            .ok_or_else(|| format!("worker not found: {worker_id}"))?;
+
+        for warning in startup_preflight_warnings(Path::new(&worker.cwd), task_prompt) {
+            push_event(
+                worker,
+                WorkerEventKind::StartupPreflightWarning,
+                worker.status,
+                Some(warning.message.clone()),
+                Some(WorkerEventPayload::StartupPreflightWarning {
+                    kind: warning.kind,
+                    message: warning.message,
+                    path: warning.path,
+                }),
+            );
+        }
+
+        Ok(worker.clone())
     }
 
     pub fn observe(&self, worker_id: &str, screen_text: &str) -> Result<Worker, String> {
@@ -1064,6 +1115,128 @@ fn extract_server_from_qualified_tool(tool: &str) -> Option<String> {
     (!server.is_empty()).then(|| server.to_string())
 }
 
+pub fn startup_preflight_warnings(
+    cwd: &Path,
+    task_prompt: &str,
+) -> Vec<WorkerStartupPreflightWarning> {
+    let mut warnings = Vec::new();
+
+    if let Some(git_path) = git_metadata_path(cwd) {
+        if !path_is_writable(&git_path) {
+            warnings.push(WorkerStartupPreflightWarning {
+                kind: WorkerStartupPreflightWarningKind::GitMetadataNotWritable,
+                message: format!(
+                    "git metadata is not writable; commits or pushes may fail: {}",
+                    git_path.display()
+                ),
+                path: Some(git_path.display().to_string()),
+            });
+        }
+    }
+
+    for path in mentioned_repo_paths(task_prompt) {
+        if !git_tracks_path(cwd, &path) {
+            warnings.push(WorkerStartupPreflightWarning {
+                kind: WorkerStartupPreflightWarningKind::FileAbsentOnBranch,
+                message: format!(
+                    "task mentions {path}, but git does not track it on the current branch"
+                ),
+                path: Some(path),
+            });
+        }
+    }
+
+    warnings
+}
+
+fn mentioned_repo_paths(task_prompt: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for raw in task_prompt.split_whitespace() {
+        let token = raw.trim_matches(|ch: char| {
+            matches!(
+                ch,
+                '`' | '"' | '\'' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';' | ':'
+            )
+        });
+        if !token.contains('/') || token.contains("://") || token.starts_with('/') {
+            continue;
+        }
+        let token = token.trim_start_matches("./");
+        if token.contains("..") {
+            continue;
+        }
+        if token
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | '_' | '-' | '.'))
+            && token
+                .rsplit('/')
+                .next()
+                .is_some_and(|name| name.contains('.'))
+            && !out.iter().any(|seen| seen == token)
+        {
+            out.push(token.to_string());
+        }
+    }
+    out
+}
+
+fn git_tracks_path(cwd: &Path, path: &str) -> bool {
+    Command::new("git")
+        .arg("ls-files")
+        .arg("--error-unmatch")
+        .arg("--")
+        .arg(path)
+        .current_dir(cwd)
+        .output()
+        .is_ok_and(|output| output.status.success())
+}
+
+fn git_metadata_path(cwd: &Path) -> Option<PathBuf> {
+    let output = Command::new("git")
+        .args(["rev-parse", "--git-dir"])
+        .current_dir(cwd)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if text.is_empty() {
+        return None;
+    }
+    let path = PathBuf::from(text);
+    Some(if path.is_absolute() {
+        path
+    } else {
+        cwd.join(path)
+    })
+}
+
+fn path_is_writable(path: &Path) -> bool {
+    let probe_dir = if path.is_dir() {
+        path
+    } else {
+        path.parent().unwrap_or(path)
+    };
+    std::fs::metadata(probe_dir)
+        .ok()
+        .filter(std::fs::Metadata::is_dir)
+        .is_some_and(|metadata| metadata_allows_directory_writes(&metadata))
+}
+
+#[cfg(unix)]
+fn metadata_allows_directory_writes(metadata: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mode = metadata.permissions().mode();
+    mode & 0o222 != 0 && mode & 0o111 != 0
+}
+
+#[cfg(not(unix))]
+fn metadata_allows_directory_writes(metadata: &std::fs::Metadata) -> bool {
+    !metadata.permissions().readonly()
+}
+
 fn detect_trust_prompt(lowered: &str) -> bool {
     [
         "do you trust the files in this folder",
@@ -1285,6 +1458,8 @@ fn cwd_matches_observed_target(expected_cwd: &str, observed_cwd: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::process::Command;
 
     #[test]
     fn allowlisted_trust_prompt_auto_resolves_then_reaches_ready_state() {
@@ -1429,6 +1604,116 @@ mod tests {
             .expect("ready snapshot should load");
         assert!(readiness.blocked);
         assert!(!readiness.ready);
+    }
+
+    #[test]
+    fn startup_preflight_warns_when_task_file_is_absent_on_branch() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        Command::new("git")
+            .arg("init")
+            .current_dir(tmp.path())
+            .output()
+            .expect("git init should run");
+        fs::create_dir_all(tmp.path().join("src")).expect("src dir");
+        fs::write(tmp.path().join("src/lib.rs"), "pub fn present() {}\n").expect("write file");
+        Command::new("git")
+            .args(["add", "src/lib.rs"])
+            .current_dir(tmp.path())
+            .output()
+            .expect("git add should run");
+
+        let warnings = startup_preflight_warnings(
+            tmp.path(),
+            "Fix src/lib.rs and rust/crates/runtime/src/trident.rs before testing.",
+        );
+
+        assert!(warnings.iter().any(|warning| {
+            warning.kind == WorkerStartupPreflightWarningKind::FileAbsentOnBranch
+                && warning.path.as_deref() == Some("rust/crates/runtime/src/trident.rs")
+        }));
+        assert!(!warnings.iter().any(|warning| {
+            warning.kind == WorkerStartupPreflightWarningKind::FileAbsentOnBranch
+                && warning.path.as_deref() == Some("src/lib.rs")
+        }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_preflight_warns_when_git_metadata_is_not_writable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let worktree = tmp.path().join("worktree");
+        let git_dir = tmp.path().join("external-gitdir");
+        fs::create_dir_all(&worktree).expect("worktree dir");
+        fs::create_dir_all(git_dir.join("objects")).expect("objects dir");
+        fs::create_dir_all(git_dir.join("refs/heads")).expect("refs dir");
+        fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").expect("HEAD");
+        fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}\n", git_dir.display()),
+        )
+        .expect(".git file");
+
+        let original_permissions = fs::metadata(&git_dir)
+            .expect("gitdir metadata")
+            .permissions();
+        let mut read_only_permissions = original_permissions.clone();
+        read_only_permissions.set_mode(0o555);
+        fs::set_permissions(&git_dir, read_only_permissions).expect("make gitdir read-only");
+
+        let warnings = startup_preflight_warnings(&worktree, "Audit repository.");
+        let registry = WorkerRegistry::new();
+        let worker = registry.create(&worktree.display().to_string(), &[], true);
+        let observed = registry
+            .observe_startup_preflight(&worker.worker_id, "Audit repository.")
+            .expect("preflight should run");
+
+        fs::set_permissions(&git_dir, original_permissions).expect("restore gitdir permissions");
+
+        assert!(warnings.iter().any(|warning| {
+            warning.kind == WorkerStartupPreflightWarningKind::GitMetadataNotWritable
+                && warning.path.as_deref() == Some(git_dir.to_string_lossy().as_ref())
+        }));
+        assert!(observed.events.iter().any(|event| {
+            matches!(
+                &event.payload,
+                Some(WorkerEventPayload::StartupPreflightWarning {
+                    kind: WorkerStartupPreflightWarningKind::GitMetadataNotWritable,
+                    path: Some(path),
+                    ..
+                }) if path == git_dir.to_string_lossy().as_ref()
+            )
+        }));
+    }
+
+    #[test]
+    fn startup_preflight_records_structured_warning_event() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        Command::new("git")
+            .arg("init")
+            .current_dir(tmp.path())
+            .output()
+            .expect("git init should run");
+        let registry = WorkerRegistry::new();
+        let worker = registry.create(&tmp.path().display().to_string(), &[], true);
+
+        let observed = registry
+            .observe_startup_preflight(&worker.worker_id, "Open missing/file.rs")
+            .expect("preflight should run");
+
+        let event = observed
+            .events
+            .iter()
+            .find(|event| event.kind == WorkerEventKind::StartupPreflightWarning)
+            .expect("preflight warning event");
+        assert!(matches!(
+            event.payload,
+            Some(WorkerEventPayload::StartupPreflightWarning {
+                kind: WorkerStartupPreflightWarningKind::FileAbsentOnBranch,
+                ..
+            })
+        ));
     }
 
     #[test]

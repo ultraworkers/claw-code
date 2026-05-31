@@ -44,7 +44,17 @@ def main() -> int:
     args = parser.parse_args()
     repo_root = args.repo_root.resolve()
     board_path = args.board or (repo_root / ".omx" / "cc2" / "board.json")
-    board = json.loads(board_path.read_text(encoding="utf-8"))
+    try:
+        board = json.loads(board_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        print(f"error: board not found at {board_path}")
+        return 1
+    except IsADirectoryError:
+        print(f"error: board path is a directory: {board_path}")
+        return 1
+    except json.JSONDecodeError as exc:
+        print(f"error: invalid board JSON at {board_path}: {exc}")
+        return 1
     errors: list[str] = []
     ids = set()
     for index, item in enumerate(board.get("items", []), 1):

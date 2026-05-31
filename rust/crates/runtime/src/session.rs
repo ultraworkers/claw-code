@@ -413,6 +413,7 @@ impl Session {
             .get("created_at_ms")
             .map(|value| required_u64_from_value(value, "created_at_ms"))
             .transpose()?
+            .or_else(|| parse_created_at_ms_from_session_id(&session_id))
             .unwrap_or(now);
         let updated_at_ms = object
             .get("updated_at_ms")
@@ -500,7 +501,10 @@ impl Session {
                 "session_meta" => {
                     version = required_u32(object, "version")?;
                     session_id = Some(required_string(object, "session_id")?);
-                    created_at_ms = Some(required_u64(object, "created_at_ms")?);
+                    created_at_ms = object
+                        .get("created_at_ms")
+                        .map(|value| required_u64_from_value(value, "created_at_ms"))
+                        .transpose()?;
                     updated_at_ms = Some(required_u64(object, "updated_at_ms")?);
                     fork = object.get("fork").map(SessionFork::from_json).transpose()?;
                     workspace_root = object
@@ -543,11 +547,15 @@ impl Session {
         }
 
         let now = current_time_millis();
+        let session_id = session_id.unwrap_or_else(generate_session_id);
+        let created_at_ms = created_at_ms
+            .or_else(|| parse_created_at_ms_from_session_id(&session_id))
+            .unwrap_or(now);
         Ok(Self {
             version,
-            session_id: session_id.unwrap_or_else(generate_session_id),
-            created_at_ms: created_at_ms.unwrap_or(now),
-            updated_at_ms: updated_at_ms.unwrap_or(created_at_ms.unwrap_or(now)),
+            session_id,
+            created_at_ms,
+            updated_at_ms: updated_at_ms.unwrap_or(created_at_ms),
             messages,
             compaction,
             fork,
@@ -1291,6 +1299,15 @@ fn current_time_millis() -> u64 {
     }
 }
 
+pub(crate) fn parse_created_at_ms_from_session_id(session_id: &str) -> Option<u64> {
+    let timestamp_and_suffix = session_id.strip_prefix("session-")?;
+    let (timestamp, suffix) = timestamp_and_suffix.split_once('-')?;
+    if suffix.is_empty() {
+        return None;
+    }
+    timestamp.parse::<u64>().ok()
+}
+
 fn generate_session_id() -> String {
     let millis = current_time_millis();
     let counter = SESSION_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -1380,8 +1397,9 @@ fn cleanup_rotated_logs(path: &Path) -> Result<(), SessionError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        cleanup_rotated_logs, current_time_millis, rotate_session_file_if_needed, ContentBlock,
-        ConversationMessage, MessageRole, Session, SessionFork,
+        cleanup_rotated_logs, current_time_millis, parse_created_at_ms_from_session_id,
+        rotate_session_file_if_needed, ContentBlock, ConversationMessage, MessageRole, Session,
+        SessionFork,
     };
     use crate::json::JsonValue;
     use crate::usage::TokenUsage;
@@ -1500,6 +1518,44 @@ mod tests {
             ConversationMessage::user_text("legacy")
         );
         assert!(!restored.session_id.is_empty());
+    }
+
+    #[test]
+    fn created_at_parser_requires_full_session_id_shape() {
+        assert_eq!(
+            parse_created_at_ms_from_session_id("session-1743724800123-0"),
+            Some(1_743_724_800_123)
+        );
+        assert_eq!(
+            parse_created_at_ms_from_session_id("session-1743724800123"),
+            None
+        );
+        assert_eq!(
+            parse_created_at_ms_from_session_id("session-1743724800123-"),
+            None
+        );
+        assert_eq!(
+            parse_created_at_ms_from_session_id("other-1743724800123-0"),
+            None
+        );
+    }
+
+    #[test]
+    fn loads_legacy_jsonl_created_at_from_session_id_when_meta_omits_it() {
+        let path = temp_session_path("legacy-jsonl-created-at");
+        fs::write(
+            &path,
+            r#"{"type":"session_meta","version":3,"session_id":"session-1743724800123-0","updated_at_ms":1743724800456}
+"#,
+        )
+        .expect("legacy jsonl should write");
+
+        let restored = Session::load_from_path(&path).expect("legacy jsonl should load");
+        fs::remove_file(&path).expect("temp file should be removable");
+
+        assert_eq!(restored.session_id, "session-1743724800123-0");
+        assert_eq!(restored.created_at_ms, 1_743_724_800_123);
+        assert_eq!(restored.updated_at_ms, 1_743_724_800_456);
     }
 
     #[test]
