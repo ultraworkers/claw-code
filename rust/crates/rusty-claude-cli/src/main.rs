@@ -1175,6 +1175,8 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 model: model.clone(),
                 model_flag_raw: model_flag_raw.clone(),
                 permission_mode: get_permission_mode(),
+                output_format,
+                allowed_tools: allowed_tools.clone(),
             })
         }
         "sandbox" => {
@@ -1571,53 +1573,26 @@ fn parse_single_word_command_alias(
         }
         return Some(Err(msg));
     }
-    None
-}
-
-    // #720: `claw help <topic>` — when `help` is the verb and a topic follows,
-    // try to route to the topic's help handler instead of erroring.
-    if rest.len() == 2 && rest[0] == "help" {
-        let topic_name = rest[1].as_str();
-        let topic = match topic_name {
-            "status" => Some(LocalHelpTopic::Status),
-            "sandbox" => Some(LocalHelpTopic::Sandbox),
-            "doctor" => Some(LocalHelpTopic::Doctor),
-            "acp" => Some(LocalHelpTopic::Acp),
-            "init" => Some(LocalHelpTopic::Init),
-            "state" => Some(LocalHelpTopic::State),
-            "export" => Some(LocalHelpTopic::Export),
-            "version" => Some(LocalHelpTopic::Version),
-            "system-prompt" => Some(LocalHelpTopic::SystemPrompt),
-            "dump-manifests" => Some(LocalHelpTopic::DumpManifests),
-            "bootstrap-plan" => Some(LocalHelpTopic::BootstrapPlan),
-            "agents" | "agent" => Some(LocalHelpTopic::Agents),
-            "skills" | "skill" => Some(LocalHelpTopic::Skills),
-            "plugins" | "plugin" | "marketplace" => Some(LocalHelpTopic::Plugins),
-            "mcp" => Some(LocalHelpTopic::Mcp),
-            "config" => Some(LocalHelpTopic::Config),
-            "diff" => Some(LocalHelpTopic::Diff),
-            _ => None,
-        };
-        if let Some(t) = topic {
-            return Some(Ok(CliAction::HelpTopic {
-                topic: t,
-                output_format,
-            }));
-        }
-        // Unknown topic falls through to the generic help action.
-        return Some(Ok(CliAction::Help { output_format }));
-    }
 
     if rest.len() != 1 {
         return None;
     }
-    if tail.len() > max_args {
-        return Some(Err(format!(
-            "unexpected extra arguments after `claw {command}`: {}",
-            tail[max_args..].join(" ")
-        )));
+
+    match verb.as_str() {
+        "status" => Some(Ok(CliAction::Status {
+            model: model.to_string(),
+            model_flag_raw: model_flag_raw.map(|s| s.to_string()),
+            permission_mode: permission_mode_override.unwrap_or_else(default_permission_mode),
+            output_format,
+            allowed_tools,
+        })),
+        "sandbox" => Some(Ok(CliAction::Sandbox { output_format })),
+        "doctor" => Some(Ok(CliAction::Doctor { output_format })),
+        "state" => Some(Ok(CliAction::State { output_format })),
+        "help" => Some(Ok(CliAction::Help { output_format })),
+        "version" => Some(Ok(CliAction::Version { output_format })),
+        _ => None,
     }
-    None
 }
 
 fn is_help_only(tail: &[String]) -> bool {
