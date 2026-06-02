@@ -95,6 +95,32 @@ pub struct RuntimeFeatureConfig {
     sandbox: SandboxConfig,
     provider_fallbacks: ProviderFallbackConfig,
     trusted_roots: Vec<String>,
+    rules_import: RulesImportConfig,
+}
+
+/// Controls which external AI coding framework rules are auto-imported
+/// into the system prompt.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum RulesImportConfig {
+    /// Auto-import from all supported frameworks (Cursor, Copilot, Windsurf, Aider)
+    Auto,
+    /// No auto-import — only .claw/rules/ and CLAUDE.md files are loaded
+    None,
+    /// Import only from the listed frameworks
+    List(Vec<String>),
+    #[default]
+    /// Default: auto-import all detected frameworks
+    Default,
+}
+
+impl RulesImportConfig {
+    pub fn should_import(&self, framework: &str) -> bool {
+        match self {
+            Self::Auto | Self::Default => true,
+            Self::None => false,
+            Self::List(frameworks) => frameworks.iter().any(|f| f.eq_ignore_ascii_case(framework)),
+        }
+    }
 }
 
 /// Ordered chain of fallback model identifiers used when the primary
@@ -353,6 +379,7 @@ impl ConfigLoader {
             sandbox: parse_optional_sandbox_config(&merged_value)?,
             provider_fallbacks: parse_optional_provider_fallbacks(&merged_value)?,
             trusted_roots: parse_optional_trusted_roots(&merged_value)?,
+            rules_import: parse_optional_rules_import(&merged_value)?,
         };
 
         Ok(RuntimeConfig {
@@ -410,6 +437,7 @@ impl ConfigLoader {
             sandbox: parse_optional_sandbox_config(&merged_value)?,
             provider_fallbacks: parse_optional_provider_fallbacks(&merged_value)?,
             trusted_roots: parse_optional_trusted_roots(&merged_value)?,
+            rules_import: parse_optional_rules_import(&merged_value)?,
         };
 
         let config = RuntimeConfig {
@@ -509,6 +537,11 @@ impl RuntimeConfig {
     #[must_use]
     pub fn trusted_roots(&self) -> &[String] {
         &self.feature_config.trusted_roots
+    }
+
+    #[must_use]
+    pub fn rules_import(&self) -> &RulesImportConfig {
+        &self.feature_config.rules_import
     }
 
     /// Merge config-level default trusted roots with per-call roots.
@@ -1160,6 +1193,34 @@ fn parse_optional_trusted_roots(root: &JsonValue) -> Result<Vec<String>, ConfigE
         optional_string_array(object, "trustedRoots", "merged settings.trustedRoots")?
             .unwrap_or_default(),
     )
+}
+
+fn parse_optional_rules_import(root: &JsonValue) -> Result<RulesImportConfig, ConfigError> {
+    let Some(object) = root.as_object() else {
+        return Ok(RulesImportConfig::Default);
+    };
+    let Some(value) = object.get("rulesImport") else {
+        return Ok(RulesImportConfig::Default);
+    };
+    match value {
+        JsonValue::String(s) => match s.as_str() {
+            "auto" => Ok(RulesImportConfig::Auto),
+            "none" => Ok(RulesImportConfig::None),
+            other => Err(ConfigError::Parse(format!(
+                r#"merged settings.rulesImport: expected "auto", "none", or an array, got "{other}""#
+            ))),
+        },
+        JsonValue::Array(arr) => {
+            let frameworks: Vec<String> = arr
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_owned))
+                .collect();
+            Ok(RulesImportConfig::List(frameworks))
+        }
+        _ => Err(ConfigError::Parse(format!(
+            r#"merged settings.rulesImport: expected "auto", "none", or an array"#
+        ))),
+    }
 }
 
 fn parse_filesystem_mode_label(value: &str) -> Result<FilesystemIsolationMode, ConfigError> {

@@ -201,6 +201,10 @@ const TOP_LEVEL_FIELDS: &[FieldSpec] = &[
         name: "provider",
         expected: FieldType::Object,
     },
+    FieldSpec {
+        name: "rulesImport",
+        expected: FieldType::String,
+    },
 ];
 
 const HOOKS_FIELDS: &[FieldSpec] = &[
