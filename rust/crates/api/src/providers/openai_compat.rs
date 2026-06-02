@@ -140,6 +140,35 @@ impl OpenAiCompatClient {
         Ok(Self::new(api_key, config))
     }
 
+    /// Resolve credentials using the 3-tier resolution chain:
+    /// 1. Environment variable (e.g. `OPENAI_API_KEY`)
+    /// 2. `.env` file in the current working directory
+    /// 3. Stored provider config in `~/.claw/settings.json`
+    ///
+    /// Falls back to the stored config when the environment variable is
+    /// not set. The stored provider kind in settings.json must match
+    /// this provider's kind (e.g. "openai", "xai", "dashscope").
+    pub fn from_env_or_saved(config: OpenAiCompatConfig) -> Result<Self, ApiError> {
+        // Tier 1+2: env vars (includes .env fallback via read_env_non_empty)
+        if let Some(api_key) = read_env_non_empty(config.api_key_env)? {
+            return Ok(Self::new(api_key, config));
+        }
+        // Tier 3: stored config in ~/.claw/settings.json
+        let provider_kind = match config.provider_name {
+            "xAI" => "xai",
+            "DashScope" => "dashscope",
+            // "OpenAI" and custom providers
+            _ => "openai",
+        };
+        if let Some(api_key) = super::read_env_or_config(config.api_key_env, provider_kind) {
+            return Ok(Self::new(api_key, config));
+        }
+        Err(ApiError::missing_credentials(
+            config.provider_name,
+            config.credential_env_vars(),
+        ))
+    }
+
     #[must_use]
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into();
@@ -1594,7 +1623,28 @@ pub fn has_api_key(key: &str) -> bool {
 
 #[must_use]
 pub fn read_base_url(config: OpenAiCompatConfig) -> String {
-    std::env::var(config.base_url_env).unwrap_or_else(|_| config.default_base_url.to_string())
+    // Tier 1: environment variable
+    if let Ok(value) = std::env::var(config.base_url_env) {
+        if !value.is_empty() {
+            return value;
+        }
+    }
+    // Tier 2: .env file
+    if let Some(value) = super::dotenv_value(config.base_url_env) {
+        if !value.is_empty() {
+            return value;
+        }
+    }
+    // Tier 3: stored config in ~/.claw/settings.json
+    let provider_kind = match config.provider_name {
+        "xAI" => "xai",
+        "DashScope" => "dashscope",
+        _ => "openai",
+    };
+    if let Some(base_url) = super::read_base_url_from_config(provider_kind) {
+        return base_url;
+    }
+    config.default_base_url.to_string()
 }
 
 fn chat_completions_endpoint(base_url: &str) -> String {

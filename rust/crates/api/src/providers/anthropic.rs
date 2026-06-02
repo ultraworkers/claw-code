@@ -618,7 +618,16 @@ fn jitter_for_base(base: Duration) -> Duration {
 }
 
 impl AuthSource {
+    /// Resolve Anthropic credentials using the 3-tier resolution chain:
+    /// 1. Environment variables (`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`)
+    /// 2. `.env` file in the current working directory
+    /// 3. Stored provider config in `~/.claw/settings.json`
+    ///
+    /// Tier 1+2 are checked via `read_env_non_empty`. Tier 3 reads
+    /// the `provider.apiKey` field from settings.json when the stored
+    /// provider kind is "anthropic".
     pub fn from_env_or_saved() -> Result<Self, ApiError> {
+        // Tier 1+2: environment variables (includes .env fallback)
         if let Some(api_key) = read_env_non_empty("ANTHROPIC_API_KEY")? {
             return match read_env_non_empty("ANTHROPIC_AUTH_TOKEN")? {
                 Some(bearer_token) => Ok(Self::ApiKeyAndBearer {
@@ -630,6 +639,21 @@ impl AuthSource {
         }
         if let Some(bearer_token) = read_env_non_empty("ANTHROPIC_AUTH_TOKEN")? {
             return Ok(Self::BearerToken(bearer_token));
+        }
+        // Tier 3: stored config in ~/.claw/settings.json
+        if let Some(api_key) = super::read_env_or_config("ANTHROPIC_API_KEY", "anthropic") {
+            // Stored config always provides an API key (not a bearer token).
+            // If an env-only auth token exists, combine both.
+            let auth_token = read_env_non_empty("ANTHROPIC_AUTH_TOKEN")
+                .ok()
+                .and_then(std::convert::identity);
+            return match auth_token {
+                Some(bearer_token) => Ok(Self::ApiKeyAndBearer {
+                    api_key,
+                    bearer_token,
+                }),
+                None => Ok(Self::ApiKey(api_key)),
+            };
         }
         Err(anthropic_missing_credentials())
     }
@@ -651,14 +675,15 @@ pub fn resolve_saved_oauth_token(config: &OAuthConfig) -> Result<Option<OAuthTok
 
 pub fn has_auth_from_env_or_saved() -> Result<bool, ApiError> {
     Ok(read_env_non_empty("ANTHROPIC_API_KEY")?.is_some()
-        || read_env_non_empty("ANTHROPIC_AUTH_TOKEN")?.is_some())
+        || read_env_non_empty("ANTHROPIC_AUTH_TOKEN")?.is_some()
+        || super::read_env_or_config("ANTHROPIC_API_KEY", "anthropic").is_some())
 }
 
 pub fn resolve_startup_auth_source<F>(load_oauth_config: F) -> Result<AuthSource, ApiError>
 where
     F: FnOnce() -> Result<Option<OAuthConfig>, ApiError>,
 {
-    let _ = load_oauth_config;
+    // Tier 1+2: environment variables (includes .env fallback)
     if let Some(api_key) = read_env_non_empty("ANTHROPIC_API_KEY")? {
         return match read_env_non_empty("ANTHROPIC_AUTH_TOKEN")? {
             Some(bearer_token) => Ok(AuthSource::ApiKeyAndBearer {
@@ -671,6 +696,13 @@ where
     if let Some(bearer_token) = read_env_non_empty("ANTHROPIC_AUTH_TOKEN")? {
         return Ok(AuthSource::BearerToken(bearer_token));
     }
+    // Tier 3: stored config in ~/.claw/settings.json
+    if let Some(api_key) = super::read_env_or_config("ANTHROPIC_API_KEY", "anthropic") {
+        let _ = load_oauth_config; // kept for API compatibility
+        return Ok(AuthSource::ApiKey(api_key));
+    }
+    // Future: resolve OAuth token from saved config
+    let _ = load_oauth_config;
     Err(anthropic_missing_credentials())
 }
 
@@ -764,7 +796,23 @@ fn read_auth_token() -> Option<String> {
 
 #[must_use]
 pub fn read_base_url() -> String {
-    std::env::var("ANTHROPIC_BASE_URL").unwrap_or_else(|_| DEFAULT_BASE_URL.to_string())
+    // Tier 1: environment variable
+    if let Ok(value) = std::env::var("ANTHROPIC_BASE_URL") {
+        if !value.is_empty() {
+            return value;
+        }
+    }
+    // Tier 2: .env file
+    if let Some(value) = super::dotenv_value("ANTHROPIC_BASE_URL") {
+        if !value.is_empty() {
+            return value;
+        }
+    }
+    // Tier 3: stored config in ~/.claw/settings.json
+    if let Some(base_url) = super::read_base_url_from_config("anthropic") {
+        return base_url;
+    }
+    DEFAULT_BASE_URL.to_string()
 }
 
 fn request_id_from_headers(headers: &reqwest::header::HeaderMap) -> Option<String> {

@@ -686,6 +686,66 @@ fn estimate_serialized_tokens<T: Serialize>(value: &T) -> u32 {
         .map_or(0, |bytes| (bytes.len() / 4 + 1) as u32)
 }
 
+/// 3-tier credential resolution for a single config key:
+/// 1. Environment variable (highest priority, immediate override)
+/// 2. `.env` file in the current working directory
+/// 3. Stored provider config in `~/.claw/settings.json` (lowest priority)
+///
+/// Returns `None` when no tier produces a non-empty value. This is the
+/// core of the provider config fallback that the setup wizard depends
+/// on — credentials saved by the wizard are read from tier 3 when the
+/// user has not set env vars.
+pub fn read_env_or_config(env_var: &str, provider_kind: &str) -> Option<String> {
+    // Tier 1: real process environment
+    if let Ok(value) = std::env::var(env_var) {
+        if !value.is_empty() {
+            return Some(value);
+        }
+    }
+    // Tier 2: .env file in the current working directory
+    if let Some(value) = dotenv_value(env_var) {
+        if !value.is_empty() {
+            return Some(value);
+        }
+    }
+    // Tier 3: stored config in ~/.claw/settings.json
+    read_provider_config_value(provider_kind, env_var)
+}
+
+/// Read a single credential value from the stored provider config in
+/// `~/.claw/settings.json`. Maps the env var name to the correct field
+/// in the `provider` JSON object:
+/// - `ANTHROPIC_API_KEY` → `provider.apiKey` (when kind is "anthropic")
+/// - `XAI_API_KEY` → `provider.apiKey` (when kind is "xai")
+/// - `OPENAI_API_KEY` → `provider.apiKey` (when kind is "openai")
+/// - `DASHSCOPE_API_KEY` → `provider.apiKey` (when kind is "dashscope")
+fn read_provider_config_value(provider_kind: &str, _env_var: &str) -> Option<String> {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let config = runtime::ConfigLoader::default_for(&cwd).load().ok()?;
+    let provider = config.provider();
+    // The stored kind must match the provider we're looking up credentials
+    // for, otherwise we'd return an xAI key for the OpenAI provider, etc.
+    let stored_kind = provider.kind()?;
+    if stored_kind != provider_kind {
+        return None;
+    }
+    provider.api_key().map(ToOwned::to_owned)
+}
+
+/// Read the stored base URL for a provider from `~/.claw/settings.json`.
+/// Returns `None` when the stored provider kind doesn't match or when
+/// no base URL override was saved.
+pub fn read_base_url_from_config(provider_kind: &str) -> Option<String> {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let config = runtime::ConfigLoader::default_for(&cwd).load().ok()?;
+    let provider = config.provider();
+    let stored_kind = provider.kind()?;
+    if stored_kind != provider_kind {
+        return None;
+    }
+    provider.base_url().map(ToOwned::to_owned)
+}
+
 /// Env var names used by other provider backends. When Anthropic auth
 /// resolution fails we sniff these so we can hint the user that their
 /// credentials probably belong to a different provider and suggest the

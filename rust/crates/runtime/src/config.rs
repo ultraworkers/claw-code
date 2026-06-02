@@ -95,6 +95,76 @@ pub struct RuntimeFeatureConfig {
     sandbox: SandboxConfig,
     provider_fallbacks: ProviderFallbackConfig,
     trusted_roots: Vec<String>,
+    provider: RuntimeProviderConfig,
+}
+
+/// Stored provider configuration read from `~/.claw/settings.json`
+/// under the top-level `"provider"` key. Written by the setup wizard
+/// and read back by the 3-tier credential resolution path
+/// (env var → .env → stored config).
+///
+/// JSON shape in settings.json:
+/// ```json
+/// {
+///   "provider": {
+///     "kind": "anthropic",
+///     "apiKey": "sk-ant-...",
+///     "baseUrl": "https://api.anthropic.com"
+///   },
+///   "model": "sonnet"
+/// }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RuntimeProviderConfig {
+    kind: Option<String>,
+    api_key: Option<String>,
+    base_url: Option<String>,
+}
+
+impl RuntimeProviderConfig {
+    /// Construct from the top-level `"provider"` object in the merged
+    /// settings. The object uses the crate-internal `JsonValue` type,
+    /// not `serde_json::Value`.
+    fn from_provider_object(obj: &BTreeMap<String, JsonValue>) -> Self {
+        Self {
+            kind: obj
+                .get("kind")
+                .and_then(JsonValue::as_str)
+                .map(String::from),
+            api_key: obj
+                .get("apiKey")
+                .and_then(JsonValue::as_str)
+                .map(String::from),
+            base_url: obj
+                .get("baseUrl")
+                .and_then(JsonValue::as_str)
+                .map(String::from),
+        }
+    }
+
+    /// The provider kind string (e.g. "anthropic", "xai", "openai", "dashscope").
+    #[must_use]
+    pub fn kind(&self) -> Option<&str> {
+        self.kind.as_deref()
+    }
+
+    /// The stored API key for this provider.
+    #[must_use]
+    pub fn api_key(&self) -> Option<&str> {
+        self.api_key.as_deref()
+    }
+
+    /// The optional custom base URL override.
+    #[must_use]
+    pub fn base_url(&self) -> Option<&str> {
+        self.base_url.as_deref()
+    }
+
+    /// Whether any provider field is set.
+    #[must_use]
+    pub fn is_set(&self) -> bool {
+        self.kind.is_some() || self.api_key.is_some()
+    }
 }
 
 /// Ordered chain of fallback model identifiers used when the primary
@@ -353,6 +423,7 @@ impl ConfigLoader {
             sandbox: parse_optional_sandbox_config(&merged_value)?,
             provider_fallbacks: parse_optional_provider_fallbacks(&merged_value)?,
             trusted_roots: parse_optional_trusted_roots(&merged_value)?,
+            provider: parse_optional_provider_config(&merged_value),
         };
 
         Ok(RuntimeConfig {
@@ -410,6 +481,7 @@ impl ConfigLoader {
             sandbox: parse_optional_sandbox_config(&merged_value)?,
             provider_fallbacks: parse_optional_provider_fallbacks(&merged_value)?,
             trusted_roots: parse_optional_trusted_roots(&merged_value)?,
+            provider: parse_optional_provider_config(&merged_value),
         };
 
         let config = RuntimeConfig {
@@ -506,6 +578,14 @@ impl RuntimeConfig {
         &self.feature_config.provider_fallbacks
     }
 
+    /// Return the stored provider configuration from `settings.json`.
+    /// Used by the 3-tier credential resolution path
+    /// (env var → .env → stored config).
+    #[must_use]
+    pub fn provider(&self) -> &RuntimeProviderConfig {
+        &self.feature_config.provider
+    }
+
     #[must_use]
     pub fn trusted_roots(&self) -> &[String] {
         &self.feature_config.trusted_roots
@@ -584,6 +664,12 @@ impl RuntimeFeatureConfig {
     #[must_use]
     pub fn provider_fallbacks(&self) -> &ProviderFallbackConfig {
         &self.provider_fallbacks
+    }
+
+    /// Return the stored provider configuration from `settings.json`.
+    #[must_use]
+    pub fn provider(&self) -> &RuntimeProviderConfig {
+        &self.provider
     }
 
     #[must_use]
@@ -980,6 +1066,21 @@ fn parse_optional_model(root: &JsonValue) -> Option<String> {
         .and_then(|object| object.get("model"))
         .and_then(JsonValue::as_str)
         .map(ToOwned::to_owned)
+}
+
+/// Parse the `"provider"` section from merged settings into a
+/// [`RuntimeProviderConfig`]. Returns a default (empty) config when the
+/// key is absent — this is the normal case when the user has not run
+/// the setup wizard.
+fn parse_optional_provider_config(root: &JsonValue) -> RuntimeProviderConfig {
+    let Some(obj) = root
+        .as_object()
+        .and_then(|object| object.get("provider"))
+        .and_then(JsonValue::as_object)
+    else {
+        return RuntimeProviderConfig::default();
+    };
+    RuntimeProviderConfig::from_provider_object(obj)
 }
 
 fn parse_optional_aliases(root: &JsonValue) -> Result<BTreeMap<String, String>, ConfigError> {
@@ -1720,6 +1821,91 @@ mod tests {
         assert_eq!(chain.primary(), None);
         assert!(chain.fallbacks().is_empty());
         assert!(chain.is_empty());
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn provider_config_default_is_empty_when_unset() {
+        // given
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&cwd).expect("project dir");
+        fs::write(home.join("settings.json"), "{}").expect("write empty settings");
+
+        // when
+        let loaded = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("config should load");
+
+        // then
+        let provider = loaded.provider();
+        assert_eq!(provider.kind(), None);
+        assert_eq!(provider.api_key(), None);
+        assert_eq!(provider.base_url(), None);
+        assert!(!provider.is_set());
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn provider_config_parses_kind_api_key_and_base_url() {
+        // given
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&cwd).expect("project dir");
+        fs::write(
+            home.join("settings.json"),
+            r#"{"provider": {"kind": "anthropic", "apiKey": "sk-ant-test-key", "baseUrl": "https://custom.api.anthropic.com"}, "model": "sonnet"}"#,
+        )
+        .expect("write settings");
+
+        // when
+        let loaded = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("config should load");
+
+        // then
+        let provider = loaded.provider();
+        assert_eq!(provider.kind(), Some("anthropic"));
+        assert_eq!(provider.api_key(), Some("sk-ant-test-key"));
+        assert_eq!(provider.base_url(), Some("https://custom.api.anthropic.com"));
+        assert!(provider.is_set());
+
+        // model is a separate top-level field
+        assert_eq!(loaded.model(), Some("sonnet"));
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn provider_config_handles_partial_provider_object() {
+        // given — only kind and apiKey set, no baseUrl
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&cwd).expect("project dir");
+        fs::write(
+            home.join("settings.json"),
+            r#"{"provider": {"kind": "openai", "apiKey": "sk-openai-test"}}"#,
+        )
+        .expect("write settings");
+
+        // when
+        let loaded = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("config should load");
+
+        // then
+        let provider = loaded.provider();
+        assert_eq!(provider.kind(), Some("openai"));
+        assert_eq!(provider.api_key(), Some("sk-openai-test"));
+        assert_eq!(provider.base_url(), None);
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
