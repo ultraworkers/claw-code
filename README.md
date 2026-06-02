@@ -228,6 +228,15 @@ Claw Code is built in the open alongside the broader UltraWorkers toolchain:
 - [oh-my-codex](https://github.com/Yeachan-Heo/oh-my-codex)
 - [UltraWorkers Discord](https://discord.gg/5TUQKqFWd)
 
+## Providers
+
+Claw Code supports the following API providers:
+
+- [Anthropic (Claude)](https://console.anthropic.com/)
+- [OpenAI](https://platform.openai.com/)
+- [xAI (Grok)](https://console.x.ai/)
+- [DashScope (Qwen/Kimi)](https://dashscope.console.aliyun.com/)
+
 ## Ownership / affiliation disclaimer
 
 - This repository does **not** claim ownership of the original Claude Code source material.
