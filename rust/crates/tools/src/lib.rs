@@ -1225,13 +1225,14 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "GitShow",
-            description: "Show a commit, tag, or tree object with its diff. Supports showing a specific file at a commit (commit:path) and stat-only mode. Use this instead of running git show via bash to get structured output.",
+            description: "Show a commit, tag, or tree object. Use `format` to control output: \"patch\" (default) shows the full diff, \"stat\" shows a diffstat summary, \"metadata\" shows commit info (author, date, message) without the diff. Supports showing a specific file at a commit (commit:path). Use this instead of running git show via bash to get structured output.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "commit": { "type": "string" },
                     "path": { "type": "string" },
-                    "stat": { "type": "boolean" }
+                    "stat": { "type": "boolean" },
+                    "format": { "type": "string", "enum": ["patch", "stat", "metadata"] }
                 },
                 "required": ["commit"],
                 "additionalProperties": false
@@ -2013,9 +2014,32 @@ fn run_git_log(input: GitLogInput) -> Result<String, String> {
 /// Uses the `commit:path` syntax when a path is specified.
 fn run_git_show(input: GitShowInput) -> Result<String, String> {
     let mut args: Vec<String> = vec!["show".to_string()];
-    if input.stat.unwrap_or(false) {
-        args.push("--stat".to_string());
+
+    // Determine output format. The `format` field takes priority over
+    // the legacy `stat` boolean for backward compatibility.
+    match input.format.as_deref() {
+        Some("stat") => {
+            args.push("--stat".to_string());
+        }
+        Some("metadata") => {
+            args.push("--format=medium".to_string());
+            args.push("--no-patch".to_string());
+        }
+        Some("patch") | None => {
+            // Default: full diff. Fall back to legacy `stat` field
+            // when `format` is not set but `stat` is true.
+            if input.format.is_none() && input.stat.unwrap_or(false) {
+                args.push("--stat".to_string());
+            }
+        }
+        Some(other) => {
+            return Err(format!(
+                "unknown GitShow format: \"{other}\". \
+                 Supported values: \"patch\" (default), \"stat\", \"metadata\"."
+            ));
+        }
     }
+
     if let Some(ref path) = input.path {
         args.push(format!("{}:{}", input.commit, path));
     } else {
@@ -2963,7 +2987,13 @@ struct GitShowInput {
     path: Option<String>,
     #[serde(default)]
     /// If true, show diffstat summary instead of full diff.
+    /// Deprecated: prefer `format` for finer control.
     stat: Option<bool>,
+    #[serde(default)]
+    /// Output format: "patch" (default) shows the full diff,
+    /// "stat" shows a diffstat summary, "metadata" shows commit
+    /// info without the diff. When set, takes priority over `stat`.
+    format: Option<String>,
 }
 
 /// Input for the GitBlame tool: shows per-line author/revision info for a file.
