@@ -720,6 +720,13 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         resume_supported: true,
     },
     SlashCommandSpec {
+        name: "setup",
+        aliases: &[],
+        summary: "Run the interactive provider setup wizard",
+        argument_hint: None,
+        resume_supported: false,
+    },
+    SlashCommandSpec {
         name: "notifications",
         aliases: &[],
         summary: "Show or configure notification settings",
@@ -1101,6 +1108,7 @@ pub enum SlashCommand {
         args: Option<String>,
     },
     Doctor,
+    Setup,
     Login,
     Logout,
     Vim,
@@ -1222,6 +1230,7 @@ impl SlashCommand {
             Self::Compact { .. } => "/compact",
             Self::Cost => "/cost",
             Self::Doctor => "/doctor",
+            Self::Setup => "/setup",
             Self::Config { .. } => "/config",
             Self::Memory { .. } => "/memory",
             Self::History { .. } => "/history",
@@ -1390,6 +1399,10 @@ pub fn validate_slash_command_input(
         "doctor" | "providers" => {
             validate_no_args(command, &args)?;
             SlashCommand::Doctor
+        }
+        "setup" => {
+            validate_no_args(command, &args)?;
+            SlashCommand::Setup
         }
         "login" | "logout" => {
             return Err(command_error(
@@ -1902,7 +1915,7 @@ fn slash_command_category(name: &str) -> &'static str {
         | "stickers" | "language" | "profile" | "max-tokens" | "temperature" | "system-prompt"
         | "api-key" | "terminal-setup" | "notifications" | "telemetry" | "providers" | "env"
         | "project" | "reasoning" | "budget" | "rate-limit" | "workspace" | "reset" | "ide"
-        | "desktop" | "upgrade" => "Config",
+        | "desktop" | "upgrade" | "setup" => "Config",
         "debug-tool-call" | "doctor" | "sandbox" | "diagnostics" | "tool-details" | "changelog"
         | "metrics" => "Debug",
         _ => "Tools",
@@ -4624,6 +4637,7 @@ pub fn handle_slash_command(
         | SlashCommand::AddDir { .. }
         | SlashCommand::History { .. }
         | SlashCommand::Team { .. }
+        | SlashCommand::Setup
         | SlashCommand::Unknown(_) => None,
     }
 }

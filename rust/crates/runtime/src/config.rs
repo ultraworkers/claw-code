@@ -95,6 +95,42 @@ pub struct RuntimeFeatureConfig {
     sandbox: SandboxConfig,
     provider_fallbacks: ProviderFallbackConfig,
     trusted_roots: Vec<String>,
+    provider: RuntimeProviderConfig,
+}
+
+/// Stored provider configuration from the setup wizard.
+///
+/// Represents the `provider` section in `~/.claw/settings.json`, used as a
+/// fallback when environment variables are absent (3-tier resolution:
+/// env var > .env file > stored config).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RuntimeProviderConfig {
+    kind: Option<String>,
+    api_key: Option<String>,
+    base_url: Option<String>,
+    model: Option<String>,
+}
+
+impl RuntimeProviderConfig {
+    #[must_use]
+    pub fn kind(&self) -> Option<&str> {
+        self.kind.as_deref()
+    }
+
+    #[must_use]
+    pub fn api_key(&self) -> Option<&str> {
+        self.api_key.as_deref()
+    }
+
+    #[must_use]
+    pub fn base_url(&self) -> Option<&str> {
+        self.base_url.as_deref()
+    }
+
+    #[must_use]
+    pub fn model(&self) -> Option<&str> {
+        self.model.as_deref()
+    }
 }
 
 /// Ordered chain of fallback model identifiers used when the primary
@@ -353,6 +389,7 @@ impl ConfigLoader {
             sandbox: parse_optional_sandbox_config(&merged_value)?,
             provider_fallbacks: parse_optional_provider_fallbacks(&merged_value)?,
             trusted_roots: parse_optional_trusted_roots(&merged_value)?,
+            provider: parse_optional_provider_config(&merged_value)?,
         };
 
         Ok(RuntimeConfig {
@@ -410,6 +447,7 @@ impl ConfigLoader {
             sandbox: parse_optional_sandbox_config(&merged_value)?,
             provider_fallbacks: parse_optional_provider_fallbacks(&merged_value)?,
             trusted_roots: parse_optional_trusted_roots(&merged_value)?,
+            provider: parse_optional_provider_config(&merged_value)?,
         };
 
         let config = RuntimeConfig {
@@ -507,6 +545,11 @@ impl RuntimeConfig {
     }
 
     #[must_use]
+    pub fn provider(&self) -> &RuntimeProviderConfig {
+        &self.feature_config.provider
+    }
+
+    #[must_use]
     pub fn trusted_roots(&self) -> &[String] {
         &self.feature_config.trusted_roots
     }
@@ -584,6 +627,11 @@ impl RuntimeFeatureConfig {
     #[must_use]
     pub fn provider_fallbacks(&self) -> &ProviderFallbackConfig {
         &self.provider_fallbacks
+    }
+
+    #[must_use]
+    pub fn provider(&self) -> &RuntimeProviderConfig {
+        &self.provider
     }
 
     #[must_use]
@@ -1160,6 +1208,25 @@ fn parse_optional_trusted_roots(root: &JsonValue) -> Result<Vec<String>, ConfigE
         optional_string_array(object, "trustedRoots", "merged settings.trustedRoots")?
             .unwrap_or_default(),
     )
+}
+
+fn parse_optional_provider_config(root: &JsonValue) -> Result<RuntimeProviderConfig, ConfigError> {
+    let Some(provider_value) = root.as_object().and_then(|object| object.get("provider")) else {
+        return Ok(RuntimeProviderConfig::default());
+    };
+    let Some(object) = provider_value.as_object() else {
+        return Ok(RuntimeProviderConfig::default());
+    };
+    let kind = optional_string(object, "kind", "provider")?.map(str::to_string);
+    let api_key = optional_string(object, "apiKey", "provider")?.map(str::to_string);
+    let base_url = optional_string(object, "baseUrl", "provider")?.map(str::to_string);
+    let model = optional_string(object, "model", "provider")?.map(str::to_string);
+    Ok(RuntimeProviderConfig {
+        kind,
+        api_key,
+        base_url,
+        model,
+    })
 }
 
 fn parse_filesystem_mode_label(value: &str) -> Result<FilesystemIsolationMode, ConfigError> {

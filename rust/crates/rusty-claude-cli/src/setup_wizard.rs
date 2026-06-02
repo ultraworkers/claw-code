@@ -23,7 +23,10 @@ const DEFAULT_BASE_URLS: &[(&str, &str)] = &[
     ("anthropic", "https://api.anthropic.com"),
     ("xai", "https://api.x.ai/v1"),
     ("openai", "https://api.openai.com/v1"),
-    ("dashscope", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
+    (
+        "dashscope",
+        "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    ),
 ];
 
 const API_KEY_ENV_VARS: &[(&str, &str)] = &[
@@ -51,12 +54,7 @@ pub fn run_setup_wizard() -> Result<(), Box<dyn std::error::Error>> {
     let model = prompt_model(&kind, &current)?;
     let fast_model = prompt_fast_model(&current, model.as_deref())?;
 
-    save_user_provider_settings(
-        &kind,
-        &api_key,
-        base_url.as_deref(),
-        model.as_deref(),
-    )?;
+    save_user_provider_settings(&kind, &api_key, base_url.as_deref(), model.as_deref())?;
 
     if let Some(fast) = &fast_model {
         save_settings_field("subagentModel", fast)?;
@@ -64,7 +62,10 @@ pub fn run_setup_wizard() -> Result<(), Box<dyn std::error::Error>> {
 
     println!();
     println!("  \x1b[32mProvider saved to ~/.claw/settings.json\x1b[0m");
-    println!("  Run \x1b[1m/model {}\x1b[0m or restart claw to activate.", model.as_deref().unwrap_or(&kind));
+    println!(
+        "  Run \x1b[1m/model {}\x1b[0m or restart claw to activate.",
+        model.as_deref().unwrap_or(&kind)
+    );
     println!();
 
     Ok(())
@@ -82,7 +83,11 @@ fn prompt_provider(current: &RuntimeProviderConfig) -> Result<String, Box<dyn st
     let current_kind = current.kind().unwrap_or("anthropic");
     println!("  \x1b[1mProvider\x1b[0m");
     for (num, label, kind) in PROVIDERS {
-        let marker = if *kind == current_kind { " (current)" } else { "" };
+        let marker = if *kind == current_kind {
+            " (current)"
+        } else {
+            ""
+        };
         println!("    [{num}] {label}{marker}");
     }
     let default = PROVIDERS
@@ -129,9 +134,7 @@ fn prompt_api_key(
     };
 
     // Check if env var is already set
-    let env_set = std::env::var(env_var)
-        .ok()
-        .is_some_and(|v| !v.is_empty());
+    let env_set = std::env::var(env_var).ok().is_some_and(|v| !v.is_empty());
     if env_set {
         println!("  {env_var} is set in environment (will take priority over stored key)");
     }
@@ -144,7 +147,9 @@ fn prompt_api_key(
     };
 
     if key.is_empty() && !env_set {
-        eprintln!("  \x1b[33mWarning: no API key configured. Set {env_var} or re-run setup.\x1b[0m");
+        eprintln!(
+            "  \x1b[33mWarning: no API key configured. Set {env_var} or re-run setup.\x1b[0m"
+        );
     }
 
     Ok(key)
@@ -174,9 +179,7 @@ fn prompt_base_url(
         "dashscope" => "DASHSCOPE_BASE_URL",
         _ => "BASE_URL",
     };
-    let env_set = std::env::var(env_var)
-        .ok()
-        .is_some_and(|v| !v.is_empty());
+    let env_set = std::env::var(env_var).ok().is_some_and(|v| !v.is_empty());
     if env_set {
         println!("  {env_var} is set in environment (will take priority over stored URL)");
     }
@@ -203,7 +206,9 @@ fn prompt_model(
         .find(|(k, _)| *k == kind)
         .map_or(empty, |(_, models)| *models);
 
-    let current_model = current.model().unwrap_or(aliases.first().copied().unwrap_or(""));
+    let current_model = current
+        .model()
+        .unwrap_or(aliases.first().copied().unwrap_or(""));
 
     println!("  \x1b[1mModel\x1b[0m");
     if !aliases.is_empty() {
@@ -235,12 +240,16 @@ fn prompt_fast_model(
     println!("    Press Enter to skip (agents will use your main model).");
 
     let current_fast = load_current_settings_field("subagentModel");
-    let default_hint = current_fast
-        .as_deref()
-        .or(main_model)
-        .unwrap_or("");
+    let default_hint = current_fast.as_deref().or(main_model).unwrap_or("");
 
-    let input = read_line(&format!("  Fast model [{}]: ", if default_hint.is_empty() { "same as main" } else { default_hint }))?;
+    let input = read_line(&format!(
+        "  Fast model [{}]: ",
+        if default_hint.is_empty() {
+            "same as main"
+        } else {
+            default_hint
+        }
+    ))?;
     if input.trim().is_empty() {
         Ok(current_fast)
     } else {
@@ -269,7 +278,10 @@ fn save_settings_field(field: &str, value: &str) -> Result<(), Box<dyn std::erro
     };
 
     if let Some(obj) = settings.as_object_mut() {
-        obj.insert(field.to_string(), serde_json::Value::String(value.to_string()));
+        obj.insert(
+            field.to_string(),
+            serde_json::Value::String(value.to_string()),
+        );
     }
 
     std::fs::create_dir_all(&settings_dir)?;
