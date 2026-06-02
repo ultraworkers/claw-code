@@ -92,12 +92,49 @@ pub struct RuntimeError {
     message: String,
 }
 
+/// Markers that indicate a context window / token limit error when the
+/// original ApiError type has been erased into a string message.
+/// Mirrors the markers in `api::error::CONTEXT_WINDOW_ERROR_MARKERS` plus
+/// the "no parseable body" heuristic from PR #3214 (OpenAI-compat backends
+/// return 400 with an un-parseable body when the request exceeds the
+/// model's context length).
+const RUNTIME_CONTEXT_WINDOW_MARKERS: &[&str] = &[
+    "maximum context length",
+    "context window",
+    "context length",
+    "too many tokens",
+    "prompt is too long",
+    "input is too long",
+    "input tokens exceed",
+    "configured limit",
+    "messages resulted in",
+    "completion tokens",
+    "prompt tokens",
+    "request is too large",
+    "no parseable body",
+];
+
 impl RuntimeError {
     #[must_use]
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
         }
+    }
+
+    /// Returns `true` when the error message is consistent with a context
+    /// window / token-limit exceeded error from the upstream provider.
+    ///
+    /// This is the runtime-level counterpart of
+    /// `api::ApiError::is_context_window_failure()`, needed because the
+    /// API error type is erased into a plain string when it crosses the
+    /// runtime boundary.
+    #[must_use]
+    pub fn is_context_window_failure(&self) -> bool {
+        let lowered = self.message.to_ascii_lowercase();
+        RUNTIME_CONTEXT_WINDOW_MARKERS
+            .iter()
+            .any(|marker| lowered.contains(marker))
     }
 }
 
