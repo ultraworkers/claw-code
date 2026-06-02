@@ -4863,6 +4863,7 @@ fn run_resume_command(
         | SlashCommand::Tag { .. }
         | SlashCommand::OutputStyle { .. }
         | SlashCommand::AddDir { .. }
+        | SlashCommand::Lsp { .. }
         | SlashCommand::Team { .. } => Err("unsupported resumed slash command".into()),
     }
 }
@@ -6120,6 +6121,7 @@ impl LiveCli {
             | SlashCommand::Tag { .. }
             | SlashCommand::OutputStyle { .. }
             | SlashCommand::AddDir { .. }
+            | SlashCommand::Lsp { .. }
             | SlashCommand::Team { .. } => {
                 let cmd_name = command.slash_name();
                 eprintln!("{cmd_name} is not yet implemented in this build.");

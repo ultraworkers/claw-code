@@ -21,6 +21,9 @@ mod hooks;
 mod json;
 mod lane_events;
 pub mod lsp_client;
+pub mod lsp_discovery;
+pub mod lsp_process;
+pub mod lsp_transport;
 mod mcp;
 mod mcp_client;
 pub mod mcp_lifecycle_hardened;
@@ -66,8 +69,8 @@ pub use compact::{
 };
 pub use config::{
     suppress_config_warnings_for_json_mode, ConfigEntry, ConfigError, ConfigLoader, ConfigSource,
-    McpConfigCollection, McpManagedProxyServerConfig, McpOAuthConfig, McpRemoteServerConfig,
-    McpSdkServerConfig, McpServerConfig, McpStdioServerConfig, McpTransport,
+    LspServerConfig, McpConfigCollection, McpManagedProxyServerConfig, McpOAuthConfig,
+    McpRemoteServerConfig, McpSdkServerConfig, McpServerConfig, McpStdioServerConfig, McpTransport,
     McpWebSocketServerConfig, OAuthConfig, ProviderFallbackConfig, ResolvedPermissionMode,
     RuntimeConfig, RuntimeFeatureConfig, RuntimeHookConfig, RuntimePermissionRuleConfig,
     RuntimePluginConfig, ScopedMcpServerConfig, CLAW_SETTINGS_SCHEMA_NAME,
@@ -97,6 +100,10 @@ pub use lane_events::{
     LaneEventBlocker, LaneEventBuilder, LaneEventMetadata, LaneEventName, LaneEventStatus,
     LaneFailureClass, LaneOwnership, SessionIdentity, ShipMergeMethod, ShipProvenance,
     WatcherAction,
+};
+pub use lsp_discovery::{
+    command_exists_on_path, discover_available_servers, find_server_for_file, known_lsp_servers,
+    LspServerDescriptor,
 };
 pub use mcp::{
     mcp_server_signature, mcp_tool_name, mcp_tool_prefix, normalize_name_for_mcp,

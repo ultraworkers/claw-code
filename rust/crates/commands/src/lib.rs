@@ -797,6 +797,13 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         resume_supported: true,
     },
     SlashCommandSpec {
+        name: "lsp",
+        aliases: &[],
+        summary: "Show or manage LSP server status",
+        argument_hint: Some("[status|start|stop|list]"),
+        resume_supported: true,
+    },
+    SlashCommandSpec {
         name: "team",
         aliases: &[],
         summary: "Manage agent teams",
@@ -1180,6 +1187,10 @@ pub enum SlashCommand {
         count: Option<String>,
     },
     Unknown(String),
+    Lsp {
+        action: Option<String>,
+        target: Option<String>,
+    },
     Team {
         action: Option<String>,
     },
@@ -1280,6 +1291,7 @@ impl SlashCommand {
             Self::Tag { .. } => "/tag",
             Self::OutputStyle { .. } => "/output-style",
             Self::AddDir { .. } => "/add-dir",
+            Self::Lsp { .. } => "/lsp",
             Self::Team { .. } => "/team",
             Self::Sandbox => "/sandbox",
             Self::Mcp { .. } => "/mcp",
@@ -1494,6 +1506,10 @@ pub fn validate_slash_command_input(
         "add-dir" => SlashCommand::AddDir { path: remainder },
         "history" => SlashCommand::History {
             count: optional_single_arg(command, &args, "[count]")?,
+        },
+        "lsp" => SlashCommand::Lsp {
+            action: args.first().map(|s| (*s).to_string()),
+            target: args.get(1).map(|s| (*s).to_string()),
         },
         other => SlashCommand::Unknown(other.to_string()),
     }))
@@ -4623,6 +4639,7 @@ pub fn handle_slash_command(
         | SlashCommand::OutputStyle { .. }
         | SlashCommand::AddDir { .. }
         | SlashCommand::History { .. }
+        | SlashCommand::Lsp { .. }
         | SlashCommand::Team { .. }
         | SlashCommand::Unknown(_) => None,
     }

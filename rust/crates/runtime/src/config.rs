@@ -81,8 +81,16 @@ pub struct RuntimePluginConfig {
     max_output_tokens: Option<u32>,
 }
 
+/// Per-language LSP server configuration supplied by the user in settings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LspServerConfig {
+    pub command: String,
+    pub args: Vec<String>,
+    pub enabled: bool,
+}
+
 /// Structured feature configuration consumed by runtime subsystems.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeFeatureConfig {
     hooks: RuntimeHookConfig,
     plugins: RuntimePluginConfig,
@@ -95,6 +103,28 @@ pub struct RuntimeFeatureConfig {
     sandbox: SandboxConfig,
     provider_fallbacks: ProviderFallbackConfig,
     trusted_roots: Vec<String>,
+    lsp_auto_start: bool,
+    lsp: BTreeMap<String, LspServerConfig>,
+}
+
+impl Default for RuntimeFeatureConfig {
+    fn default() -> Self {
+        Self {
+            hooks: RuntimeHookConfig::default(),
+            plugins: RuntimePluginConfig::default(),
+            mcp: McpConfigCollection::default(),
+            oauth: None,
+            model: None,
+            aliases: BTreeMap::new(),
+            permission_mode: None,
+            permission_rules: RuntimePermissionRuleConfig::default(),
+            sandbox: SandboxConfig::default(),
+            provider_fallbacks: ProviderFallbackConfig::default(),
+            trusted_roots: Vec::new(),
+            lsp_auto_start: true,
+            lsp: BTreeMap::new(),
+        }
+    }
 }
 
 /// Ordered chain of fallback model identifiers used when the primary
@@ -353,6 +383,12 @@ impl ConfigLoader {
             sandbox: parse_optional_sandbox_config(&merged_value)?,
             provider_fallbacks: parse_optional_provider_fallbacks(&merged_value)?,
             trusted_roots: parse_optional_trusted_roots(&merged_value)?,
+            lsp_auto_start: merged_value
+                .as_object()
+                .and_then(|o| o.get("lspAutoStart"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true),
+            lsp: parse_optional_lsp_config(&merged_value)?,
         };
 
         Ok(RuntimeConfig {
@@ -410,6 +446,12 @@ impl ConfigLoader {
             sandbox: parse_optional_sandbox_config(&merged_value)?,
             provider_fallbacks: parse_optional_provider_fallbacks(&merged_value)?,
             trusted_roots: parse_optional_trusted_roots(&merged_value)?,
+            lsp_auto_start: merged_value
+                .as_object()
+                .and_then(|o| o.get("lspAutoStart"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true),
+            lsp: parse_optional_lsp_config(&merged_value)?,
         };
 
         let config = RuntimeConfig {
@@ -595,6 +637,16 @@ impl RuntimeFeatureConfig {
     #[must_use]
     pub fn trusted_roots_with_overrides(&self, per_call_roots: &[String]) -> Vec<String> {
         merge_trusted_roots(self.trusted_roots(), per_call_roots)
+    }
+
+    #[must_use]
+    pub fn lsp(&self) -> &BTreeMap<String, LspServerConfig> {
+        &self.lsp
+    }
+
+    #[must_use]
+    pub fn lsp_auto_start(&self) -> bool {
+        self.lsp_auto_start
     }
 }
 
@@ -1160,6 +1212,35 @@ fn parse_optional_trusted_roots(root: &JsonValue) -> Result<Vec<String>, ConfigE
         optional_string_array(object, "trustedRoots", "merged settings.trustedRoots")?
             .unwrap_or_default(),
     )
+}
+
+fn parse_optional_lsp_config(
+    root: &JsonValue,
+) -> Result<BTreeMap<String, LspServerConfig>, ConfigError> {
+    let Some(lsp_value) = root.as_object().and_then(|object| object.get("lsp")) else {
+        return Ok(BTreeMap::new());
+    };
+    let lsp_object = expect_object(lsp_value, "merged settings.lsp")?;
+    let mut result = BTreeMap::new();
+    for (language, value) in lsp_object {
+        let entry = expect_object(value, &format!("merged settings.lsp.{language}"))?;
+        let command =
+            expect_string(entry, "command", &format!("merged settings.lsp.{language}"))?.to_owned();
+        let args =
+            optional_string_array(entry, "args", &format!("merged settings.lsp.{language}"))?
+                .unwrap_or_default();
+        let enabled = optional_bool(entry, "enabled", &format!("merged settings.lsp.{language}"))?
+            .unwrap_or(true);
+        result.insert(
+            language.clone(),
+            LspServerConfig {
+                command,
+                args,
+                enabled,
+            },
+        );
+    }
+    Ok(result)
 }
 
 fn parse_filesystem_mode_label(value: &str) -> Result<FilesystemIsolationMode, ConfigError> {
