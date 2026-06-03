@@ -5741,11 +5741,7 @@ impl LiveCli {
             if removed > 0 {
                 println!(
                     "{}",
-                    format_compact_report(
-                        removed,
-                        result.compacted_session.messages.len(),
-                        false
-                    )
+                    format_compact_report(removed, result.compacted_session.messages.len(), false)
                 );
             }
 
@@ -5756,11 +5752,10 @@ impl LiveCli {
             *self.runtime.session_mut() = result.compacted_session.clone();
 
             // Build a new runtime with the compacted session and retry
-            let (mut new_runtime, hook_abort_monitor) =
-                match self.prepare_turn_runtime(true) {
-                    Ok(pair) => pair,
-                    Err(e) => return Err(RuntimeError::new(e.to_string())),
-                };
+            let (mut new_runtime, hook_abort_monitor) = match self.prepare_turn_runtime(true) {
+                Ok(pair) => pair,
+                Err(e) => return Err(RuntimeError::new(e.to_string())),
+            };
             drop(hook_abort_monitor);
 
             let mut rp = CliPermissionPrompter::new(self.permission_mode);
