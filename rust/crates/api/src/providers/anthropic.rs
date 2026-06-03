@@ -771,11 +771,7 @@ fn now_unix_timestamp() -> u64 {
 }
 
 fn read_env_non_empty(key: &str) -> Result<Option<String>, ApiError> {
-    match std::env::var(key) {
-        Ok(value) if !value.is_empty() => Ok(Some(value)),
-        Ok(_) | Err(std::env::VarError::NotPresent) => Ok(super::dotenv_value(key)),
-        Err(error) => Err(ApiError::from(error)),
-    }
+    super::read_env_non_empty(key)
 }
 
 #[cfg(test)]
@@ -796,23 +792,7 @@ fn read_auth_token() -> Option<String> {
 
 #[must_use]
 pub fn read_base_url() -> String {
-    // Tier 1: environment variable
-    if let Ok(value) = std::env::var("ANTHROPIC_BASE_URL") {
-        if !value.is_empty() {
-            return value;
-        }
-    }
-    // Tier 2: .env file
-    if let Some(value) = super::dotenv_value("ANTHROPIC_BASE_URL") {
-        if !value.is_empty() {
-            return value;
-        }
-    }
-    // Tier 3: stored config in ~/.claw/settings.json
-    if let Some(base_url) = super::read_base_url_from_config("anthropic") {
-        return base_url;
-    }
-    DEFAULT_BASE_URL.to_string()
+    super::resolve_base_url("ANTHROPIC_BASE_URL", "anthropic", DEFAULT_BASE_URL)
 }
 
 fn request_id_from_headers(headers: &reqwest::header::HeaderMap) -> Option<String> {

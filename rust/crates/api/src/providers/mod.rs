@@ -859,6 +859,44 @@ pub(crate) fn load_dotenv_file(
     Some(parse_dotenv(&content))
 }
 
+/// Read an environment variable, falling back to `.env` file lookup.
+/// Returns `None` when neither the process environment nor the `.env` file
+/// provides a non-empty value for `key`. This is the Tier 1+2 portion of
+/// the credential resolution chain (Tier 3 is `read_env_or_config`).
+pub(crate) fn read_env_non_empty(key: &str) -> Result<Option<String>, ApiError> {
+    match std::env::var(key) {
+        Ok(value) if !value.is_empty() => Ok(Some(value)),
+        Ok(_) | Err(std::env::VarError::NotPresent) => Ok(dotenv_value(key)),
+        Err(error) => Err(ApiError::from(error)),
+    }
+}
+
+/// Resolve a provider's base URL using the 3-tier resolution chain:
+/// 1. Process environment variable (e.g. `ANTHROPIC_BASE_URL`)
+/// 2. `.env` file in the current working directory
+/// 3. Stored provider config in `~/.claw/settings.json`
+/// Falls back to `default` when no tier provides a non-empty value.
+#[must_use]
+pub fn resolve_base_url(env_var: &str, provider_kind: &str, default: &str) -> String {
+    // Tier 1: environment variable
+    if let Ok(value) = std::env::var(env_var) {
+        if !value.is_empty() {
+            return value;
+        }
+    }
+    // Tier 2: .env file
+    if let Some(value) = dotenv_value(env_var) {
+        if !value.is_empty() {
+            return value;
+        }
+    }
+    // Tier 3: stored config in ~/.claw/settings.json
+    if let Some(base_url) = read_base_url_from_config(provider_kind) {
+        return base_url;
+    }
+    default.to_string()
+}
+
 /// Look up `key` in a `.env` file located in the current working directory.
 /// Returns `None` when the file is missing, the key is absent, or the value
 /// is empty.

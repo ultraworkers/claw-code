@@ -1873,7 +1873,10 @@ mod tests {
         let provider = loaded.provider();
         assert_eq!(provider.kind(), Some("anthropic"));
         assert_eq!(provider.api_key(), Some("sk-ant-test-key"));
-        assert_eq!(provider.base_url(), Some("https://custom.api.anthropic.com"));
+        assert_eq!(
+            provider.base_url(),
+            Some("https://custom.api.anthropic.com")
+        );
         assert!(provider.is_set());
 
         // model is a separate top-level field
