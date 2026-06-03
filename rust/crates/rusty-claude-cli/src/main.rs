@@ -53,10 +53,12 @@ use init::initialize_repo;
 use plugins::{PluginHooks, PluginManager, PluginManagerConfig, PluginRegistry};
 use render::{MarkdownStreamState, Spinner, TerminalRenderer};
 use runtime::{
-    check_base_commit, format_stale_base_warning, format_usd, load_oauth_credentials,
-    load_system_prompt, pricing_for_model, resolve_expected_base, resolve_sandbox_status,
-    ApiClient, ApiRequest, AssistantEvent, BaseCommitState, CompactionConfig, ConfigLoader,
-    ConfigSource, ContentBlock, ConversationMessage, ConversationRuntime, McpServer,
+    check_base_commit, check_lsp_availability, command_exists_on_path,
+    discover_available_servers, format_install_prompt, format_stale_base_warning, format_usd,
+    known_lsp_servers, load_oauth_credentials, load_system_prompt, pricing_for_model,
+    resolve_expected_base, resolve_sandbox_status, ApiClient, ApiRequest, AssistantEvent,
+    BaseCommitState, CompactionConfig, ConfigLoader, ConfigSource, ContentBlock,
+    ConversationMessage, ConversationRuntime, LspInstallAction, LspServerDescriptor, McpServer,
     McpServerManager, McpServerSpec, McpTool, MessageRole, ModelPricing, PermissionMode,
     PermissionPolicy, ProjectContext, PromptCacheEvent, ResolvedPermissionMode, RuntimeError,
     Session, TokenUsage, ToolError, ToolExecutor, UsageTracker,
@@ -6121,10 +6123,13 @@ impl LiveCli {
             | SlashCommand::Tag { .. }
             | SlashCommand::OutputStyle { .. }
             | SlashCommand::AddDir { .. }
-            | SlashCommand::Lsp { .. }
             | SlashCommand::Team { .. } => {
                 let cmd_name = command.slash_name();
                 eprintln!("{cmd_name} is not yet implemented in this build.");
+                false
+            }
+            SlashCommand::Lsp { action, .. } => {
+                self.handle_lsp_command(action.as_deref());
                 false
             }
             SlashCommand::Unknown(name) => {
@@ -6132,6 +6137,67 @@ impl LiveCli {
                 false
             }
         })
+    }
+
+    /// Handle the `/lsp` slash command.
+    ///
+    /// - `/lsp` or `/lsp status` — show all known LSP servers with availability
+    /// - `/lsp list` — list all known servers with language and file extensions
+    /// - `/lsp start` / `/lsp stop` — lazy-start is handled automatically
+    fn handle_lsp_command(&self, action: Option<&str>) {
+        match action {
+            None | Some("status") => {
+                let actions = check_lsp_availability();
+                let available = actions.iter().filter(|a| matches!(a, LspInstallAction::Installed)).count();
+                let total = actions.len();
+                println!("LSP Server Status ({total} known, {available} available):\n");
+                let servers = known_lsp_servers();
+                for action in &actions {
+                    match action {
+                        LspInstallAction::Installed => {}
+                        LspInstallAction::Missing { language, instructions } => {
+                            let hint = instructions
+                                .first()
+                                .map(|i| i.command.as_str())
+                                .unwrap_or("no install command known");
+                            println!("  ❌ {language:<30} — missing: {hint}");
+                        }
+                        LspInstallAction::RustupProxyMissing { language, component } => {
+                            println!("  ⚠️ {language:<30} — rustup proxy: run `rustup component add {component}`");
+                        }
+                    }
+                }
+                for server in &servers {
+                    if command_exists_on_path(&server.command) {
+                        let exts = server.extensions.join(", ");
+                        println!("  ✅ {:<30} — {exts}       [installed]", server.command);
+                    }
+                }
+                println!("\nRun /lsp list for all known servers.");
+            }
+            Some("list") => {
+                let servers = known_lsp_servers();
+                let available = discover_available_servers();
+                println!("Known LSP Servers ({}):\n", servers.len());
+                for server in &servers {
+                    let status = if available.iter().any(|a| a.command == server.command) {
+                        "✅"
+                    } else {
+                        "❌"
+                    };
+                    let exts = server.extensions.join(", ");
+                    println!("  {status} {:<25} {:<20} — {exts}", server.language, server.command);
+                }
+            }
+            Some("start") | Some("stop") => {
+                println!("LSP servers are managed automatically via lazy-start when tools need them.");
+                println!("Use /lsp status to check availability.");
+            }
+            Some(other) => {
+                println!("Unknown /lsp action: {other}");
+                println!("Usage: /lsp [status|list|start|stop]");
+            }
+        }
     }
 
     fn persist_session(&self) -> Result<(), Box<dyn std::error::Error>> {

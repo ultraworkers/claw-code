@@ -102,8 +102,9 @@ pub use lane_events::{
     WatcherAction,
 };
 pub use lsp_discovery::{
-    command_exists_on_path, discover_available_servers, find_server_for_file, known_lsp_servers,
-    LspServerDescriptor,
+    check_lsp_availability, command_exists_on_path, discover_available_servers,
+    find_server_for_file, format_install_prompt, known_lsp_servers, InstallInstruction,
+    LspInstallAction, LspServerDescriptor,
 };
 pub use mcp::{
     mcp_server_signature, mcp_tool_name, mcp_tool_prefix, normalize_name_for_mcp,
