@@ -28,7 +28,8 @@ pub struct SessionStore {
 impl SessionStore {
     /// Build a store from the server's current working directory.
     ///
-    /// The on-disk layout becomes `<cwd>/.claw/sessions/<workspace_hash>/`.
+    /// The on-disk layout is `<cwd>/.claw/sessions/<workspace_hash>/`,
+    /// created lazily on first successful session save.
     pub fn from_cwd(cwd: impl AsRef<Path>) -> Result<Self, SessionControlError> {
         let cwd = cwd.as_ref();
         // #151: canonicalize so equivalent paths (symlinks, relative vs
@@ -40,7 +41,6 @@ impl SessionStore {
             .join(".claw")
             .join("sessions")
             .join(workspace_fingerprint(&canonical_cwd));
-        fs::create_dir_all(&sessions_root)?;
         Ok(Self {
             sessions_root,
             workspace_root: canonical_cwd,
@@ -49,7 +49,8 @@ impl SessionStore {
 
     /// Build a store from an explicit `--data-dir` flag.
     ///
-    /// The on-disk layout becomes `<data_dir>/sessions/<workspace_hash>/`
+    /// The on-disk layout is `<data_dir>/sessions/<workspace_hash>/`,
+    /// created lazily on first successful session save.
     /// where `<workspace_hash>` is derived from `workspace_root`.
     pub fn from_data_dir(
         data_dir: impl AsRef<Path>,
@@ -64,7 +65,6 @@ impl SessionStore {
             .as_ref()
             .join("sessions")
             .join(workspace_fingerprint(&canonical_workspace));
-        fs::create_dir_all(&sessions_root)?;
         Ok(Self {
             sessions_root,
             workspace_root: canonical_workspace,
@@ -760,14 +760,21 @@ mod tests {
     use crate::session::Session;
     use std::fs;
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     fn temp_dir() -> PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("time should be after epoch")
             .as_nanos();
-        std::env::temp_dir().join(format!("runtime-session-control-{nanos}"))
+        let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "runtime-session-control-{}-{nanos}-{counter}",
+            std::process::id()
+        ))
     }
 
     fn persist_session(root: &Path, text: &str) -> Session {
@@ -979,6 +986,38 @@ mod tests {
         if base.exists() {
             fs::remove_dir_all(base).expect("cleanup ok");
         }
+    }
+
+    #[test]
+    fn session_store_from_cwd_is_side_effect_free_until_save() {
+        // given
+        let base = temp_dir();
+        let workspace = base.join("fresh-workspace");
+        fs::create_dir_all(&workspace).expect("workspace should exist");
+
+        // when
+        let store = SessionStore::from_cwd(&workspace).expect("store should build");
+
+        // then — resolving the store must not create .claw/session partitions.
+        assert!(
+            !workspace.join(".claw").exists(),
+            "session store construction must not create .claw side effects"
+        );
+        assert!(
+            !store.sessions_dir().exists(),
+            "session partition should be created lazily on save"
+        );
+
+        let session = persist_session_via_store(&store, "first saved turn");
+        assert!(
+            store
+                .sessions_dir()
+                .join(format!("{}.jsonl", session.session_id))
+                .exists(),
+            "saving a managed session should create the lazy session partition"
+        );
+
+        fs::remove_dir_all(base).expect("temp dir should clean up");
     }
 
     #[test]

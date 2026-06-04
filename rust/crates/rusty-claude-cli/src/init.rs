@@ -4,7 +4,14 @@ use std::path::{Path, PathBuf};
 const STARTER_CLAW_JSON: &str = concat!(
     "{\n",
     "  \"permissions\": {\n",
-    "    \"defaultMode\": \"dontAsk\"\n",
+    "    \"defaultMode\": \"acceptEdits\"\n",
+    "  }\n",
+    "}\n",
+);
+const STARTER_SETTINGS_JSON: &str = concat!(
+    "{\n",
+    "  \"permissions\": {\n",
+    "    \"defaultMode\": \"acceptEdits\"\n",
     "  }\n",
     "}\n",
 );
@@ -15,6 +22,8 @@ const GITIGNORE_ENTRIES: [&str; 3] = [".claw/settings.local.json", ".claw/sessio
 pub(crate) enum InitStatus {
     Created,
     Updated,
+    Partial,
+    Deferred,
     Skipped,
 }
 
@@ -24,6 +33,8 @@ impl InitStatus {
         match self {
             Self::Created => "created",
             Self::Updated => "updated",
+            Self::Partial => "partial (created missing sub-files)",
+            Self::Deferred => "deferred (created on first session save)",
             Self::Skipped => "skipped (already exists)",
         }
     }
@@ -36,6 +47,8 @@ impl InitStatus {
         match self {
             Self::Created => "created",
             Self::Updated => "updated",
+            Self::Partial => "partial",
+            Self::Deferred => "deferred",
             Self::Skipped => "skipped",
         }
     }
@@ -123,9 +136,30 @@ pub(crate) fn initialize_repo(cwd: &Path) -> Result<InitReport, Box<dyn std::err
     let mut artifacts = Vec::new();
 
     let claw_dir = cwd.join(".claw");
+    let claw_dir_status = ensure_dir(&claw_dir)?;
+    let settings_json = claw_dir.join("settings.json");
+    let settings_status = write_file_if_missing(&settings_json, STARTER_SETTINGS_JSON)?;
+    let claw_dir_status =
+        if claw_dir_status == InitStatus::Skipped && settings_status == InitStatus::Created {
+            InitStatus::Partial
+        } else {
+            claw_dir_status
+        };
     artifacts.push(InitArtifact {
         name: ".claw/",
-        status: ensure_dir(&claw_dir)?,
+        status: claw_dir_status,
+    });
+    artifacts.push(InitArtifact {
+        name: ".claw/settings.json",
+        status: settings_status,
+    });
+    artifacts.push(InitArtifact {
+        name: ".claw/sessions/",
+        status: if claw_dir.join("sessions").is_dir() {
+            InitStatus::Skipped
+        } else {
+            InitStatus::Deferred
+        },
     });
 
     let claw_json = cwd.join(".claw.json");
@@ -414,10 +448,25 @@ mod tests {
             concat!(
                 "{\n",
                 "  \"permissions\": {\n",
-                "    \"defaultMode\": \"dontAsk\"\n",
+                "    \"defaultMode\": \"acceptEdits\"\n",
                 "  }\n",
                 "}\n",
             )
+        );
+        assert_eq!(
+            fs::read_to_string(root.join(".claw").join("settings.json"))
+                .expect("read project settings"),
+            concat!(
+                "{\n",
+                "  \"permissions\": {\n",
+                "    \"defaultMode\": \"acceptEdits\"\n",
+                "  }\n",
+                "}\n",
+            )
+        );
+        assert!(
+            !root.join(".claw").join("sessions").exists(),
+            "sessions directory should be deferred until first session save"
         );
         let gitignore = fs::read_to_string(root.join(".gitignore")).expect("read gitignore");
         assert!(gitignore.contains(".claw/settings.local.json"));
@@ -436,14 +485,24 @@ mod tests {
         fs::create_dir_all(&root).expect("create root");
         fs::write(root.join("CLAUDE.md"), "custom guidance\n").expect("write existing claude md");
         fs::write(root.join(".gitignore"), ".claw/settings.local.json\n").expect("write gitignore");
+        fs::create_dir_all(root.join(".claw")).expect("create existing .claw dir");
 
         let first = initialize_repo(&root).expect("first init should succeed");
         assert!(first
             .render()
             .contains("CLAUDE.md        skipped (already exists)"));
+        assert_eq!(
+            first.artifacts_with_status(InitStatus::Partial),
+            vec![".claw/".to_string()],
+            "existing .claw/ should report partial when init creates missing settings.json"
+        );
+        assert!(root.join(".claw").join("settings.json").is_file());
+
         let second = initialize_repo(&root).expect("second init should succeed");
         let second_rendered = second.render();
         assert!(second_rendered.contains(".claw/"));
+        assert!(second_rendered.contains(".claw/settings.json"));
+        assert!(second_rendered.contains(".claw/sessions/"));
         assert!(second_rendered.contains(".claw.json"));
         assert!(second_rendered.contains("skipped (already exists)"));
         assert!(second_rendered.contains(".gitignore       skipped (already exists)"));
@@ -474,15 +533,21 @@ mod tests {
             created_names,
             vec![
                 ".claw/".to_string(),
+                ".claw/settings.json".to_string(),
                 ".claw.json".to_string(),
                 ".gitignore".to_string(),
                 "CLAUDE.md".to_string(),
             ],
-            "fresh init should place all four artifacts in created[]"
+            "fresh init should place created artifacts in created[]"
         );
         assert!(
             fresh.artifacts_with_status(InitStatus::Skipped).is_empty(),
             "fresh init should have no skipped artifacts"
+        );
+        assert_eq!(
+            fresh.artifacts_with_status(InitStatus::Deferred),
+            vec![".claw/sessions/".to_string()],
+            "fresh init should report session storage as deferred"
         );
 
         let second = initialize_repo(&root).expect("second init should succeed");
@@ -491,27 +556,38 @@ mod tests {
             skipped_names,
             vec![
                 ".claw/".to_string(),
+                ".claw/settings.json".to_string(),
                 ".claw.json".to_string(),
                 ".gitignore".to_string(),
                 "CLAUDE.md".to_string(),
             ],
-            "idempotent init should place all four artifacts in skipped[]"
+            "idempotent init should place existing artifacts in skipped[]"
         );
         assert!(
             second.artifacts_with_status(InitStatus::Created).is_empty(),
             "idempotent init should have no created artifacts"
         );
+        assert_eq!(
+            second.artifacts_with_status(InitStatus::Deferred),
+            vec![".claw/sessions/".to_string()],
+            "idempotent init should keep session storage deferred until first save"
+        );
 
         // artifact_json_entries() uses the machine-stable `json_tag()` which
         // never changes wording (unlike `label()` which says "skipped (already exists)").
         let entries = second.artifact_json_entries();
-        assert_eq!(entries.len(), 4);
+        assert_eq!(entries.len(), 6);
         for entry in &entries {
+            let name = entry.get("name").and_then(|v| v.as_str()).unwrap();
             let status = entry.get("status").and_then(|v| v.as_str()).unwrap();
-            assert_eq!(
-                status, "skipped",
-                "machine status tag should be the bare word 'skipped', not label()'s 'skipped (already exists)'"
-            );
+            if name == ".claw/sessions/" {
+                assert_eq!(status, "deferred");
+            } else {
+                assert_eq!(
+                    status, "skipped",
+                    "machine status tag should be the bare word 'skipped', not label()'s 'skipped (already exists)'"
+                );
+            }
         }
 
         fs::remove_dir_all(root).expect("cleanup temp dir");

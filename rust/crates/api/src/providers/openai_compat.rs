@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use std::collections::{BTreeMap, VecDeque};
+use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -131,13 +132,22 @@ impl OpenAiCompatClient {
     }
 
     pub fn from_env(config: OpenAiCompatConfig) -> Result<Self, ApiError> {
-        let Some(api_key) = read_env_non_empty(config.api_key_env)? else {
-            return Err(ApiError::missing_credentials(
-                config.provider_name,
-                config.credential_env_vars(),
-            ));
+        let base_url = read_base_url(config);
+        let api_key = match read_env_non_empty(config.api_key_env)? {
+            Some(api_key) => api_key,
+            None if config.provider_name == "OpenAI"
+                && is_local_openai_compatible_base_url(&base_url) =>
+            {
+                "local-dev-token".to_string()
+            }
+            None => {
+                return Err(ApiError::missing_credentials(
+                    config.provider_name,
+                    config.credential_env_vars(),
+                ));
+            }
         };
-        Ok(Self::new(api_key, config))
+        Ok(Self::new(api_key, config).with_base_url(base_url))
     }
 
     #[must_use]
@@ -915,14 +925,18 @@ pub fn model_requires_reasoning_content_in_history(model: &str) -> bool {
 
 /// Strip routing prefix (e.g., "openai/gpt-4" → "gpt-4") for the wire.
 /// The prefix is used only to select transport; the backend expects the
-/// bare model id.
+/// bare model id. Use `local/` to force OpenAI-compatible routing while
+/// preserving any slashes that follow the prefix.
 #[allow(dead_code)]
 fn strip_routing_prefix(model: &str) -> &str {
     if let Some(pos) = model.find('/') {
         let prefix = &model[..pos];
         // Only strip if the prefix before "/" is a known routing prefix,
         // not if "/" appears in the middle of the model name for other reasons.
-        if matches!(prefix, "openai" | "xai" | "grok" | "qwen" | "kimi") {
+        if matches!(
+            prefix,
+            "openai" | "xai" | "grok" | "qwen" | "kimi" | "local"
+        ) {
             &model[pos + 1..]
         } else {
             model
@@ -930,6 +944,44 @@ fn strip_routing_prefix(model: &str) -> &str {
     } else {
         model
     }
+}
+
+fn normalize_base_url_for_model_routing(url: &str) -> &str {
+    let trimmed = url.trim_end_matches('/');
+    trimmed
+        .strip_suffix("/chat/completions")
+        .map(|value| value.trim_end_matches('/'))
+        .unwrap_or(trimmed)
+}
+
+fn url_host(url: &str) -> &str {
+    let after_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let authority = after_scheme.split(['/', '?', '#']).next().unwrap_or("");
+    let host_port = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host_port)| host_port);
+    if host_port.starts_with('[') {
+        return host_port
+            .split(']')
+            .next()
+            .unwrap_or("")
+            .trim_start_matches('[');
+    }
+    host_port.split(':').next().unwrap_or("")
+}
+
+fn is_local_openai_compatible_base_url(url: &str) -> bool {
+    let host = url_host(url.trim());
+    if host.eq_ignore_ascii_case("localhost") || host == "::1" {
+        return true;
+    }
+    let Ok(address) = host.parse::<Ipv4Addr>() else {
+        return false;
+    };
+    let [first, second, ..] = address.octets();
+    matches!(first, 10 | 127)
+        || first == 192 && second == 168
+        || first == 172 && (16..=31).contains(&second)
 }
 
 fn wire_model_for_base_url<'a>(
@@ -944,24 +996,20 @@ fn wire_model_for_base_url<'a>(
     let lowered_prefix = prefix.to_ascii_lowercase();
 
     if lowered_prefix == "openai" {
-        let trimmed_base_url = base_url.trim_end_matches('/');
-        let default_openai = DEFAULT_OPENAI_BASE_URL.trim_end_matches('/');
-        if matches!(
-            lowered_prefix.as_str(),
-            "xai" | "grok" | "kimi" | "gemini" | "gemma"
-        ) {
+        let normalized_base_url = normalize_base_url_for_model_routing(base_url);
+        let default_base_url = normalize_base_url_for_model_routing(config.default_base_url);
+        if normalized_base_url.eq_ignore_ascii_case(default_base_url)
+            || is_local_openai_compatible_base_url(base_url)
+        {
             return Cow::Borrowed(&model[pos + 1..]);
         }
-        if config.provider_name == "OpenAI" && trimmed_base_url != default_openai {
-            // Only preserve the full slug if it's NOT a model we want to strip
-            if !model.contains("gemini") && !model.contains("gemma") {
-                return Cow::Borrowed(model);
-            }
-        }
-        return Cow::Borrowed(&model[pos + 1..]);
+        return Cow::Borrowed(model);
     }
 
     if matches!(lowered_prefix.as_str(), "xai" | "grok" | "qwen" | "kimi") {
+        return Cow::Borrowed(&model[pos + 1..]);
+    }
+    if lowered_prefix == "local" {
         return Cow::Borrowed(&model[pos + 1..]);
     }
 
@@ -1115,6 +1163,13 @@ fn build_chat_completion_request_for_base_url(
         payload[key] = value.clone();
     }
 
+    // DeepSeek V4 Pro/Flash thinking mode requires this provider-specific opt-in
+    // and also requires assistant reasoning history to be echoed as `reasoning_content`.
+    // Apply it after extra_body so callers cannot accidentally override the required shape.
+    if model_requires_reasoning_content_in_history(wire_model) {
+        payload["thinking"] = json!({"type": "enabled"});
+    }
+
     payload
 }
 
@@ -1172,16 +1227,19 @@ pub fn translate_message(message: &InputMessage, model: &str) -> Vec<Value> {
                     InputContentBlock::ToolResult { .. } => {}
                 }
             }
-            let include_reasoning =
-                model_requires_reasoning_content_in_history(model) && !reasoning.is_empty();
-            if text.is_empty() && tool_calls.is_empty() && !include_reasoning {
+            let needs_reasoning = model_requires_reasoning_content_in_history(model);
+            if text.is_empty() && tool_calls.is_empty() && reasoning.is_empty() {
                 Vec::new()
             } else {
                 let mut msg = serde_json::json!({
                     "role": "assistant",
-                    "content": (!text.is_empty()).then_some(text),
                 });
-                if include_reasoning {
+                if !text.is_empty() {
+                    msg["content"] = json!(text);
+                } else if !needs_reasoning {
+                    msg["content"] = Value::Null;
+                }
+                if needs_reasoning {
                     msg["reasoning_content"] = json!(reasoning);
                 }
                 // Only include tool_calls when non-empty: some providers reject
@@ -1698,6 +1756,7 @@ mod tests {
         ToolChoice, ToolDefinition, ToolResultContentBlock,
     };
     use serde_json::json;
+    use std::borrow::Cow;
     use std::collections::BTreeMap;
     use std::sync::{Mutex, OnceLock};
 
@@ -1794,6 +1853,31 @@ mod tests {
         let assistant = &payload["messages"][0];
         assert_eq!(assistant["reasoning_content"], json!("prior reasoning"));
         assert_eq!(assistant["content"], json!("answer"));
+    }
+
+    #[test]
+    fn deepseek_v4_assistant_with_only_tool_calls_omits_content_and_includes_reasoning() {
+        let request = MessageRequest {
+            model: "deepseek-v4-pro".to_string(),
+            max_tokens: 100,
+            messages: vec![InputMessage {
+                role: "assistant".to_string(),
+                content: vec![InputContentBlock::ToolUse {
+                    id: "call_1".to_string(),
+                    name: "get_weather".to_string(),
+                    input: json!({"city": "Paris"}),
+                }],
+            }],
+            stream: false,
+            ..Default::default()
+        };
+
+        let payload = build_chat_completion_request(&request, OpenAiCompatConfig::openai());
+        let assistant = &payload["messages"][0];
+
+        assert!(assistant.get("content").is_none());
+        assert_eq!(assistant["reasoning_content"], json!(""));
+        assert_eq!(assistant["tool_calls"].as_array().map(Vec::len), Some(1));
     }
 
     #[test]
@@ -1983,6 +2067,49 @@ mod tests {
     }
 
     #[test]
+    fn deepseek_v4_request_includes_thinking_parameter() {
+        let payload = build_chat_completion_request(
+            &MessageRequest {
+                model: "deepseek-v4-pro".to_string(),
+                max_tokens: 1024,
+                messages: vec![InputMessage::user_text("hello")],
+                ..Default::default()
+            },
+            OpenAiCompatConfig::openai(),
+        );
+        assert_eq!(payload["thinking"], json!({"type": "enabled"}));
+        assert_eq!(payload["model"], json!("deepseek-v4-pro"));
+
+        let mut extra_body = BTreeMap::new();
+        extra_body.insert("thinking".to_string(), json!({"type": "disabled"}));
+        let payload_with_override = build_chat_completion_request(
+            &MessageRequest {
+                model: "openai/deepseek-v4-flash".to_string(),
+                max_tokens: 1024,
+                messages: vec![InputMessage::user_text("hello")],
+                extra_body,
+                ..Default::default()
+            },
+            OpenAiCompatConfig::openai(),
+        );
+        assert_eq!(
+            payload_with_override["thinking"],
+            json!({"type": "enabled"})
+        );
+
+        let non_deepseek_payload = build_chat_completion_request(
+            &MessageRequest {
+                model: "gpt-4o".to_string(),
+                max_tokens: 64,
+                messages: vec![InputMessage::user_text("hello")],
+                ..Default::default()
+            },
+            OpenAiCompatConfig::openai(),
+        );
+        assert!(non_deepseek_payload.get("thinking").is_none());
+    }
+
+    #[test]
     fn reasoning_effort_omitted_when_not_set() {
         let payload = build_chat_completion_request(
             &MessageRequest {
@@ -2067,6 +2194,28 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn local_openai_base_url_does_not_require_api_key() {
+        let _lock = env_lock();
+        let original_base_url = std::env::var_os("OPENAI_BASE_URL");
+        let original_api_key = std::env::var_os("OPENAI_API_KEY");
+        std::env::set_var("OPENAI_BASE_URL", "http://127.0.0.1:11434/v1");
+        std::env::remove_var("OPENAI_API_KEY");
+
+        let client = OpenAiCompatClient::from_env(OpenAiCompatConfig::openai())
+            .expect("local OpenAI-compatible endpoint should not require an API key");
+        assert_eq!(client.base_url(), "http://127.0.0.1:11434/v1");
+
+        match original_base_url {
+            Some(value) => std::env::set_var("OPENAI_BASE_URL", value),
+            None => std::env::remove_var("OPENAI_BASE_URL"),
+        }
+        match original_api_key {
+            Some(value) => std::env::set_var("OPENAI_API_KEY", value),
+            None => std::env::remove_var("OPENAI_API_KEY"),
+        }
     }
 
     #[test]
@@ -2682,6 +2831,66 @@ mod tests {
             }
             _ => panic!("expected RequestBodySizeExceeded error, got {err:?}"),
         }
+    }
+
+    #[test]
+    fn wire_model_strips_openai_prefix_for_default_and_local_preserves_custom_gateways() {
+        assert_eq!(
+            super::wire_model_for_base_url(
+                "openai/gpt-4o",
+                OpenAiCompatConfig::openai(),
+                super::DEFAULT_OPENAI_BASE_URL,
+            ),
+            Cow::Borrowed("gpt-4o")
+        );
+        assert_eq!(
+            super::wire_model_for_base_url(
+                "openai/qwen2.5-coder:7b",
+                OpenAiCompatConfig::openai(),
+                "http://127.0.0.1:11434/v1",
+            ),
+            Cow::Borrowed("qwen2.5-coder:7b")
+        );
+        assert_eq!(
+            super::wire_model_for_base_url(
+                "openai/llama3.2",
+                OpenAiCompatConfig::openai(),
+                "http://localhost:11434/v1/chat/completions",
+            ),
+            Cow::Borrowed("llama3.2")
+        );
+        assert_eq!(
+            super::wire_model_for_base_url(
+                "openai/gpt-4.1-mini",
+                OpenAiCompatConfig::openai(),
+                "https://openrouter.ai/api/v1",
+            ),
+            Cow::Borrowed("openai/gpt-4.1-mini")
+        );
+        assert_eq!(
+            super::wire_model_for_base_url(
+                "openai/gpt-4.1-mini",
+                OpenAiCompatConfig::openai(),
+                "https://not-localhost.example.com/v1",
+            ),
+            Cow::Borrowed("openai/gpt-4.1-mini")
+        );
+    }
+
+    #[test]
+    fn local_routing_prefix_strips_only_escape_hatch() {
+        assert_eq!(
+            super::strip_routing_prefix("local/Qwen/Qwen3.6-27B-FP8"),
+            "Qwen/Qwen3.6-27B-FP8"
+        );
+        assert_eq!(
+            super::wire_model_for_base_url(
+                "local/Qwen/Qwen3.6-27B-FP8",
+                OpenAiCompatConfig::openai(),
+                "http://127.0.0.1:8000/v1",
+            ),
+            Cow::Borrowed("Qwen/Qwen3.6-27B-FP8")
+        );
     }
 
     #[test]

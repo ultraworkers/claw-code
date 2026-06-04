@@ -27,7 +27,7 @@ use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
@@ -49,26 +49,27 @@ use commands::{
     slash_command_specs, validate_slash_command_input, PluginsCommandResult, SkillSlashDispatch,
     SlashCommand,
 };
-use compat_harness::{extract_manifest, UpstreamPaths};
 use init::initialize_repo;
 use plugins::{PluginHooks, PluginManager, PluginManagerConfig, PluginRegistry};
 use render::{MarkdownStreamState, Spinner, TerminalRenderer};
 use runtime::{
     check_base_commit, format_stale_base_warning, format_usd, load_oauth_credentials,
-    load_system_prompt, pricing_for_model, resolve_expected_base, resolve_sandbox_status,
-    ApiClient, ApiRequest, AssistantEvent, BaseCommitState, CompactionConfig, ConfigLoader,
-    ConfigSource, ContentBlock, ConversationMessage, ConversationRuntime, McpServer,
-    McpServerManager, McpServerSpec, McpTool, MessageRole, ModelPricing, PermissionMode,
+    load_system_prompt, load_system_prompt_with_context, pricing_for_model, resolve_expected_base,
+    resolve_sandbox_status, ApiClient, ApiRequest, AssistantEvent, BaseCommitState,
+    CompactionConfig, ConfigFileReport, ConfigLoader, ConfigSource, ContentBlock, ContextFile,
+    ConversationMessage, ConversationRuntime, McpConfigCollection, McpInvalidServerConfig,
+    McpServer, McpServerManager, McpServerSpec, McpTool, MessageRole, ModelPricing, PermissionMode,
     PermissionPolicy, ProjectContext, PromptCacheEvent, ResolvedPermissionMode, RuntimeError,
     Session, TokenUsage, ToolError, ToolExecutor, UsageTracker,
 };
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use tools::{
-    execute_tool, mvp_tool_specs, GlobalToolRegistry, RuntimeToolDefinition, ToolSearchOutput,
+    canonical_allowed_tool_name, execute_tool, mvp_tool_specs, GlobalToolRegistry,
+    RuntimeToolDefinition, ToolSearchOutput,
 };
 
-const DEFAULT_MODEL: &str = "anthropic/claude-opus-4-6";
+const DEFAULT_MODEL: &str = "anthropic/claude-opus-4-7";
 
 /// #148: Model provenance for `claw status` JSON/text output. Records where
 /// the resolved model string came from so claws don't have to re-read argv
@@ -78,12 +79,12 @@ const DEFAULT_MODEL: &str = "anthropic/claude-opus-4-6";
 enum ModelSource {
     /// Explicit `--model` / `--model=` CLI flag.
     Flag,
-    /// ANTHROPIC_MODEL environment variable (when no flag was passed).
+    /// Runtime model environment variable (when no flag was passed).
     Env,
     /// `model` key in `.claw.json` / `.claw/settings.json` (when neither
     /// flag nor env set it).
     Config,
-    /// Compiled-in DEFAULT_MODEL fallback.
+    /// Compiled-in `DEFAULT_MODEL` fallback.
     Default,
 }
 
@@ -106,6 +107,62 @@ struct ModelProvenance {
     raw: Option<String>,
     /// Where the resolved model string originated.
     source: ModelSource,
+    /// Alias-expanded target when `raw` differs from `resolved`.
+    alias_resolved_to: Option<String>,
+    /// Environment variable that supplied the model, when source is Env.
+    env_var: Option<String>,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PermissionModeSource {
+    Flag,
+    Env,
+    Config,
+    Default,
+}
+
+impl PermissionModeSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Flag => "flag",
+            Self::Env => "env",
+            Self::Config => "config",
+            Self::Default => "default",
+        }
+    }
+
+    fn is_explicit(self) -> bool {
+        !matches!(self, Self::Default)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PermissionModeProvenance {
+    mode: PermissionMode,
+    source: PermissionModeSource,
+    env_var: Option<&'static str>,
+}
+
+impl PermissionModeProvenance {
+    fn from_flag(mode: PermissionMode) -> Self {
+        Self {
+            mode,
+            source: PermissionModeSource::Flag,
+            env_var: None,
+        }
+    }
+
+    fn default_fallback() -> Self {
+        Self {
+            mode: PermissionMode::WorkspaceWrite,
+            source: PermissionModeSource::Default,
+            env_var: None,
+        }
+    }
+}
+
+struct EnvModel {
+    name: &'static str,
+    value: String,
 }
 
 impl ModelProvenance {
@@ -114,49 +171,90 @@ impl ModelProvenance {
             resolved: DEFAULT_MODEL.to_string(),
             raw: None,
             source: ModelSource::Default,
+            alias_resolved_to: None,
+            env_var: None,
         }
     }
 
-    fn from_flag(raw: &str) -> Self {
+    fn from_flag(raw: &str, resolved: &str) -> Self {
+        Self::from_resolved(raw, resolved, ModelSource::Flag, None)
+    }
+
+    fn from_raw(raw: &str, source: ModelSource, env_var: Option<&str>) -> Self {
+        let resolved = resolve_model_alias_with_config(raw);
+        Self::from_resolved(raw, &resolved, source, env_var)
+    }
+
+    fn from_resolved(
+        raw: &str,
+        resolved: &str,
+        source: ModelSource,
+        env_var: Option<&str>,
+    ) -> Self {
+        let raw_trimmed = raw.trim();
+        let alias_resolved_to = (raw_trimmed != resolved).then(|| resolved.to_string());
         Self {
-            resolved: resolve_model_alias_with_config(raw),
+            resolved: resolved.to_string(),
             raw: Some(raw.to_string()),
-            source: ModelSource::Flag,
+            source,
+            alias_resolved_to,
+            env_var: env_var.map(str::to_string),
         }
     }
 
-    fn from_env_or_config_or_default(cli_model: &str) -> Self {
+    fn from_env_or_config_or_default(cli_model: &str) -> Result<Self, String> {
         // Only called when no --model flag was passed. Probe env first,
         // then config, else fall back to default. Mirrors the logic in
         // resolve_repl_model() but captures the source.
         if cli_model != DEFAULT_MODEL {
-            // Already resolved from some prior path; treat as flag.
-            return Self {
-                resolved: cli_model.to_string(),
-                raw: Some(cli_model.to_string()),
-                source: ModelSource::Flag,
-            };
+            let provenance = Self::from_resolved(cli_model, cli_model, ModelSource::Flag, None);
+            provenance.validate()?;
+            return Ok(provenance);
         }
-        if let Some(env_model) = env::var("ANTHROPIC_MODEL")
-            .ok()
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
-        {
-            return Self {
-                resolved: resolve_model_alias_with_config(&env_model),
-                raw: Some(env_model),
-                source: ModelSource::Env,
-            };
+        if let Some(env_model) = env_model_for_runtime() {
+            let provenance =
+                Self::from_raw(&env_model.value, ModelSource::Env, Some(env_model.name));
+            provenance.validate()?;
+            return Ok(provenance);
         }
         if let Some(config_model) = config_model_for_current_dir() {
-            return Self {
-                resolved: resolve_model_alias_with_config(&config_model),
-                raw: Some(config_model),
-                source: ModelSource::Config,
-            };
+            let provenance = Self::from_raw(&config_model, ModelSource::Config, None);
+            provenance.validate()?;
+            return Ok(provenance);
         }
-        Self::default_fallback()
+        Ok(Self::default_fallback())
     }
+
+    fn validate(&self) -> Result<(), String> {
+        validate_model_syntax(&self.resolved).map_err(|error| {
+            let source = match self.source {
+                ModelSource::Flag => "--model",
+                ModelSource::Env => self.env_var.as_deref().unwrap_or("environment"),
+                ModelSource::Config => "config model",
+                ModelSource::Default => "default model",
+            };
+            if let Some(raw) = &self.raw {
+                format!(
+                    "invalid_model: {source} model `{raw}` is invalid after alias resolution to `{}`.\n{error}",
+                    self.resolved
+                )
+            } else {
+                error
+            }
+        })
+    }
+}
+
+fn env_model_for_runtime() -> Option<EnvModel> {
+    ["CLAW_MODEL", "ANTHROPIC_MODEL", "ANTHROPIC_DEFAULT_MODEL"]
+        .into_iter()
+        .find_map(|name| {
+            env::var(name)
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .map(|value| EnvModel { name, value })
+        })
 }
 
 fn max_tokens_for_model(model: &str) -> u32 {
@@ -172,6 +270,12 @@ const DEFAULT_OAUTH_CALLBACK_PORT: u16 = 4545;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const BUILD_TARGET: Option<&str> = option_env!("TARGET");
 const GIT_SHA: Option<&str> = option_env!("GIT_SHA");
+const GIT_SHA_SHORT: Option<&str> = option_env!("GIT_SHA_SHORT");
+const GIT_DIRTY: Option<&str> = option_env!("GIT_DIRTY");
+const GIT_BRANCH: Option<&str> = option_env!("GIT_BRANCH");
+const GIT_COMMIT_DATE: Option<&str> = option_env!("GIT_COMMIT_DATE");
+const GIT_COMMIT_TIMESTAMP: Option<&str> = option_env!("GIT_COMMIT_TIMESTAMP");
+const RUSTC_VERSION: Option<&str> = option_env!("RUSTC_VERSION");
 const INTERNAL_PROGRESS_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3);
 const POST_TOOL_STALL_TIMEOUT: Duration = Duration::from_secs(10);
 const PRIMARY_SESSION_EXTENSION: &str = "jsonl";
@@ -189,6 +293,10 @@ const CLI_OPTION_SUGGESTIONS: &[&str] = &[
     "--model",
     "--output-format",
     "--permission-mode",
+    "--cwd",
+    "--directory",
+    "-C",
+    "--skip-permissions",
     "--dangerously-skip-permissions",
     "--allowedTools",
     "--allowed-tools",
@@ -200,6 +308,17 @@ const CLI_OPTION_SUGGESTIONS: &[&str] = &[
     "--base-commit",
     "-p",
 ];
+
+fn is_registered_cli_flag_token(value: &str) -> bool {
+    let flag = value.split_once('=').map_or(value, |(flag, _)| flag);
+    CLI_OPTION_SUGGESTIONS.contains(&flag)
+}
+
+fn should_reject_unknown_option_like(value: &str) -> bool {
+    is_registered_cli_flag_token(value)
+        || (value.starts_with("--")
+            && suggest_closest_term(value, CLI_OPTION_SUGGESTIONS).is_some())
+}
 
 type AllowedToolSet = BTreeSet<String>;
 type RuntimePluginStateBuildOutput = (
@@ -213,10 +332,7 @@ fn main() {
         // When --output-format json is active, emit errors as JSON so downstream
         // tools can parse failures the same way they parse successes (ROADMAP #42).
         let argv: Vec<String> = std::env::args().collect();
-        let json_output = argv
-            .windows(2)
-            .any(|w| w[0] == "--output-format" && w[1] == "json")
-            || argv.iter().any(|a| a == "--output-format=json");
+        let json_output = raw_args_request_json_output(&argv[1..]);
         if json_output {
             // #77/#696: classify error by prefix so downstream claws can route
             // without regex-scraping prose. Keep the legacy `type`/`kind`
@@ -226,23 +342,70 @@ fn main() {
             let (short_reason, inline_hint) = split_error_hint(&message);
             // #781: fall back to a kind-derived hint when the message has no \n-delimited hint
             let hint = inline_hint.or_else(|| fallback_hint_for_error_kind(kind).map(String::from));
+            let mut error_json = serde_json::json!({
+                "type": "error",
+                "kind": kind,
+                "status": "error",
+                "error_kind": kind,
+                "error": short_reason,
+                "message": short_reason,
+                "action": "abort",
+                "hint": hint,
+                "exit_code": 1,
+            });
+            if kind == "invalid_cwd" {
+                if let Some(error) = error.downcast_ref::<InvalidCwdError>() {
+                    if let Some(object) = error_json.as_object_mut() {
+                        object.insert("path".to_string(), serde_json::json!(&error.path));
+                        object.insert(
+                            "reason".to_string(),
+                            serde_json::json!(error.reason.as_str()),
+                        );
+                    }
+                }
+            } else if kind == "invalid_output_path" {
+                if let Some(error) = error.downcast_ref::<InvalidOutputPathError>() {
+                    if let Some(object) = error_json.as_object_mut() {
+                        object.insert("path".to_string(), serde_json::json!(&error.path));
+                        object.insert(
+                            "reason".to_string(),
+                            serde_json::json!(error.reason.as_str()),
+                        );
+                    }
+                }
+            } else if kind == "invalid_output_format" {
+                if let Some(object) = error_json.as_object_mut() {
+                    object.insert(
+                        "value".to_string(),
+                        serde_json::json!(invalid_output_format_value(&message)),
+                    );
+                    object.insert("expected".to_string(), serde_json::json!(["text", "json"]));
+                }
+            } else if kind == "invalid_tool_name" {
+                let (tool_name, available, aliases) = invalid_tool_name_details(&message);
+                if let Some(object) = error_json.as_object_mut() {
+                    if let Some(tool_name) = tool_name {
+                        object.insert("tool_name".to_string(), serde_json::json!(tool_name));
+                    }
+                    object.insert("available".to_string(), serde_json::json!(available));
+                    object.insert("tool_aliases".to_string(), aliases);
+                }
+            } else if kind == "missing_argument" {
+                if let Some(object) = error_json.as_object_mut() {
+                    if message.contains("--allowedTools") {
+                        object.insert("argument".to_string(), serde_json::json!("--allowedTools"));
+                    } else if message.contains("prompt or subcommand") {
+                        object.insert(
+                            "argument".to_string(),
+                            serde_json::json!("prompt or subcommand"),
+                        );
+                    }
+                }
+            }
             // #819/#820/#823: JSON mode error envelopes must go to stdout so machine
             // consumers can parse failures from stdout byte 0 (parity with all
             // non-interactive command guards that already use println! / to_stdout).
-            println!(
-                "{}",
-                serde_json::json!({
-                    "type": "error",
-                    "kind": kind,
-                    "status": "error",
-                    "error_kind": kind,
-                    "error": short_reason,
-                    "message": short_reason,
-                    "action": "abort",
-                    "hint": hint,
-                    "exit_code": 1,
-                })
-            );
+            println!("{}", error_json);
         } else {
             // #156: Add machine-readable error kind to text output so stderr observers
             // don't need to regex-scrape the prose.
@@ -267,7 +430,7 @@ Run `claw --help` for usage."
 
 /// #77: Classify a stringified error message into a machine-readable kind.
 ///
-/// Returns a snake_case token that downstream consumers can switch on instead
+/// Returns a `snake_case` token that downstream consumers can switch on instead
 /// of regex-scraping the prose. The classification is best-effort prefix/keyword
 /// matching against the error messages produced throughout the CLI surface.
 fn classify_error_kind(message: &str) -> &'static str {
@@ -278,7 +441,9 @@ fn classify_error_kind(message: &str) -> &'static str {
         "command_not_found"
     } else if message.contains("missing Anthropic credentials") {
         "missing_credentials"
-    } else if message.contains("Manifest source files are missing") {
+    } else if message.contains("Manifest source files are missing")
+        || message.starts_with("missing_manifests:")
+    {
         "missing_manifests"
     } else if message.contains("no worker state file found") {
         "missing_worker_state"
@@ -298,14 +463,30 @@ fn classify_error_kind(message: &str) -> &'static str {
         "session_load_failed"
     } else if message.contains("unsupported ACP invocation") {
         "unsupported_acp_invocation"
+    } else if message.starts_with("missing_argument:") {
+        "missing_argument"
     } else if message.contains("unsupported skills action") {
         "unsupported_skills_action"
+    } else if message.starts_with("invalid_install_source:") {
+        "invalid_install_source"
+    } else if message.starts_with("invalid_cwd:") {
+        "invalid_cwd"
+    } else if message.starts_with("invalid_output_path:") {
+        "invalid_output_path"
+    } else if message.starts_with("invalid_output_format:") {
+        "invalid_output_format"
+    } else if message.starts_with("invalid_tool_name:") {
+        "invalid_tool_name"
     } else if message.contains("unrecognized argument") || message.contains("unknown option") {
         "cli_parse"
     } else if message.starts_with("missing_flag_value:") {
         "missing_flag_value"
+    } else if message.starts_with("invalid_permission_mode:") {
+        "invalid_permission_mode"
     } else if message.starts_with("invalid_flag_value:") {
         "invalid_flag_value"
+    } else if message.starts_with("invalid_model:") {
+        "invalid_model"
     } else if message.contains("invalid model syntax") {
         "invalid_model_syntax"
     } else if message.contains("is not yet implemented") {
@@ -389,9 +570,9 @@ fn classify_error_kind(message: &str) -> &'static str {
     }
 }
 
-/// #77: Split a multi-line error message into (short_reason, optional_hint).
+/// #77: Split a multi-line error message into (`short_reason`, `optional_hint`).
 ///
-/// The short_reason is the first line (up to the first newline), and the hint
+/// The `short_reason` is the first line (up to the first newline), and the hint
 /// is the remaining text or `None` if there's no newline. This prevents the
 /// runbook prose from being stuffed into the `error` field that downstream
 /// parsers expect to be the short reason alone.
@@ -400,6 +581,51 @@ fn split_error_hint(message: &str) -> (String, Option<String>) {
         Some((short, hint)) => (short.to_string(), Some(hint.trim().to_string())),
         None => (message.to_string(), None),
     }
+}
+
+fn invalid_tool_name_details(message: &str) -> (Option<String>, Vec<String>, Value) {
+    let tool_name = message
+        .strip_prefix("invalid_tool_name: unsupported tool in --allowedTools:")
+        .and_then(|rest| rest.lines().next())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+    let available = message
+        .lines()
+        .find_map(|line| line.strip_prefix("Available:"))
+        .map(|line| {
+            line.split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let aliases = message
+        .lines()
+        .find_map(|line| line.strip_prefix("Aliases:"))
+        .map(|line| {
+            line.split(',')
+                .filter_map(|entry| entry.trim().split_once('='))
+                .map(|(alias, canonical)| {
+                    (
+                        alias.trim().to_string(),
+                        Value::String(canonical.trim().to_string()),
+                    )
+                })
+                .collect::<Map<_, _>>()
+        })
+        .unwrap_or_default();
+    (tool_name, available, Value::Object(aliases))
+}
+
+fn invalid_output_format_value(message: &str) -> Option<String> {
+    message
+        .strip_prefix("invalid_output_format: unsupported value for --output-format:")
+        .and_then(|rest| rest.lines().next())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 /// #781: derive a stable fallback hint from a classified error kind when the error
@@ -416,6 +642,9 @@ fn fallback_hint_for_error_kind(kind: &str) -> Option<&'static str> {
         "missing_credentials" => {
             Some("Set ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN before running claw.")
         }
+        "config_parse_error" => Some(
+            "Fix the JSON syntax or schema in the referenced .claw/settings.json or .claw.json file, then rerun the command.",
+        ),
         // #787: session load failures have no \n-delimited hint from the OS error path
         "session_load_failed" => Some(
             "Pass a path to a .jsonl session file, not a directory. Managed sessions live in .claw/sessions/.",
@@ -434,12 +663,238 @@ fn fallback_hint_for_error_kind(kind: &str) -> Option<&'static str> {
         "skill_not_found" => Some(
             "Run `claw skills list` to see available skills, or `claw skills install <path>` to install a new one.",
         ),
-        // #795: unsupported action on skills (e.g. /skills uninstall) with no \n hint
+        // #795/#431: unsupported/invalid skills lifecycle input should include actionable local guidance.
         "unsupported_skills_action" => Some(
-            "Supported: list, install <path>, show <name>, help. Run `claw skills help` for details.",
+            "Supported: list, show <name>, install <path>, uninstall <name>, help. Run `claw skills help` for details.",
         ),
+        "invalid_install_source" => Some(
+            "Pass a local skill directory containing SKILL.md or a standalone markdown file.",
+        ),
+        "invalid_tool_name" => Some(
+            "Use canonical snake_case tool names from `available` or documented aliases from `tool_aliases`.",
+        ),
+        "invalid_output_format" => Some("Use --output-format text or --output-format json."),
         _ => None,
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InvalidCwdReason {
+    Empty,
+    NotFound,
+    NotADirectory,
+}
+
+impl InvalidCwdReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Empty => "empty",
+            Self::NotFound => "not_found",
+            Self::NotADirectory => "not_a_directory",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct InvalidCwdError {
+    path: String,
+    reason: InvalidCwdReason,
+}
+
+impl InvalidCwdError {
+    fn new(path: impl Into<String>, reason: InvalidCwdReason) -> Self {
+        Self {
+            path: path.into(),
+            reason,
+        }
+    }
+}
+
+impl std::fmt::Display for InvalidCwdError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "invalid_cwd: {}: `{}`\nUsage: --cwd <path>, -C <path>, or --directory <path>",
+            self.reason.as_str(),
+            self.path
+        )
+    }
+}
+
+impl std::error::Error for InvalidCwdError {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InvalidOutputPathReason {
+    Empty,
+    ParentNotFound,
+    ParentNotADirectory,
+    PathIsDirectory,
+}
+
+impl InvalidOutputPathReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Empty => "empty",
+            Self::ParentNotFound => "parent_not_found",
+            Self::ParentNotADirectory => "parent_not_a_directory",
+            Self::PathIsDirectory => "path_is_directory",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct InvalidOutputPathError {
+    path: String,
+    reason: InvalidOutputPathReason,
+}
+
+impl InvalidOutputPathError {
+    fn new(path: impl Into<String>, reason: InvalidOutputPathReason) -> Self {
+        Self {
+            path: path.into(),
+            reason,
+        }
+    }
+}
+
+impl std::fmt::Display for InvalidOutputPathError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "invalid_output_path: {}: `{}`\nUsage: claw export [PATH] [--session SESSION] [--output PATH]",
+            self.reason.as_str(),
+            self.path
+        )
+    }
+}
+
+impl std::error::Error for InvalidOutputPathError {}
+
+fn split_global_cwd_args(
+    args: &[String],
+) -> Result<(Vec<String>, Option<PathBuf>), Box<dyn std::error::Error>> {
+    let mut filtered = Vec::with_capacity(args.len());
+    let mut cwd = None;
+    let mut index = 0;
+
+    while index < args.len() {
+        let arg = &args[index];
+        match arg.as_str() {
+            "--cwd" | "-C" | "--directory" => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "missing_flag_value: missing value for --cwd.\nUsage: --cwd <path>, -C <path>, or --directory <path>",
+                    )
+                })?;
+                cwd = Some(validate_global_cwd(value)?);
+                index += 2;
+            }
+            flag if flag.starts_with("--cwd=") => {
+                let value = &flag[6..];
+                cwd = Some(validate_global_cwd(value)?);
+                index += 1;
+            }
+            flag if flag.starts_with("--directory=") => {
+                let value = &flag[12..];
+                cwd = Some(validate_global_cwd(value)?);
+                index += 1;
+            }
+            flag if global_flag_takes_value(flag) => {
+                filtered.push(arg.clone());
+                if let Some(value) = args.get(index + 1) {
+                    filtered.push(value.clone());
+                    index += 2;
+                } else {
+                    index += 1;
+                }
+            }
+            flag if global_flag_is_value_inline(flag) => {
+                filtered.push(arg.clone());
+                index += 1;
+            }
+            flag if global_flag_without_value(flag) => {
+                filtered.push(arg.clone());
+                index += 1;
+            }
+            "--" => {
+                filtered.extend(args[index..].iter().cloned());
+                break;
+            }
+            other if other.starts_with('-') => {
+                filtered.push(arg.clone());
+                index += 1;
+            }
+            _ => {
+                filtered.extend(args[index..].iter().cloned());
+                break;
+            }
+        }
+    }
+
+    Ok((filtered, cwd))
+}
+
+fn global_flag_takes_value(flag: &str) -> bool {
+    matches!(
+        flag,
+        "--model"
+            | "--output-format"
+            | "--permission-mode"
+            | "--base-commit"
+            | "--reasoning-effort"
+            | "--allowedTools"
+            | "--allowed-tools"
+    )
+}
+
+fn global_flag_is_value_inline(flag: &str) -> bool {
+    flag.starts_with("--model=")
+        || flag.starts_with("--output-format=")
+        || flag.starts_with("--permission-mode=")
+        || flag.starts_with("--base-commit=")
+        || flag.starts_with("--reasoning-effort=")
+        || flag.starts_with("--allowedTools=")
+        || flag.starts_with("--allowed-tools=")
+}
+
+fn global_flag_without_value(flag: &str) -> bool {
+    matches!(
+        flag,
+        "--help"
+            | "-h"
+            | "--version"
+            | "-V"
+            | "--dangerously-skip-permissions"
+            | "--skip-permissions"
+            | "--compact"
+            | "--allow-broad-cwd"
+            | "--print"
+            | "--acp"
+            | "-acp"
+    )
+}
+
+fn validate_global_cwd(value: &str) -> Result<PathBuf, InvalidCwdError> {
+    if value.trim().is_empty() {
+        return Err(InvalidCwdError::new(value, InvalidCwdReason::Empty));
+    }
+    let path = PathBuf::from(value);
+    match fs::metadata(&path) {
+        Ok(metadata) if metadata.is_dir() => Ok(path),
+        Ok(_) => Err(InvalidCwdError::new(value, InvalidCwdReason::NotADirectory)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            Err(InvalidCwdError::new(value, InvalidCwdReason::NotFound))
+        }
+        Err(_) => Err(InvalidCwdError::new(value, InvalidCwdReason::NotFound)),
+    }
+}
+
+fn apply_global_cwd(cwd: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(cwd) = cwd {
+        env::set_current_dir(cwd)?;
+    }
+    Ok(())
 }
 
 /// Read piped stdin content when stdin is not a terminal.
@@ -541,13 +996,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // #824: suppress config deprecation prose warnings to stderr when JSON
     // output mode is active.  Scan the raw argv before parse_args so the
     // suppression is in place before any settings file is loaded.
-    let json_mode = args
-        .windows(2)
-        .any(|w| w[0] == "--output-format" && w[1] == "json")
-        || args.iter().any(|a| a == "--output-format=json");
+    let json_mode = raw_args_request_json_output(&args);
     if json_mode {
         runtime::suppress_config_warnings_for_json_mode();
     }
+    let (args, cwd) = split_global_cwd_args(&args)?;
+    apply_global_cwd(cwd)?;
     match parse_args(&args)? {
         CliAction::DumpManifests {
             output_format,
@@ -621,11 +1075,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 None
             };
             let effective_prompt = merge_prompt_with_stdin(&prompt, stdin_context.as_deref());
-            let mut cli = LiveCli::new(model, true, allowed_tools, permission_mode)?;
+            let resolved_model = resolve_repl_model(model)?;
+            let mut cli = LiveCli::new(resolved_model, true, allowed_tools, permission_mode)?;
             cli.set_reasoning_effort(reasoning_effort);
             cli.run_turn_with_output(&effective_prompt, output_format, compact)?;
         }
-        CliAction::Doctor { output_format } => run_doctor(output_format)?,
+        CliAction::Doctor {
+            output_format,
+            permission_mode,
+        } => run_doctor(output_format, permission_mode)?,
         CliAction::Acp { output_format } => print_acp_status(output_format)?,
         CliAction::State { output_format } => run_worker_state(output_format)?,
         CliAction::Init { output_format } => run_init(output_format)?,
@@ -647,6 +1105,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
         },
+        CliAction::Models {
+            action,
+            output_format,
+        } => print_models(action.as_deref(), output_format)?,
         CliAction::Diff { output_format } => match output_format {
             CliOutputFormat::Text => {
                 println!("{}", render_diff_report()?);
@@ -734,7 +1196,7 @@ enum CliAction {
         // None means no flag was supplied; env/config/default fallback is
         // resolved inside `print_status_snapshot`.
         model_flag_raw: Option<String>,
-        permission_mode: PermissionMode,
+        permission_mode: PermissionModeProvenance,
         output_format: CliOutputFormat,
         allowed_tools: Option<AllowedToolSet>,
     },
@@ -754,6 +1216,7 @@ enum CliAction {
     },
     Doctor {
         output_format: CliOutputFormat,
+        permission_mode: PermissionModeProvenance,
     },
     Acp {
         output_format: CliOutputFormat,
@@ -771,6 +1234,10 @@ enum CliAction {
     // introspection commands; wire them as standalone CLI subcommands.
     Config {
         section: Option<String>,
+        output_format: CliOutputFormat,
+    },
+    Models {
+        action: Option<String>,
         output_format: CliOutputFormat,
     },
     Diff {
@@ -809,6 +1276,9 @@ enum LocalHelpTopic {
     // `claw <subcommand> --help` has one consistent contract.
     Init,
     State,
+    Resume,
+    Session,
+    Compact,
     Export,
     Version,
     SystemPrompt,
@@ -820,6 +1290,8 @@ enum LocalHelpTopic {
     Plugins,
     Mcp,
     Config,
+    Model,
+    Settings,
     Diff,
     Setup,
 }
@@ -830,14 +1302,143 @@ enum CliOutputFormat {
     Json,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutputFormatSource {
+    Default,
+    Env,
+    Flag,
+}
+
+impl OutputFormatSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Env => "env",
+            Self::Flag => "flag",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OutputFormatSelection {
+    format: CliOutputFormat,
+    source: OutputFormatSource,
+    raw: Option<String>,
+    overridden: Vec<String>,
+}
+
+impl Default for OutputFormatSelection {
+    fn default() -> Self {
+        Self {
+            format: CliOutputFormat::Text,
+            source: OutputFormatSource::Default,
+            raw: None,
+            overridden: Vec::new(),
+        }
+    }
+}
+
+static OUTPUT_FORMAT_SELECTION: OnceLock<Mutex<OutputFormatSelection>> = OnceLock::new();
+
+fn output_format_selection_cell() -> &'static Mutex<OutputFormatSelection> {
+    OUTPUT_FORMAT_SELECTION.get_or_init(|| Mutex::new(OutputFormatSelection::default()))
+}
+
+fn set_current_output_format_selection(selection: &OutputFormatSelection) {
+    *output_format_selection_cell()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = selection.clone();
+}
+
+fn current_output_format_selection() -> OutputFormatSelection {
+    output_format_selection_cell()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
+fn cli_has_output_format_flag(args: &[String]) -> bool {
+    args.iter()
+        .take_while(|arg| arg.as_str() != "--")
+        .any(|arg| arg == "--output-format" || arg.starts_with("--output-format="))
+}
+
+fn raw_args_request_json_output(args: &[String]) -> bool {
+    let mut values = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        if arg == "--" {
+            break;
+        }
+        if arg == "--output-format" {
+            if let Some(value) = args.get(index + 1) {
+                values.push(value.as_str());
+            }
+            index += 2;
+            continue;
+        }
+        if let Some(value) = arg.strip_prefix("--output-format=") {
+            values.push(value);
+        }
+        index += 1;
+    }
+    if let Some(value) = values.last() {
+        let value = value.trim();
+        return !value.eq_ignore_ascii_case("text");
+    }
+    env::var("CLAW_OUTPUT_FORMAT").ok().is_some_and(|value| {
+        let value = value.trim();
+        !value.is_empty() && !value.eq_ignore_ascii_case("text")
+    })
+}
+
+fn output_format_selection_from_env() -> Result<OutputFormatSelection, String> {
+    match env::var("CLAW_OUTPUT_FORMAT") {
+        Ok(raw) if !raw.trim().is_empty() => Ok(OutputFormatSelection {
+            format: CliOutputFormat::parse(&raw)?,
+            source: OutputFormatSource::Env,
+            raw: Some(raw),
+            overridden: Vec::new(),
+        }),
+        _ => Ok(OutputFormatSelection::default()),
+    }
+}
+
+fn apply_output_format_flag(
+    selection: &mut OutputFormatSelection,
+    value: &str,
+) -> Result<CliOutputFormat, String> {
+    let parsed = CliOutputFormat::parse(value)?;
+    if selection.source == OutputFormatSource::Flag {
+        let previous = selection
+            .raw
+            .clone()
+            .unwrap_or_else(|| selection.format.as_str().to_string());
+        eprintln!("warning: --output-format specified multiple times; using last value '{value}'");
+        selection.overridden.push(previous);
+    }
+    selection.format = parsed;
+    selection.source = OutputFormatSource::Flag;
+    selection.raw = Some(value.to_string());
+    set_current_output_format_selection(selection);
+    Ok(parsed)
+}
 impl CliOutputFormat {
     fn parse(value: &str) -> Result<Self, String> {
-        match value {
-            "text" => Ok(Self::Text),
-            "json" => Ok(Self::Json),
+        match value.trim() {
+            value if value.eq_ignore_ascii_case("text") => Ok(Self::Text),
+            value if value.eq_ignore_ascii_case("json") => Ok(Self::Json),
             other => Err(format!(
-                "unsupported value for --output-format: {other} (expected text or json)"
+                "invalid_output_format: unsupported value for --output-format: {other}\nExpected: text, json\nHint: Use --output-format text or --output-format json."
             )),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::Json => "json",
         }
     }
 }
@@ -848,7 +1449,13 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
     // #148: when user passes --model/--model=, capture the raw input so we
     // can attribute source: "flag" later. None means no flag was supplied.
     let mut model_flag_raw: Option<String> = None;
-    let mut output_format = CliOutputFormat::Text;
+    let mut output_format_selection = if cli_has_output_format_flag(args) {
+        OutputFormatSelection::default()
+    } else {
+        output_format_selection_from_env()?
+    };
+    set_current_output_format_selection(&output_format_selection);
+    let mut output_format = output_format_selection.format;
     let mut permission_mode_override = None;
     let mut wants_help = false;
     let mut wants_version = false;
@@ -861,6 +1468,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
     // flag parsing. None until `-p <text>` is seen.
     let mut short_p_prompt: Option<String> = None;
     let mut rest: Vec<String> = Vec::new();
+    let mut positional_after_separator = false;
     let mut index = 0;
 
     while index < args.len() {
@@ -912,25 +1520,26 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 let value = args
                     .get(index + 1)
                     .ok_or_else(|| "missing_flag_value: missing value for --output-format.\nUsage: --output-format text  or  --output-format json".to_string())?;
-                output_format = CliOutputFormat::parse(value)?;
+                output_format = apply_output_format_flag(&mut output_format_selection, value)?;
                 index += 2;
             }
             "--permission-mode" => {
                 let value = args
                     .get(index + 1)
-                    .ok_or_else(|| "missing_flag_value: missing value for --permission-mode.\nUsage: --permission-mode default|acceptEdits|bypassPermissions|dangerFullAccess".to_string())?;
+                    .ok_or_else(|| "missing_flag_value: missing value for --permission-mode.\nUsage: --permission-mode read-only|workspace-write|danger-full-access".to_string())?;
                 permission_mode_override = Some(parse_permission_mode_arg(value)?);
                 index += 2;
             }
             flag if flag.starts_with("--output-format=") => {
-                output_format = CliOutputFormat::parse(&flag[16..])?;
+                output_format =
+                    apply_output_format_flag(&mut output_format_selection, &flag[16..])?;
                 index += 1;
             }
             flag if flag.starts_with("--permission-mode=") => {
                 permission_mode_override = Some(parse_permission_mode_arg(&flag[18..])?);
                 index += 1;
             }
-            "--dangerously-skip-permissions" => {
+            "--dangerously-skip-permissions" | "--skip-permissions" => {
                 permission_mode_override = Some(PermissionMode::DangerFullAccess);
                 index += 1;
             }
@@ -974,6 +1583,16 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             "--allow-broad-cwd" => {
                 allow_broad_cwd = true;
                 index += 1;
+            }
+            "--" => {
+                if rest.is_empty() {
+                    positional_after_separator = true;
+                    rest.extend(args[index + 1..].iter().cloned());
+                } else {
+                    rest.push("--".to_string());
+                    rest.extend(args[index + 1..].iter().cloned());
+                }
+                break;
             }
             "-p" => {
                 // Claw Code compat: -p "prompt" = one-shot prompt.
@@ -1032,20 +1651,35 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             "--allowedTools" | "--allowed-tools" => {
                 let value = args
                     .get(index + 1)
-                    .ok_or_else(|| "missing_flag_value: missing value for --allowedTools.\nUsage: --allowedTools <tool-name>  e.g. --allowedTools Bash".to_string())?;
+                    .ok_or_else(allowed_tools_missing_error)?;
+                if value.starts_with('-') || is_known_top_level_subcommand(value) {
+                    return Err(allowed_tools_missing_error());
+                }
                 allowed_tool_values.push(value.clone());
                 index += 2;
             }
             flag if flag.starts_with("--allowedTools=") => {
-                allowed_tool_values.push(flag[15..].to_string());
+                let value = flag[15..].to_string();
+                if value.trim().is_empty() {
+                    return Err(allowed_tools_missing_error());
+                }
+                allowed_tool_values.push(value);
                 index += 1;
             }
             flag if flag.starts_with("--allowed-tools=") => {
-                allowed_tool_values.push(flag[16..].to_string());
+                let value = flag[16..].to_string();
+                if value.trim().is_empty() {
+                    return Err(allowed_tools_missing_error());
+                }
+                allowed_tool_values.push(value);
                 index += 1;
             }
             other if rest.is_empty() && other.starts_with('-') => {
-                return Err(format_unknown_option(other))
+                if should_reject_unknown_option_like(other) {
+                    return Err(format_unknown_option(other));
+                }
+                rest.push(other.to_string());
+                index += 1;
             }
             other => {
                 rest.push(other.to_string());
@@ -1071,6 +1705,10 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 "init" => Some(LocalHelpTopic::Init),
                 "setup" => Some(LocalHelpTopic::Setup),
                 "state" => Some(LocalHelpTopic::State),
+                "resume" => Some(LocalHelpTopic::Resume),
+                "session" => Some(LocalHelpTopic::Session),
+                "compact" => Some(LocalHelpTopic::Compact),
+                "--resume" => Some(LocalHelpTopic::Resume),
                 "export" => Some(LocalHelpTopic::Export),
                 "version" => Some(LocalHelpTopic::Version),
                 "system-prompt" => Some(LocalHelpTopic::SystemPrompt),
@@ -1081,6 +1719,8 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 "plugins" | "plugin" | "marketplace" => Some(LocalHelpTopic::Plugins),
                 "mcp" => Some(LocalHelpTopic::Mcp),
                 "config" => Some(LocalHelpTopic::Config),
+                "model" | "models" => Some(LocalHelpTopic::Model),
+                "settings" => Some(LocalHelpTopic::Settings),
                 "diff" => Some(LocalHelpTopic::Diff),
                 _ => None,
             };
@@ -1115,13 +1755,32 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         });
     }
 
+    if positional_after_separator && !rest.is_empty() {
+        let permission_mode = permission_mode_override.unwrap_or_else(default_permission_mode);
+        return Ok(CliAction::Prompt {
+            prompt: rest.join(" "),
+            model,
+            output_format,
+            allowed_tools,
+            permission_mode,
+            compact,
+            base_commit,
+            reasoning_effort: reasoning_effort.clone(),
+            allow_broad_cwd,
+        });
+    }
+
     if rest.is_empty() {
         let permission_mode = permission_mode_override.unwrap_or_else(default_permission_mode);
+        let stdin_is_terminal = std::io::stdin().is_terminal();
+        if compact && stdin_is_terminal {
+            return Err(compact_missing_argument_error());
+        }
         // When stdin is not a terminal (pipe/redirect) and no prompt is given on the
         // command line, read stdin as the prompt and dispatch as a one-shot Prompt
         // rather than starting the interactive REPL (which would consume the pipe and
         // print the startup banner, then exit without sending anything to the API).
-        if !std::io::stdin().is_terminal() {
+        if !stdin_is_terminal {
             let mut buf = String::new();
             let _ = std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf);
             let piped = buf.trim().to_string();
@@ -1132,11 +1791,14 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                     allowed_tools,
                     permission_mode,
                     output_format,
-                    compact: false,
+                    compact,
                     base_commit,
                     reasoning_effort,
                     allow_broad_cwd,
                 });
+            }
+            if compact {
+                return Err(compact_missing_argument_error());
             }
             // Non-TTY stdin with no piped content: refuse to start the interactive
             // REPL (it would block forever waiting for input that will never arrive).
@@ -1155,11 +1817,14 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             allow_broad_cwd,
         });
     }
+    if let Some(action) = parse_local_help_action(&rest, output_format) {
+        return action;
+    }
     if rest.first().map(String::as_str) == Some("--resume") {
         return parse_resume_args(&rest[1..], output_format);
     }
-    if let Some(action) = parse_local_help_action(&rest, output_format) {
-        return action;
+    if rest.first().map(String::as_str) == Some("resume") {
+        return parse_resume_args(&rest[1..], output_format);
     }
     // #696: `claw compact` is the bare name of the interactive `/compact`
     // slash command, not a prompt. When extra args such as `--help` appear
@@ -1187,6 +1852,11 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
     // structurally without an earlier default-resolution load writing prose
     // warnings to stderr.
     let permission_mode = || permission_mode_override.unwrap_or_else(default_permission_mode);
+    let permission_mode_provenance = || {
+        permission_mode_override
+            .map(PermissionModeProvenance::from_flag)
+            .unwrap_or_else(permission_mode_provenance_for_current_dir)
+    };
 
     match rest[0].as_str() {
         "dump-manifests" => parse_dump_manifests_args(&rest[1..], output_format),
@@ -1297,10 +1967,23 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             "interactive_only: `claw ultraplan` is a slash command.\nStart `claw` and run `/ultraplan` inside the REPL."
                 .to_string(),
         ),
-        "model" if rest.len() > 1 => Err(
-            "interactive_only: `claw model` is a slash command.\nStart `claw` and run `/model [model-name]` inside the REPL."
-                .to_string(),
-        ),
+        "model" | "models" => {
+            let tail = &rest[1..];
+            let action = tail.first().cloned();
+            if tail.len() > 1 {
+                return Err(format!(
+                    "unexpected extra arguments after `claw {} {}`: {}\nUsage: claw {} [help] [--output-format json]",
+                    rest[0],
+                    tail[0],
+                    tail[1..].join(" "),
+                    rest[0]
+                ));
+            }
+            Ok(CliAction::Models {
+                action,
+                output_format,
+            })
+        }
         // #771: usage/stats/fork are slash-only verbs with no multi-arg match arms
         "usage" => Err(
             "interactive_only: `claw usage` is a slash command.\nUse `claw --resume SESSION.jsonl /usage` or start `claw` and run `/usage`."
@@ -1318,9 +2001,9 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             let args = join_optional_args(&rest[1..]);
             if let Some(action) = args.as_deref() {
                 let first_word = action.split_whitespace().next().unwrap_or(action);
-                if matches!(first_word, "remove" | "add" | "uninstall" | "delete") {
+                if matches!(first_word, "add") {
                     return Err(format!(
-                        "unsupported skills action: {first_word}. Supported actions: list, install <path>, help, or <skill> [args]"
+                        "unsupported skills action: {first_word}. Supported actions: list, show <name>, install <path>, uninstall <name>, help, or <skill> [args]"
                     ));
                 }
             }
@@ -1340,6 +2023,25 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                     args,
                     output_format,
                 }),
+            }
+        }
+        "settings" => {
+            let tail = &rest[1..];
+            if tail.is_empty() {
+                Ok(CliAction::Config {
+                    section: Some("settings".to_string()),
+                    output_format,
+                })
+            } else if tail.len() == 1 && matches!(tail[0].as_str(), "help" | "--help" | "-h") {
+                Ok(CliAction::HelpTopic {
+                    topic: LocalHelpTopic::Settings,
+                    output_format,
+                })
+            } else {
+                Err(format!(
+                    "unexpected extra arguments after `claw settings`: {}\nUsage: claw settings [help] [--output-format json]",
+                    tail.join(" ")
+                ))
             }
         }
         "system-prompt" => parse_system_prompt_args(&rest[1..], model, output_format),
@@ -1366,10 +2068,37 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         }
         "export" => parse_export_args(&rest[1..], output_format),
         "prompt" => {
-            let prompt = rest[1..].join(" ");
+            let mut read_stdin = false;
+            let prompt_parts = rest[1..]
+                .iter()
+                .filter_map(|arg| {
+                    if matches!(arg.as_str(), "--stdin" | "--prompt-stdin") {
+                        read_stdin = true;
+                        None
+                    } else {
+                        Some(arg.as_str())
+                    }
+                })
+                .collect::<Vec<_>>();
+            let positional_prompt = prompt_parts.join(" ");
+            let stdin_prompt = if read_stdin || positional_prompt.trim().is_empty() {
+                read_piped_stdin()
+            } else {
+                None
+            };
+            let prompt = if read_stdin {
+                merge_prompt_with_stdin(&positional_prompt, stdin_prompt.as_deref())
+            } else {
+                stdin_prompt
+                    .as_deref()
+                    .map(str::trim)
+                    .unwrap_or(&positional_prompt)
+                    .to_string()
+            };
             if prompt.trim().is_empty() {
-                // #750: provide error_kind-compatible prefix + \n for hint extraction
-                return Err("missing_prompt: prompt subcommand requires a prompt string.\nUsage: claw prompt <text>  or  echo '<text>' | claw".to_string());
+                // #750/#823/#423: provide error_kind-compatible prefix + \n for hint extraction.
+                return Err("missing_prompt: prompt subcommand requires a prompt string.
+Usage: claw prompt <text>  or  echo '<text>' | claw prompt".to_string());
             }
             Ok(CliAction::Prompt {
                 prompt,
@@ -1388,20 +2117,24 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             model,
             output_format,
             allowed_tools,
-            permission_mode(),
+            permission_mode_provenance(),
             compact,
             base_commit,
             reasoning_effort,
             allow_broad_cwd,
         ),
         other => {
-            if rest.len() == 1 && looks_like_subcommand_typo(other) {
-                // #825: always emit a command_not_found error for
-                // single-word all-alpha/dash tokens that don't match any
-                // known subcommand — with or without close suggestions.
-                // Multi-word cases fall through to CliAction::Prompt so
-                // natural language prompts like `claw explain this` work.
-                // (#826 documents the multi-word gap as a known limitation.)
+            if !compact
+                && !other.starts_with('-')
+                && looks_like_subcommand_typo(other)
+                && (rest.len() == 1
+                    || (output_format == CliOutputFormat::Json && model_flag_raw.is_none()))
+            {
+                // #825/#826: emit command_not_found before provider startup for
+                // command-shaped tokens that do not match known subcommands.
+                // Text-mode multi-word prompt shorthand remains available, but
+                // JSON-mode automation must not turn an unknown command into a
+                // credential-gated prompt request.
                 let mut message = format!("command_not_found: unknown subcommand: {other}.");
                 if let Some(suggestions) = suggest_similar_subcommand(other) {
                     if let Some(line) = render_suggestion_line("Did you mean", &suggestions) {
@@ -1467,6 +2200,11 @@ fn parse_local_help_action(
         "system-prompt" => LocalHelpTopic::SystemPrompt,
         "dump-manifests" => LocalHelpTopic::DumpManifests,
         "bootstrap-plan" => LocalHelpTopic::BootstrapPlan,
+        "resume" | "--resume" => LocalHelpTopic::Resume,
+        "session" => LocalHelpTopic::Session,
+        "compact" => LocalHelpTopic::Compact,
+        "model" | "models" => LocalHelpTopic::Model,
+        "settings" => LocalHelpTopic::Settings,
         _ => return None,
     };
     let has_non_help = rest[1..].iter().any(|a| !is_help_flag(a));
@@ -1528,11 +2266,16 @@ fn parse_single_word_command_alias(
                 "system-prompt" => Some(LocalHelpTopic::SystemPrompt),
                 "dump-manifests" => Some(LocalHelpTopic::DumpManifests),
                 "bootstrap-plan" => Some(LocalHelpTopic::BootstrapPlan),
+                "resume" => Some(LocalHelpTopic::Resume),
+                "session" => Some(LocalHelpTopic::Session),
+                "compact" => Some(LocalHelpTopic::Compact),
                 "agents" | "agent" => Some(LocalHelpTopic::Agents),
                 "skills" | "skill" => Some(LocalHelpTopic::Skills),
                 "plugins" | "plugin" | "marketplace" => Some(LocalHelpTopic::Plugins),
                 "mcp" => Some(LocalHelpTopic::Mcp),
                 "config" => Some(LocalHelpTopic::Config),
+                "model" | "models" => Some(LocalHelpTopic::Model),
+                "settings" => Some(LocalHelpTopic::Settings),
                 "diff" => Some(LocalHelpTopic::Diff),
                 _ => None,
             };
@@ -1578,11 +2321,16 @@ fn parse_single_word_command_alias(
             "system-prompt" => Some(LocalHelpTopic::SystemPrompt),
             "dump-manifests" => Some(LocalHelpTopic::DumpManifests),
             "bootstrap-plan" => Some(LocalHelpTopic::BootstrapPlan),
+            "resume" => Some(LocalHelpTopic::Resume),
+            "session" => Some(LocalHelpTopic::Session),
+            "compact" => Some(LocalHelpTopic::Compact),
             "agents" | "agent" => Some(LocalHelpTopic::Agents),
             "skills" | "skill" => Some(LocalHelpTopic::Skills),
             "plugins" | "plugin" | "marketplace" => Some(LocalHelpTopic::Plugins),
             "mcp" => Some(LocalHelpTopic::Mcp),
             "config" => Some(LocalHelpTopic::Config),
+            "model" | "models" => Some(LocalHelpTopic::Model),
+            "settings" => Some(LocalHelpTopic::Settings),
             "diff" => Some(LocalHelpTopic::Diff),
             _ => None,
         };
@@ -1606,12 +2354,19 @@ fn parse_single_word_command_alias(
         "status" => Some(Ok(CliAction::Status {
             model: model.to_string(),
             model_flag_raw: model_flag_raw.map(str::to_string), // #148
-            permission_mode: permission_mode_override.unwrap_or_else(default_permission_mode),
+            permission_mode: permission_mode_override
+                .map(PermissionModeProvenance::from_flag)
+                .unwrap_or_else(permission_mode_provenance_for_current_dir),
             output_format,
             allowed_tools,
         })),
         "sandbox" => Some(Ok(CliAction::Sandbox { output_format })),
-        "doctor" => Some(Ok(CliAction::Doctor { output_format })),
+        "doctor" => Some(Ok(CliAction::Doctor {
+            output_format,
+            permission_mode: permission_mode_override
+                .map(PermissionModeProvenance::from_flag)
+                .unwrap_or_else(permission_mode_provenance_for_current_dir),
+        })),
         "setup" => Some(Ok(CliAction::Setup { output_format })),
         "state" => Some(Ok(CliAction::State { output_format })),
         // #146: let `config` and `diff` fall through to parse_subcommand
@@ -1718,7 +2473,7 @@ fn parse_direct_slash_cli_action(
     model: String,
     output_format: CliOutputFormat,
     allowed_tools: Option<AllowedToolSet>,
-    permission_mode: PermissionMode,
+    permission_mode: PermissionModeProvenance,
     compact: bool,
     base_commit: Option<String>,
     reasoning_effort: Option<String>,
@@ -1727,6 +2482,20 @@ fn parse_direct_slash_cli_action(
     let raw = rest.join(" ");
     match SlashCommand::parse(&raw) {
         Ok(Some(SlashCommand::Help)) => Ok(CliAction::Help { output_format }),
+        Ok(Some(SlashCommand::Status)) => Ok(CliAction::Status {
+            model,
+            model_flag_raw: None,
+            permission_mode,
+            output_format,
+            allowed_tools,
+        }),
+        Ok(Some(SlashCommand::Sandbox)) => Ok(CliAction::Sandbox { output_format }),
+        Ok(Some(SlashCommand::Diff)) => Ok(CliAction::Diff { output_format }),
+        Ok(Some(SlashCommand::Version)) => Ok(CliAction::Version { output_format }),
+        Ok(Some(SlashCommand::Doctor)) => Ok(CliAction::Doctor {
+            output_format,
+            permission_mode,
+        }),
         Ok(Some(SlashCommand::Agents { args })) => Ok(CliAction::Agents {
             args,
             output_format,
@@ -1747,7 +2516,7 @@ fn parse_direct_slash_cli_action(
                     model,
                     output_format,
                     allowed_tools,
-                    permission_mode,
+                    permission_mode: permission_mode.mode,
                     compact,
                     base_commit,
                     reasoning_effort: reasoning_effort.clone(),
@@ -1802,6 +2571,9 @@ fn parse_direct_slash_cli_action(
 }
 
 fn format_unknown_option(option: &str) -> String {
+    if option == "--" {
+        return "end_of_flags: `--` terminates flag parsing. Pass literal prompt text after it, for example `claw -- \"-literal prompt\"`.\nRun `claw --help` for usage.".to_string();
+    }
     let mut message = format!("unknown option: {option}");
     if let Some(suggestion) = suggest_closest_term(option, CLI_OPTION_SUGGESTIONS) {
         message.push_str("\nDid you mean ");
@@ -1924,6 +2696,41 @@ fn suggest_similar_subcommand(input: &str) -> Option<Vec<String>> {
     (!suggestions.is_empty()).then_some(suggestions)
 }
 
+fn is_known_top_level_subcommand(value: &str) -> bool {
+    matches!(
+        value,
+        "help"
+            | "version"
+            | "status"
+            | "sandbox"
+            | "doctor"
+            | "state"
+            | "dump-manifests"
+            | "bootstrap-plan"
+            | "agents"
+            | "agent"
+            | "mcp"
+            | "skills"
+            | "skill"
+            | "plugins"
+            | "plugin"
+            | "marketplace"
+            | "system-prompt"
+            | "acp"
+            | "init"
+            | "export"
+            | "prompt"
+            | "resume"
+            | "session"
+            | "compact"
+            | "config"
+            | "model"
+            | "models"
+            | "settings"
+            | "diff"
+    )
+}
+
 fn common_prefix_len(left: &str, right: &str) -> usize {
     left.chars()
         .zip(right.chars())
@@ -1989,7 +2796,7 @@ fn levenshtein_distance(left: &str, right: &str) -> usize {
 
 fn resolve_model_alias(model: &str) -> &str {
     match model {
-        "opus" => "anthropic/claude-opus-4-6",
+        "opus" => "anthropic/claude-opus-4-7",
         "sonnet" => "anthropic/claude-sonnet-4-6",
         "haiku" => "anthropic/claude-haiku-4-5-20251213",
         _ => model,
@@ -2022,6 +2829,12 @@ fn validate_model_syntax(model: &str) -> Result<(), String> {
             trimmed
         ));
     }
+    if is_bare_provider_model(trimmed) {
+        return Ok(());
+    }
+    if is_local_openai_model_syntax(trimmed) {
+        return Ok(());
+    }
     // Check provider/model format: provider_id/model_id
     let parts: Vec<&str> = trimmed.split('/').collect();
     if parts.len() != 2 || parts[0].is_empty() || parts[1].is_empty() {
@@ -2048,6 +2861,17 @@ fn validate_model_syntax(model: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn is_bare_provider_model(model: &str) -> bool {
+    model.starts_with("claude-") || model.starts_with("gpt-")
+}
+
+fn is_local_openai_model_syntax(model: &str) -> bool {
+    if let Some(rest) = model.strip_prefix("local/") {
+        return !rest.is_empty() && rest.split('/').all(|segment| !segment.is_empty());
+    }
+    std::env::var_os("OPENAI_BASE_URL").is_some() && (model.contains(':') || model.contains('.'))
+}
+
 fn config_alias_for_current_dir(alias: &str) -> Option<String> {
     if alias.is_empty() {
         return None;
@@ -2063,6 +2887,25 @@ fn normalize_allowed_tools(values: &[String]) -> Result<Option<AllowedToolSet>, 
         return Ok(None);
     }
     current_tool_registry()?.normalize_allowed_tools(values)
+}
+
+fn allowed_tools_missing_error() -> String {
+    "missing_argument: --allowedTools requires a tool list before subcommands or flags.\nUsage: --allowedTools <tool-name>[,<tool-name>...]  e.g. --allowedTools read,glob".to_string()
+}
+
+fn compact_missing_argument_error() -> String {
+    "missing_argument: --compact requires prompt text, piped stdin, or a subcommand. argument: prompt or subcommand\nUsage: claw --compact <prompt>  or  echo '<prompt>' | claw --compact"
+        .to_string()
+}
+
+fn allowed_tool_aliases_json(registry: &GlobalToolRegistry) -> Value {
+    Value::Object(
+        registry
+            .allowed_tool_aliases()
+            .into_iter()
+            .map(|(alias, canonical)| (alias, Value::String(canonical)))
+            .collect(),
+    )
 }
 
 fn current_tool_registry() -> Result<GlobalToolRegistry, String> {
@@ -2086,7 +2929,7 @@ fn parse_permission_mode_arg(value: &str) -> Result<PermissionMode, String> {
     normalize_permission_mode(value)
         .ok_or_else(|| {
             format!(
-                "invalid_flag_value: unsupported permission mode '{value}'.\nUsage: --permission-mode read-only|workspace-write|danger-full-access"
+                "invalid_permission_mode: unsupported permission mode '{value}'.\nUsage: --permission-mode read-only|workspace-write|danger-full-access"
             )
         })
         .map(permission_mode_from_label)
@@ -2110,13 +2953,32 @@ fn permission_mode_from_resolved(mode: ResolvedPermissionMode) -> PermissionMode
 }
 
 fn default_permission_mode() -> PermissionMode {
-    env::var("RUSTY_CLAUDE_PERMISSION_MODE")
+    permission_mode_provenance_for_current_dir().mode
+}
+
+fn permission_mode_provenance_for_current_dir() -> PermissionModeProvenance {
+    if let Some(mode) = env::var("RUSTY_CLAUDE_PERMISSION_MODE")
         .ok()
         .as_deref()
         .and_then(normalize_permission_mode)
         .map(permission_mode_from_label)
-        .or_else(config_permission_mode_for_current_dir)
-        .unwrap_or(PermissionMode::DangerFullAccess)
+    {
+        return PermissionModeProvenance {
+            mode,
+            source: PermissionModeSource::Env,
+            env_var: Some("RUSTY_CLAUDE_PERMISSION_MODE"),
+        };
+    }
+
+    if let Some(mode) = config_permission_mode_for_current_dir() {
+        return PermissionModeProvenance {
+            mode,
+            source: PermissionModeSource::Config,
+            env_var: None,
+        };
+    }
+
+    PermissionModeProvenance::default_fallback()
 }
 
 fn config_permission_mode_for_current_dir() -> Option<PermissionMode> {
@@ -2135,21 +2997,47 @@ fn config_model_for_current_dir() -> Option<String> {
     loader.load().ok()?.model().map(ToOwned::to_owned)
 }
 
-fn resolve_repl_model(cli_model: String) -> String {
-    if cli_model != DEFAULT_MODEL {
-        return cli_model;
-    }
-    if let Some(env_model) = env::var("ANTHROPIC_MODEL")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-    {
-        return resolve_model_alias_with_config(&env_model);
-    }
-    if let Some(config_model) = config_model_for_current_dir() {
-        return resolve_model_alias_with_config(&config_model);
-    }
-    cli_model
+fn resolve_repl_model(cli_model: String) -> Result<String, String> {
+    Ok(ModelProvenance::from_env_or_config_or_default(&cli_model)?.resolved)
+}
+
+fn print_model_validation_warning_status(
+    error: &str,
+    usage: StatusUsage,
+    permission_mode: &str,
+    context: &StatusContext,
+    allowed_tools: Option<&AllowedToolSet>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let kind = classify_error_kind(error);
+    let (short_reason, inline_hint) = split_error_hint(error);
+    let hint = inline_hint.or_else(|| fallback_hint_for_error_kind(kind).map(String::from));
+    let format_selection = current_output_format_selection();
+    let mut value = status_json_value(
+        None,
+        usage,
+        permission_mode,
+        context,
+        None,
+        None,
+        allowed_tools,
+        Some(&format_selection),
+    );
+    let object = value
+        .as_object_mut()
+        .expect("status_json_value should render an object");
+    object.insert("status".to_string(), serde_json::json!("warn"));
+    object.insert("error_kind".to_string(), serde_json::json!(kind));
+    object.insert(
+        "model_validation_error".to_string(),
+        serde_json::json!(short_reason),
+    );
+    object.insert(
+        "model_validation_error_kind".to_string(),
+        serde_json::json!(kind),
+    );
+    object.insert("model_validation_hint".to_string(), serde_json::json!(hint));
+    println!("{}", serde_json::to_string_pretty(&value)?);
+    Ok(())
 }
 
 fn provider_label(kind: ProviderKind) -> &'static str {
@@ -2562,6 +3450,7 @@ impl DoctorReport {
     fn json_value(&self) -> Value {
         let report = self.render();
         let (ok_count, warn_count, fail_count) = self.counts();
+        let tool_registry = GlobalToolRegistry::builtin();
         json!({
             "kind": "doctor",
             "action": "doctor",
@@ -2580,6 +3469,10 @@ impl DoctorReport {
                 .iter()
                 .map(DiagnosticCheck::json_value)
                 .collect::<Vec<_>>(),
+            "allowed_tools": {
+                "available": tool_registry.canonical_allowed_tool_names(),
+                "aliases": allowed_tool_aliases_json(&tool_registry),
+            },
         })
     }
 }
@@ -2600,6 +3493,7 @@ fn render_diagnostic_check(check: &DiagnosticCheck) -> String {
 
 fn render_doctor_report(
     config_warning_mode: ConfigWarningMode,
+    permission_mode: PermissionModeProvenance,
 ) -> Result<DoctorReport, Box<dyn std::error::Error>> {
     let cwd = env::current_dir()?;
     let config_loader = ConfigLoader::default_for(&cwd);
@@ -2620,6 +3514,16 @@ fn render_doctor_report(
         config.as_ref().ok(),
         config.as_ref().err().map(ToString::to_string).as_deref(),
     );
+    let memory_files = memory_file_summaries_for(
+        &cwd,
+        project_root.as_deref(),
+        &project_context.instruction_files,
+    );
+    let mcp_validation = config
+        .as_ref()
+        .ok()
+        .map(|runtime_config| McpValidationSummary::from_collection(runtime_config.mcp()))
+        .unwrap_or_default();
     let context = StatusContext {
         cwd: cwd.clone(),
         session_path: None,
@@ -2629,6 +3533,12 @@ fn render_doctor_report(
             .map_or(0, |runtime_config| runtime_config.loaded_entries().len()),
         discovered_config_files: discovered_config.len(),
         memory_file_count: project_context.instruction_files.len(),
+        memory_files: memory_files.clone(),
+        unloaded_memory_files: unloaded_memory_candidates(
+            &cwd,
+            project_root.as_deref(),
+            &memory_files,
+        ),
         project_root,
         git_branch,
         git_summary,
@@ -2637,29 +3547,40 @@ fn render_doctor_report(
         session_lifecycle: classify_session_lifecycle_for(&cwd),
         boot_preflight,
         sandbox_status: resolve_sandbox_status(sandbox_config.sandbox(), &cwd),
+        binary_provenance: binary_provenance_for(Some(&cwd)),
         // Doctor path has its own config check; StatusContext here is only
         // fed into health renderers that don't read config_load_error.
         config_load_error: config.as_ref().err().map(ToString::to_string),
         config_load_error_kind: None,
+        mcp_validation: mcp_validation.clone(),
     };
     Ok(DoctorReport {
         checks: vec![
             check_auth_health(),
             check_config_health(&config_loader, config.as_ref()),
+            check_mcp_validation_health(&mcp_validation),
             check_install_source_health(),
             check_workspace_health(&context),
+            check_memory_health(&context),
             check_boot_preflight_health(&context),
             check_sandbox_health(&context.sandbox_status),
+            check_permission_health(permission_mode),
             check_system_health(&cwd, config.as_ref().ok()),
         ],
     })
 }
 
-fn run_doctor(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::Error>> {
-    let report = render_doctor_report(match output_format {
-        CliOutputFormat::Json => ConfigWarningMode::SuppressStderr,
-        CliOutputFormat::Text => ConfigWarningMode::EmitStderr,
-    })?;
+fn run_doctor(
+    output_format: CliOutputFormat,
+    permission_mode: PermissionModeProvenance,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let report = render_doctor_report(
+        match output_format {
+            CliOutputFormat::Json => ConfigWarningMode::SuppressStderr,
+            CliOutputFormat::Text => ConfigWarningMode::EmitStderr,
+        },
+        permission_mode,
+    )?;
     let message = report.render();
     match output_format {
         CliOutputFormat::Text => println!("{message}"),
@@ -2903,8 +3824,14 @@ fn check_config_health(
             }
             details.push(format!(
                 "MCP servers       {}",
-                runtime_config.mcp().servers().len()
+                runtime_config.mcp().valid_count()
             ));
+            if runtime_config.mcp().invalid_count() > 0 {
+                details.push(format!(
+                    "MCP invalid       {}",
+                    runtime_config.mcp().invalid_count()
+                ));
+            }
             if present_paths.is_empty() {
                 details.push("Discovered files  <none> (defaults active)".to_string());
             } else {
@@ -2931,7 +3858,11 @@ fn check_config_health(
                 ("resolved_model".to_string(), json!(runtime_config.model())),
                 (
                     "mcp_servers".to_string(),
-                    json!(runtime_config.mcp().servers().len()),
+                    json!(runtime_config.mcp().valid_count()),
+                ),
+                (
+                    "mcp_invalid_servers".to_string(),
+                    json!(runtime_config.mcp().invalid_count()),
                 ),
             ]))
         }
@@ -2961,6 +3892,118 @@ fn check_config_health(
             ("load_error".to_string(), json!(error.to_string())),
         ])),
     }
+}
+
+fn check_mcp_validation_health(summary: &McpValidationSummary) -> DiagnosticCheck {
+    let mut details = vec![
+        format!("Total entries     {}", summary.total_configured),
+        format!("Valid entries     {}", summary.valid_count),
+        format!("Invalid entries   {}", summary.invalid_count()),
+    ];
+    details.extend(
+        summary
+            .invalid_servers
+            .iter()
+            .map(|server| format!("Invalid server   {} ({})", server.name, server.reason)),
+    );
+
+    DiagnosticCheck::new(
+        "MCP validation",
+        if summary.has_invalid_servers() {
+            DiagnosticLevel::Warn
+        } else {
+            DiagnosticLevel::Ok
+        },
+        if summary.has_invalid_servers() {
+            format!(
+                "{} MCP server entries are invalid; {} valid entries remain loaded",
+                summary.invalid_count(),
+                summary.valid_count
+            )
+        } else {
+            format!("{} MCP server entries validated", summary.valid_count)
+        },
+    )
+    .with_hint(if summary.has_invalid_servers() {
+        "Inspect `claw mcp list --output-format json` invalid_servers and fix each rejected mcpServers entry."
+    } else {
+        ""
+    })
+    .with_details(details)
+    .with_data(Map::from_iter([
+        (
+            "total_configured".to_string(),
+            json!(summary.total_configured),
+        ),
+        ("valid_count".to_string(), json!(summary.valid_count)),
+        ("invalid_count".to_string(), json!(summary.invalid_count())),
+        (
+            "invalid_servers".to_string(),
+            Value::Array(invalid_mcp_servers_json(&summary.invalid_servers)),
+        ),
+    ]))
+}
+
+fn check_permission_health(permission_mode: PermissionModeProvenance) -> DiagnosticCheck {
+    let mode = permission_mode.mode.as_str();
+    let source = permission_mode.source.as_str();
+    let explicit = permission_mode.source.is_explicit();
+    let warning = matches!(permission_mode.mode, PermissionMode::DangerFullAccess) && !explicit;
+    let message = if warning {
+        "running with full access without explicit opt-in"
+    } else if matches!(permission_mode.mode, PermissionMode::DangerFullAccess) {
+        "danger-full-access was explicitly selected"
+    } else if matches!(permission_mode.mode, PermissionMode::WorkspaceWrite) && !explicit {
+        "default permission mode is workspace-write"
+    } else {
+        "permission mode is explicitly bounded below danger-full-access"
+    };
+    let source_detail = permission_mode.env_var.map_or_else(
+        || source.to_string(),
+        |env_var| format!("{source}:{env_var}"),
+    );
+    let specs = mvp_tool_specs();
+    let tools_satisfied = specs
+        .iter()
+        .filter(|spec| permission_mode.mode >= spec.required_permission)
+        .map(|spec| spec.name)
+        .collect::<Vec<_>>();
+    let tools_gated = specs
+        .iter()
+        .filter(|spec| permission_mode.mode < spec.required_permission)
+        .map(|spec| spec.name)
+        .collect::<Vec<_>>();
+
+    DiagnosticCheck::new(
+        "Permissions",
+        if warning {
+            DiagnosticLevel::Warn
+        } else {
+            DiagnosticLevel::Ok
+        },
+        message,
+    )
+    .with_details(vec![
+        format!("Mode             {mode}"),
+        format!("Source           {source_detail}"),
+        format!("Explicit opt-in  {explicit}"),
+        format!("Tools allowed    {}", tools_satisfied.join(", ")),
+        format!("Tools gated      {}", tools_gated.join(", ")),
+    ])
+    .with_hint(if warning {
+        "Use the workspace-write default, or pass --permission-mode danger-full-access / --dangerously-skip-permissions only when full filesystem, network, and command access is intentional."
+    } else {
+        "Use --permission-mode read-only|workspace-write|danger-full-access to make the runtime permission boundary explicit."
+    })
+    .with_data(Map::from_iter([
+        ("mode".to_string(), json!(mode)),
+        ("source".to_string(), json!(source)),
+        ("source_explicit".to_string(), json!(explicit)),
+        ("env_var".to_string(), json!(permission_mode.env_var)),
+        ("message".to_string(), json!(message)),
+        ("tools_satisfied".to_string(), json!(tools_satisfied)),
+        ("tools_gated".to_string(), json!(tools_gated)),
+    ]))
 }
 
 fn check_install_source_health() -> DiagnosticCheck {
@@ -3039,6 +4082,19 @@ fn check_workspace_health(context: &StatusContext) -> DiagnosticCheck {
             context.memory_file_count, context.loaded_config_files, context.discovered_config_files
         ),
         format!(
+            "Loaded memory    {}",
+            if context.memory_files.is_empty() {
+                "<none>".to_string()
+            } else {
+                context
+                    .memory_files
+                    .iter()
+                    .map(|file| format!("{}:{}", file.source, file.path))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            }
+        ),
+        format!(
             "Stale base      {}",
             stale_base_warning.as_deref().unwrap_or("ok")
         ),
@@ -3067,6 +4123,14 @@ fn check_workspace_health(context: &StatusContext) -> DiagnosticCheck {
             json!(context.memory_file_count),
         ),
         (
+            "memory_files".to_string(),
+            Value::Array(memory_files_json(&context.memory_files)),
+        ),
+        (
+            "unloaded_memory_files".to_string(),
+            json!(context.unloaded_memory_files),
+        ),
+        (
             "loaded_config_files".to_string(),
             json!(context.loaded_config_files),
         ),
@@ -3077,6 +4141,62 @@ fn check_workspace_health(context: &StatusContext) -> DiagnosticCheck {
         (
             "stale_base".to_string(),
             stale_base_json_value(&context.stale_base_state),
+        ),
+    ]))
+}
+
+fn check_memory_health(context: &StatusContext) -> DiagnosticCheck {
+    let has_unloaded = !context.unloaded_memory_files.is_empty();
+    let has_outside_project = context.memory_files.iter().any(|file| file.outside_project);
+    let mut details = vec![format!("Loaded files     {}", context.memory_file_count)];
+    details.extend(context.memory_files.iter().map(|file| {
+        format!(
+            "Loaded          {} ({}, chars={})",
+            file.path, file.source, file.chars
+        )
+    }));
+    details.extend(
+        context
+            .unloaded_memory_files
+            .iter()
+            .map(|path| format!("Unloaded        {path}")),
+    );
+
+    DiagnosticCheck::new(
+        "Memory",
+        if has_unloaded || has_outside_project {
+            DiagnosticLevel::Warn
+        } else {
+            DiagnosticLevel::Ok
+        },
+        if has_outside_project {
+            "memory files outside the current git project are loaded".to_string()
+        } else if has_unloaded {
+            "some workspace memory files exist but were not loaded".to_string()
+        } else {
+            format!("{} workspace memory files loaded", context.memory_file_count)
+        },
+    )
+    .with_hint(if has_outside_project {
+        "Inspect workspace.memory_files in `claw status --output-format json`; move unintended ancestor instructions inside the git project or run from the intended workspace root."
+    } else if has_unloaded {
+        "Move instructions into CLAUDE.md, CLAW.md, or AGENTS.md within the current workspace ancestry, or inspect workspace.memory_files in `claw status --output-format json`."
+    } else {
+        ""
+    })
+    .with_details(details)
+    .with_data(Map::from_iter([
+        (
+            "memory_file_count".to_string(),
+            json!(context.memory_file_count),
+        ),
+        (
+            "memory_files".to_string(),
+            Value::Array(memory_files_json(&context.memory_files)),
+        ),
+        (
+            "unloaded_memory_files".to_string(),
+            json!(context.unloaded_memory_files),
         ),
     ]))
 }
@@ -3255,10 +4375,27 @@ fn check_system_health(cwd: &Path, config: Option<&runtime::RuntimeConfig>) -> D
         format!("Version          {}", VERSION),
         format!("Build target     {}", BUILD_TARGET.unwrap_or("<unknown>")),
         format!("Git SHA          {}", GIT_SHA.unwrap_or("<unknown>")),
+        format!(
+            "Output format env  CLAW_OUTPUT_FORMAT={}",
+            env::var("CLAW_OUTPUT_FORMAT").unwrap_or_else(|_| "<unset>".to_string())
+        ),
+        format!(
+            "Logging env      CLAW_LOG={} RUST_LOG={}",
+            env::var("CLAW_LOG").unwrap_or_else(|_| "<unset>".to_string()),
+            env::var("RUST_LOG").unwrap_or_else(|_| "<unset>".to_string())
+        ),
     ];
     if let Some(model) = default_model {
         details.push(format!("Default model    {model}"));
     }
+    let binary_provenance = binary_provenance_for(Some(cwd));
+    details.push(format!(
+        "Binary provenance  status={} workspace_match={}",
+        binary_provenance.status(),
+        binary_provenance
+            .workspace_match
+            .map_or_else(|| "unknown".to_string(), |matches| matches.to_string())
+    ));
     DiagnosticCheck::new(
         "System",
         DiagnosticLevel::Ok,
@@ -3272,7 +4409,17 @@ fn check_system_health(cwd: &Path, config: Option<&runtime::RuntimeConfig>) -> D
         ("version".to_string(), json!(VERSION)),
         ("build_target".to_string(), json!(BUILD_TARGET)),
         ("git_sha".to_string(), json!(GIT_SHA)),
+        (
+            "binary_provenance".to_string(),
+            binary_provenance.json_value(),
+        ),
         ("default_model".to_string(), json!(default_model)),
+        (
+            "claw_output_format".to_string(),
+            json!(env::var("CLAW_OUTPUT_FORMAT").ok()),
+        ),
+        ("claw_log".to_string(), json!(env::var("CLAW_LOG").ok())),
+        ("rust_log".to_string(), json!(env::var("RUST_LOG").ok())),
     ]))
 }
 
@@ -3304,12 +4451,12 @@ fn dump_manifests(
     manifests_dir: Option<&Path>,
     output_format: CliOutputFormat,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let workspace_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let workspace_dir = env::current_dir()?;
     dump_manifests_at_path(&workspace_dir, manifests_dir, output_format)
 }
 
-const DUMP_MANIFESTS_OVERRIDE_HINT: &str =
-    "Hint: set CLAUDE_CODE_UPSTREAM=/path/to/upstream or pass `claw dump-manifests --manifests-dir /path/to/upstream`.";
+const DUMP_MANIFESTS_USAGE_HINT: &str =
+    "Usage: claw dump-manifests [--manifests-dir <path>] [--output-format json]";
 
 // Internal function for testing that accepts a workspace directory path.
 fn dump_manifests_at_path(
@@ -3317,72 +4464,105 @@ fn dump_manifests_at_path(
     manifests_dir: Option<&Path>,
     output_format: CliOutputFormat,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let paths = if let Some(dir) = manifests_dir {
-        let resolved = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
-        UpstreamPaths::from_repo_root(resolved)
-    } else {
-        // Surface the resolved path in the error so users can diagnose missing
-        // manifest files without guessing what path the binary expected.
-        let resolved = workspace_dir
-            .canonicalize()
-            .unwrap_or_else(|_| workspace_dir.to_path_buf());
-        UpstreamPaths::from_workspace_dir(&resolved)
-    };
+    let discovery_root = manifests_dir.unwrap_or(workspace_dir);
+    let resolved_root = discovery_root
+        .canonicalize()
+        .unwrap_or_else(|_| discovery_root.to_path_buf());
 
-    let source_root = paths.repo_root();
-    if !source_root.exists() {
+    if !resolved_root.exists() {
         return Err(format!(
-            "Manifest source directory does not exist.\n  looked in: {}\n  {DUMP_MANIFESTS_OVERRIDE_HINT}",
-            source_root.display(),
+            "missing_manifests: manifest discovery directory does not exist.\n  looked in: {}\n  {DUMP_MANIFESTS_USAGE_HINT}",
+            resolved_root.display(),
+        )
+        .into());
+    }
+    if !resolved_root.is_dir() {
+        return Err(format!(
+            "missing_manifests: manifest discovery path is not a directory.\n  looked in: {}\n  {DUMP_MANIFESTS_USAGE_HINT}",
+            resolved_root.display(),
         )
         .into());
     }
 
-    let required_paths = [
-        ("src/commands.ts", paths.commands_path()),
-        ("src/tools.ts", paths.tools_path()),
-        ("src/entrypoints/cli.tsx", paths.cli_path()),
-    ];
-    let missing = required_paths
-        .iter()
-        .filter_map(|(label, path)| (!path.is_file()).then_some(*label))
-        .collect::<Vec<_>>();
-    if !missing.is_empty() {
-        return Err(format!(
-            "Manifest source files are missing.\n  repo root: {}\n  missing: {}\n  {DUMP_MANIFESTS_OVERRIDE_HINT}",
-            source_root.display(),
-            missing.join(", "),
-        )
-        .into());
-    }
-
-    match extract_manifest(&paths) {
-        Ok(manifest) => {
-            match output_format {
-                CliOutputFormat::Text => {
-                    println!("commands: {}", manifest.commands.entries().len());
-                    println!("tools: {}", manifest.tools.entries().len());
-                    println!("bootstrap phases: {}", manifest.bootstrap.phases().len());
-                }
-                CliOutputFormat::Json => println!(
-                    "{}",
-                    serde_json::to_string_pretty(&json!({
-                        "kind": "dump-manifests",
-                        "action": "dump",
-                        "commands": manifest.commands.entries().len(),
-                        "tools": manifest.tools.entries().len(),
-                        "bootstrap_phases": manifest.bootstrap.phases().len(),
-                    }))?
-                ),
-            }
-            Ok(())
+    let manifest = build_rust_resolver_manifest(&resolved_root)?;
+    match output_format {
+        CliOutputFormat::Text => {
+            println!("Manifest Dump");
+            println!("  Source           rust-resolver");
+            println!("  Workspace        {}", resolved_root.display());
+            println!("  Commands         {}", manifest["commands"]);
+            println!("  Tools            {}", manifest["tools"]);
+            println!("  Agents           {}", manifest["agents"]);
+            println!("  Skills           {}", manifest["skills"]);
+            println!("  Bootstrap phases {}", manifest["bootstrap_phases"]);
         }
-        Err(error) => Err(format!(
-            "failed to extract manifests: {error}\n  looked in: {path}\n  {DUMP_MANIFESTS_OVERRIDE_HINT}",
-            path = paths.repo_root().display()
-        )
-        .into()),
+        CliOutputFormat::Json => println!("{}", serde_json::to_string_pretty(&manifest)?),
     }
+    Ok(())
+}
+
+fn build_rust_resolver_manifest(workspace_dir: &Path) -> Result<Value, Box<dyn std::error::Error>> {
+    let command_entries = slash_command_specs()
+        .iter()
+        .map(|spec| {
+            json!({
+                "name": spec.name,
+                "aliases": spec.aliases,
+                "summary": spec.summary,
+                "argument_hint": spec.argument_hint,
+                "resume_supported": spec.resume_supported,
+                "implemented": !STUB_COMMANDS.contains(&spec.name),
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let tool_entries = mvp_tool_specs()
+        .into_iter()
+        .map(|spec| {
+            json!({
+                "name": spec.name,
+                "description": spec.description,
+                "required_permission": spec.required_permission.as_str(),
+                "input_schema": spec.input_schema,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let agent_report = handle_agents_slash_command_json(None, workspace_dir)?;
+    let skill_report = handle_skills_slash_command_json(None, workspace_dir)?;
+    let agents = agent_report
+        .get("agents")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let skills = skill_report
+        .get("skills")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let bootstrap = runtime::BootstrapPlan::claude_code_default()
+        .phases()
+        .iter()
+        .map(|phase| format!("{phase:?}"))
+        .collect::<Vec<_>>();
+
+    Ok(json!({
+        "kind": "dump-manifests",
+        "action": "dump",
+        "status": "ok",
+        "source": "rust-resolver",
+        "workspace": workspace_dir.display().to_string(),
+        "commands": command_entries.len(),
+        "tools": tool_entries.len(),
+        "agents": agents.len(),
+        "skills": skills.len(),
+        "bootstrap_phases": bootstrap.len(),
+        "command_manifests": command_entries,
+        "tool_manifests": tool_entries,
+        "agent_manifests": agents,
+        "skill_manifests": skills,
+        "bootstrap_manifest": bootstrap,
+    }))
 }
 
 fn print_bootstrap_plan(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::Error>> {
@@ -3416,13 +4596,20 @@ fn print_system_prompt(
     model: &str,
     output_format: CliOutputFormat,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let sections = load_system_prompt(
+    let (sections, project_context) = load_system_prompt_with_context(
         cwd,
         date,
         env::consts::OS,
         "unknown",
         model_family_identity_for(model),
     )?;
+    let (project_root, _) =
+        parse_git_status_metadata_for(&project_context.cwd, project_context.git_status.as_deref());
+    let memory_files = memory_file_summaries_for(
+        &project_context.cwd,
+        project_root.as_deref(),
+        &project_context.instruction_files,
+    );
     let message = sections.join(
         "
 
@@ -3438,6 +4625,8 @@ fn print_system_prompt(
                 "status": "ok",
                 "message": message,
                 "sections": sections,
+                "memory_file_count": memory_files.len(),
+                "memory_files": memory_files_json(&memory_files),
             }))?
         ),
     }
@@ -3455,17 +4644,25 @@ fn print_version(output_format: CliOutputFormat) -> Result<(), Box<dyn std::erro
 }
 
 fn version_json_value() -> serde_json::Value {
-    let executable_path = env::current_exe().ok().map(|p| p.display().to_string());
+    let cwd = env::current_dir().ok();
+    let binary_provenance = binary_provenance_for(cwd.as_deref());
     json!({
         "kind": "version",
         "action": "show",
         "status": "ok",
-        "message": render_version_report(),
+        "human_readable": render_version_report(),
         "version": VERSION,
-        "git_sha": GIT_SHA,
-        "target": BUILD_TARGET,
-        "build_date": DEFAULT_DATE,
-        "executable_path": executable_path,
+        "git_sha": binary_provenance.git_sha,
+        "git_sha_short": binary_provenance.git_sha_short,
+        "is_dirty": binary_provenance.is_dirty,
+        "branch": binary_provenance.branch,
+        "commit_date": binary_provenance.commit_date,
+        "commit_timestamp": binary_provenance.commit_timestamp,
+        "rustc_version": binary_provenance.rustc_version,
+        "target": binary_provenance.target,
+        "build_date": binary_provenance.build_date,
+        "executable_path": binary_provenance.executable_path,
+        "binary_provenance": binary_provenance.json_value(),
     })
 }
 
@@ -3483,6 +4680,7 @@ fn resume_session(session_path: &Path, commands: &[String], output_format: CliOu
                 // #787: fall back to kind-derived hint when message has no \n delimiter
                 let hint =
                     inline_hint.or_else(|| fallback_hint_for_error_kind(kind).map(String::from));
+                let sessions_dir = sessions_dir().ok().map(|path| path.display().to_string());
                 // #819: JSON mode resume errors go to stdout for parity with other
                 // non-interactive command guards.
                 println!(
@@ -3495,6 +4693,7 @@ fn resume_session(session_path: &Path, commands: &[String], output_format: CliOu
                         "error": short_reason,
                         "exit_code": 1,
                         "hint": hint,
+                        "sessions_dir": sessions_dir,
                     })
                 );
             } else {
@@ -3665,6 +4864,197 @@ struct ResumeCommandOutcome {
     json: Option<serde_json::Value>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MemoryFileSummary {
+    path: String,
+    source: String,
+    chars: usize,
+    origin: String,
+    scope_path: String,
+    outside_project: bool,
+    contributes: bool,
+}
+
+impl MemoryFileSummary {
+    fn json_value(&self) -> serde_json::Value {
+        json!({
+            "path": self.path,
+            "source": self.source,
+            "chars": self.chars,
+            "origin": self.origin,
+            "scope_path": self.scope_path,
+            "outside_project": self.outside_project,
+            "contributes": self.contributes,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct McpValidationSummary {
+    total_configured: usize,
+    valid_count: usize,
+    invalid_servers: Vec<McpInvalidServerConfig>,
+}
+
+impl McpValidationSummary {
+    fn from_collection(collection: &McpConfigCollection) -> Self {
+        Self {
+            total_configured: collection.total_configured(),
+            valid_count: collection.valid_count(),
+            invalid_servers: collection.invalid_servers().to_vec(),
+        }
+    }
+
+    fn invalid_count(&self) -> usize {
+        self.invalid_servers.len()
+    }
+
+    fn has_invalid_servers(&self) -> bool {
+        !self.invalid_servers.is_empty()
+    }
+
+    fn json_value(&self) -> serde_json::Value {
+        json!({
+            "total_configured": self.total_configured,
+            "valid_count": self.valid_count,
+            "invalid_count": self.invalid_count(),
+            "invalid_servers": invalid_mcp_servers_json(&self.invalid_servers),
+        })
+    }
+}
+
+fn invalid_mcp_servers_json(invalid_servers: &[McpInvalidServerConfig]) -> Vec<serde_json::Value> {
+    invalid_servers
+        .iter()
+        .map(|server| {
+            json!({
+                "name": &server.name,
+                "scope": config_source_json_value(server.scope),
+                "path": server.path.display().to_string(),
+                "error_field": &server.error_field,
+                "reason": &server.reason,
+                "valid": false,
+            })
+        })
+        .collect()
+}
+
+fn config_source_json_value(source: ConfigSource) -> serde_json::Value {
+    let id = match source {
+        ConfigSource::User => "user",
+        ConfigSource::Project => "project",
+        ConfigSource::Local => "local",
+    };
+    json!({"id": id, "label": id})
+}
+
+fn memory_file_summaries_for(
+    cwd: &Path,
+    project_root: Option<&Path>,
+    files: &[ContextFile],
+) -> Vec<MemoryFileSummary> {
+    let cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+    let project_root =
+        project_root.map(|path| path.canonicalize().unwrap_or_else(|_| path.to_path_buf()));
+    files
+        .iter()
+        .map(|file| {
+            let path = file
+                .path
+                .canonicalize()
+                .unwrap_or_else(|_| file.path.clone());
+            let scope_path = memory_scope_path(&path);
+            let origin = memory_origin(&cwd, project_root.as_deref(), &scope_path);
+            let outside_project = project_root
+                .as_ref()
+                .is_some_and(|root| !path.starts_with(root));
+            MemoryFileSummary {
+                path: file.path.display().to_string(),
+                source: file.source().to_string(),
+                origin: origin.to_string(),
+                scope_path: scope_path.display().to_string(),
+                chars: file.char_count(),
+                outside_project,
+                contributes: true,
+            }
+        })
+        .collect()
+}
+
+fn memory_scope_path(path: &Path) -> PathBuf {
+    let Some(parent) = path.parent() else {
+        return PathBuf::from(".");
+    };
+    let parent_name = parent.file_name().and_then(|name| name.to_str());
+    if matches!(parent_name, Some(".claw" | ".claude")) {
+        return parent.parent().unwrap_or(parent).to_path_buf();
+    }
+    if matches!(parent_name, Some("rules" | "rules.local")) {
+        if let Some(grandparent) = parent.parent() {
+            if grandparent.file_name().and_then(|name| name.to_str()) == Some(".claw") {
+                return grandparent.parent().unwrap_or(grandparent).to_path_buf();
+            }
+        }
+    }
+    parent.to_path_buf()
+}
+
+fn memory_origin(cwd: &Path, project_root: Option<&Path>, scope_path: &Path) -> &'static str {
+    if scope_path == cwd {
+        return "workspace";
+    }
+    if project_root.is_some_and(|root| !scope_path.starts_with(root)) {
+        return "outside_project";
+    }
+    if let Some(home) = env::var_os("HOME").map(PathBuf::from) {
+        let home = home.canonicalize().unwrap_or(home);
+        if scope_path == home {
+            return "home";
+        }
+    }
+    if cwd.parent().is_some_and(|parent| parent == scope_path) {
+        return "parent_dir";
+    }
+    if cwd.starts_with(scope_path) {
+        return "ancestor";
+    }
+    "workspace"
+}
+
+fn memory_files_json(files: &[MemoryFileSummary]) -> Vec<serde_json::Value> {
+    files.iter().map(MemoryFileSummary::json_value).collect()
+}
+
+fn unloaded_memory_candidates(
+    cwd: &Path,
+    project_root: Option<&Path>,
+    files: &[MemoryFileSummary],
+) -> Vec<String> {
+    let mut loaded = files
+        .iter()
+        .map(|file| PathBuf::from(&file.path))
+        .collect::<Vec<_>>();
+    loaded.sort();
+
+    let boundary = project_root.unwrap_or(cwd);
+    let mut missing = Vec::new();
+    let mut cursor = Some(cwd);
+    while let Some(dir) = cursor {
+        for name in ["CLAW.md", "AGENTS.md"] {
+            let candidate = dir.join(name);
+            if candidate.is_file() && !loaded.iter().any(|path| path == &candidate) {
+                missing.push(candidate.display().to_string());
+            }
+        }
+        if dir == boundary {
+            break;
+        }
+        cursor = dir.parent();
+    }
+    missing.sort();
+    missing.dedup();
+    missing
+}
 #[derive(Debug, Clone)]
 struct StatusContext {
     cwd: PathBuf,
@@ -3672,6 +5062,8 @@ struct StatusContext {
     loaded_config_files: usize,
     discovered_config_files: usize,
     memory_file_count: usize,
+    memory_files: Vec<MemoryFileSummary>,
+    unloaded_memory_files: Vec<String>,
     project_root: Option<PathBuf>,
     git_branch: Option<String>,
     git_summary: GitWorkspaceSummary,
@@ -3680,6 +5072,7 @@ struct StatusContext {
     session_lifecycle: SessionLifecycleSummary,
     boot_preflight: BootPreflightSnapshot,
     sandbox_status: runtime::SandboxStatus,
+    binary_provenance: BinaryProvenance,
     /// #143: when `.claw.json` (or another loaded config file) fails to parse,
     /// we capture the parse error here and still populate every field that
     /// doesn't depend on runtime config (workspace, git, sandbox defaults,
@@ -3692,6 +5085,123 @@ struct StatusContext {
     /// readable string so downstream claws can switch on the kind token
     /// instead of regex-scraping the prose.
     config_load_error_kind: Option<&'static str>,
+    mcp_validation: McpValidationSummary,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BinaryProvenance {
+    git_sha: Option<String>,
+    git_sha_short: Option<String>,
+    is_dirty: bool,
+    branch: Option<String>,
+    commit_date: String,
+    commit_timestamp: i64,
+    rustc_version: String,
+    target: Option<String>,
+    build_date: String,
+    executable_path: Option<String>,
+    workspace_git_sha: Option<String>,
+    workspace_match: Option<bool>,
+    hint: Option<String>,
+}
+
+impl BinaryProvenance {
+    fn status(&self) -> &'static str {
+        if self.git_sha.is_some() {
+            "known"
+        } else {
+            "unknown"
+        }
+    }
+
+    fn json_value(&self) -> serde_json::Value {
+        json!({
+            "status": self.status(),
+            "git_sha": self.git_sha,
+            "git_sha_short": self.git_sha_short,
+            "is_dirty": self.is_dirty,
+            "branch": self.branch,
+            "commit_date": self.commit_date,
+            "commit_timestamp": self.commit_timestamp,
+            "rustc_version": self.rustc_version,
+            "target": self.target,
+            "build_date": self.build_date,
+            "executable_path": self.executable_path,
+            "workspace_git_sha": self.workspace_git_sha,
+            "workspace_match": self.workspace_match,
+            "hint": self.hint,
+        })
+    }
+}
+
+fn known_build_metadata(value: Option<&str>) -> Option<String> {
+    let value = value?.trim();
+    if value.is_empty() || value == "unknown" {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
+fn parse_build_bool(value: Option<&str>) -> bool {
+    value
+        .map(str::trim)
+        .is_some_and(|value| value.eq_ignore_ascii_case("true") || value == "1")
+}
+
+fn parse_build_timestamp(value: Option<&str>) -> i64 {
+    value
+        .and_then(|value| value.trim().parse::<i64>().ok())
+        .unwrap_or(0)
+}
+
+fn binary_provenance_for(cwd: Option<&Path>) -> BinaryProvenance {
+    let git_sha = known_build_metadata(GIT_SHA);
+    let git_sha_short = known_build_metadata(GIT_SHA_SHORT).or_else(|| {
+        git_sha
+            .as_ref()
+            .map(|sha| sha.chars().take(12).collect::<String>())
+    });
+    let target = known_build_metadata(BUILD_TARGET);
+    let workspace_git_sha = cwd.and_then(|cwd| {
+        run_git_capture_in(cwd, &["rev-parse", "HEAD"])
+            .map(|sha| sha.trim().to_string())
+            .filter(|sha| !sha.is_empty())
+    });
+    let workspace_match = git_sha
+        .as_deref()
+        .zip(workspace_git_sha.as_deref())
+        .map(|(binary, workspace)| binary == workspace);
+    let hint = if git_sha.is_none() {
+        Some(
+            "Build metadata did not include a git SHA; rebuild from a git checkout before filing provenance-sensitive dogfood reports."
+                .to_string(),
+        )
+    } else if workspace_match == Some(false) {
+        Some(
+            "The running binary was built from a different commit than the current workspace HEAD; rebuild or switch binaries before attributing behavior to this checkout."
+                .to_string(),
+        )
+    } else {
+        None
+    };
+    BinaryProvenance {
+        git_sha,
+        git_sha_short,
+        is_dirty: parse_build_bool(GIT_DIRTY),
+        branch: known_build_metadata(GIT_BRANCH),
+        commit_date: known_build_metadata(GIT_COMMIT_DATE).unwrap_or_else(|| "unknown".to_string()),
+        commit_timestamp: parse_build_timestamp(GIT_COMMIT_TIMESTAMP),
+        rustc_version: known_build_metadata(RUSTC_VERSION).unwrap_or_else(|| "unknown".to_string()),
+        target,
+        build_date: DEFAULT_DATE.to_string(),
+        executable_path: env::current_exe()
+            .ok()
+            .map(|path| path.display().to_string()),
+        workspace_git_sha,
+        workspace_match,
+        hint,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4585,6 +6095,7 @@ fn run_resume_command(
                     default_permission_mode().as_str(),
                     &context,
                     None, // #148: resumed sessions don't have flag provenance
+                    None,
                 )),
                 json: Some(status_json_value(
                     session.model.as_deref(),
@@ -4598,6 +6109,8 @@ fn run_resume_command(
                     default_permission_mode().as_str(),
                     &context,
                     None, // #148: resumed sessions don't have flag provenance
+                    None,
+                    None,
                     None,
                 )),
             })
@@ -4772,6 +6285,7 @@ fn run_resume_command(
                     "load_failures": payload.load_failures.len(),
                 },
                 "config_load_error": payload.config_load_error,
+                "mcp_validation": payload.mcp_validation.json_value(),
                 "plugins": payload.plugins,
                 "load_failures": payload.load_failures,
             });
@@ -4787,7 +6301,10 @@ fn run_resume_command(
             })
         }
         SlashCommand::Doctor => {
-            let report = render_doctor_report(ConfigWarningMode::EmitStderr)?;
+            let report = render_doctor_report(
+                ConfigWarningMode::EmitStderr,
+                permission_mode_provenance_for_current_dir(),
+            )?;
             Ok(ResumeCommandOutcome {
                 session: session.clone(),
                 message: Some(report.render()),
@@ -5018,7 +6535,7 @@ fn run_repl(
 ) -> Result<(), Box<dyn std::error::Error>> {
     enforce_broad_cwd_policy(allow_broad_cwd, CliOutputFormat::Text)?;
     run_stale_base_preflight(base_commit.as_deref());
-    let resolved_model = resolve_repl_model(model);
+    let resolved_model = resolve_repl_model(model)?;
     let mut cli = LiveCli::new(resolved_model, true, allowed_tools, permission_mode)?;
     cli.set_reasoning_effort(reasoning_effort);
     let mut editor =
@@ -6096,7 +7613,11 @@ impl LiveCli {
             SlashCommand::Doctor => {
                 println!(
                     "{}",
-                    render_doctor_report(ConfigWarningMode::EmitStderr)?.render()
+                    render_doctor_report(
+                        ConfigWarningMode::EmitStderr,
+                        permission_mode_provenance_for_current_dir(),
+                    )?
+                    .render()
                 );
                 false
             }
@@ -6187,6 +7708,7 @@ impl LiveCli {
                 self.permission_mode.as_str(),
                 &status_context(Some(&self.session.path)).expect("status context should load"),
                 None, // #148: REPL /status doesn't carry flag provenance
+                None,
             )
         );
     }
@@ -6477,8 +7999,8 @@ impl LiveCli {
                 // Propagate ok:false → non-zero exit so automation callers
                 // can rely on exit code instead of inspecting the envelope.
                 // (#68: mcp error envelopes previously always exited 0.)
-                let is_error = value.get("ok").and_then(|v| v.as_bool()) == Some(false)
-                    || value.get("status").and_then(|v| v.as_str()) == Some("error");
+                let is_error = value.get("ok").and_then(serde_json::Value::as_bool) == Some(false)
+                    || value.get("status").and_then(serde_json::Value::as_str) == Some("error");
                 println!("{}", serde_json::to_string_pretty(&value)?);
                 if is_error {
                     std::process::exit(1);
@@ -6679,6 +8201,7 @@ impl LiveCli {
                         "load_failures": payload.load_failures.len(),
                     },
                     "config_load_error": payload.config_load_error,
+                    "mcp_validation": payload.mcp_validation.json_value(),
                     "plugins": filtered_plugins,
                     "load_failures": payload.load_failures,
                 });
@@ -7377,7 +8900,7 @@ fn render_repl_help() -> String {
 fn print_status_snapshot(
     model: &str,
     model_flag_raw: Option<&str>,
-    permission_mode: PermissionMode,
+    permission_mode: PermissionModeProvenance,
     output_format: CliOutputFormat,
     allowed_tools: Option<&AllowedToolSet>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -7392,23 +8915,36 @@ fn print_status_snapshot(
     // #148: resolve model provenance. If user passed --model, source is
     // "flag" with the raw input preserved. Otherwise probe env -> config
     // -> default and record the winning source.
-    let provenance = match model_flag_raw {
-        Some(raw) => ModelProvenance {
-            resolved: model.to_string(),
-            raw: Some(raw.to_string()),
-            source: ModelSource::Flag,
-        },
+    let provenance_result = match model_flag_raw {
+        Some(raw) => Ok(ModelProvenance::from_flag(raw, model)),
         None => ModelProvenance::from_env_or_config_or_default(model),
     };
+    let provenance = match provenance_result {
+        Ok(provenance) => provenance,
+        Err(error) => match output_format {
+            CliOutputFormat::Json => {
+                return print_model_validation_warning_status(
+                    &error,
+                    usage,
+                    permission_mode.mode.as_str(),
+                    &context,
+                    allowed_tools,
+                );
+            }
+            CliOutputFormat::Text => return Err(error.into()),
+        },
+    };
+    let format_selection = current_output_format_selection();
     match output_format {
         CliOutputFormat::Text => println!(
             "{}",
             format_status_report(
                 &provenance.resolved,
                 usage,
-                permission_mode.as_str(),
+                permission_mode.mode.as_str(),
                 &context,
-                Some(&provenance)
+                Some(&provenance),
+                Some(&permission_mode),
             )
         ),
         CliOutputFormat::Json => println!(
@@ -7416,10 +8952,12 @@ fn print_status_snapshot(
             serde_json::to_string_pretty(&status_json_value(
                 Some(&provenance.resolved),
                 usage,
-                permission_mode.as_str(),
+                permission_mode.mode.as_str(),
                 &context,
                 Some(&provenance),
+                Some(&permission_mode),
                 allowed_tools,
+                Some(&format_selection),
             ))?
         ),
     }
@@ -7437,7 +8975,9 @@ fn status_json_value(
     // that don't have provenance (legacy resume paths) pass None, in which
     // case both new fields are omitted.
     provenance: Option<&ModelProvenance>,
+    permission_provenance: Option<&PermissionModeProvenance>,
     allowed_tools: Option<&AllowedToolSet>,
+    format_selection: Option<&OutputFormatSelection>,
 ) -> serde_json::Value {
     // #143: top-level `status` marker so claws can distinguish
     // a clean run from a degraded run (config parse failed but other fields
@@ -7449,6 +8989,14 @@ fn status_json_value(
     let degraded = context.config_load_error.is_some();
     let model_source = provenance.map(|p| p.source.as_str());
     let model_raw = provenance.and_then(|p| p.raw.clone());
+    let model_alias_resolved_to = provenance.and_then(|p| p.alias_resolved_to.clone());
+    let model_env_var = provenance.and_then(|p| p.env_var.clone());
+    let permission_mode_source = permission_provenance.map(|p| p.source.as_str());
+    let permission_mode_env_var = permission_provenance.and_then(|p| p.env_var);
+    let tool_registry = GlobalToolRegistry::builtin();
+    let available_tool_names = tool_registry.canonical_allowed_tool_names();
+    let tool_aliases = allowed_tool_aliases_json(&tool_registry);
+    let output_format_selection = format_selection.cloned().unwrap_or_default();
     // #732: always emit an array (empty when unrestricted) so callers can do
     // `.allowed_tools.entries | length > 0` without a null-check first.
     let allowed_tool_entries = allowed_tools
@@ -7457,18 +9005,29 @@ fn status_json_value(
     json!({
         "kind": "status",
         "action": "show",
-        "status": if degraded { "degraded" } else { "ok" },
+        "status": if degraded || context.mcp_validation.has_invalid_servers() { "degraded" } else { "ok" },
         "config_load_error": context.config_load_error,
         "config_load_error_kind": context.config_load_error_kind,
+        "mcp_validation": context.mcp_validation.json_value(),
         "model": model,
         "model_source": model_source,
         "model_raw": model_raw,
+        "model_alias_resolved_to": model_alias_resolved_to,
+        "model_env_var": model_env_var,
         "permission_mode": permission_mode,
+        "permission_mode_source": permission_mode_source,
+        "permission_mode_env_var": permission_mode_env_var,
         "allowed_tools": {
             "source": if allowed_tools.is_some() { "flag" } else { "default" },
             "restricted": allowed_tools.is_some(),
             "entries": allowed_tool_entries,
+            "available": available_tool_names,
+            "aliases": tool_aliases,
         },
+        "format_source": output_format_selection.source.as_str(),
+        "format_raw": output_format_selection.raw,
+        "format_overridden": output_format_selection.overridden,
+        "binary_provenance": context.binary_provenance.json_value(),
         "usage": {
             "messages": usage.message_count,
             "turns": usage.turns,
@@ -7514,6 +9073,9 @@ fn status_json_value(
             "loaded_config_files": context.loaded_config_files,
             "discovered_config_files": context.discovered_config_files,
             "memory_file_count": context.memory_file_count,
+            "memory_files": memory_files_json(&context.memory_files),
+            "unloaded_memory_files": context.unloaded_memory_files,
+            "mcp_validation": context.mcp_validation.json_value(),
         },
         "sandbox": {
             "enabled": context.sandbox_status.enabled,
@@ -7582,12 +9144,28 @@ fn status_context(
         runtime_config.as_ref().ok(),
         config_load_error.as_deref(),
     );
+    let memory_files = memory_file_summaries_for(
+        &cwd,
+        project_root.as_deref(),
+        &project_context.instruction_files,
+    );
+    let mcp_validation = runtime_config
+        .as_ref()
+        .ok()
+        .map(|runtime_config| McpValidationSummary::from_collection(runtime_config.mcp()))
+        .unwrap_or_default();
     Ok(StatusContext {
         cwd: cwd.clone(),
         session_path: session_path.map(Path::to_path_buf),
         loaded_config_files,
         discovered_config_files,
         memory_file_count: project_context.instruction_files.len(),
+        memory_files: memory_files.clone(),
+        unloaded_memory_files: unloaded_memory_candidates(
+            &cwd,
+            project_root.as_deref(),
+            &memory_files,
+        ),
         project_root,
         git_branch,
         git_summary,
@@ -7596,8 +9174,10 @@ fn status_context(
         session_lifecycle: classify_session_lifecycle_for(&cwd),
         boot_preflight,
         sandbox_status,
+        binary_provenance: binary_provenance_for(Some(&cwd)),
         config_load_error,
         config_load_error_kind,
+        mcp_validation,
     })
 }
 
@@ -7610,6 +9190,7 @@ fn format_status_report(
     // Callers without provenance (legacy resume paths) pass None and the
     // source line is omitted for backward compat.
     provenance: Option<&ModelProvenance>,
+    permission_provenance: Option<&PermissionModeProvenance>,
 ) -> String {
     // #143: if config failed to parse, surface a degraded banner at the top
     // of the text report so humans see the parse error before the body, while
@@ -7631,17 +9212,38 @@ fn format_status_report(
     let model_source_line = provenance
         .map(|p| match &p.raw {
             Some(raw) if raw != model => {
-                format!("\n  Model source     {} (raw: {raw})", p.source.as_str())
+                let env_suffix = p
+                    .env_var
+                    .as_deref()
+                    .map_or(String::new(), |name| format!(" via {name}"));
+                format!(
+                    "\n  Model source     {}{env_suffix} (raw: {raw}, alias: {model})",
+                    p.source.as_str()
+                )
             }
-            Some(_) => format!("\n  Model source     {}", p.source.as_str()),
+            Some(_) => {
+                let env_suffix = p
+                    .env_var
+                    .as_deref()
+                    .map_or(String::new(), |name| format!(" via {name}"));
+                format!("\n  Model source     {}{env_suffix}", p.source.as_str())
+            }
             None => format!("\n  Model source     {}", p.source.as_str()),
+        })
+        .unwrap_or_default();
+    let permission_source_line = permission_provenance
+        .map(|p| {
+            let env_suffix = p
+                .env_var
+                .map_or(String::new(), |name| format!(" via {name}"));
+            format!("\n  Permission source {}{env_suffix}", p.source.as_str())
         })
         .unwrap_or_default();
     blocks.extend([
         format!(
             "{status_line}
   Model            {model}{model_source_line}
-  Permission mode  {permission_mode}
+  Permission mode  {permission_mode}{permission_source_line}
   Messages         {}
   Turns            {}
   Estimated tokens {}",
@@ -7680,6 +9282,7 @@ fn format_status_report(
   Boot preflight   {}
   Config files     loaded {}/{}
   Memory files     {}
+  Loaded memory    {}
   Suggested flow   /status → /diff → /commit",
             context.cwd.display(),
             context
@@ -7706,6 +9309,16 @@ fn format_status_report(
             context.loaded_config_files,
             context.discovered_config_files,
             context.memory_file_count,
+            if context.memory_files.is_empty() {
+                "<none>".to_string()
+            } else {
+                context
+                    .memory_files
+                    .iter()
+                    .map(|file| format!("{}:{}", file.source, file.path))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            },
         ),
         format_sandbox_report(&context.sandbox_status),
     ]);
@@ -7872,8 +9485,8 @@ fn render_help_topic(topic: LocalHelpTopic) -> String {
             .to_string(),
         LocalHelpTopic::Init => "Init
   Usage            claw init [--output-format <format>]
-  Purpose          create .claw/, .claw.json, .gitignore, and CLAUDE.md in the current project
-  Output           list of created vs. skipped files (idempotent: safe to re-run)
+  Purpose          create .claw/settings.json, .claw.json, .gitignore, and CLAUDE.md in the current project
+  Output           per-artifact created/updated/partial/deferred/skipped status (idempotent: safe to re-run)
   Formats          text (default), json
   Related          claw status · claw doctor"
             .to_string(),
@@ -7886,6 +9499,25 @@ fn render_help_topic(topic: LocalHelpTopic) -> String {
   Observes state   `claw state` reads; clawhip/CI may poll this file without HTTP
   Exit codes       0 if state file exists and parses; 1 with actionable hint otherwise
   Related          claw status · ROADMAP #139 (this worker-concept contract)"
+            .to_string(),
+        LocalHelpTopic::Resume => format!(
+            "Resume\n  Usage            claw resume [session-path|session-id|{LATEST_SESSION_REFERENCE}] [/slash-command ...] [--output-format <format>]\n  Alias            claw --resume [session-path|session-id|{LATEST_SESSION_REFERENCE}]\n  Purpose          restore or inspect a saved session without starting a new provider turn\n  Output           session restore or resume-safe command output; missing sessions return session_not_found\n  Formats          text (default), json\n  Related          /resume · /session list · claw --resume {LATEST_SESSION_REFERENCE} /status"
+        ),
+        LocalHelpTopic::Session => "Session
+  Usage            claw session --help [--output-format <format>]
+  Purpose          show /session command guidance without loading config, credentials, or a session
+  Actions          list · exists <id> · switch <id> · fork <name> · delete <id>
+  Direct use       run /session in the REPL or claw --resume SESSION.jsonl /session <action>
+  Formats          text (default), json
+  Related          claw resume · claw export · .claw/sessions/"
+            .to_string(),
+        LocalHelpTopic::Compact => "Compact
+  Usage            claw compact --help [--output-format <format>]
+  Purpose          show compaction guidance without loading config, credentials, or a session
+  Direct use       run /compact in the REPL or claw --resume SESSION.jsonl /compact
+  Output           compaction removes older tool-detail messages when the selected session is large enough
+  Formats          text (default), json
+  Related          claw resume · /compact · /status"
             .to_string(),
         LocalHelpTopic::Export => "Export
   Usage            claw export [--session <id|latest>] [--output <path>] [--output-format <format>]
@@ -7950,6 +9582,21 @@ fn render_help_topic(topic: LocalHelpTopic) -> String {
   Formats          text (default), json
   Related          /config · claw doctor"
             .to_string(),
+        LocalHelpTopic::Model => "Models
+  Usage            claw models [help] [--output-format <format>]
+  Aliases          claw model
+  Purpose          show bounded local model command guidance without entering the REPL
+  Output           supported model-selection surfaces and current config model value
+  Formats          text (default), json
+  Related          /model · claw config model · claw status"
+            .to_string(),
+        LocalHelpTopic::Settings => "Settings
+  Usage            claw settings [help] [--output-format <format>]
+  Purpose          show effective settings/config using the local config envelope
+  Output           same as claw config settings; no provider request or session resume required
+  Formats          text (default), json
+  Related          claw config · claw doctor"
+            .to_string(),
         LocalHelpTopic::Diff => "Diff
   Usage            claw diff [--output-format <format>]
   Purpose          show the diff of changes relative to the expected base commit
@@ -7974,6 +9621,9 @@ fn local_help_topic_command(topic: LocalHelpTopic) -> &'static str {
         LocalHelpTopic::Acp => "acp",
         LocalHelpTopic::Init => "init",
         LocalHelpTopic::State => "state",
+        LocalHelpTopic::Resume => "resume",
+        LocalHelpTopic::Session => "session",
+        LocalHelpTopic::Compact => "compact",
         LocalHelpTopic::Export => "export",
         LocalHelpTopic::Version => "version",
         LocalHelpTopic::SystemPrompt => "system-prompt",
@@ -7984,9 +9634,76 @@ fn local_help_topic_command(topic: LocalHelpTopic) -> &'static str {
         LocalHelpTopic::Plugins => "plugins",
         LocalHelpTopic::Mcp => "mcp",
         LocalHelpTopic::Config => "config",
+        LocalHelpTopic::Model => "models",
+        LocalHelpTopic::Settings => "settings",
         LocalHelpTopic::Diff => "diff",
         LocalHelpTopic::Setup => "setup",
     }
+}
+
+fn print_models(
+    action: Option<&str>,
+    output_format: CliOutputFormat,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let help_requested = action.is_some_and(|value| matches!(value, "help" | "--help" | "-h"));
+    if help_requested {
+        return print_help_topic(LocalHelpTopic::Model, output_format);
+    }
+    if let Some(action) = action {
+        return Err(format!(
+            "unsupported_models_action: unsupported models action: {action}.\nUsage: claw models [help] [--output-format json]"
+        )
+        .into());
+    }
+
+    let configured_model = config_model_for_current_dir();
+    let resolved_config_model = configured_model
+        .as_deref()
+        .map(resolve_model_alias_with_config);
+
+    match output_format {
+        CliOutputFormat::Text => {
+            println!("Models");
+            println!("  Default          {DEFAULT_MODEL}");
+            println!("  Built-in aliases opus, sonnet, haiku");
+            if let Some(raw) = configured_model.as_deref() {
+                println!(
+                    "  Config model     {raw}{}",
+                    resolved_config_model
+                        .as_deref()
+                        .filter(|resolved| *resolved != raw)
+                        .map(|resolved| format!(" -> {resolved}"))
+                        .unwrap_or_default()
+                );
+            } else {
+                println!("  Config model     <unset>");
+            }
+            println!("  Usage            claw --model <provider/model> prompt <text>");
+        }
+        CliOutputFormat::Json => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "kind": "models",
+                    "action": "list",
+                    "status": "ok",
+                    "default_model": DEFAULT_MODEL,
+                    "aliases": [
+                        {"name": "opus", "model": resolve_model_alias("opus")},
+                        {"name": "sonnet", "model": resolve_model_alias("sonnet")},
+                        {"name": "haiku", "model": resolve_model_alias("haiku")}
+                    ],
+                    "configured_model": configured_model,
+                    "resolved_configured_model": resolved_config_model,
+                    "local_only": true,
+                    "requires_credentials": false,
+                    "requires_provider_request": false,
+                    "message": "Use --model <provider/model> or configure a model in claw settings."
+                }))?
+            );
+        }
+    }
+    Ok(())
 }
 
 fn render_export_help_json() -> serde_json::Value {
@@ -8043,15 +9760,15 @@ fn render_doctor_help_json() -> serde_json::Value {
         "command": "doctor",
         "schema_version": "1.0",
         "usage": "claw doctor [--output-format <format>]",
-        "purpose": "diagnose local auth, config, workspace, sandbox, boot preflight, and build metadata",
+        "purpose": "diagnose local auth, config, workspace memory, permissions, sandbox, boot preflight, and build metadata",
         "formats": ["text", "json"],
         "local_only": true,
         "requires_credentials": false,
         "requires_provider_request": false,
         "requires_session_resume": false,
         "mutates_workspace": false,
-        "output_fields": ["kind", "action", "status", "message", "report", "has_failures", "summary", "checks"],
-        "check_names": ["auth", "config", "install source", "workspace", "boot preflight", "sandbox", "system"],
+        "output_fields": ["kind", "action", "status", "message", "report", "has_failures", "summary", "checks", "allowed_tools"],
+        "check_names": ["auth", "config", "mcp validation", "install source", "workspace", "memory", "boot preflight", "sandbox", "permissions", "system"],
         "status_values": ["ok", "warn", "fail"],
         "options": [
             {
@@ -8226,24 +9943,29 @@ fn render_config_report(section: Option<&str>) -> Result<String, Box<dyn std::er
 
     if let Some(section) = section {
         lines.push(format!("Merged section: {section}"));
-        let value = match section {
-            "env" => runtime_config.get("env"),
-            "hooks" => runtime_config.get("hooks"),
-            "model" => runtime_config.get("model"),
+        let rendered = match section {
+            "env" => runtime_config.get("env").map(|value| value.render()),
+            "hooks" => runtime_config.get("hooks").map(|value| value.render()),
+            "model" => runtime_config.get("model").map(|value| value.render()),
             "plugins" => runtime_config
                 .get("plugins")
-                .or_else(|| runtime_config.get("enabledPlugins")),
+                .or_else(|| runtime_config.get("enabledPlugins"))
+                .map(|value| value.render()),
             "mcp" | "mcp_servers" | "mcpServers" => runtime_config
                 .get("mcp")
                 .or_else(|| runtime_config.get("mcp_servers"))
-                .or_else(|| runtime_config.get("mcpServers")),
-            "sandbox" => runtime_config.get("sandbox"),
-            "permissions" => runtime_config.get("permissions"),
-            "skills" => runtime_config.get("skills"),
-            "agents" => runtime_config.get("agents"),
+                .or_else(|| runtime_config.get("mcpServers"))
+                .map(|value| value.render()),
+            "sandbox" => runtime_config.get("sandbox").map(|value| value.render()),
+            "permissions" => runtime_config
+                .get("permissions")
+                .map(|value| value.render()),
+            "skills" => runtime_config.get("skills").map(|value| value.render()),
+            "agents" => runtime_config.get("agents").map(|value| value.render()),
+            "settings" => Some(runtime_config.as_json().render()),
             other => {
                 lines.push(format!(
-                    "  Unsupported config section '{other}'. Use: env, hooks, model, plugins, mcp, sandbox, permissions, skills, or agents."
+                    "  Unsupported config section '{other}'. Use: env, hooks, model, plugins, mcp, sandbox, permissions, skills, agents, or settings."
                 ));
                 return Ok(lines.join(
                     "
@@ -8253,10 +9975,7 @@ fn render_config_report(section: Option<&str>) -> Result<String, Box<dyn std::er
         };
         lines.push(format!(
             "  {}",
-            match value {
-                Some(value) => value.render(),
-                None => "<unset>".to_string(),
-            }
+            rendered.unwrap_or_else(|| "<unset>".to_string())
         ));
         return Ok(lines.join(
             "
@@ -8277,38 +9996,28 @@ fn render_config_json(
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
     let cwd = env::current_dir()?;
     let loader = ConfigLoader::default_for(&cwd);
-    let discovered = loader.discover();
-    // #773: use load_collecting_warnings so deprecation warnings are surfaced in the
-    // JSON envelope instead of only as unstructured stderr text.
-    let (runtime_config, config_warnings) = loader.load_collecting_warnings()?;
-
-    let loaded_paths: Vec<_> = runtime_config
-        .loaded_entries()
+    // #773: keep deprecation warnings in the JSON envelope, and #407: include
+    // per-file status/reason/detail for every discovered config path.
+    let inspection = loader.inspect_collecting_warnings();
+    if section.is_some() {
+        if let Some(error) = &inspection.load_error {
+            return Err(error.clone().into());
+        }
+    }
+    let runtime_config = inspection
+        .runtime_config
+        .clone()
+        .unwrap_or_else(runtime::RuntimeConfig::empty);
+    let loaded_files = runtime_config.loaded_entries().len();
+    let merged_keys = runtime_config.merged().len();
+    let files: Vec<_> = inspection
+        .files
         .iter()
-        .map(|e| e.path.display().to_string())
+        .map(config_file_report_json)
         .collect();
 
-    let files: Vec<_> = discovered
-        .iter()
-        .map(|e| {
-            let source = match e.source {
-                ConfigSource::User => "user",
-                ConfigSource::Project => "project",
-                ConfigSource::Local => "local",
-            };
-            let is_loaded = runtime_config
-                .loaded_entries()
-                .iter()
-                .any(|le| le.path == e.path);
-            serde_json::json!({
-                "path": e.path.display().to_string(),
-                "source": source,
-                "loaded": is_loaded,
-            })
-        })
-        .collect();
-
-    let warnings_json: Vec<serde_json::Value> = config_warnings
+    let warnings_json: Vec<serde_json::Value> = inspection
+        .warnings
         .iter()
         .map(|w| serde_json::Value::String(w.clone()))
         .collect();
@@ -8316,14 +10025,15 @@ fn render_config_json(
     let base = serde_json::json!({
         "kind": "config",
         "action": if section.is_some() { "show" } else { "list" },
-        "status": "ok",
+        "status": if inspection.load_error.is_some() { "error" } else { "ok" },
         "cwd": cwd.display().to_string(),
-        "loaded_files": loaded_paths.len(),
-        "merged_keys": runtime_config.merged().len(),
+        "loaded_files": loaded_files,
+        "merged_keys": merged_keys,
+        "merged_key_count": merged_keys,
+        "merged_keys_meaning": "count of top-level keys in the effective merged JSON object",
         "files": files,
-        // #773: deprecation warnings surfaced structurally so JSON-mode callers
-        // don't need to strip unstructured text from stderr
         "warnings": warnings_json,
+        "load_error": inspection.load_error.clone(),
     });
 
     if let Some(section) = section {
@@ -8346,16 +10056,17 @@ fn render_config_json(
             "permissions" => runtime_config.get("permissions").map(|v| v.render()),
             "skills" => runtime_config.get("skills").map(|v| v.render()),
             "agents" => runtime_config.get("agents").map(|v| v.render()),
+            "settings" => Some(runtime_config.as_json().render()),
             other => {
                 // #741: populate hint field for unsupported section errors so callers reading
                 // .hint get actionable guidance instead of null
                 let hint = if matches!(other, "list" | "show" | "help" | "info") {
                     format!(
-                        "'claw config {other}' is not a subcommand. To list all config: `claw config`. To inspect a section: `claw config <section>` where section is one of: env, hooks, model, plugins, mcp, sandbox, permissions, skills, agents."
+                        "'claw config {other}' is not a subcommand. To list all config: `claw config`. To inspect a section: `claw config <section>` where section is one of: env, hooks, model, plugins, mcp, sandbox, permissions, skills, agents, settings."
                     )
                 } else {
                     format!(
-                        "'{other}' is not a config section. Supported: env, hooks, model, plugins, mcp, sandbox, permissions, skills, agents."
+                        "'{other}' is not a config section. Supported: env, hooks, model, plugins, mcp, sandbox, permissions, skills, agents, settings."
                     )
                 };
                 return Ok(serde_json::json!({
@@ -8365,12 +10076,12 @@ fn render_config_json(
                     "error_kind": "unsupported_config_section",
                     "section": other,
                     "ok": false,
-                    "error": format!("Unsupported config section '{other}'. Use: env, hooks, model, plugins, mcp, sandbox, permissions, skills, or agents."),
+                    "error": format!("Unsupported config section '{other}'. Use: env, hooks, model, plugins, mcp, sandbox, permissions, skills, agents, or settings."),
                     "hint": hint,
-                    "supported_sections": ["env", "hooks", "model", "plugins", "mcp", "sandbox", "permissions", "skills", "agents"],
+                    "supported_sections": ["env", "hooks", "model", "plugins", "mcp", "sandbox", "permissions", "skills", "agents", "settings"],
                     "cwd": cwd.display().to_string(),
-                    "loaded_files": loaded_paths.len(),
-                    "files": files,
+                    "loaded_files": loaded_files,
+                    "files": base["files"].clone(),
                 }));
             }
         };
@@ -8393,6 +10104,69 @@ fn render_config_json(
     Ok(base)
 }
 
+fn config_file_report_json(file: &ConfigFileReport) -> serde_json::Value {
+    let source = match file.entry.source {
+        ConfigSource::User => "user",
+        ConfigSource::Project => "project",
+        ConfigSource::Local => "local",
+    };
+    let mut object = serde_json::Map::new();
+    object.insert(
+        "path".to_string(),
+        serde_json::Value::String(file.entry.path.display().to_string()),
+    );
+    object.insert(
+        "source".to_string(),
+        serde_json::Value::String(source.to_string()),
+    );
+    object.insert("loaded".to_string(), serde_json::Value::Bool(file.loaded));
+    object.insert(
+        "precedence_rank".to_string(),
+        serde_json::Value::Number(serde_json::Number::from(file.precedence_rank)),
+    );
+    object.insert(
+        "wins_for_keys".to_string(),
+        serde_json::Value::Array(
+            file.wins_for_keys
+                .iter()
+                .cloned()
+                .map(serde_json::Value::String)
+                .collect(),
+        ),
+    );
+    object.insert(
+        "shadowed_keys".to_string(),
+        serde_json::Value::Array(
+            file.shadowed_keys
+                .iter()
+                .cloned()
+                .map(serde_json::Value::String)
+                .collect(),
+        ),
+    );
+    object.insert(
+        "status".to_string(),
+        serde_json::Value::String(file.status.as_str().to_string()),
+    );
+    if let Some(reason) = &file.reason {
+        object.insert(
+            "reason".to_string(),
+            serde_json::Value::String(reason.clone()),
+        );
+        object.insert(
+            "skip_reason".to_string(),
+            serde_json::Value::String(reason.clone()),
+        );
+    }
+    if let Some(detail) = &file.detail {
+        object.insert(
+            "detail".to_string(),
+            serde_json::Value::String(detail.clone()),
+        );
+    }
+    serde_json::Value::Object(object)
+}
+
 fn render_memory_report() -> Result<String, Box<dyn std::error::Error>> {
     let cwd = env::current_dir()?;
     let project_context = ProjectContext::discover(&cwd, DEFAULT_DATE)?;
@@ -8406,7 +10180,7 @@ fn render_memory_report() -> Result<String, Box<dyn std::error::Error>> {
     if project_context.instruction_files.is_empty() {
         lines.push("Discovered files".to_string());
         lines.push(
-            "  No CLAUDE instruction files discovered in the current directory ancestry."
+            "  No CLAUDE.md, CLAW.md, AGENTS.md, or scoped instruction files discovered in the current directory ancestry."
                 .to_string(),
         );
     } else {
@@ -8420,8 +10194,10 @@ fn render_memory_report() -> Result<String, Box<dyn std::error::Error>> {
             };
             lines.push(format!("  {}. {}", index + 1, file.path.display(),));
             lines.push(format!(
-                "     lines={} preview={}",
+                "     source={} lines={} chars={} preview={}",
+                file.source(),
                 file.content.lines().count(),
+                file.char_count(),
                 preview
             ));
         }
@@ -8482,10 +10258,12 @@ fn init_json_value(report: &crate::init::InitReport, message: &str) -> serde_jso
     // Derive top-level status: "ok" when all artifacts succeeded (created or
     // skipped = idempotent); no failure path exists today so always "ok".
     let status = "ok";
-    // #783: already_initialized lets orchestrators detect the idempotent case
-    // without checking created.len() == 0; hint gives a stable next-action pointer.
+    // #783/#436: already_initialized lets orchestrators detect the idempotent
+    // case without checking every status bucket; deferred session storage does
+    // not make the workspace uninitialized because it is created on first save.
     let already_initialized = report.artifacts_with_status(InitStatus::Created).is_empty()
-        && report.artifacts_with_status(InitStatus::Updated).is_empty();
+        && report.artifacts_with_status(InitStatus::Updated).is_empty()
+        && report.artifacts_with_status(InitStatus::Partial).is_empty();
     let hint = if already_initialized {
         "Workspace already initialised. Run `claw doctor` to verify health, or edit CLAUDE.md to customise guidance."
     } else {
@@ -8500,6 +10278,8 @@ fn init_json_value(report: &crate::init::InitReport, message: &str) -> serde_jso
         "created": report.artifacts_with_status(InitStatus::Created),
         "updated": report.artifacts_with_status(InitStatus::Updated),
         "skipped": report.artifacts_with_status(InitStatus::Skipped),
+        "partial": report.artifacts_with_status(InitStatus::Partial),
+        "deferred": report.artifacts_with_status(InitStatus::Deferred),
         "artifacts": report.artifact_json_entries(),
         "hint": hint,
         "next_step": crate::init::InitReport::NEXT_STEP,
@@ -8509,9 +10289,11 @@ fn init_json_value(report: &crate::init::InitReport, message: &str) -> serde_jso
 
 fn normalize_permission_mode(mode: &str) -> Option<&'static str> {
     match mode.trim() {
-        "read-only" => Some("read-only"),
-        "workspace-write" => Some("workspace-write"),
-        "danger-full-access" => Some("danger-full-access"),
+        "default" | "plan" | "read-only" => Some("read-only"),
+        "acceptEdits" | "auto" | "workspace-write" => Some("workspace-write"),
+        "dontAsk" | "bypassPermissions" | "dangerFullAccess" | "danger-full-access" => {
+            Some("danger-full-access")
+        }
         _ => None,
     }
 }
@@ -8528,8 +10310,7 @@ fn render_diff_report_for(cwd: &Path) -> Result<String, Box<dyn std::error::Erro
         .args(["rev-parse", "--is-inside-work-tree"])
         .current_dir(cwd)
         .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
+        .is_ok_and(|o| o.status.success());
     if !in_git_repo {
         return Ok(format!(
             "Diff\n  Result           no git repository\n  Detail           {} is not inside a git project",
@@ -8561,8 +10342,7 @@ fn render_diff_json_for(cwd: &Path) -> Result<serde_json::Value, Box<dyn std::er
         .args(["rev-parse", "--is-inside-work-tree"])
         .current_dir(cwd)
         .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
+        .is_ok_and(|o| o.status.success());
     if !in_git_repo {
         // #801: add error_kind, hint, message fields for envelope parity with other error paths
         return Ok(serde_json::json!({
@@ -8813,8 +10593,7 @@ fn command_exists(name: &str) -> bool {
     Command::new("which")
         .arg(name)
         .output()
-        .map(|output| output.status.success())
-        .unwrap_or(false)
+        .is_ok_and(|output| output.status.success())
 }
 
 fn write_temp_text_file(
@@ -8990,10 +10769,12 @@ fn parse_titled_body(value: &str) -> Option<(String, String)> {
 }
 
 fn render_version_report() -> String {
-    let git_sha = GIT_SHA.unwrap_or("unknown");
+    let git_sha = GIT_SHA_SHORT.or(GIT_SHA).unwrap_or("unknown");
     let target = BUILD_TARGET.unwrap_or("unknown");
+    let branch = GIT_BRANCH.unwrap_or("unknown");
+    let dirty = GIT_DIRTY.unwrap_or("unknown");
     format!(
-        "Claw Code\n  Version          {VERSION}\n  Git SHA          {git_sha}\n  Target           {target}\n  Build date       {DEFAULT_DATE}"
+        "Claw Code\n  Version          {VERSION}\n  Git SHA          {git_sha}\n  Branch           {branch}\n  Dirty            {dirty}\n  Target           {target}\n  Build date       {DEFAULT_DATE}"
     )
 }
 
@@ -9085,6 +10866,52 @@ fn resolve_export_path(
     Ok(cwd.join(final_name))
 }
 
+fn validate_export_output_path(path: Option<&Path>) -> Result<(), InvalidOutputPathError> {
+    let Some(path) = path else {
+        return Ok(());
+    };
+    let raw = path.to_string_lossy();
+    if raw.trim().is_empty() {
+        return Err(InvalidOutputPathError::new(
+            raw.to_string(),
+            InvalidOutputPathReason::Empty,
+        ));
+    }
+    if matches!(fs::metadata(path), Ok(metadata) if metadata.is_dir()) {
+        return Err(InvalidOutputPathError::new(
+            raw.to_string(),
+            InvalidOutputPathReason::PathIsDirectory,
+        ));
+    }
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        match fs::metadata(parent) {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => {
+                return Err(InvalidOutputPathError::new(
+                    raw.to_string(),
+                    InvalidOutputPathReason::ParentNotADirectory,
+                ));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Err(InvalidOutputPathError::new(
+                    raw.to_string(),
+                    InvalidOutputPathReason::ParentNotFound,
+                ));
+            }
+            Err(_) => {
+                return Err(InvalidOutputPathError::new(
+                    raw.to_string(),
+                    InvalidOutputPathReason::ParentNotFound,
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 const SESSION_MARKDOWN_TOOL_SUMMARY_LIMIT: usize = 280;
 
 fn summarize_tool_payload_for_markdown(payload: &str) -> String {
@@ -9103,6 +10930,7 @@ fn run_export(
     output_path: Option<&Path>,
     output_format: CliOutputFormat,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    validate_export_output_path(output_path)?;
     let (handle, session) = load_session_reference(session_reference)?;
     let markdown = render_session_markdown(&session, &handle.id, &handle.path);
 
@@ -9270,6 +11098,7 @@ struct PluginsCommandPayload {
     reload_runtime: bool,
     status: &'static str,
     config_load_error: Option<String>,
+    mcp_validation: McpValidationSummary,
     plugins: Vec<Value>,
     load_failures: Vec<Value>,
 }
@@ -9282,9 +11111,16 @@ fn plugins_command_payload_for(
 ) -> Result<PluginsCommandPayload, Box<dyn std::error::Error>> {
     let loader = ConfigLoader::default_for(cwd);
     let loaded_config = load_config_with_warning_mode(&loader, config_warning_mode);
-    let (runtime_config, config_load_error) = match loaded_config {
-        Ok(runtime_config) => (runtime_config, None),
-        Err(error) => (runtime::RuntimeConfig::empty(), Some(error.to_string())),
+    let (runtime_config, config_load_error, mcp_validation) = match loaded_config {
+        Ok(runtime_config) => {
+            let mcp_validation = McpValidationSummary::from_collection(runtime_config.mcp());
+            (runtime_config, None, mcp_validation)
+        }
+        Err(error) => (
+            runtime::RuntimeConfig::empty(),
+            Some(error.to_string()),
+            McpValidationSummary::default(),
+        ),
     };
     let mut manager = build_plugin_manager(cwd, &loader, &runtime_config);
     let result = handle_plugins_slash_command(action, target, &mut manager)?;
@@ -9292,6 +11128,7 @@ fn plugins_command_payload_for(
     Ok(plugins_command_payload_from_result(
         result,
         config_load_error,
+        mcp_validation,
         &report,
     ))
 }
@@ -9299,10 +11136,14 @@ fn plugins_command_payload_for(
 fn plugins_command_payload_from_result(
     result: PluginsCommandResult,
     config_load_error: Option<String>,
+    mcp_validation: McpValidationSummary,
     report: &plugins::PluginRegistryReport,
 ) -> PluginsCommandPayload {
     let failures = report.failures();
-    let status = if config_load_error.is_some() || !failures.is_empty() {
+    let status = if config_load_error.is_some()
+        || mcp_validation.has_invalid_servers()
+        || !failures.is_empty()
+    {
         "degraded"
     } else {
         "ok"
@@ -9312,6 +11153,11 @@ fn plugins_command_payload_from_result(
             "Config load error\n  Status           fail\n  Summary          runtime config failed to load; reporting partial plugins view\n  Details          {error}\n  Hint             `claw doctor` classifies config parse errors; fix the listed field and rerun\n\n{}",
             result.message
         ),
+        None if mcp_validation.has_invalid_servers() => format!(
+            "MCP validation\n  Status           warn\n  Summary          {} MCP server entries are invalid; reporting plugins with valid MCP siblings only\n  Hint             Inspect `claw mcp list --output-format json` invalid_servers and fix each rejected mcpServers entry.\n\n{}",
+            mcp_validation.invalid_count(),
+            result.message
+        ),
         None => result.message,
     };
     PluginsCommandPayload {
@@ -9319,6 +11165,7 @@ fn plugins_command_payload_from_result(
         reload_runtime: result.reload_runtime,
         status,
         config_load_error,
+        mcp_validation,
         plugins: report.summaries().iter().map(plugin_summary_json).collect(),
         load_failures: failures.iter().map(plugin_load_failure_json).collect(),
     }
@@ -11245,7 +13092,7 @@ impl ToolExecutor for CliToolExecutor {
         if self
             .allowed_tools
             .as_ref()
-            .is_some_and(|allowed| !allowed.contains(tool_name))
+            .is_some_and(|allowed| !allowed.contains(&canonical_allowed_tool_name(tool_name)))
         {
             return Err(ToolError::new(format!(
                 "tool `{tool_name}` is not enabled by the current --allowedTools setting"
@@ -11364,14 +13211,21 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(out, "      Start the interactive REPL")?;
     writeln!(
         out,
-        "  claw [--model MODEL] [--output-format text|json] prompt TEXT"
+        "  claw [--model MODEL] [--output-format text|json] prompt [--stdin] [TEXT]"
     )?;
-    writeln!(out, "      Send one prompt and exit")?;
+    writeln!(
+        out,
+        "      Send one prompt and exit; reads stdin when TEXT is omitted"
+    )?;
     writeln!(
         out,
         "  claw [--model MODEL] [--output-format text|json] TEXT"
     )?;
     writeln!(out, "      Shorthand non-interactive prompt mode")?;
+    writeln!(
+        out,
+        "      Use `--` before TEXT when the prompt itself starts with '-' or '--'"
+    )?;
     writeln!(
         out,
         "  claw --resume [SESSION.jsonl|session-id|latest] [/status] [/compact] [...]"
@@ -11429,7 +13283,19 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     )?;
     writeln!(
         out,
-        "  --output-format FORMAT     Non-interactive output format: text or json"
+        "  --output-format FORMAT     Non-interactive output format: text or json (case-insensitive)"
+    )?;
+    writeln!(
+        out,
+        "                              CLAW_OUTPUT_FORMAT sets the default; flags override env"
+    )?;
+    writeln!(
+        out,
+        "                              Log env vars: CLAW_LOG or RUST_LOG"
+    )?;
+    writeln!(
+        out,
+        "  --cwd PATH, -C PATH, --directory PATH  Run as if launched from PATH"
     )?;
     writeln!(
         out,
@@ -11441,9 +13307,13 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     )?;
     writeln!(
         out,
-        "  --dangerously-skip-permissions  Skip all permission checks"
+        "  --dangerously-skip-permissions, --skip-permissions  Skip all permission checks"
     )?;
-    writeln!(out, "  --allowedTools TOOLS       Restrict enabled tools (repeatable; comma-separated aliases supported)")?;
+    writeln!(
+        out,
+        "  --allowedTools TOOLS       Restrict enabled tools by canonical snake_case name or alias"
+    )?;
+    writeln!(out, "                              Examples: read, glob, web_fetch, WebFetch; status JSON exposes aliases")?;
     writeln!(
         out,
         "  --version, -V              Print version and build information locally"
@@ -11551,9 +13421,9 @@ mod tests {
         split_error_hint, status_context, status_json_value, summarize_tool_payload_for_markdown,
         try_resolve_bare_skill_prompt, validate_no_args, write_mcp_server_fixture, CliAction,
         CliOutputFormat, CliToolExecutor, GitWorkspaceSummary, InternalPromptProgressEvent,
-        InternalPromptProgressState, LiveCli, LocalHelpTopic, PromptHistoryEntry,
-        SessionLifecycleKind, SessionLifecycleSummary, SlashCommand, StatusUsage, TmuxPaneSnapshot,
-        DEFAULT_MODEL, LATEST_SESSION_REFERENCE, STUB_COMMANDS,
+        InternalPromptProgressState, LiveCli, LocalHelpTopic, PermissionModeProvenance,
+        PromptHistoryEntry, SessionLifecycleKind, SessionLifecycleSummary, SlashCommand,
+        StatusUsage, TmuxPaneSnapshot, DEFAULT_MODEL, LATEST_SESSION_REFERENCE, STUB_COMMANDS,
     };
     use api::{ApiError, MessageResponse, OutputContentBlock, Usage};
     use plugins::{
@@ -11894,7 +13764,7 @@ mod tests {
             CliAction::Repl {
                 model: DEFAULT_MODEL.to_string(),
                 allowed_tools: None,
-                permission_mode: PermissionMode::DangerFullAccess,
+                permission_mode: PermissionMode::WorkspaceWrite,
                 base_commit: None,
                 reasoning_effort: None,
                 allow_broad_cwd: false,
@@ -12027,7 +13897,7 @@ mod tests {
                 model: DEFAULT_MODEL.to_string(),
                 output_format: CliOutputFormat::Text,
                 allowed_tools: None,
-                permission_mode: PermissionMode::DangerFullAccess,
+                permission_mode: PermissionMode::WorkspaceWrite,
                 compact: false,
                 base_commit: None,
                 reasoning_effort: None,
@@ -12115,16 +13985,77 @@ mod tests {
             parse_args(&args).expect("args should parse"),
             CliAction::Prompt {
                 prompt: "explain this".to_string(),
-                model: "anthropic/claude-opus-4-6".to_string(),
+                model: "anthropic/claude-opus-4-7".to_string(),
                 output_format: CliOutputFormat::Json,
                 allowed_tools: None,
-                permission_mode: PermissionMode::DangerFullAccess,
+                permission_mode: PermissionMode::WorkspaceWrite,
                 compact: false,
                 base_commit: None,
                 reasoning_effort: None,
                 allow_broad_cwd: false,
             }
         );
+    }
+
+    #[test]
+    fn parses_dash_prefixed_prompt_text_434() {
+        let _guard = env_lock();
+        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+
+        assert_eq!(
+            parse_args(&["--".to_string(), "-prompt-with-dash".to_string()])
+                .expect("-- should terminate flag parsing"),
+            CliAction::Prompt {
+                prompt: "-prompt-with-dash".to_string(),
+                model: DEFAULT_MODEL.to_string(),
+                output_format: CliOutputFormat::Text,
+                allowed_tools: None,
+                permission_mode: PermissionMode::WorkspaceWrite,
+                compact: false,
+                base_commit: None,
+                reasoning_effort: None,
+                allow_broad_cwd: false,
+            }
+        );
+
+        assert_eq!(
+            parse_args(&["-not-a-flag".to_string()])
+                .expect("unknown dash-prefixed shorthand prompt should parse as prompt text"),
+            CliAction::Prompt {
+                prompt: "-not-a-flag".to_string(),
+                model: DEFAULT_MODEL.to_string(),
+                output_format: CliOutputFormat::Text,
+                allowed_tools: None,
+                permission_mode: PermissionMode::WorkspaceWrite,
+                compact: false,
+                base_commit: None,
+                reasoning_effort: None,
+                allow_broad_cwd: false,
+            }
+        );
+
+        assert_eq!(
+            parse_args(&["--bogus-flag-like".to_string(), "literal".to_string()])
+                .expect("unknown double-dash text should stay eligible for prompt shorthand"),
+            CliAction::Prompt {
+                prompt: "--bogus-flag-like literal".to_string(),
+                model: DEFAULT_MODEL.to_string(),
+                output_format: CliOutputFormat::Text,
+                allowed_tools: None,
+                permission_mode: PermissionMode::WorkspaceWrite,
+                compact: false,
+                base_commit: None,
+                reasoning_effort: None,
+                allow_broad_cwd: false,
+            }
+        );
+
+        assert!(parse_args(&["--".to_string()]).is_ok());
+
+        let error = parse_args(&["--resum".to_string()])
+            .expect_err("nearby real flags should still be rejected as unknown options");
+        assert!(error.contains("unknown option: --resum"));
+        assert!(error.contains("Did you mean --resume?"));
     }
 
     #[test]
@@ -12149,7 +14080,22 @@ mod tests {
                 model: DEFAULT_MODEL.to_string(),
                 output_format: CliOutputFormat::Text,
                 allowed_tools: None,
-                permission_mode: PermissionMode::DangerFullAccess,
+                permission_mode: PermissionMode::WorkspaceWrite,
+                compact: true,
+                base_commit: None,
+                reasoning_effort: None,
+                allow_broad_cwd: false,
+            }
+        );
+        assert_eq!(
+            parse_args(&["--compact".to_string(), "hello".to_string()])
+                .expect("compact single-word prompt should parse"),
+            CliAction::Prompt {
+                prompt: "hello".to_string(),
+                model: DEFAULT_MODEL.to_string(),
+                output_format: CliOutputFormat::Text,
+                allowed_tools: None,
+                permission_mode: PermissionMode::WorkspaceWrite,
                 compact: true,
                 base_commit: None,
                 reasoning_effort: None,
@@ -12189,10 +14135,10 @@ mod tests {
             parse_args(&args).expect("args should parse"),
             CliAction::Prompt {
                 prompt: "explain this".to_string(),
-                model: "anthropic/claude-opus-4-6".to_string(),
+                model: "anthropic/claude-opus-4-7".to_string(),
                 output_format: CliOutputFormat::Text,
                 allowed_tools: None,
-                permission_mode: PermissionMode::DangerFullAccess,
+                permission_mode: PermissionMode::WorkspaceWrite,
                 compact: false,
                 base_commit: None,
                 reasoning_effort: None,
@@ -12203,13 +14149,19 @@ mod tests {
 
     #[test]
     fn resolves_known_model_aliases() {
-        assert_eq!(resolve_model_alias("opus"), "anthropic/claude-opus-4-6");
+        assert_eq!(resolve_model_alias("opus"), "anthropic/claude-opus-4-7");
         assert_eq!(resolve_model_alias("sonnet"), "anthropic/claude-sonnet-4-6");
         assert_eq!(
             resolve_model_alias("haiku"),
             "anthropic/claude-haiku-4-5-20251213"
         );
         assert_eq!(resolve_model_alias("claude-opus"), "claude-opus");
+    }
+
+    #[test]
+    fn default_model_alias_uses_anthropic_routing_prefix() {
+        assert_eq!(DEFAULT_MODEL, "anthropic/claude-opus-4-7");
+        assert_eq!(resolve_model_alias("opus"), "anthropic/claude-opus-4-7");
     }
 
     #[test]
@@ -12245,7 +14197,7 @@ mod tests {
 
         // then
         assert_eq!(direct, "anthropic/claude-haiku-4-5-20251213");
-        assert_eq!(chained, "anthropic/claude-opus-4-6");
+        assert_eq!(chained, "anthropic/claude-opus-4-7");
         assert_eq!(cross_provider, "grok-3-mini");
         assert_eq!(unknown, "unknown-model");
         assert_eq!(builtin, "anthropic/claude-haiku-4-5-20251213");
@@ -12353,7 +14305,7 @@ mod tests {
                         .map(str::to_string)
                         .collect()
                 ),
-                permission_mode: PermissionMode::DangerFullAccess,
+                permission_mode: PermissionMode::WorkspaceWrite,
                 base_commit: None,
                 reasoning_effort: None,
                 allow_broad_cwd: false,
@@ -12362,12 +14314,40 @@ mod tests {
     }
 
     #[test]
+    fn rejects_allowed_tools_followed_by_subcommand_or_flag_432() {
+        let _env_guard = env_lock();
+        let _cwd_guard = cwd_guard();
+        for args in [
+            vec!["--allowedTools".to_string(), "status".to_string()],
+            vec![
+                "--allowedTools".to_string(),
+                "status".to_string(),
+                "--output-format".to_string(),
+                "json".to_string(),
+            ],
+            vec!["--allowedTools".to_string(), "--output-format".to_string()],
+            vec!["--allowedTools=".to_string()],
+        ] {
+            let error = parse_args(&args).expect_err("allowedTools missing value should reject");
+            assert!(
+                error.starts_with("missing_argument: --allowedTools requires a tool list"),
+                "unexpected error for {args:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
     fn rejects_unknown_allowed_tools() {
         let _env_guard = env_lock();
         let _cwd_guard = cwd_guard();
         let error = parse_args(&["--allowedTools".to_string(), "teleport".to_string()])
             .expect_err("tool should be rejected");
+        assert!(error.starts_with("invalid_tool_name:"));
         assert!(error.contains("unsupported tool in --allowedTools: teleport"));
+        assert!(error.contains("Available: "));
+        assert!(error.contains("web_fetch"));
+        assert!(error.contains("Aliases: "));
+        assert!(error.contains("WebFetch=web_fetch"));
     }
 
     #[test]
@@ -12441,6 +14421,7 @@ mod tests {
             parse_args(&["doctor".to_string()]).expect("doctor should parse"),
             CliAction::Doctor {
                 output_format: CliOutputFormat::Text,
+                permission_mode: PermissionModeProvenance::default_fallback(),
             }
         );
         assert_eq!(
@@ -12719,6 +14700,19 @@ mod tests {
             }
             other => panic!("expected CliAction::Status, got: {other:?}"),
         }
+        match parse_args(&["--model=claude-opus-4-6".to_string(), "status".to_string()])
+            .expect("bare Anthropic model should parse")
+        {
+            CliAction::Status {
+                model,
+                model_flag_raw,
+                ..
+            } => {
+                assert_eq!(model, "claude-opus-4-6");
+                assert_eq!(model_flag_raw.as_deref(), Some("claude-opus-4-6"));
+            }
+            other => panic!("expected CliAction::Status, got: {other:?}"),
+        }
     }
 
     #[test]
@@ -12929,9 +14923,10 @@ mod tests {
     }
 
     #[test]
-    fn plugins_degrades_gracefully_on_malformed_mcp_config() {
-        // Keep the plugins surface consistent with status/doctor/mcp: a bad
-        // MCP entry should not make local plugin introspection unusable.
+    fn plugins_degrades_on_invalid_mcp_server_without_global_config_error_440() {
+        // #440: invalid MCP entries should not make local plugin introspection
+        // unusable, and should surface as validation metadata instead of a
+        // whole-config parse failure.
         let _guard = env_lock();
         let root = temp_dir();
         let cwd = root.join("project-with-malformed-mcp-for-plugins");
@@ -12964,16 +14959,19 @@ mod tests {
         }
 
         assert_eq!(payload.status, "degraded");
-        let err = payload
-            .config_load_error
-            .as_deref()
-            .expect("config_load_error should be populated");
-        assert!(
-            err.contains("mcpServers.missing-command"),
-            "config_load_error should name the malformed MCP field: {err}"
+        assert!(payload.config_load_error.is_none());
+        assert_eq!(payload.mcp_validation.total_configured, 1);
+        assert_eq!(payload.mcp_validation.valid_count, 0);
+        assert_eq!(payload.mcp_validation.invalid_count(), 1);
+        assert_eq!(
+            payload.mcp_validation.invalid_servers[0].name,
+            "missing-command"
         );
-        assert!(payload.message.contains("Config load error"));
-        assert!(payload.message.contains("partial plugins view"));
+        assert!(payload.mcp_validation.invalid_servers[0]
+            .reason
+            .contains("missing string field command"));
+        assert!(payload.message.contains("MCP validation"));
+        assert!(payload.message.contains("valid MCP siblings only"));
         assert!(payload.message.contains("Plugins"));
 
         let _ = std::fs::remove_dir_all(root);
@@ -12989,14 +14987,13 @@ mod tests {
         let root = temp_dir();
         let cwd = root.join("project-with-malformed-mcp");
         std::fs::create_dir_all(&cwd).expect("project dir should exist");
-        // One valid server + one malformed entry missing `command`.
+        // Top-level `mcpServers` shape errors still degrade through the
+        // config_load_error path; per-server errors are handled by the #440
+        // MCP validation summary instead.
         std::fs::write(
             cwd.join(".claw.json"),
             r#"{
-  "mcpServers": {
-    "everything": {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-everything"]},
-    "missing-command": {"args": ["arg-only-no-command"]}
-  }
+  "mcpServers": "not-an-object"
 }
 "#,
         )
@@ -13007,17 +15004,17 @@ mod tests {
                 .expect("status_context should not hard-fail on config parse errors (#143)")
         });
 
-        // Phase 1 contract: config_load_error is populated with the parse error.
+        // Config-shape errors still populate config_load_error.
         let err = context
             .config_load_error
             .as_ref()
-            .expect("config_load_error should be Some when config parse fails");
+            .expect("config_load_error should be Some when config shape parsing fails");
         assert!(
-            err.contains("mcpServers.missing-command"),
-            "config_load_error should name the malformed field path: {err}"
+            err.contains("mcpServers"),
+            "config_load_error should name the malformed mcpServers path: {err}"
         );
         assert!(
-            err.contains("missing string field command"),
+            err.contains("must be an object"),
             "config_load_error should carry the underlying parse error: {err}"
         );
 
@@ -13048,6 +15045,8 @@ mod tests {
             &context,
             None,
             None,
+            None,
+            None,
         );
         assert_eq!(
             json.get("status").and_then(|v| v.as_str()),
@@ -13057,7 +15056,7 @@ mod tests {
         assert!(
             json.get("config_load_error")
                 .and_then(|v| v.as_str())
-                .is_some_and(|s| s.contains("mcpServers.missing-command")),
+                .is_some_and(|s| s.contains("mcpServers")),
             "config_load_error should surface in JSON output: {json}"
         );
         // Independent fields still populated.
@@ -13097,6 +15096,18 @@ mod tests {
             Some(false),
             "default status should expose unrestricted tool state: {json}"
         );
+        assert_eq!(
+            json.pointer("/allowed_tools/available/0")
+                .and_then(|v| v.as_str()),
+            Some("agent"),
+            "status JSON should expose canonical snake_case available tools: {json}"
+        );
+        assert_eq!(
+            json.pointer("/allowed_tools/aliases/WebFetch")
+                .and_then(|v| v.as_str()),
+            Some("web_fetch"),
+            "status JSON should expose allowed-tool aliases: {json}"
+        );
 
         let allowed: super::AllowedToolSet = ["read_file", "grep_search"]
             .into_iter()
@@ -13108,7 +15119,9 @@ mod tests {
             "workspace-write",
             &context,
             None,
+            None,
             Some(&allowed),
+            None,
         );
         assert_eq!(
             restricted_json
@@ -13138,6 +15151,8 @@ mod tests {
             usage,
             "workspace-write",
             &clean_context,
+            None,
+            None,
             None,
             None,
         );
@@ -13215,7 +15230,7 @@ mod tests {
             CliAction::Status {
                 model: DEFAULT_MODEL.to_string(),
                 model_flag_raw: None, // #148: no --model flag passed
-                permission_mode: PermissionMode::DangerFullAccess,
+                permission_mode: PermissionModeProvenance::default_fallback(),
                 output_format: CliOutputFormat::Text,
                 allowed_tools: None,
             }
@@ -13244,22 +15259,19 @@ mod tests {
             !err_other.contains("--output-format json"),
             "unrelated args should not trigger --json hint: {err_other}"
         );
-        // #154: model syntax error should hint at provider prefix when applicable
-        let err_gpt = parse_args(&[
+        // #424: bare canonical GPT model ids should parse and route via provider
+        // detection instead of forcing the local-only `openai/` routing prefix.
+        match parse_args(&[
             "prompt".to_string(),
             "test".to_string(),
             "--model".to_string(),
             "gpt-4".to_string(),
         ])
-        .expect_err("`--model gpt-4` should fail with OpenAI hint");
-        assert!(
-            err_gpt.contains("Did you mean `openai/gpt-4`?"),
-            "GPT model error should hint openai/ prefix: {err_gpt}"
-        );
-        assert!(
-            err_gpt.contains("OPENAI_API_KEY"),
-            "GPT model error should mention env var: {err_gpt}"
-        );
+        .expect("`--model gpt-4` should parse as a bare OpenAI model")
+        {
+            CliAction::Prompt { model, .. } => assert_eq!(model, "gpt-4"),
+            other => panic!("expected CliAction::Prompt, got: {other:?}"),
+        }
         let err_qwen = parse_args(&[
             "prompt".to_string(),
             "test".to_string(),
@@ -13287,6 +15299,35 @@ mod tests {
             !err_garbage.contains("Did you mean"),
             "Unrelated model errors should not get a hint: {err_garbage}"
         );
+
+        let original_openai_base_url = std::env::var_os("OPENAI_BASE_URL");
+        std::env::set_var("OPENAI_BASE_URL", "http://127.0.0.1:11434/v1");
+        match parse_args(&[
+            "prompt".to_string(),
+            "test".to_string(),
+            "--model".to_string(),
+            "qwen2.5-coder:7b".to_string(),
+        ])
+        .expect("Ollama-style tag should parse when OPENAI_BASE_URL is set")
+        {
+            CliAction::Prompt { model, .. } => assert_eq!(model, "qwen2.5-coder:7b"),
+            other => panic!("expected CliAction::Prompt, got: {other:?}"),
+        }
+        match parse_args(&[
+            "prompt".to_string(),
+            "test".to_string(),
+            "--model".to_string(),
+            "local/Qwen/Qwen3.6-27B-FP8".to_string(),
+        ])
+        .expect("local/ slash-containing model should parse")
+        {
+            CliAction::Prompt { model, .. } => assert_eq!(model, "local/Qwen/Qwen3.6-27B-FP8"),
+            other => panic!("expected CliAction::Prompt, got: {other:?}"),
+        }
+        match original_openai_base_url {
+            Some(value) => std::env::set_var("OPENAI_BASE_URL", value),
+            None => std::env::remove_var("OPENAI_BASE_URL"),
+        }
     }
 
     #[test]
@@ -13386,14 +15427,32 @@ mod tests {
             "unsupported_skills_action"
         );
         assert_eq!(
+            classify_error_kind("invalid_install_source: bogus"),
+            "invalid_install_source"
+        );
+        assert_eq!(
+            classify_error_kind("invalid_tool_name: unsupported tool in --allowedTools: teleport"),
+            "invalid_tool_name"
+        );
+        assert_eq!(
+            classify_error_kind(
+                "invalid_output_format: unsupported value for --output-format: YAML"
+            ),
+            "invalid_output_format"
+        );
+        assert_eq!(
             classify_error_kind(
                 "missing_flag_value: missing value for --model.\nUsage: --model <provider/model>"
             ),
             "missing_flag_value"
         );
         assert_eq!(
-            classify_error_kind("invalid_flag_value: unsupported permission mode 'bogus'.\nUsage: --permission-mode read-only|workspace-write|danger-full-access"),
-            "invalid_flag_value"
+            classify_error_kind("invalid_permission_mode: unsupported permission mode 'bogus'.\nUsage: --permission-mode read-only|workspace-write|danger-full-access"),
+            "invalid_permission_mode"
+        );
+        assert_eq!(
+            classify_error_kind("invalid_cwd: not_found: `/tmp/missing`\nUsage: --cwd <path>"),
+            "invalid_cwd"
         );
         assert_eq!(
             classify_error_kind("is not yet implemented"),
@@ -13516,6 +15575,11 @@ mod tests {
         assert_eq!(
             classify_error_kind("unknown_option: unknown system-prompt option: --foo."),
             "unknown_option"
+        );
+        // #830: known command with missing required argument must not collapse to unknown.
+        assert_eq!(
+            classify_error_kind("missing_argument: mcp show requires a server name."),
+            "missing_argument"
         );
     }
 
@@ -13851,7 +15915,7 @@ mod tests {
             .expect("prompt shorthand should still work"),
             CliAction::Prompt {
                 prompt: "please debug this".to_string(),
-                model: "anthropic/claude-opus-4-6".to_string(),
+                model: "anthropic/claude-opus-4-7".to_string(),
                 output_format: CliOutputFormat::Text,
                 allowed_tools: None,
                 permission_mode: crate::default_permission_mode(),
@@ -13959,16 +16023,15 @@ mod tests {
                 allow_broad_cwd: false,
             }
         );
-        let error = parse_args(&["/status".to_string()])
-            .expect_err("/status should remain REPL-only when invoked directly");
-        // #829: prefix changed from "interactive-only" to "interactive_only:"
-        assert!(
-            error.contains("interactive_only:"),
-            "expected interactive_only: prefix, got: {error}"
-        );
-        assert!(
-            error.contains("claw --resume SESSION.jsonl /status"),
-            "expected --resume suggestion for resume-safe /status, got: {error}"
+        assert_eq!(
+            parse_args(&["/status".to_string()]).expect("/status should parse as local status"),
+            CliAction::Status {
+                model: DEFAULT_MODEL.to_string(),
+                model_flag_raw: None,
+                permission_mode: PermissionModeProvenance::default_fallback(),
+                output_format: CliOutputFormat::Text,
+                allowed_tools: None,
+            }
         );
     }
 
@@ -14024,17 +16087,27 @@ mod tests {
 
     #[test]
     fn unsupported_skills_actions_return_typed_error_683() {
-        for action in ["remove", "add", "uninstall", "delete"] {
-            let error = parse_args(&["skills".to_string(), action.to_string()])
-                .expect_err(&format!("skills {action} should error"));
-            assert!(
-                error.contains("unsupported skills action"),
-                "skills {action} should contain 'unsupported skills action', got: {error}"
-            );
+        let error = parse_args(&["skills".to_string(), "add".to_string()])
+            .expect_err("skills add should error");
+        assert!(
+            error.contains("unsupported skills action"),
+            "skills add should contain 'unsupported skills action', got: {error}"
+        );
+        assert_eq!(
+            classify_error_kind(&error),
+            "unsupported_skills_action",
+            "skills add should classify as unsupported_skills_action, got: {error}"
+        );
+
+        for action in ["remove", "uninstall", "delete"] {
             assert_eq!(
-                classify_error_kind(&error),
-                "unsupported_skills_action",
-                "skills {action} should classify as unsupported_skills_action, got: {error}"
+                parse_args(&["skills".to_string(), action.to_string()])
+                    .expect(&format!("skills {action} should parse")),
+                CliAction::Skills {
+                    args: Some(action.to_string()),
+                    output_format: CliOutputFormat::Text,
+                },
+                "skills {action} should route locally so missing targets are handled without credentials"
             );
         }
     }
@@ -14097,7 +16170,7 @@ mod tests {
                 model: DEFAULT_MODEL.to_string(),
                 output_format: CliOutputFormat::Text,
                 allowed_tools: None,
-                permission_mode: PermissionMode::DangerFullAccess,
+                permission_mode: PermissionMode::WorkspaceWrite,
                 compact: false,
                 base_commit: None,
                 reasoning_effort: None,
@@ -14126,7 +16199,7 @@ mod tests {
                 model: DEFAULT_MODEL.to_string(),
                 output_format: CliOutputFormat::Text,
                 allowed_tools: None,
-                permission_mode: PermissionMode::DangerFullAccess,
+                permission_mode: PermissionMode::WorkspaceWrite,
                 compact: false,
                 base_commit: None,
                 reasoning_effort: None,
@@ -14435,7 +16508,7 @@ mod tests {
     fn resolve_repl_model_returns_user_supplied_model_unchanged_when_explicit() {
         let user_model = "anthropic/claude-sonnet-4-6".to_string();
 
-        let resolved = resolve_repl_model(user_model);
+        let resolved = resolve_repl_model(user_model).expect("explicit model should resolve");
 
         assert_eq!(resolved, "anthropic/claude-sonnet-4-6");
     }
@@ -14451,7 +16524,8 @@ mod tests {
         std::env::remove_var("ANTHROPIC_MODEL");
         std::env::set_var("ANTHROPIC_MODEL", "sonnet");
 
-        let resolved = with_current_dir(&root, || resolve_repl_model(DEFAULT_MODEL.to_string()));
+        let resolved = with_current_dir(&root, || resolve_repl_model(DEFAULT_MODEL.to_string()))
+            .expect("env model should resolve");
 
         assert_eq!(resolved, "anthropic/claude-sonnet-4-6");
 
@@ -14470,7 +16544,8 @@ mod tests {
         std::env::set_var("CLAW_CONFIG_HOME", &config_home);
         std::env::remove_var("ANTHROPIC_MODEL");
 
-        let resolved = with_current_dir(&root, || resolve_repl_model(DEFAULT_MODEL.to_string()));
+        let resolved = with_current_dir(&root, || resolve_repl_model(DEFAULT_MODEL.to_string()))
+            .expect("default model should resolve");
 
         assert_eq!(resolved, DEFAULT_MODEL);
 
@@ -14667,6 +16742,16 @@ mod tests {
                 loaded_config_files: 2,
                 discovered_config_files: 3,
                 memory_file_count: 4,
+                memory_files: vec![super::MemoryFileSummary {
+                    path: "/tmp/project/CLAUDE.md".to_string(),
+                    source: "claude_md".to_string(),
+                    origin: "workspace".to_string(),
+                    scope_path: "/tmp/project".to_string(),
+                    outside_project: false,
+                    chars: 42,
+                    contributes: true,
+                }],
+                unloaded_memory_files: Vec::new(),
                 project_root: Some(PathBuf::from("/tmp")),
                 git_branch: Some("main".to_string()),
                 git_summary: GitWorkspaceSummary {
@@ -14688,10 +16773,13 @@ mod tests {
                 },
                 boot_preflight: test_boot_preflight(),
                 sandbox_status: runtime::SandboxStatus::default(),
+                binary_provenance: super::binary_provenance_for(None),
                 config_load_error: None,
                 config_load_error_kind: None,
+                mcp_validation: super::McpValidationSummary::default(),
             },
             None, // #148
+            None,
         );
         assert!(status.contains("Status"));
         assert!(status.contains("Model            claude-sonnet"));
@@ -14709,6 +16797,7 @@ mod tests {
             status.contains("Git state        dirty · 3 files · 1 staged, 1 unstaged, 1 untracked")
         );
         assert!(status.contains("Changed files    3"));
+        assert!(status.contains("Loaded memory    claude_md:/tmp/project/CLAUDE.md"));
         assert!(status.contains("Staged           1"));
         assert!(status.contains("Unstaged         1"));
         assert!(status.contains("Untracked        1"));
@@ -14815,6 +16904,8 @@ mod tests {
             loaded_config_files: 0,
             discovered_config_files: 0,
             memory_file_count: 0,
+            memory_files: Vec::new(),
+            unloaded_memory_files: Vec::new(),
             project_root: Some(PathBuf::from("/tmp/project")),
             git_branch: Some("feature/stale-base".to_string()),
             git_summary: GitWorkspaceSummary::default(),
@@ -14833,8 +16924,10 @@ mod tests {
             },
             boot_preflight: test_boot_preflight(),
             sandbox_status: runtime::SandboxStatus::default(),
+            binary_provenance: super::binary_provenance_for(None),
             config_load_error: None,
             config_load_error_kind: None,
+            mcp_validation: super::McpValidationSummary::default(),
         };
 
         let check = super::check_workspace_health(&context);
@@ -14849,6 +16942,56 @@ mod tests {
     }
 
     #[test]
+    fn memory_health_surfaces_loaded_and_unloaded_files_438() {
+        let context = super::StatusContext {
+            cwd: PathBuf::from("/tmp/project"),
+            session_path: None,
+            loaded_config_files: 0,
+            discovered_config_files: 0,
+            memory_file_count: 1,
+            memory_files: vec![super::MemoryFileSummary {
+                path: "/tmp/project/CLAUDE.md".to_string(),
+                source: "claude_md".to_string(),
+                origin: "workspace".to_string(),
+                scope_path: "/tmp/project".to_string(),
+                outside_project: false,
+                chars: 12,
+                contributes: true,
+            }],
+            unloaded_memory_files: vec!["/tmp/project/AGENTS.md".to_string()],
+            project_root: Some(PathBuf::from("/tmp/project")),
+            git_branch: Some("main".to_string()),
+            git_summary: GitWorkspaceSummary::default(),
+            branch_freshness: test_branch_freshness(),
+            stale_base_state: super::BaseCommitState::NoExpectedBase,
+            session_lifecycle: SessionLifecycleSummary {
+                kind: SessionLifecycleKind::SavedOnly,
+                pane_id: None,
+                pane_command: None,
+                pane_path: None,
+                workspace_dirty: false,
+                abandoned: false,
+            },
+            boot_preflight: test_boot_preflight(),
+            sandbox_status: runtime::SandboxStatus::default(),
+            binary_provenance: super::binary_provenance_for(None),
+            config_load_error: None,
+            config_load_error_kind: None,
+            mcp_validation: super::McpValidationSummary::default(),
+        };
+
+        let check = super::check_memory_health(&context);
+
+        assert_eq!(check.level, super::DiagnosticLevel::Warn);
+        assert_eq!(check.data["memory_file_count"], 1);
+        assert_eq!(check.data["memory_files"][0]["source"], "claude_md");
+        assert_eq!(
+            check.data["unloaded_memory_files"][0],
+            "/tmp/project/AGENTS.md"
+        );
+    }
+
+    #[test]
     fn status_json_surfaces_session_lifecycle_for_clawhip() {
         let context = super::StatusContext {
             cwd: PathBuf::from("/tmp/project"),
@@ -14856,6 +16999,8 @@ mod tests {
             loaded_config_files: 0,
             discovered_config_files: 0,
             memory_file_count: 0,
+            memory_files: Vec::new(),
+            unloaded_memory_files: Vec::new(),
             project_root: Some(PathBuf::from("/tmp/project")),
             git_branch: Some("feature/session-lifecycle".to_string()),
             git_summary: GitWorkspaceSummary::default(),
@@ -14871,8 +17016,10 @@ mod tests {
             },
             boot_preflight: test_boot_preflight(),
             sandbox_status: runtime::SandboxStatus::default(),
+            binary_provenance: super::binary_provenance_for(None),
             config_load_error: None,
             config_load_error_kind: None,
+            mcp_validation: super::McpValidationSummary::default(),
         };
 
         let value = status_json_value(
@@ -14886,6 +17033,8 @@ mod tests {
             },
             "workspace-write",
             &context,
+            None,
+            None,
             None,
             None,
         );
@@ -16148,7 +18297,7 @@ UU conflicted.rs",
             .expect("mcp tools should be allow-listable")
             .expect("allow-list should exist");
         assert!(allowed.contains("mcp__alpha__echo"));
-        assert!(allowed.contains("MCPTool"));
+        assert!(allowed.contains("mcp_tool"));
 
         let mut executor = CliToolExecutor::new(
             None,
@@ -16573,78 +18722,73 @@ mod sandbox_report_tests {
 
 #[cfg(test)]
 mod dump_manifests_tests {
-    use super::{dump_manifests_at_path, CliOutputFormat};
+    use super::{build_rust_resolver_manifest, dump_manifests_at_path, CliOutputFormat};
     use std::fs;
 
     #[test]
-    fn dump_manifests_shows_helpful_error_when_manifests_missing() {
-        let root = std::env::temp_dir().join(format!(
-            "claw_test_missing_manifests_{}",
-            std::process::id()
-        ));
+    fn dump_manifests_defaults_to_rust_resolver_inventory() {
+        let root =
+            std::env::temp_dir().join(format!("claw_test_rust_manifests_{}", std::process::id()));
         let workspace = root.join("workspace");
-        std::fs::create_dir_all(&workspace).expect("failed to create temp workspace");
+        fs::create_dir_all(&workspace).expect("workspace should exist");
 
-        let result = dump_manifests_at_path(&workspace, None, CliOutputFormat::Text);
-        assert!(
-            result.is_err(),
-            "expected an error when manifests are missing"
-        );
+        let manifest = build_rust_resolver_manifest(&workspace).expect("manifest should build");
+        assert_eq!(manifest["kind"], "dump-manifests");
+        assert_eq!(manifest["source"], "rust-resolver");
+        assert!(manifest["commands"].as_u64().expect("commands count") > 0);
+        assert!(manifest["tools"].as_u64().expect("tools count") > 0);
+        assert!(manifest["command_manifests"]
+            .as_array()
+            .expect("command manifests")
+            .iter()
+            .any(|entry| entry["name"] == "status"));
+        assert!(manifest["tool_manifests"]
+            .as_array()
+            .expect("tool manifests")
+            .iter()
+            .any(|entry| entry["name"] == "read_file"));
+        assert!(dump_manifests_at_path(&workspace, None, CliOutputFormat::Text).is_ok());
 
-        let error_msg = result.unwrap_err().to_string();
-
-        assert!(
-            error_msg.contains("Manifest source files are missing"),
-            "error message should mention missing manifest sources: {error_msg}"
-        );
-        assert!(
-            error_msg.contains(&root.display().to_string()),
-            "error message should contain the resolved repo root path: {error_msg}"
-        );
-        assert!(
-            error_msg.contains("src/commands.ts"),
-            "error message should mention missing commands.ts: {error_msg}"
-        );
-        assert!(
-            error_msg.contains("CLAUDE_CODE_UPSTREAM"),
-            "error message should explain how to supply the upstream path: {error_msg}"
-        );
-
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
-    fn dump_manifests_uses_explicit_manifest_dir() {
+    fn dump_manifests_scopes_explicit_manifest_dir_without_upstream_ts() {
         let root = std::env::temp_dir().join(format!(
             "claw_test_explicit_manifest_dir_{}",
             std::process::id()
         ));
         let workspace = root.join("workspace");
-        let upstream = root.join("upstream");
-        fs::create_dir_all(workspace.join("nested")).expect("workspace should exist");
-        fs::create_dir_all(upstream.join("src/entrypoints"))
-            .expect("upstream fixture should exist");
-        fs::write(
-            upstream.join("src/commands.ts"),
-            "import FooCommand from './commands/foo'\n",
-        )
-        .expect("commands fixture should write");
-        fs::write(
-            upstream.join("src/tools.ts"),
-            "import ReadTool from './tools/read'\n",
-        )
-        .expect("tools fixture should write");
-        fs::write(
-            upstream.join("src/entrypoints/cli.tsx"),
-            "startupProfiler()\n",
-        )
-        .expect("cli fixture should write");
+        let manifest_dir = root.join("manifest-source");
+        fs::create_dir_all(&workspace).expect("workspace should exist");
+        fs::create_dir_all(&manifest_dir).expect("manifest dir should exist");
 
-        let result = dump_manifests_at_path(&workspace, Some(&upstream), CliOutputFormat::Text);
+        let result = dump_manifests_at_path(&workspace, Some(&manifest_dir), CliOutputFormat::Text);
         assert!(
             result.is_ok(),
-            "explicit manifest dir should succeed: {result:?}"
+            "explicit manifest dir should not require upstream TS files: {result:?}"
         );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn dump_manifests_missing_explicit_dir_has_typed_kind() {
+        let root = std::env::temp_dir().join(format!(
+            "claw_test_missing_manifest_dir_{}",
+            std::process::id()
+        ));
+        let workspace = root.join("workspace");
+        let missing = root.join("missing");
+        fs::create_dir_all(&workspace).expect("workspace should exist");
+
+        let result = dump_manifests_at_path(&workspace, Some(&missing), CliOutputFormat::Text);
+        let error = result.expect_err("missing explicit manifest dir should fail");
+        let error_msg = error.to_string();
+        assert!(error_msg.starts_with("missing_manifests:"));
+        assert!(error_msg.contains(&missing.display().to_string()));
+        assert!(!error_msg.contains("CLAUDE_CODE_UPSTREAM"));
+        assert!(!error_msg.contains("src/commands.ts"));
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -16659,7 +18803,7 @@ mod alias_resolution_tests {
         // Built-in aliases should resolve to their full IDs
         assert_eq!(
             resolve_model_alias_with_config("opus"),
-            "anthropic/claude-opus-4-6"
+            "anthropic/claude-opus-4-7"
         );
         assert_eq!(
             resolve_model_alias_with_config("sonnet"),
