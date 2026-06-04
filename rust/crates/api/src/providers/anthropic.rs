@@ -468,8 +468,7 @@ impl AnthropicClient {
         request: &MessageRequest,
     ) -> Result<reqwest::Response, ApiError> {
         let request_url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
-        let mut request_body = self.request_profile.render_json_body(request)?;
-        strip_unsupported_beta_body_fields(&mut request_body);
+        let request_body = render_standard_messages_body(&self.request_profile, request)?;
         let request_builder = self.build_request(&request_url).json(&request_body);
         request_builder.send().await.map_err(ApiError::from)
     }
@@ -529,8 +528,7 @@ impl AnthropicClient {
             "{}/v1/messages/count_tokens",
             self.base_url.trim_end_matches('/')
         );
-        let mut request_body = self.request_profile.render_json_body(request)?;
-        strip_unsupported_beta_body_fields(&mut request_body);
+        let request_body = render_standard_messages_body(&self.request_profile, request)?;
         let response = self
             .build_request(&request_url)
             .json(&request_body)
@@ -975,6 +973,21 @@ fn enrich_bearer_auth_error(error: ApiError, auth: &AuthSource) -> ApiError {
         retryable,
         suggested_action,
     }
+}
+
+fn anthropic_wire_model(model: &str) -> &str {
+    model.strip_prefix("anthropic/").unwrap_or(model)
+}
+
+fn render_standard_messages_body(
+    request_profile: &AnthropicRequestProfile,
+    request: &MessageRequest,
+) -> Result<Value, serde_json::Error> {
+    let mut wire_request = request.clone();
+    wire_request.model = anthropic_wire_model(&request.model).to_string();
+    let mut body = request_profile.render_json_body(&wire_request)?;
+    strip_unsupported_beta_body_fields(&mut body);
+    Ok(body)
 }
 
 /// Remove beta-only body fields that the standard `/v1/messages` and
@@ -1548,6 +1561,27 @@ mod tests {
             rendered.get("model").and_then(serde_json::Value::as_str),
             Some("claude-sonnet-4-6")
         );
+    }
+
+    #[test]
+    fn standard_messages_body_strips_anthropic_routing_prefix() {
+        let client = AnthropicClient::new("test-key");
+        let request = MessageRequest {
+            model: "anthropic/claude-opus-4-6".to_string(),
+            max_tokens: 64,
+            messages: vec![],
+            system: None,
+            tools: None,
+            tool_choice: None,
+            stream: false,
+            ..Default::default()
+        };
+
+        let rendered = super::render_standard_messages_body(client.request_profile(), &request)
+            .expect("body should render");
+
+        assert_eq!(rendered["model"], serde_json::json!("claude-opus-4-6"));
+        assert!(rendered.get("betas").is_none());
     }
 
     #[test]

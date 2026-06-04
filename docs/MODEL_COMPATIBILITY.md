@@ -148,12 +148,12 @@ pub const DEFAULT_DASHSCOPE_BASE_URL: &str = "https://dashscope.aliyuncs.com/com
 **Affected models:** Slash-containing model IDs routed through the OpenAI-compatible provider, especially custom gateways configured with `OPENAI_BASE_URL` such as OpenRouter, local routers, or other `/v1/chat/completions` services.
 
 **Behavior:**
-- The default OpenAI API treats `openai/` as a routing prefix and sends the bare model name on the wire.
-- Custom OpenAI-compatible base URLs preserve slash-containing slugs such as `openai/gpt-4.1-mini` so the gateway receives the exact model ID it expects.
+- The default OpenAI API and local/private OpenAI-compatible base URLs treat `openai/` as a routing prefix and send the bare model name on the wire.
+- Non-local custom OpenAI-compatible base URLs preserve slash-containing slugs such as `openai/gpt-4.1-mini` so gateways like OpenRouter receive the exact model ID they expect. Local slash-containing model IDs can use `local/`, which strips only that escape-hatch prefix and sends the remainder verbatim.
 - `MessageRequest::extra_body` passes through custom request JSON after core fields are populated. This supports provider-specific options such as `web_search_options` and `parallel_tool_calls`.
 - Protected core fields (`model`, `messages`, `stream`, `tools`, `tool_choice`, `max_tokens`, `max_completion_tokens`) cannot be overridden through `extra_body`.
 
-**Testing:** See `custom_openai_gateway_preserves_slash_model_ids_and_extra_body_params` in `openai_compat_integration.rs` and `extra_body_params_are_passed_through_without_overriding_core_fields` in `openai_compat.rs`.
+**Testing:** See `custom_openai_gateway_preserves_slash_model_ids_and_extra_body_params` in `openai_compat_integration.rs`, `wire_model_strips_openai_prefix_for_default_and_local_preserves_custom_gateways`, `local_routing_prefix_strips_only_escape_hatch`, and `extra_body_params_are_passed_through_without_overriding_core_fields` in `openai_compat.rs`.
 
 ## Implementation Details
 

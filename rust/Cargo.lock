@@ -2244,7 +2244,6 @@ version = "0.1.3"
 dependencies = [
  "api",
  "commands",
- "compat-harness",
  "crossterm",
  "log",
  "mock-anthropic-service",

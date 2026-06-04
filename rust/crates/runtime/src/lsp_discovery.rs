@@ -470,14 +470,20 @@ fn is_rustup_proxy(command: &str) -> bool {
 }
 
 /// Check whether a rustup component is actually functional by running it through
-/// `rustup run stable <command> --version`. Returns `true` only if the process
-/// exits successfully (exit code 0), meaning the component is installed.
+/// `rustup run <toolchain> <command> --version`. Tries stable and nightly
+/// in order; returns `Some(toolchain)` if any succeeds, `None` if all fail.
 #[must_use]
-fn rustup_component_works(component: &str) -> bool {
-    Command::new("rustup")
-        .args(["run", "stable", component, "--version"])
-        .output()
-        .is_ok_and(|o| o.status.success())
+fn rustup_component_works(component: &str) -> Option<&'static str> {
+    for toolchain in ["stable", "nightly"] {
+        if Command::new("rustup")
+            .args(["run", toolchain, component, "--version"])
+            .output()
+            .is_ok_and(|o| o.status.success())
+        {
+            return Some(toolchain);
+        }
+    }
+    None
 }
 
 /// Detect the current platform/distro for install suggestion filtering.
@@ -568,7 +574,7 @@ pub fn check_lsp_availability() -> Vec<LspInstallAction> {
         }
 
         if desc.command == "rust-analyzer" && is_rustup_proxy("rust-analyzer") {
-            if rustup_component_works("rust-analyzer") {
+            if rustup_component_works("rust-analyzer").is_some() {
                 actions.push(LspInstallAction::Installed);
             } else {
                 actions.push(LspInstallAction::RustupProxyMissing {
@@ -652,11 +658,11 @@ pub fn discover_available_servers() -> Vec<LspServerDescriptor> {
         .filter_map(|desc| {
             let mut server = desc.to_descriptor();
             if desc.command == "rust-analyzer" && is_rustup_proxy("rust-analyzer") {
-                if rustup_component_works("rust-analyzer") {
+                if let Some(toolchain) = rustup_component_works("rust-analyzer") {
                     server.command = "rustup".to_string();
                     server.args = vec![
                         "run".to_string(),
-                        "stable".to_string(),
+                        toolchain.to_string(),
                         "rust-analyzer".to_string(),
                     ];
                 } else {

@@ -68,12 +68,14 @@ pub use compact::{
     get_compact_continuation_message, should_compact, CompactionConfig, CompactionResult,
 };
 pub use config::{
-    suppress_config_warnings_for_json_mode, ConfigEntry, ConfigError, ConfigLoader, ConfigSource,
-    LspServerConfig, McpConfigCollection, McpManagedProxyServerConfig, McpOAuthConfig,
+    suppress_config_warnings_for_json_mode, ConfigEntry, ConfigError, ConfigFileReport,
+    ConfigFileStatus, ConfigInspection, ConfigLoader, ConfigSource, LspServerConfig,
+    McpConfigCollection, McpInvalidServerConfig, McpManagedProxyServerConfig, McpOAuthConfig,
     McpRemoteServerConfig, McpSdkServerConfig, McpServerConfig, McpStdioServerConfig, McpTransport,
     McpWebSocketServerConfig, OAuthConfig, ProviderFallbackConfig, ResolvedPermissionMode,
-    RuntimeConfig, RuntimeFeatureConfig, RuntimeHookConfig, RuntimePermissionRuleConfig,
-    RuntimePluginConfig, ScopedMcpServerConfig, CLAW_SETTINGS_SCHEMA_NAME,
+    RulesImportConfig, RuntimeConfig, RuntimeFeatureConfig, RuntimeHookCommand, RuntimeHookConfig,
+    RuntimePermissionRuleConfig, RuntimePluginConfig, ScopedMcpServerConfig,
+    CLAW_SETTINGS_SCHEMA_NAME,
 };
 pub use config_validate::{
     check_unsupported_format, format_diagnostics, validate_config_file, ConfigDiagnostic,
@@ -149,8 +151,9 @@ pub use policy_engine::{
     PolicyEvaluation, PolicyRule, ReconcileReason, ReviewStatus,
 };
 pub use prompt::{
-    load_system_prompt, prepend_bullets, ContextFile, ModelFamilyIdentity, ProjectContext,
-    PromptBuildError, SystemPromptBuilder, FRONTIER_MODEL_NAME, SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
+    load_system_prompt, load_system_prompt_with_context, prepend_bullets, ContextFile,
+    ModelFamilyIdentity, ProjectContext, PromptBuildError, SystemPromptBuilder,
+    FRONTIER_MODEL_NAME, SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
 };
 pub use recovery_recipes::{
     attempt_recovery, recipe_for, EscalationPolicy, FailureScenario, RecoveryAttemptState,

@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
-use crate::config::{RuntimeFeatureConfig, RuntimeHookConfig};
+use crate::config::{RuntimeFeatureConfig, RuntimeHookCommand, RuntimeHookConfig};
 use crate::permissions::PermissionOverride;
 
 const HOOK_PREVIEW_CHAR_LIMIT: usize = 160;
@@ -182,7 +182,7 @@ impl HookRunner {
     ) -> HookRunResult {
         Self::run_commands(
             HookEvent::PreToolUse,
-            self.config.pre_tool_use(),
+            self.config.pre_tool_use_entries(),
             tool_name,
             tool_input,
             None,
@@ -232,7 +232,7 @@ impl HookRunner {
     ) -> HookRunResult {
         Self::run_commands(
             HookEvent::PostToolUse,
-            self.config.post_tool_use(),
+            self.config.post_tool_use_entries(),
             tool_name,
             tool_input,
             Some(tool_output),
@@ -282,7 +282,7 @@ impl HookRunner {
     ) -> HookRunResult {
         Self::run_commands(
             HookEvent::PostToolUseFailure,
-            self.config.post_tool_use_failure(),
+            self.config.post_tool_use_failure_entries(),
             tool_name,
             tool_input,
             Some(tool_error),
@@ -312,7 +312,7 @@ impl HookRunner {
     #[allow(clippy::too_many_arguments)]
     fn run_commands(
         event: HookEvent,
-        commands: &[String],
+        commands: &[RuntimeHookCommand],
         tool_name: &str,
         tool_input: &str,
         tool_output: Option<&str>,
@@ -342,17 +342,21 @@ impl HookRunner {
         let payload = hook_payload(event, tool_name, tool_input, tool_output, is_error).to_string();
         let mut result = HookRunResult::allow(Vec::new());
 
-        for command in commands {
+        for command in commands
+            .iter()
+            .filter(|command| command.matches_tool(tool_name))
+        {
+            let command_text = command.command();
             if let Some(reporter) = reporter.as_deref_mut() {
                 reporter.on_event(&HookProgressEvent::Started {
                     event,
                     tool_name: tool_name.to_string(),
-                    command: command.clone(),
+                    command: command_text.to_string(),
                 });
             }
 
             match Self::run_command(
-                command,
+                command_text,
                 event,
                 tool_name,
                 tool_input,
@@ -366,7 +370,7 @@ impl HookRunner {
                         reporter.on_event(&HookProgressEvent::Completed {
                             event,
                             tool_name: tool_name.to_string(),
-                            command: command.clone(),
+                            command: command_text.to_string(),
                         });
                     }
                     merge_parsed_hook_output(&mut result, parsed);
@@ -376,7 +380,7 @@ impl HookRunner {
                         reporter.on_event(&HookProgressEvent::Completed {
                             event,
                             tool_name: tool_name.to_string(),
-                            command: command.clone(),
+                            command: command_text.to_string(),
                         });
                     }
                     merge_parsed_hook_output(&mut result, parsed);
@@ -388,7 +392,7 @@ impl HookRunner {
                         reporter.on_event(&HookProgressEvent::Completed {
                             event,
                             tool_name: tool_name.to_string(),
-                            command: command.clone(),
+                            command: command_text.to_string(),
                         });
                     }
                     merge_parsed_hook_output(&mut result, parsed);
@@ -400,7 +404,7 @@ impl HookRunner {
                         reporter.on_event(&HookProgressEvent::Cancelled {
                             event,
                             tool_name: tool_name.to_string(),
-                            command: command.clone(),
+                            command: command_text.to_string(),
                         });
                     }
                     result.cancelled = true;
@@ -737,7 +741,7 @@ fn format_hook_failure(command: &str, code: i32, stdout: Option<&str>, stderr: &
 
 fn shell_command(command: &str) -> CommandWithStdin {
     #[cfg(windows)]
-    let mut command_builder = {
+    let command_builder = {
         let mut command_builder = Command::new("cmd");
         command_builder.arg("/C").arg(command);
         CommandWithStdin::new(command_builder)
@@ -825,7 +829,7 @@ mod tests {
         HookAbortSignal, HookEvent, HookProgressEvent, HookProgressReporter, HookRunResult,
         HookRunner,
     };
-    use crate::config::{RuntimeFeatureConfig, RuntimeHookConfig};
+    use crate::config::{RuntimeFeatureConfig, RuntimeHookCommand, RuntimeHookConfig};
     use crate::permissions::PermissionOverride;
 
     struct RecordingReporter {
@@ -849,6 +853,37 @@ mod tests {
         let result = runner.run_pre_tool_use("Read", r#"{"path":"README.md"}"#);
 
         assert_eq!(result, HookRunResult::allow(vec!["pre ok".to_string()]));
+    }
+
+    #[test]
+    fn object_style_hook_matchers_filter_runtime_execution() {
+        let runner = HookRunner::new(RuntimeHookConfig::from_hook_commands(
+            vec![
+                RuntimeHookCommand::new(shell_snippet("printf 'legacy'")),
+                RuntimeHookCommand::with_matcher(
+                    shell_snippet("printf 'bash only'"),
+                    Some("Bash".to_string()),
+                ),
+                RuntimeHookCommand::with_matcher(
+                    shell_snippet("printf 'read only'"),
+                    Some("Read*".to_string()),
+                ),
+            ],
+            Vec::new(),
+            Vec::new(),
+        ));
+
+        let read_result = runner.run_pre_tool_use("ReadFile", r#"{"path":"README.md"}"#);
+        let bash_result = runner.run_pre_tool_use("Bash", r#"{"command":"pwd"}"#);
+
+        assert_eq!(
+            read_result,
+            HookRunResult::allow(vec!["legacy".to_string(), "read only".to_string()])
+        );
+        assert_eq!(
+            bash_result,
+            HookRunResult::allow(vec!["legacy".to_string(), "bash only".to_string()])
+        );
     }
 
     #[test]

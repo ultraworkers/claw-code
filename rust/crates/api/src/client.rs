@@ -161,7 +161,7 @@ mod tests {
 
     #[test]
     fn resolves_existing_and_grok_aliases() {
-        assert_eq!(resolve_model_alias("opus"), "claude-opus-4-6");
+        assert_eq!(resolve_model_alias("opus"), "claude-opus-4-7");
         assert_eq!(resolve_model_alias("grok"), "grok-3");
         assert_eq!(resolve_model_alias("grok-mini"), "grok-3-mini");
     }
@@ -233,6 +233,24 @@ mod tests {
                 );
             }
             other => panic!("Expected ProviderClient::OpenAi for qwen-plus, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn local_openai_base_url_routes_authless_ollama_models() {
+        let _lock = env_lock();
+        let _base_url = EnvVarGuard::set("OPENAI_BASE_URL", Some("http://127.0.0.1:11434/v1"));
+        let _openai_key = EnvVarGuard::set("OPENAI_API_KEY", None);
+        let _anthropic_key = EnvVarGuard::set("ANTHROPIC_API_KEY", Some("test-anthropic-key"));
+        let _anthropic_token = EnvVarGuard::set("ANTHROPIC_AUTH_TOKEN", None);
+
+        let client = ProviderClient::from_model("qwen2.5-coder:7b")
+            .expect("local model should route to OpenAI-compatible client without auth");
+        match client {
+            ProviderClient::OpenAi(openai_client) => {
+                assert_eq!(openai_client.base_url(), "http://127.0.0.1:11434/v1")
+            }
+            other => panic!("Expected ProviderClient::OpenAi for local model, got: {other:?}"),
         }
     }
 }
