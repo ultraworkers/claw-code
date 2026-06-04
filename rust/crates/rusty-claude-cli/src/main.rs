@@ -7206,6 +7206,11 @@ impl LiveCli {
     /// user unchanged.
     const MAX_COMPACT_RETRIES: usize = 3;
 
+    /// Number of recent messages preserved on each successive compaction round.
+    /// Each round preserves fewer messages (4 → 2 → 0), trading conversation
+    /// continuity for a smaller payload until the request fits.
+    const PRESERVE_SCHEDULE: [usize; Self::MAX_COMPACT_RETRIES] = [4, 2, 0];
+
     /// When a turn fails with a context-window error, automatically compact the
     /// session (removing old messages to free token budget) and retry the same
     /// user input. Each retry round preserves fewer recent messages
@@ -7226,12 +7231,10 @@ impl LiveCli {
         }
 
         // Progressive compaction: each round preserves fewer recent messages
-        // (4 → 2 → 1 → 0), trading conversation continuity for a smaller
-        // payload until it fits.
-        let preserve_schedule: [usize; Self::MAX_COMPACT_RETRIES] = [4, 2, 0];
-
+        // (see PRESERVE_SCHEDULE), trading conversation continuity for a
+        // smaller payload until it fits.
         for round in 0..Self::MAX_COMPACT_RETRIES {
-            let preserve = preserve_schedule[round];
+            let preserve = Self::PRESERVE_SCHEDULE[round];
             println!(
                 "  Context limit reached, auto-compacting session... (attempt {}/{})",
                 round + 1,
@@ -18769,7 +18772,7 @@ mod dump_manifests_tests {
 
 #[cfg(test)]
 mod alias_resolution_tests {
-    use super::{resolve_model_alias_with_config, validate_model_syntax};
+    use super::{resolve_model_alias_with_config, validate_model_syntax, LiveCli};
 
     #[test]
     fn test_alias_resolution_builtin() {
@@ -18816,5 +18819,37 @@ mod alias_resolution_tests {
         let model = "openai/gpt-4o";
         assert_eq!(resolve_model_alias_with_config(model), model);
         assert!(validate_model_syntax(model).is_ok());
+    }
+
+    #[test]
+    fn auto_compact_retry_preserve_schedule_bounds_rounds() {
+        // The auto-compact-retry loop runs at most MAX_COMPACT_RETRIES rounds,
+        // indexing PRESERVE_SCHEDULE by round. The schedule must have exactly
+        // one entry per round so every round has a defined preserve count and
+        // the loop can never index out of bounds.
+        assert_eq!(
+            LiveCli::PRESERVE_SCHEDULE.len(),
+            LiveCli::MAX_COMPACT_RETRIES,
+            "preserve schedule must cover every retry round"
+        );
+
+        // Progressive compaction: each round must preserve strictly fewer
+        // recent messages than the previous one, so retries actually shrink the
+        // payload instead of resending the same too-large request.
+        for pair in LiveCli::PRESERVE_SCHEDULE.windows(2) {
+            assert!(
+                pair[0] > pair[1],
+                "preserve schedule must strictly decrease, got {:?}",
+                LiveCli::PRESERVE_SCHEDULE
+            );
+        }
+
+        // The final round must preserve zero recent messages — the most
+        // aggressive compaction possible before surfacing the error.
+        assert_eq!(
+            *LiveCli::PRESERVE_SCHEDULE.last().unwrap(),
+            0,
+            "final retry round must compact maximally"
+        );
     }
 }
