@@ -1,6 +1,7 @@
 #![allow(clippy::while_let_on_iterator)]
 
 use std::fs;
+use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -246,8 +247,121 @@ stderr:
 }
 
 #[test]
-fn compact_subcommand_json_help_fails_fast_when_stdin_closed() {
-    let workspace = unique_temp_dir("compact-nontty-json-help");
+fn prompt_subcommand_reads_prompt_from_stdin_when_no_positional_arg_423() {
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+    let server = runtime
+        .block_on(MockAnthropicService::spawn())
+        .expect("mock service should start");
+    let base_url = server.base_url();
+
+    let workspace = unique_temp_dir("prompt-stdin-423");
+    let config_home = workspace.join("config-home");
+    let home = workspace.join("home");
+    fs::create_dir_all(&workspace).expect("workspace should exist");
+    fs::create_dir_all(&config_home).expect("config home should exist");
+    fs::create_dir_all(&home).expect("home should exist");
+
+    let prompt = format!("{SCENARIO_PREFIX}streaming_text\n");
+    let output = run_claw_with_stdin(
+        &workspace,
+        &config_home,
+        &home,
+        &base_url,
+        &[
+            "prompt",
+            "--output-format",
+            "json",
+            "--compact",
+            "--permission-mode",
+            "read-only",
+            "--model",
+            "sonnet",
+        ],
+        &prompt,
+    );
+
+    assert!(
+        output.status.success(),
+        "prompt stdin run should succeed\nstdout:\n{}\n\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let parsed: Value = serde_json::from_slice(&output.stdout).expect("stdout should parse");
+    assert_eq!(
+        parsed["message"],
+        "Mock streaming says hello from the parity harness."
+    );
+    let captured = runtime.block_on(server.captured_requests());
+    assert!(
+        captured
+            .iter()
+            .any(|request| request.raw_body.contains("PARITY_SCENARIO:streaming_text")),
+        "stdin prompt should reach the provider request: {captured:?}"
+    );
+
+    fs::remove_dir_all(&workspace).expect("workspace cleanup should succeed");
+}
+
+#[test]
+fn prompt_subcommand_stdin_flag_appends_pipe_context_423() {
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+    let server = runtime
+        .block_on(MockAnthropicService::spawn())
+        .expect("mock service should start");
+    let base_url = server.base_url();
+
+    let workspace = unique_temp_dir("prompt-stdin-flag-423");
+    let config_home = workspace.join("config-home");
+    let home = workspace.join("home");
+    fs::create_dir_all(&workspace).expect("workspace should exist");
+    fs::create_dir_all(&config_home).expect("config home should exist");
+    fs::create_dir_all(&home).expect("home should exist");
+
+    let prompt_context = format!("{SCENARIO_PREFIX}streaming_text\n");
+    let output = run_claw_with_stdin(
+        &workspace,
+        &config_home,
+        &home,
+        &base_url,
+        &[
+            "prompt",
+            "Use stdin context",
+            "--stdin",
+            "--output-format",
+            "json",
+            "--compact",
+            "--permission-mode",
+            "read-only",
+            "--model",
+            "sonnet",
+        ],
+        &prompt_context,
+    );
+
+    assert!(
+        output.status.success(),
+        "prompt --stdin run should succeed\nstdout:\n{}\n\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let captured = runtime.block_on(server.captured_requests());
+    let provider_body = captured
+        .iter()
+        .find(|request| request.raw_body.contains("Use stdin context"))
+        .expect("merged prompt should reach provider");
+    assert!(
+        provider_body
+            .raw_body
+            .contains("PARITY_SCENARIO:streaming_text"),
+        "merged prompt should include stdin context: {provider_body:?}"
+    );
+
+    fs::remove_dir_all(&workspace).expect("workspace cleanup should succeed");
+}
+
+#[test]
+fn compact_subcommand_json_fails_fast_when_stdin_closed() {
+    let workspace = unique_temp_dir("compact-nontty-json");
     let config_home = workspace.join("config-home");
     let home = workspace.join("home");
     fs::create_dir_all(&workspace).expect("workspace should exist");
@@ -258,19 +372,19 @@ fn compact_subcommand_json_help_fails_fast_when_stdin_closed() {
         &workspace,
         &config_home,
         &home,
-        &["compact", "--output-format", "json", "--help"],
+        &["compact", "--output-format", "json"],
         Duration::from_secs(2),
     );
 
     assert!(
         !output.status.success(),
-        "compact json help should fail non-zero"
+        "compact json should fail non-zero"
     );
     // #819/#820/#823: JSON abort envelopes route to stdout
     let stderr = String::from_utf8(output.stderr).expect("stderr should be utf8");
     assert!(
         stderr.trim().is_empty() || !stderr.trim_start().starts_with('{'),
-        "compact json help should not emit JSON envelope to stderr (#819/#820/#823): {stderr}"
+        "compact json should not emit JSON envelope to stderr (#819/#820/#823): {stderr}"
     );
     let stdout = String::from_utf8(output.stdout).expect("stdout should be utf8");
     let parsed: Value =
@@ -354,6 +468,39 @@ fn run_claw(
         .env("PATH", "/usr/bin:/bin")
         .args(args);
     command.output().expect("claw should launch")
+}
+
+fn run_claw_with_stdin(
+    cwd: &std::path::Path,
+    config_home: &std::path::Path,
+    home: &std::path::Path,
+    base_url: &str,
+    args: &[&str],
+    stdin: &str,
+) -> Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_claw"))
+        .current_dir(cwd)
+        .env_clear()
+        .env("ANTHROPIC_API_KEY", "test-compact-key")
+        .env("ANTHROPIC_BASE_URL", base_url)
+        .env("CLAW_CONFIG_HOME", config_home)
+        .env("HOME", home)
+        .env("NO_COLOR", "1")
+        .env("PATH", "/usr/bin:/bin")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .args(args)
+        .spawn()
+        .expect("claw should launch");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin should be piped")
+        .write_all(stdin.as_bytes())
+        .expect("stdin should write");
+    child.stdin.take();
+    child.wait_with_output().expect("output should collect")
 }
 
 fn run_claw_closed_stdin_with_timeout(

@@ -6,8 +6,9 @@ use std::path::{Path, PathBuf};
 
 use plugins::{PluginError, PluginLoadFailure, PluginManager, PluginSummary};
 use runtime::{
-    compact_session, CompactionConfig, ConfigLoader, ConfigSource, McpOAuthConfig, McpServerConfig,
-    RuntimeConfig, ScopedMcpServerConfig, Session,
+    compact_session, CompactionConfig, ConfigLoader, ConfigSource, McpConfigCollection,
+    McpInvalidServerConfig, McpOAuthConfig, McpServerConfig, RuntimeConfig, ScopedMcpServerConfig,
+    Session,
 };
 use serde_json::{json, Value};
 
@@ -239,15 +240,15 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "agents",
         aliases: &[],
-        summary: "List configured agents",
-        argument_hint: Some("[list|help]"),
+        summary: "List, show, or create configured agents",
+        argument_hint: Some("[list|show <name>|create <name>|help]"),
         resume_supported: true,
     },
     SlashCommandSpec {
         name: "skills",
         aliases: &["skill"],
-        summary: "List, install, or invoke available skills",
-        argument_hint: Some("[list|install <path>|help|<skill> [args]]"),
+        summary: "List, install, uninstall, or invoke available skills",
+        argument_hint: Some("[list|show <name>|install <path>|uninstall <name>|help|<skill> [args]]"),
         resume_supported: true,
     },
     SlashCommandSpec {
@@ -1670,7 +1671,11 @@ fn parse_mcp_command(args: &[&str]) -> Result<SlashCommand, SlashCommandParseErr
             target: None,
         }),
         ["list", ..] => Err(usage_error("mcp list", "")),
-        ["show"] => Err(usage_error("mcp show", "<server>")),
+        ["show"] => Err(command_error(
+            "missing_argument: mcp show requires a server name.",
+            "mcp",
+            "/mcp show <server>",
+        )),
         ["show", target] => Ok(SlashCommand::Mcp {
             action: Some("show".to_string()),
             target: Some((*target).to_string()),
@@ -1763,13 +1768,25 @@ fn parse_list_or_help_args(
     args: Option<String>,
 ) -> Result<Option<String>, SlashCommandParseError> {
     match normalize_optional_args(args.as_deref()) {
-        None | Some("list" | "help" | "-h" | "--help") => Ok(args),
+        None
+        | Some(
+            "list" | "help" | "-h" | "--help" | "show" | "info" | "describe" | "create",
+        ) => Ok(args),
+        Some(value)
+            if value.starts_with("list ")
+                || value.starts_with("show ")
+                || value.starts_with("info ")
+                || value.starts_with("describe ")
+                || value.starts_with("create ") =>
+        {
+            Ok(args)
+        }
         Some(unexpected) => Err(command_error(
             &format!(
-                "Unexpected arguments for /{command}: {unexpected}. Use /{command}, /{command} list, or /{command} help."
+                "Unexpected arguments for /{command}: {unexpected}. Use /{command}, /{command} list, /{command} show <name>, /{command} create <name>, or /{command} help."
             ),
             command,
-            &format!("/{command} [list|help]"),
+            &format!("/{command} [list|show <name>|create <name>|help]"),
         )),
     }
 }
@@ -1781,14 +1798,6 @@ fn parse_skills_args(args: Option<&str>) -> Result<Option<String>, SlashCommandP
 
     if matches!(args, "list" | "help" | "-h" | "--help") {
         return Ok(Some(args.to_string()));
-    }
-
-    if args == "install" {
-        return Err(command_error(
-            "Usage: /skills install <path>",
-            "skills",
-            "/skills install <path>",
-        ));
     }
 
     if let Some(target) = args.strip_prefix("install").map(str::trim) {
@@ -2192,6 +2201,30 @@ struct InstalledSkill {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct UninstalledSkill {
+    invocation_name: String,
+    registry_root: PathBuf,
+    removed_path: PathBuf,
+    available_names: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SkillUninstallOutcome {
+    Removed(UninstalledSkill),
+    Missing {
+        requested: String,
+        registry_root: PathBuf,
+        available_names: Vec<String>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CreatedAgent {
+    name: String,
+    path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum SkillInstallSource {
     Directory { root: PathBuf, prompt_path: PathBuf },
     MarkdownFile { path: PathBuf },
@@ -2418,10 +2451,32 @@ pub fn handle_agents_slash_command(args: Option<&str>, cwd: &Path) -> std::io::R
             }
             Ok(render_agents_report(&matched))
         }
+        Some("create") => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "missing_argument: agents create requires an agent name.\nUsage: claw agents create <name>",
+        )),
+        Some(args) if args.starts_with("create ") => {
+            let mut parts = args.split_whitespace();
+            let _ = parts.next();
+            let Some(name) = parts.next() else {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "missing_argument: agents create requires an agent name.\nUsage: claw agents create <name>",
+                ));
+            };
+            if let Some(extra) = parts.next() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("unexpected extra arguments after agent name\nUsage: claw agents create <name>\nUnexpected extra: '{extra}'"),
+                ));
+            }
+            let agent = create_agent(name, cwd)?;
+            Ok(render_agent_create_report(&agent))
+        }
         Some(args) if is_help_arg(args) => Ok(render_agents_usage(None)),
         Some(args) => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            format!("unknown agents subcommand: {args}.\nSupported: list, show, help"),
+            format!("unknown agents subcommand: {args}.\nSupported: list, show, create, help"),
         )),
     }
 }
@@ -2518,10 +2573,32 @@ pub fn handle_agents_slash_command_json(args: Option<&str>, cwd: &Path) -> std::
             }
             Ok(render_agents_report_json_with_action(cwd, &matched, "show"))
         }
+        Some("create") => Ok(render_agents_missing_argument_json("create", "agent_name")),
+        Some(args) if args.starts_with("create ") => {
+            let mut parts = args.split_whitespace();
+            let _ = parts.next();
+            let Some(name) = parts.next() else {
+                return Ok(render_agents_missing_argument_json("create", "agent_name"));
+            };
+            if let Some(extra) = parts.next() {
+                return Ok(json!({
+                    "kind": "agents",
+                    "action": "create",
+                    "status": "error",
+                    "error_kind": "unexpected_extra_args",
+                    "unexpected": extra,
+                    "hint": format!("Usage: claw agents create <name>\nUnexpected extra: '{extra}'"),
+                }));
+            }
+            match create_agent(name, cwd) {
+                Ok(agent) => Ok(render_agent_create_report_json(&agent)),
+                Err(error) => Ok(render_agent_create_error_json(name, &error)),
+            }
+        }
         Some(args) if is_help_arg(args) => Ok(render_agents_usage_json(None)),
         Some(args) => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            format!("unknown agents subcommand: {args}.\nSupported: list, show, help"),
+            format!("unknown agents subcommand: {args}.\nSupported: list, show, create, help"),
         )),
     }
 }
@@ -2623,14 +2700,52 @@ pub fn handle_skills_slash_command(args: Option<&str>, cwd: &Path) -> std::io::R
             }
             Ok(render_skills_report(&matched))
         }
-        Some("install") => Ok(render_skills_usage(Some("install"))),
+        Some("install") => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "missing_argument: skills install requires an install source.\nUsage: claw skills install <path>",
+        )),
         Some(args) if args.starts_with("install ") => {
             let target = args["install ".len()..].trim();
             if target.is_empty() {
-                return Ok(render_skills_usage(Some("install")));
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "missing_argument: skills install requires an install source.\nUsage: claw skills install <path>",
+                ));
             }
             let install = install_skill(target, cwd)?;
             Ok(render_skill_install_report(&install))
+        }
+        Some("uninstall" | "remove" | "delete") => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "missing_argument: skills uninstall requires a skill name.\nUsage: claw skills uninstall <name>",
+        )),
+        Some(args)
+            if args.starts_with("uninstall ")
+                || args.starts_with("remove ")
+                || args.starts_with("delete ") =>
+        {
+            let (_, target) = args.split_once(' ').unwrap_or_default();
+            let target = target.trim();
+            if target.is_empty() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "missing_argument: skills uninstall requires a skill name.\nUsage: claw skills uninstall <name>",
+                ));
+            }
+            match uninstall_skill(target)? {
+                SkillUninstallOutcome::Removed(skill) => Ok(render_skill_uninstall_report(&skill)),
+                SkillUninstallOutcome::Missing {
+                    requested,
+                    available_names,
+                    ..
+                } => Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!(
+                        "skill '{requested}' not found\nAvailable skills: {}\nRun `claw skills list` to see available skills.",
+                        format_optional_list(&available_names)
+                    ),
+                )),
+            }
         }
         Some(args) if is_help_arg(args) => Ok(render_skills_usage(None)),
         Some(args) => Ok(render_skills_usage(Some(args))),
@@ -2730,14 +2845,58 @@ pub fn handle_skills_slash_command_json(args: Option<&str>, cwd: &Path) -> std::
             }
             Ok(render_skills_report_json_with_action(&matched, "show"))
         }
-        Some("install") => Ok(render_skills_usage_json(Some("install"))),
+        Some("install") => Ok(render_skills_missing_argument_json(
+            "install",
+            "install_source",
+            "Usage: claw skills install <path>",
+        )),
         Some(args) if args.starts_with("install ") => {
             let target = args["install ".len()..].trim();
             if target.is_empty() {
-                return Ok(render_skills_usage_json(Some("install")));
+                return Ok(render_skills_missing_argument_json(
+                    "install",
+                    "install_source",
+                    "Usage: claw skills install <path>",
+                ));
             }
-            let install = install_skill(target, cwd)?;
-            Ok(render_skill_install_report_json(&install))
+            match install_skill(target, cwd) {
+                Ok(install) => Ok(render_skill_install_report_json(&install)),
+                Err(error) => Ok(render_skill_install_error_json(target, &error)),
+            }
+        }
+        Some("uninstall" | "remove" | "delete") => Ok(render_skills_missing_argument_json(
+            "uninstall",
+            "skill_name",
+            "Usage: claw skills uninstall <name>",
+        )),
+        Some(args)
+            if args.starts_with("uninstall ")
+                || args.starts_with("remove ")
+                || args.starts_with("delete ") =>
+        {
+            let (_, target) = args.split_once(' ').unwrap_or_default();
+            let target = target.trim();
+            if target.is_empty() {
+                return Ok(render_skills_missing_argument_json(
+                    "uninstall",
+                    "skill_name",
+                    "Usage: claw skills uninstall <name>",
+                ));
+            }
+            match uninstall_skill(target)? {
+                SkillUninstallOutcome::Removed(skill) => {
+                    Ok(render_skill_uninstall_report_json(&skill))
+                }
+                SkillUninstallOutcome::Missing {
+                    requested,
+                    registry_root,
+                    available_names,
+                } => Ok(render_skill_uninstall_missing_json(
+                    &requested,
+                    &registry_root,
+                    &available_names,
+                )),
+            }
         }
         Some(args) if is_help_arg(args) => Ok(render_skills_usage_json(None)),
         Some(args) => Ok(render_skills_usage_json(Some(args))),
@@ -2747,9 +2906,11 @@ pub fn handle_skills_slash_command_json(args: Option<&str>, cwd: &Path) -> std::
 #[must_use]
 pub fn classify_skills_slash_command(args: Option<&str>) -> SkillSlashDispatch {
     match normalize_optional_args(args) {
-        None | Some("list" | "help" | "-h" | "--help" | "show" | "info" | "describe") => {
-            SkillSlashDispatch::Local
-        }
+        None
+        | Some(
+            "list" | "help" | "-h" | "--help" | "show" | "info" | "describe" | "install"
+            | "uninstall" | "remove" | "delete",
+        ) => SkillSlashDispatch::Local,
         Some(args)
             if args
                 .split_whitespace()
@@ -2757,7 +2918,12 @@ pub fn classify_skills_slash_command(args: Option<&str>) -> SkillSlashDispatch {
         {
             SkillSlashDispatch::Local
         }
-        Some(args) if args == "install" || args.starts_with("install ") => {
+        Some(args)
+            if args.starts_with("install ")
+                || args.starts_with("uninstall ")
+                || args.starts_with("remove ")
+                || args.starts_with("delete ") =>
+        {
             SkillSlashDispatch::Local
         }
         Some(args)
@@ -2802,7 +2968,7 @@ pub fn resolve_skill_invocation(
                         message.push_str(&names.join(", "));
                     }
                 }
-                message.push_str("\n  Usage: /skills [list|install <path>|help|<skill> [args]]");
+                message.push_str("\n  Usage: /skills [list|show <name>|install <path>|uninstall <name>|help|<skill> [args]]");
                 return Err(message);
             }
         }
@@ -2899,31 +3065,23 @@ fn render_mcp_report_for(
     }
 
     match normalize_optional_args(args) {
-        None | Some("list") => {
-            // #144: degrade gracefully on config parse failure (same contract
-            // as #143 for `status`). Text mode prepends a "Config load error"
-            // block before the MCP list; the list falls back to empty.
-            match loader.load() {
-                Ok(runtime_config) => Ok(render_mcp_summary_report(
-                    cwd,
-                    runtime_config.mcp().servers(),
-                )),
-                Err(err) => {
-                    let empty = std::collections::BTreeMap::new();
-                    Ok(format!(
-                        "Config load error\n  Status           fail\n  Summary          runtime config failed to load; reporting partial MCP view\n  Details          {err}\n  Hint             `claw doctor` classifies config parse errors; fix the listed field and rerun\n\n{}",
-                        render_mcp_summary_report(cwd, &empty)
-                    ))
-                }
+        None | Some("list") => match loader.load() {
+            Ok(runtime_config) => Ok(render_mcp_summary_report(cwd, runtime_config.mcp())),
+            Err(err) => {
+                let empty = McpConfigCollection::default();
+                Ok(format!(
+                    "Config load error\n  Status           fail\n  Summary          runtime config failed to load; reporting partial MCP view\n  Details          {err}\n  Hint             `claw doctor` classifies config parse errors; fix the listed field and rerun\n\n{}",
+                    render_mcp_summary_report(cwd, &empty)
+                ))
             }
-        }
+        },
         Some(args) if is_help_arg(args) => Ok(render_mcp_usage(None)),
-        Some("show") => Ok(render_mcp_usage(Some("show"))),
+        Some("show") => Ok(render_mcp_missing_argument_text("show")),
         Some(args) if args.split_whitespace().next() == Some("show") => {
             let mut parts = args.split_whitespace();
             let _ = parts.next();
             let Some(server_name) = parts.next() else {
-                return Ok(render_mcp_usage(Some("show")));
+                return Ok(render_mcp_missing_argument_text("show"));
             };
             if parts.next().is_some() {
                 return Ok(render_mcp_usage(Some(args)));
@@ -2935,7 +3093,7 @@ fn render_mcp_report_for(
                 Ok(runtime_config) => Ok(render_mcp_server_report(
                     cwd,
                     server_name,
-                    runtime_config.mcp().get(server_name),
+                    runtime_config.mcp(),
                 )),
                 Err(err) => Ok(format!(
                     "Config load error\n  Status           fail\n  Summary          runtime config failed to load; cannot resolve `{server_name}`\n  Details          {err}\n  Hint             `claw doctor` classifies config parse errors; fix the listed field and rerun"
@@ -2997,42 +3155,45 @@ fn render_mcp_report_json_for(
     }
 
     match normalize_optional_args(args) {
-        None | Some("list") => {
-            // #144: match #143's degraded envelope contract. On config parse
-            // failure, emit top-level `status: "degraded"` with
-            // `config_load_error`, empty servers[], and exit 0. On clean
-            // runs, the existing serializer adds `status: "ok"` below.
-            match load_runtime_config_without_stderr_warnings(loader) {
-                Ok(runtime_config) => {
-                    let mut value =
-                        render_mcp_summary_report_json(cwd, runtime_config.mcp().servers());
-                    if let Some(map) = value.as_object_mut() {
-                        map.insert("status".to_string(), Value::String("ok".to_string()));
-                        map.insert("config_load_error".to_string(), Value::Null);
-                    }
-                    Ok(value)
+        None | Some("list") => match load_runtime_config_without_stderr_warnings(loader) {
+            Ok(runtime_config) => {
+                let mut value = render_mcp_summary_report_json(cwd, runtime_config.mcp());
+                if let Some(map) = value.as_object_mut() {
+                    map.insert(
+                        "status".to_string(),
+                        Value::String(
+                            if runtime_config.mcp().has_invalid_servers() {
+                                "degraded"
+                            } else {
+                                "ok"
+                            }
+                            .to_string(),
+                        ),
+                    );
+                    map.insert("config_load_error".to_string(), Value::Null);
                 }
-                Err(err) => {
-                    let empty = std::collections::BTreeMap::new();
-                    let mut value = render_mcp_summary_report_json(cwd, &empty);
-                    if let Some(map) = value.as_object_mut() {
-                        map.insert("status".to_string(), Value::String("degraded".to_string()));
-                        map.insert(
-                            "config_load_error".to_string(),
-                            Value::String(err.to_string()),
-                        );
-                    }
-                    Ok(value)
-                }
+                Ok(value)
             }
-        }
+            Err(err) => {
+                let empty = McpConfigCollection::default();
+                let mut value = render_mcp_summary_report_json(cwd, &empty);
+                if let Some(map) = value.as_object_mut() {
+                    map.insert("status".to_string(), Value::String("degraded".to_string()));
+                    map.insert(
+                        "config_load_error".to_string(),
+                        Value::String(err.to_string()),
+                    );
+                }
+                Ok(value)
+            }
+        },
         Some(args) if is_help_arg(args) => Ok(render_mcp_usage_json(None)),
-        Some("show") => Ok(render_mcp_usage_json(Some("show"))),
+        Some("show") => Ok(render_mcp_missing_argument_json("show")),
         Some(args) if args.split_whitespace().next() == Some("show") => {
             let mut parts = args.split_whitespace();
             let _ = parts.next();
             let Some(server_name) = parts.next() else {
-                return Ok(render_mcp_usage_json(Some("show")));
+                return Ok(render_mcp_missing_argument_json("show"));
             };
             if parts.next().is_some() {
                 return Ok(render_mcp_usage_json(Some(args)));
@@ -3040,16 +3201,21 @@ fn render_mcp_report_json_for(
             // #144: same degradation pattern for show action.
             match load_runtime_config_without_stderr_warnings(loader) {
                 Ok(runtime_config) => {
-                    let mut value = render_mcp_server_report_json(
-                        cwd,
-                        server_name,
-                        runtime_config.mcp().get(server_name),
-                    );
+                    let mut value =
+                        render_mcp_server_report_json(cwd, server_name, runtime_config.mcp());
                     if let Some(map) = value.as_object_mut() {
-                        // Only override status to "ok" if the server was found;
-                        // render_mcp_server_report_json already sets status:"error" for not-found.
                         if map.get("found") == Some(&Value::Bool(true)) {
-                            map.insert("status".to_string(), Value::String("ok".to_string()));
+                            map.insert(
+                                "status".to_string(),
+                                Value::String(
+                                    if runtime_config.mcp().has_invalid_servers() {
+                                        "degraded"
+                                    } else {
+                                        "ok"
+                                    }
+                                    .to_string(),
+                                ),
+                            );
                         }
                         map.insert("config_load_error".to_string(), Value::Null);
                     }
@@ -3455,6 +3621,103 @@ fn install_skill_into(
         registry_root: registry_root.to_path_buf(),
         installed_path,
     })
+}
+
+fn uninstall_skill(target: &str) -> std::io::Result<SkillUninstallOutcome> {
+    let registry_root = default_skill_install_root()?;
+    let requested = sanitize_skill_invocation_name(target).unwrap_or_else(|| {
+        target
+            .trim()
+            .trim_start_matches('/')
+            .trim_start_matches('$')
+            .to_ascii_lowercase()
+    });
+    let available_names = installed_skill_names(&registry_root)?;
+    let matched_name = available_names
+        .iter()
+        .find(|name| name.eq_ignore_ascii_case(&requested))
+        .cloned();
+
+    let Some(invocation_name) = matched_name else {
+        return Ok(SkillUninstallOutcome::Missing {
+            requested,
+            registry_root,
+            available_names,
+        });
+    };
+
+    let removed_path = registry_root.join(&invocation_name);
+    if removed_path.is_dir() {
+        fs::remove_dir_all(&removed_path)?;
+    } else {
+        fs::remove_file(&removed_path)?;
+    }
+    let available_names = available_names
+        .into_iter()
+        .filter(|name| !name.eq_ignore_ascii_case(&invocation_name))
+        .collect();
+
+    Ok(SkillUninstallOutcome::Removed(UninstalledSkill {
+        invocation_name,
+        registry_root,
+        removed_path,
+        available_names,
+    }))
+}
+
+fn installed_skill_names(registry_root: &Path) -> std::io::Result<Vec<String>> {
+    let entries = match fs::read_dir(registry_root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    let mut names = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() && path.join("SKILL.md").is_file() {
+            names.push(entry.file_name().to_string_lossy().to_string());
+        } else if path
+            .extension()
+            .is_some_and(|extension| extension.to_string_lossy().eq_ignore_ascii_case("md"))
+        {
+            if let Some(stem) = path.file_stem() {
+                names.push(stem.to_string_lossy().to_string());
+            }
+        }
+    }
+    names.sort();
+    Ok(names)
+}
+
+fn create_agent(name: &str, cwd: &Path) -> std::io::Result<CreatedAgent> {
+    let Some(name) = sanitize_skill_invocation_name(name) else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid_agent_name: agent name must contain at least one alphanumeric character",
+        ));
+    };
+    let root = cwd.join(".claw").join("agents");
+    let path = root.join(format!("{name}.toml"));
+    if path.exists() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!(
+                "agent_already_exists: agent '{name}' already exists at {}",
+                path.display()
+            ),
+        ));
+    }
+
+    fs::create_dir_all(&root)?;
+    fs::write(
+        &path,
+        format!(
+            "name = \"{name}\"\ndescription = \"Describe when to use this agent.\"\nmodel_reasoning_effort = \"medium\"\n"
+        ),
+    )?;
+
+    Ok(CreatedAgent { name, path })
 }
 
 fn default_skill_install_root() -> std::io::Result<PathBuf> {
@@ -3898,6 +4161,59 @@ fn render_agents_report_json_with_action(
     })
 }
 
+fn render_agents_missing_argument_json(action: &str, argument: &str) -> Value {
+    json!({
+        "kind": "agents",
+        "action": action,
+        "status": "error",
+        "error_kind": "missing_argument",
+        "argument": argument,
+        "hint": "Usage: claw agents create <name>",
+    })
+}
+
+fn render_agent_create_report(agent: &CreatedAgent) -> String {
+    format!(
+        "Agents\n  Result           created {}\n  Path             {}\n  Format           TOML",
+        agent.name,
+        agent.path.display()
+    )
+}
+
+fn render_agent_create_report_json(agent: &CreatedAgent) -> Value {
+    json!({
+        "kind": "agents",
+        "status": "ok",
+        "action": "create",
+        "result": "created",
+        "name": &agent.name,
+        "path": agent.path.display().to_string(),
+        "format": "toml",
+    })
+}
+
+fn render_agent_create_error_json(name: &str, error: &std::io::Error) -> Value {
+    let message = error.to_string();
+    let error_kind = if message.starts_with("invalid_agent_name:") {
+        "invalid_agent_name"
+    } else if message.starts_with("agent_already_exists:")
+        || error.kind() == std::io::ErrorKind::AlreadyExists
+    {
+        "agent_already_exists"
+    } else {
+        "agent_create_failed"
+    };
+    json!({
+        "kind": "agents",
+        "status": "error",
+        "action": "create",
+        "error_kind": error_kind,
+        "name": name,
+        "message": message,
+        "hint": "Use `claw agents create <name>` with a simple alphanumeric, dash, underscore, or dot name.",
+    })
+}
+
 fn agent_detail(agent: &AgentSummary) -> String {
     let mut parts = vec![agent.name.clone()];
     if let Some(description) = &agent.description {
@@ -4015,55 +4331,176 @@ fn render_skill_install_report_json(skill: &InstalledSkill) -> Value {
     })
 }
 
-fn render_mcp_summary_report(
-    cwd: &Path,
-    servers: &BTreeMap<String, ScopedMcpServerConfig>,
-) -> String {
+fn render_skills_missing_argument_json(action: &str, argument: &str, hint: &str) -> Value {
+    json!({
+        "kind": "skills",
+        "action": action,
+        "status": "error",
+        "error_kind": "missing_argument",
+        "argument": argument,
+        "hint": hint,
+    })
+}
+
+fn render_skill_install_error_json(target: &str, error: &std::io::Error) -> Value {
+    let source_kind = skill_install_source_kind(target);
+    json!({
+        "kind": "skills",
+        "action": "install",
+        "status": "error",
+        "error_kind": "invalid_install_source",
+        "source": target,
+        "source_kind": source_kind,
+        "reason": io_error_reason(error),
+        "message": format!("invalid install source: {error}"),
+        "hint": match source_kind {
+            "url" => "Remote skill install is not supported yet; pass a local directory containing SKILL.md or a markdown file.",
+            "name" => "Skill install expects a local path, not a registry name. Pass a directory containing SKILL.md or a markdown file.",
+            _ => "Check that the path exists and is a directory containing SKILL.md or a markdown file.",
+        },
+    })
+}
+
+fn render_skill_uninstall_report(skill: &UninstalledSkill) -> String {
+    format!(
+        "Skills\n  Result           uninstalled {}\n  Registry         {}\n  Removed path     {}\n  Remaining        {}",
+        skill.invocation_name,
+        skill.registry_root.display(),
+        skill.removed_path.display(),
+        format_optional_list(&skill.available_names)
+    )
+}
+
+fn render_skill_uninstall_report_json(skill: &UninstalledSkill) -> Value {
+    json!({
+        "kind": "skills",
+        "status": "ok",
+        "action": "uninstall",
+        "result": "removed",
+        "removed": &skill.invocation_name,
+        "skills_dir": skill.registry_root.display().to_string(),
+        "removed_path": skill.removed_path.display().to_string(),
+        "available_names": &skill.available_names,
+    })
+}
+
+fn render_skill_uninstall_missing_json(
+    requested: &str,
+    registry_root: &Path,
+    available_names: &[String],
+) -> Value {
+    json!({
+        "kind": "skills",
+        "status": "error",
+        "action": "uninstall",
+        "error_kind": "skill_not_found",
+        "requested": requested,
+        "skills_dir": registry_root.display().to_string(),
+        "available_names": available_names,
+        "message": format!("skill '{requested}' not found"),
+        "hint": "Run `claw skills list` to see available skills.",
+    })
+}
+
+fn skill_install_source_kind(source: &str) -> &'static str {
+    let trimmed = source.trim();
+    if trimmed.contains("://") {
+        "url"
+    } else if Path::new(trimmed).is_absolute()
+        || trimmed.starts_with('.')
+        || trimmed.contains('/')
+        || trimmed.contains('\\')
+    {
+        "path"
+    } else {
+        "name"
+    }
+}
+
+fn io_error_reason(error: &std::io::Error) -> &'static str {
+    match error.kind() {
+        std::io::ErrorKind::NotFound => "not_found",
+        std::io::ErrorKind::AlreadyExists => "already_exists",
+        std::io::ErrorKind::PermissionDenied => "permission_denied",
+        std::io::ErrorKind::InvalidInput => "invalid",
+        _ => "io_error",
+    }
+}
+
+fn render_mcp_summary_report(cwd: &Path, mcp: &McpConfigCollection) -> String {
+    let servers = mcp.servers();
     let mut lines = vec![
         "MCP".to_string(),
         format!("  Working directory {}", cwd.display()),
-        format!("  Configured servers {}", servers.len()),
+        format!("  Configured servers {}", mcp.valid_count()),
+        format!("  Total entries     {}", mcp.total_configured()),
+        format!("  Invalid entries   {}", mcp.invalid_count()),
     ];
     if servers.is_empty() {
-        lines.push("  No MCP servers configured.".to_string());
-        return lines.join("\n");
+        lines.push("  No valid MCP servers configured.".to_string());
     }
 
-    lines.push(String::new());
-    for (name, server) in servers {
-        lines.push(format!(
-            "  {name:<16} {transport:<13} {scope:<7} {summary}",
-            transport = mcp_transport_label(&server.config),
-            scope = config_source_label(server.scope),
-            summary = mcp_server_summary(&server.config)
-        ));
+    if !servers.is_empty() {
+        lines.push(String::new());
+        for (name, server) in servers {
+            lines.push(format!(
+                "  {name:<16} {transport:<13} {scope:<7} {summary}",
+                transport = mcp_transport_label(&server.config),
+                scope = config_source_label(server.scope),
+                summary = mcp_server_summary(&server.config)
+            ));
+        }
+    }
+
+    if !mcp.invalid_servers().is_empty() {
+        lines.push(String::new());
+        lines.push("  Invalid MCP servers".to_string());
+        for invalid in mcp.invalid_servers() {
+            lines.push(format!("    - {}: {}", invalid.name, invalid.reason));
+        }
     }
 
     lines.join("\n")
 }
 
-fn render_mcp_summary_report_json(
-    cwd: &Path,
-    servers: &BTreeMap<String, ScopedMcpServerConfig>,
-) -> Value {
+fn render_mcp_summary_report_json(cwd: &Path, mcp: &McpConfigCollection) -> Value {
     json!({
         "kind": "mcp",
         "action": "list",
         "working_directory": cwd.display().to_string(),
-        "configured_servers": servers.len(),
-        "servers": servers
+        "configured_servers": mcp.valid_count(),
+        "total_configured": mcp.total_configured(),
+        "valid_count": mcp.valid_count(),
+        "invalid_count": mcp.invalid_count(),
+        "invalid_servers": invalid_mcp_servers_json(mcp.invalid_servers()),
+        "servers": mcp
+            .servers()
             .iter()
             .map(|(name, server)| mcp_server_json(name, server))
             .collect::<Vec<_>>(),
     })
 }
 
-fn render_mcp_server_report(
-    cwd: &Path,
-    server_name: &str,
-    server: Option<&ScopedMcpServerConfig>,
-) -> String {
-    let Some(server) = server else {
+fn invalid_mcp_servers_json(invalid_servers: &[McpInvalidServerConfig]) -> Value {
+    Value::Array(
+        invalid_servers
+            .iter()
+            .map(|server| {
+                json!({
+                    "name": &server.name,
+                    "scope": config_source_json(server.scope),
+                    "path": server.path.display().to_string(),
+                    "error_field": &server.error_field,
+                    "reason": &server.reason,
+                    "valid": false,
+                })
+            })
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn render_mcp_server_report(cwd: &Path, server_name: &str, mcp: &McpConfigCollection) -> String {
+    let Some(server) = mcp.get(server_name) else {
         return format!(
             "MCP\n  Working directory {}\n  Result            server `{server_name}` is not configured",
             cwd.display()
@@ -4141,9 +4578,9 @@ fn render_mcp_server_report(
 fn render_mcp_server_report_json(
     cwd: &Path,
     server_name: &str,
-    server: Option<&ScopedMcpServerConfig>,
+    mcp: &McpConfigCollection,
 ) -> Value {
-    match server {
+    match mcp.get(server_name) {
         Some(server) => json!({
             "kind": "mcp",
             "action": "show",
@@ -4151,6 +4588,10 @@ fn render_mcp_server_report_json(
             "working_directory": cwd.display().to_string(),
             "found": true,
             "server": mcp_server_json(server_name, server),
+            "total_configured": mcp.total_configured(),
+            "valid_count": mcp.valid_count(),
+            "invalid_count": mcp.invalid_count(),
+            "invalid_servers": invalid_mcp_servers_json(mcp.invalid_servers()),
         }),
         None => json!({
             "kind": "mcp",
@@ -4163,6 +4604,10 @@ fn render_mcp_server_report_json(
             "message": format!("server `{server_name}` is not configured"),
             // #761: hint so callers know how to enumerate configured MCP servers
             "hint": "Run `claw mcp list` to see configured servers.",
+            "total_configured": mcp.total_configured(),
+            "valid_count": mcp.valid_count(),
+            "invalid_count": mcp.invalid_count(),
+            "invalid_servers": invalid_mcp_servers_json(mcp.invalid_servers()),
         }),
     }
 }
@@ -4184,8 +4629,10 @@ fn help_path_from_args(args: &str) -> Option<Vec<&str>> {
 fn render_agents_usage(unexpected: Option<&str>) -> String {
     let mut lines = vec![
         "Agents".to_string(),
-        "  Usage            /agents [list|help]".to_string(),
-        "  Direct CLI       claw agents".to_string(),
+        "  Usage            /agents [list|show <name>|create <name>|help]".to_string(),
+        "  Direct CLI       claw agents [list|show <name>|create <name>|help]".to_string(),
+        "  Format           TOML files (.toml); create scaffolds .claw/agents/<name>.toml"
+            .to_string(),
         "  Sources          .claw/agents, ~/.claw/agents, $CLAW_CONFIG_HOME/agents".to_string(),
     ];
     if let Some(args) = unexpected {
@@ -4201,8 +4648,10 @@ fn render_agents_usage_json(unexpected: Option<&str>) -> Value {
         "ok": unexpected.is_none(),
         "status": if unexpected.is_some() { "error" } else { "ok" },
         "usage": {
-            "slash_command": "/agents [list|help]",
-            "direct_cli": "claw agents [list|help]",
+            "slash_command": "/agents [list|show <name>|create <name>|help]",
+            "direct_cli": "claw agents [list|show <name>|create <name>|help]",
+            "format": "toml",
+            "create": "claw agents create <name>",
             "sources": [".claw/agents", "~/.claw/agents", "$CLAW_CONFIG_HOME/agents"],
         },
         "unexpected": unexpected,
@@ -4212,9 +4661,10 @@ fn render_agents_usage_json(unexpected: Option<&str>) -> Value {
 fn render_skills_usage(unexpected: Option<&str>) -> String {
     let mut lines = vec![
         "Skills".to_string(),
-        "  Usage            /skills [list|install <path>|help|<skill> [args]]".to_string(),
+        "  Usage            /skills [list|show <name>|install <path>|uninstall <name>|help|<skill> [args]]".to_string(),
         "  Alias            /skill".to_string(),
-        "  Direct CLI       claw skills [list|install <path>|help|<skill> [args]]".to_string(),
+        "  Direct CLI       claw skills [list|show <name>|install <path>|uninstall <name>|help|<skill> [args]]".to_string(),
+        "  Lifecycle        install <path>, uninstall <name>".to_string(),
         "  Invoke           /skills help overview -> $help overview".to_string(),
         "  Install root     $CLAW_CONFIG_HOME/skills or ~/.claw/skills".to_string(),
         "  Sources          .claw/skills, .omc/skills, .agents/skills, .codex/skills, .claude/skills, ~/.claw/skills, ~/.omc/skills, ~/.claude/skills/omc-learned, ~/.codex/skills, ~/.claude/skills, legacy /commands".to_string(),
@@ -4232,9 +4682,10 @@ fn render_skills_usage_json(unexpected: Option<&str>) -> Value {
         "ok": unexpected.is_none(),
         "status": if unexpected.is_some() { "error" } else { "ok" },
         "usage": {
-            "slash_command": "/skills [list|install <path>|help|<skill> [args]]",
+            "slash_command": "/skills [list|show <name>|install <path>|uninstall <name>|help|<skill> [args]]",
             "aliases": ["/skill"],
-            "direct_cli": "claw skills [list|install <path>|help|<skill> [args]]",
+            "direct_cli": "claw skills [list|show <name>|install <path>|uninstall <name>|help|<skill> [args]]",
+            "lifecycle": ["install <path>", "uninstall <name>"],
             "invoke": "/skills help overview -> $help overview",
             "install_root": "$CLAW_CONFIG_HOME/skills or ~/.claw/skills",
             "sources": [
@@ -4267,6 +4718,44 @@ fn render_mcp_usage(unexpected: Option<&str>) -> String {
         lines.push(format!("  Unexpected       {args}"));
     }
     lines.join("\n")
+}
+
+fn render_mcp_missing_argument_text(action: &str) -> String {
+    let hint = match action {
+        "show" => "use `claw mcp show <server>` to inspect a server",
+        _ => "provide the required argument for this MCP action",
+    };
+    format!(
+        "MCP\n  Error            missing argument for '{action}'\n  Hint             {hint}\n  Usage            /mcp [list|show <server>|help]"
+    )
+}
+
+fn render_mcp_missing_argument_json(action: &str) -> Value {
+    let (message, hint) = match action {
+        "show" => (
+            "mcp show requires a server name",
+            "Usage: claw mcp show <server>",
+        ),
+        _ => (
+            "mcp action requires an argument",
+            "Usage: claw mcp [list|show <server>|help]",
+        ),
+    };
+    json!({
+        "kind": "mcp",
+        "action": action,
+        "ok": false,
+        "status": "error",
+        "error_kind": "missing_argument",
+        "message": message,
+        "hint": hint,
+        "usage": {
+            "slash_command": "/mcp [list|show <server>|help]",
+            "direct_cli": "claw mcp [list|show <server>|help]",
+            "sources": [".claw/settings.json", ".claw/settings.local.json"],
+        },
+        "unexpected": Value::Null,
+    })
 }
 
 fn render_mcp_usage_json(unexpected: Option<&str>) -> Value {
@@ -4512,6 +5001,7 @@ fn mcp_server_details_json(config: &McpServerConfig) -> Value {
 fn mcp_server_json(name: &str, server: &ScopedMcpServerConfig) -> Value {
     json!({
         "name": name,
+        "valid": true,
         "required": server.required,
         "scope": config_source_json(server.scope),
         "transport": mcp_transport_json(&server.config),
@@ -5071,16 +5561,17 @@ mod tests {
     #[test]
     fn rejects_invalid_agents_arguments() {
         // given
-        let agents_input = "/agents show planner";
+        let agents_input = "/agents frobnicate";
 
         // when
         let agents_error = parse_error_message(agents_input);
 
         // then
         assert!(agents_error.contains(
-            "Unexpected arguments for /agents: show planner. Use /agents, /agents list, or /agents help."
+            "Unexpected arguments for /agents: frobnicate. Use /agents, /agents list, /agents show <name>, /agents create <name>, or /agents help."
         ));
-        assert!(agents_error.contains("  Usage            /agents [list|help]"));
+        assert!(agents_error
+            .contains("  Usage            /agents [list|show <name>|create <name>|help]"));
     }
 
     #[test]
@@ -5098,6 +5589,13 @@ mod tests {
             let arg = format!("{prefix}plan");
             assert_eq!(
                 classify_skills_slash_command(Some(&arg)),
+                SkillSlashDispatch::Local,
+                "`skills {arg}` must be Local, not Invoke"
+            );
+        }
+        for arg in ["uninstall", "uninstall plan", "remove plan", "delete plan"] {
+            assert_eq!(
+                classify_skills_slash_command(Some(arg)),
                 SkillSlashDispatch::Local,
                 "`skills {arg}` must be Local, not Invoke"
             );
@@ -5127,6 +5625,10 @@ mod tests {
         );
         assert_eq!(
             classify_skills_slash_command(Some("install ./skill-pack")),
+            SkillSlashDispatch::Local
+        );
+        assert_eq!(
+            classify_skills_slash_command(Some("uninstall help")),
             SkillSlashDispatch::Local
         );
     }
@@ -5221,8 +5723,10 @@ mod tests {
             "/plugin [list|install <path>|enable <name>|disable <name>|uninstall <id>|update <id>]"
         ));
         assert!(help.contains("aliases: /plugins, /marketplace"));
-        assert!(help.contains("/agents [list|help]"));
-        assert!(help.contains("/skills [list|install <path>|help|<skill> [args]]"));
+        assert!(help.contains("/agents [list|show <name>|create <name>|help]"));
+        assert!(help.contains(
+            "/skills [list|show <name>|install <path>|uninstall <name>|help|<skill> [args]]"
+        ));
         assert!(help.contains("aliases: /skill"));
         assert!(!help.contains("/login"));
         assert!(!help.contains("/logout"));
@@ -5567,10 +6071,27 @@ mod tests {
 
     #[test]
     fn renders_agents_reports_as_json() {
+        let _guard = env_guard();
         let workspace = temp_dir("agents-json-workspace");
         let project_agents = workspace.join(".codex").join("agents");
         let user_home = temp_dir("agents-json-home");
         let user_agents = user_home.join(".codex").join("agents");
+        let isolated_home = temp_dir("agents-json-isolated-home");
+        let config_home = temp_dir("agents-json-config-home");
+        let codex_home = temp_dir("agents-json-codex-home");
+        let claude_config = temp_dir("agents-json-claude-config");
+        fs::create_dir_all(&isolated_home).expect("isolated home");
+        fs::create_dir_all(&config_home).expect("config home");
+        fs::create_dir_all(&codex_home).expect("codex home");
+        fs::create_dir_all(&claude_config).expect("claude config");
+        let original_home = std::env::var_os("HOME");
+        let original_claw_config_home = std::env::var_os("CLAW_CONFIG_HOME");
+        let original_codex_home = std::env::var_os("CODEX_HOME");
+        let original_claude_config_dir = std::env::var_os("CLAUDE_CONFIG_DIR");
+        std::env::set_var("HOME", &isolated_home);
+        std::env::set_var("CLAW_CONFIG_HOME", &config_home);
+        std::env::set_var("CODEX_HOME", &codex_home);
+        std::env::set_var("CLAUDE_CONFIG_DIR", &claude_config);
 
         write_agent(
             &project_agents,
@@ -5622,7 +6143,10 @@ mod tests {
         assert_eq!(help["kind"], "agents");
         assert_eq!(help["action"], "help");
         assert_eq!(help["status"], "ok");
-        assert_eq!(help["usage"]["direct_cli"], "claw agents [list|help]");
+        assert_eq!(
+            help["usage"]["direct_cli"],
+            "claw agents [list|show <name>|create <name>|help]"
+        );
 
         // `show <name>` is now valid. Known agent returns ok with matching entry.
         let show_planner = handle_agents_slash_command_json(Some("show planner"), &workspace)
@@ -5644,6 +6168,14 @@ mod tests {
 
         let _ = fs::remove_dir_all(workspace);
         let _ = fs::remove_dir_all(user_home);
+        restore_env_var("HOME", original_home);
+        restore_env_var("CLAW_CONFIG_HOME", original_claw_config_home);
+        restore_env_var("CODEX_HOME", original_codex_home);
+        restore_env_var("CLAUDE_CONFIG_DIR", original_claude_config_dir);
+        let _ = fs::remove_dir_all(isolated_home);
+        let _ = fs::remove_dir_all(config_home);
+        let _ = fs::remove_dir_all(codex_home);
+        let _ = fs::remove_dir_all(claude_config);
     }
 
     #[test]
@@ -5774,7 +6306,7 @@ mod tests {
         assert_eq!(help["usage"]["aliases"][0], "/skill");
         assert_eq!(
             help["usage"]["direct_cli"],
-            "claw skills [list|install <path>|help|<skill> [args]]"
+            "claw skills [list|show <name>|install <path>|uninstall <name>|help|<skill> [args]]"
         );
 
         let _ = fs::remove_dir_all(workspace);
@@ -5787,13 +6319,20 @@ mod tests {
 
         let agents_help =
             super::handle_agents_slash_command(Some("help"), &cwd).expect("agents help");
-        assert!(agents_help.contains("Usage            /agents [list|help]"));
-        assert!(agents_help.contains("Direct CLI       claw agents"));
+        assert!(
+            agents_help.contains("Usage            /agents [list|show <name>|create <name>|help]")
+        );
+        assert!(agents_help
+            .contains("Direct CLI       claw agents [list|show <name>|create <name>|help]"));
+        assert!(agents_help.contains(
+            "Format           TOML files (.toml); create scaffolds .claw/agents/<name>.toml"
+        ));
         assert!(agents_help
             .contains("Sources          .claw/agents, ~/.claw/agents, $CLAW_CONFIG_HOME/agents"));
 
         // `show <name>` is now valid. For an agent that doesn't exist it returns Err(NotFound).
-        let agents_show_missing = super::handle_agents_slash_command(Some("show planner"), &cwd);
+        let agents_show_missing =
+            super::handle_agents_slash_command(Some("show definitely-missing-agent-431"), &cwd);
         assert!(
             agents_show_missing.is_err(),
             "show of a missing agent should Err"
@@ -5812,9 +6351,11 @@ mod tests {
 
         let skills_help =
             super::handle_skills_slash_command(Some("--help"), &cwd).expect("skills help");
-        assert!(skills_help
-            .contains("Usage            /skills [list|install <path>|help|<skill> [args]]"));
+        assert!(skills_help.contains(
+            "Usage            /skills [list|show <name>|install <path>|uninstall <name>|help|<skill> [args]]"
+        ));
         assert!(skills_help.contains("Alias            /skill"));
+        assert!(skills_help.contains("Lifecycle        install <path>, uninstall <name>"));
         assert!(skills_help.contains("Invoke           /skills help overview -> $help overview"));
         assert!(skills_help.contains("Install root     $CLAW_CONFIG_HOME/skills or ~/.claw/skills"));
         assert!(skills_help.contains(".omc/skills"));
@@ -5828,15 +6369,17 @@ mod tests {
 
         let skills_install_help = super::handle_skills_slash_command(Some("install --help"), &cwd)
             .expect("nested skills help");
-        assert!(skills_install_help
-            .contains("Usage            /skills [list|install <path>|help|<skill> [args]]"));
+        assert!(skills_install_help.contains(
+            "Usage            /skills [list|show <name>|install <path>|uninstall <name>|help|<skill> [args]]"
+        ));
         assert!(skills_install_help.contains("Alias            /skill"));
         assert!(skills_install_help.contains("Unexpected       install"));
 
         let skills_unknown_help =
             super::handle_skills_slash_command(Some("show --help"), &cwd).expect("skills help");
-        assert!(skills_unknown_help
-            .contains("Usage            /skills [list|install <path>|help|<skill> [args]]"));
+        assert!(skills_unknown_help.contains(
+            "Usage            /skills [list|show <name>|install <path>|uninstall <name>|help|<skill> [args]]"
+        ));
         assert!(skills_unknown_help.contains("Unexpected       show"));
 
         let skills_help_json =
@@ -6111,12 +6654,9 @@ mod tests {
     }
 
     #[test]
-    fn mcp_degrades_gracefully_on_malformed_mcp_config_144() {
-        // #144: mirror of #143's partial-success contract for `claw mcp`.
-        // Previously `mcp` hard-failed on any config parse error, hiding
-        // well-formed servers and forcing claws to fall back to `doctor`.
-        // Now `mcp` emits a degraded envelope instead: exit 0, status:
-        // "degraded", config_load_error populated, servers[] empty.
+    fn mcp_loads_valid_servers_and_reports_invalid_siblings_440() {
+        // #440: invalid sibling MCP entries must not drop valid servers, and
+        // the JSON envelope must expose all rejected entries for one-pass repair.
         let _guard = env_guard();
         let workspace = temp_dir("mcp-degrades-144");
         let config_home = temp_dir("mcp-degrades-144-cfg");
@@ -6146,17 +6686,19 @@ mod tests {
             Some("degraded"),
             "top-level status should be 'degraded': {list}"
         );
-        let err = list["config_load_error"]
+        assert!(list["config_load_error"].is_null());
+        assert_eq!(list["configured_servers"], 1);
+        assert_eq!(list["total_configured"], 2);
+        assert_eq!(list["valid_count"], 1);
+        assert_eq!(list["invalid_count"], 1);
+        assert_eq!(list["servers"][0]["name"], "everything");
+        assert_eq!(list["servers"][0]["valid"], true);
+        assert_eq!(list["invalid_servers"][0]["name"], "missing-command");
+        assert!(list["invalid_servers"][0]["reason"]
             .as_str()
-            .expect("config_load_error must be a string on degraded runs");
-        assert!(
-            err.contains("mcpServers.missing-command"),
-            "config_load_error should name the malformed field path: {err}"
-        );
-        assert_eq!(list["configured_servers"], 0);
-        assert!(list["servers"].as_array().unwrap().is_empty());
+            .is_some_and(|reason| reason.contains("missing string field command")));
 
-        // show action: should also degrade (not hard-fail).
+        // show action still resolves valid siblings while carrying validation metadata.
         let show = render_mcp_report_json_for(&loader, &workspace, Some("show everything"))
             .expect("mcp show should not hard-fail on config parse errors (#144)");
         assert_eq!(show["kind"], "mcp");
@@ -6166,7 +6708,11 @@ mod tests {
             Some("degraded"),
             "show action should also report status: 'degraded': {show}"
         );
-        assert!(show["config_load_error"].is_string());
+        assert!(show["config_load_error"].is_null());
+        assert_eq!(show["found"], true);
+        assert_eq!(show["server"]["name"], "everything");
+        assert_eq!(show["server"]["valid"], true);
+        assert_eq!(show["invalid_count"], 1);
 
         // Clean path: status: "ok", config_load_error: null.
         let clean_ws = temp_dir("mcp-degrades-144-clean");

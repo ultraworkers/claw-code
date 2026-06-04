@@ -13,7 +13,7 @@ cd "$repo_root"
 
 if [[ -x scripts/roadmap-check-ids.sh ]]; then
   echo "pre-push: scripts/roadmap-check-ids.sh" >&2
-  scripts/roadmap-check-ids.sh
+  scripts/roadmap-check-ids.sh >&2
 fi
 
 if [[ "${SKIP_CLAW_PRE_PUSH_BUILD:-}" == "1" ]]; then

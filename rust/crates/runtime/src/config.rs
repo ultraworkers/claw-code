@@ -70,6 +70,50 @@ pub struct RuntimeConfig {
     feature_config: RuntimeFeatureConfig,
 }
 
+/// Machine-readable load state for a discovered config file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigFileStatus {
+    Loaded,
+    NotFound,
+    Skipped,
+    LoadError,
+}
+
+impl ConfigFileStatus {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Loaded => "loaded",
+            Self::NotFound => "not_found",
+            Self::Skipped => "skipped",
+            Self::LoadError => "load_error",
+        }
+    }
+}
+
+/// Structured status for one discovered config file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigFileReport {
+    pub entry: ConfigEntry,
+    pub loaded: bool,
+    pub status: ConfigFileStatus,
+    pub reason: Option<String>,
+    pub detail: Option<String>,
+    pub precedence_rank: usize,
+    pub wins_for_keys: Vec<String>,
+    pub shadowed_keys: Vec<String>,
+    key_paths: Vec<String>,
+}
+
+/// Best-effort inspection of the config discovery and load pipeline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigInspection {
+    pub files: Vec<ConfigFileReport>,
+    pub runtime_config: Option<RuntimeConfig>,
+    pub warnings: Vec<String>,
+    pub load_error: Option<String>,
+}
+
 /// Parsed plugin-related settings extracted from runtime config.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RuntimePluginConfig {
@@ -95,6 +139,32 @@ pub struct RuntimeFeatureConfig {
     sandbox: SandboxConfig,
     provider_fallbacks: ProviderFallbackConfig,
     trusted_roots: Vec<String>,
+    rules_import: RulesImportConfig,
+}
+
+/// Controls which external AI coding framework rules are imported into the system prompt.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum RulesImportConfig {
+    /// Import from all supported frameworks when files are detected.
+    #[default]
+    Auto,
+    /// Do not import external framework rules; keep Claw instruction files only.
+    None,
+    /// Import only the named frameworks.
+    List(Vec<String>),
+}
+
+impl RulesImportConfig {
+    #[must_use]
+    pub fn should_import(&self, framework: &str) -> bool {
+        match self {
+            Self::Auto => true,
+            Self::None => false,
+            Self::List(frameworks) => frameworks
+                .iter()
+                .any(|candidate| candidate.eq_ignore_ascii_case(framework)),
+        }
+    }
 }
 
 /// Ordered chain of fallback model identifiers used when the primary
@@ -109,9 +179,16 @@ pub struct ProviderFallbackConfig {
 /// Hook command lists grouped by lifecycle stage.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RuntimeHookConfig {
-    pre_tool_use: Vec<String>,
-    post_tool_use: Vec<String>,
-    post_tool_use_failure: Vec<String>,
+    pre_tool_use: Vec<RuntimeHookCommand>,
+    post_tool_use: Vec<RuntimeHookCommand>,
+    post_tool_use_failure: Vec<RuntimeHookCommand>,
+}
+
+/// A hook command plus optional tool matcher from object-style hook config.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeHookCommand {
+    command: String,
+    matcher: Option<String>,
 }
 
 /// Raw permission rule lists grouped by allow, deny, and ask behavior.
@@ -130,9 +207,19 @@ pub struct RuntimePermissionRuleConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct McpConfigCollection {
     servers: BTreeMap<String, ScopedMcpServerConfig>,
+    invalid_servers: Vec<McpInvalidServerConfig>,
+    total_configured: usize,
 }
 
-/// MCP server config paired with the scope that defined it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpInvalidServerConfig {
+    pub name: String,
+    pub scope: ConfigSource,
+    pub path: PathBuf,
+    pub error_field: String,
+    pub reason: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScopedMcpServerConfig {
     pub required: bool,
@@ -309,12 +396,12 @@ impl ConfigLoader {
     pub fn load(&self) -> Result<RuntimeConfig, ConfigError> {
         let mut merged = BTreeMap::new();
         let mut loaded_entries = Vec::new();
-        let mut mcp_servers = BTreeMap::new();
+        let mut mcp = McpConfigCollection::default();
         let mut all_warnings = Vec::new();
 
         for entry in self.discover() {
             crate::config_validate::check_unsupported_format(&entry.path)?;
-            let Some(parsed) = read_optional_json_object(&entry.path)? else {
+            let OptionalConfigFile::Loaded(parsed) = read_optional_json_object(&entry.path)? else {
                 continue;
             };
             let validation = crate::config_validate::validate_config_file(
@@ -328,7 +415,7 @@ impl ConfigLoader {
             }
             all_warnings.extend(validation.warnings);
             validate_optional_hooks_config(&parsed.object, &entry.path)?;
-            merge_mcp_servers(&mut mcp_servers, entry.source, &parsed.object, &entry.path)?;
+            merge_mcp_servers(&mut mcp, entry.source, &parsed.object, &entry.path)?;
             deep_merge_objects(&mut merged, &parsed.object);
             loaded_entries.push(entry);
         }
@@ -337,29 +424,7 @@ impl ConfigLoader {
             emit_config_warning_once(&warning.to_string());
         }
 
-        let merged_value = JsonValue::Object(merged.clone());
-
-        let feature_config = RuntimeFeatureConfig {
-            hooks: parse_optional_hooks_config(&merged_value)?,
-            plugins: parse_optional_plugin_config(&merged_value)?,
-            mcp: McpConfigCollection {
-                servers: mcp_servers,
-            },
-            oauth: parse_optional_oauth_config(&merged_value, "merged settings.oauth")?,
-            model: parse_optional_model(&merged_value),
-            aliases: parse_optional_aliases(&merged_value)?,
-            permission_mode: parse_optional_permission_mode(&merged_value)?,
-            permission_rules: parse_optional_permission_rules(&merged_value)?,
-            sandbox: parse_optional_sandbox_config(&merged_value)?,
-            provider_fallbacks: parse_optional_provider_fallbacks(&merged_value)?,
-            trusted_roots: parse_optional_trusted_roots(&merged_value)?,
-        };
-
-        Ok(RuntimeConfig {
-            merged,
-            loaded_entries,
-            feature_config,
-        })
+        build_runtime_config(merged, loaded_entries, mcp)
     }
 
     /// Like [`load`] but also returns the list of validation warnings collected during
@@ -370,12 +435,12 @@ impl ConfigLoader {
     pub fn load_collecting_warnings(&self) -> Result<(RuntimeConfig, Vec<String>), ConfigError> {
         let mut merged = BTreeMap::new();
         let mut loaded_entries = Vec::new();
-        let mut mcp_servers = BTreeMap::new();
+        let mut mcp = McpConfigCollection::default();
         let mut all_warnings: Vec<String> = Vec::new();
 
         for entry in self.discover() {
             crate::config_validate::check_unsupported_format(&entry.path)?;
-            let Some(parsed) = read_optional_json_object(&entry.path)? else {
+            let OptionalConfigFile::Loaded(parsed) = read_optional_json_object(&entry.path)? else {
                 continue;
             };
             let validation = crate::config_validate::validate_config_file(
@@ -389,35 +454,298 @@ impl ConfigLoader {
             }
             all_warnings.extend(validation.warnings.iter().map(|w| w.to_string()));
             validate_optional_hooks_config(&parsed.object, &entry.path)?;
-            merge_mcp_servers(&mut mcp_servers, entry.source, &parsed.object, &entry.path)?;
+            merge_mcp_servers(&mut mcp, entry.source, &parsed.object, &entry.path)?;
             deep_merge_objects(&mut merged, &parsed.object);
             loaded_entries.push(entry);
         }
 
-        let merged_value = JsonValue::Object(merged.clone());
-
-        let feature_config = RuntimeFeatureConfig {
-            hooks: parse_optional_hooks_config(&merged_value)?,
-            plugins: parse_optional_plugin_config(&merged_value)?,
-            mcp: McpConfigCollection {
-                servers: mcp_servers,
-            },
-            oauth: parse_optional_oauth_config(&merged_value, "merged settings.oauth")?,
-            model: parse_optional_model(&merged_value),
-            aliases: parse_optional_aliases(&merged_value)?,
-            permission_mode: parse_optional_permission_mode(&merged_value)?,
-            permission_rules: parse_optional_permission_rules(&merged_value)?,
-            sandbox: parse_optional_sandbox_config(&merged_value)?,
-            provider_fallbacks: parse_optional_provider_fallbacks(&merged_value)?,
-            trusted_roots: parse_optional_trusted_roots(&merged_value)?,
-        };
-
-        let config = RuntimeConfig {
-            merged,
-            loaded_entries,
-            feature_config,
-        };
+        let config = build_runtime_config(merged, loaded_entries, mcp)?;
         Ok((config, all_warnings))
+    }
+
+    /// Inspect every discovered config path and return per-file status details.
+    /// Unlike [`Self::load`], this is best-effort: invalid files are reported in
+    /// `files[]` and skipped from the merged runtime view so JSON config callers can
+    /// show the whole discovery picture without collapsing every unloaded path to
+    /// `loaded:false`.
+    #[must_use]
+    pub fn inspect_collecting_warnings(&self) -> ConfigInspection {
+        let mut merged = BTreeMap::new();
+        let mut loaded_entries = Vec::new();
+        let mut mcp = McpConfigCollection::default();
+        let mut warnings = Vec::new();
+        let mut files = Vec::new();
+        let mut load_error = None;
+
+        for (index, entry) in self.discover().into_iter().enumerate() {
+            let precedence_rank = index + 1;
+            if let Err(error) = crate::config_validate::check_unsupported_format(&entry.path) {
+                let detail = error.to_string();
+                load_error.get_or_insert_with(|| detail.clone());
+                files.push(ConfigFileReport::load_error(
+                    entry,
+                    precedence_rank,
+                    "unsupported_format",
+                    detail,
+                ));
+                continue;
+            }
+
+            let parsed = match read_optional_json_object(&entry.path) {
+                Ok(OptionalConfigFile::Loaded(parsed)) => parsed,
+                Ok(OptionalConfigFile::NotFound) => {
+                    files.push(ConfigFileReport::not_found(entry, precedence_rank));
+                    continue;
+                }
+                Ok(OptionalConfigFile::Skipped { reason, detail }) => {
+                    files.push(ConfigFileReport::skipped(
+                        entry,
+                        precedence_rank,
+                        reason,
+                        detail,
+                    ));
+                    continue;
+                }
+                Err(error) => {
+                    let reason = config_error_reason(&error).to_string();
+                    let detail = error.to_string();
+                    load_error.get_or_insert_with(|| detail.clone());
+                    files.push(ConfigFileReport::load_error(
+                        entry,
+                        precedence_rank,
+                        reason,
+                        detail,
+                    ));
+                    continue;
+                }
+            };
+
+            let validation = crate::config_validate::validate_config_file(
+                &parsed.object,
+                &parsed.source,
+                &entry.path,
+            );
+            if !validation.is_ok() {
+                let detail = validation.errors[0].to_string();
+                load_error.get_or_insert_with(|| detail.clone());
+                files.push(ConfigFileReport::load_error(
+                    entry,
+                    precedence_rank,
+                    "validation_error",
+                    detail,
+                ));
+                continue;
+            }
+            warnings.extend(
+                validation
+                    .warnings
+                    .iter()
+                    .map(|warning| warning.to_string()),
+            );
+
+            if let Err(error) = validate_optional_hooks_config(&parsed.object, &entry.path) {
+                let detail = error.to_string();
+                load_error.get_or_insert_with(|| detail.clone());
+                files.push(ConfigFileReport::load_error(
+                    entry,
+                    precedence_rank,
+                    "validation_error",
+                    detail,
+                ));
+                continue;
+            }
+
+            if let Err(error) =
+                merge_mcp_servers(&mut mcp, entry.source, &parsed.object, &entry.path)
+            {
+                let detail = error.to_string();
+                load_error.get_or_insert_with(|| detail.clone());
+                files.push(ConfigFileReport::load_error(
+                    entry,
+                    precedence_rank,
+                    "parse_error",
+                    detail,
+                ));
+                continue;
+            }
+
+            let key_paths = collect_config_key_paths(&parsed.object);
+            deep_merge_objects(&mut merged, &parsed.object);
+            loaded_entries.push(entry.clone());
+            files.push(ConfigFileReport::loaded(entry, precedence_rank, key_paths));
+        }
+
+        annotate_config_file_precedence(&mut files);
+
+        let runtime_config = match build_runtime_config(merged, loaded_entries, mcp) {
+            Ok(config) => Some(config),
+            Err(error) => {
+                load_error.get_or_insert_with(|| error.to_string());
+                None
+            }
+        };
+
+        ConfigInspection {
+            files,
+            runtime_config,
+            warnings,
+            load_error,
+        }
+    }
+}
+
+impl ConfigFileReport {
+    fn loaded(entry: ConfigEntry, precedence_rank: usize, key_paths: Vec<String>) -> Self {
+        Self {
+            entry,
+            loaded: true,
+            status: ConfigFileStatus::Loaded,
+            reason: None,
+            detail: None,
+            precedence_rank,
+            wins_for_keys: Vec::new(),
+            shadowed_keys: Vec::new(),
+            key_paths,
+        }
+    }
+
+    fn not_found(entry: ConfigEntry, precedence_rank: usize) -> Self {
+        Self {
+            entry,
+            loaded: false,
+            status: ConfigFileStatus::NotFound,
+            reason: Some("not_found".to_string()),
+            detail: None,
+            precedence_rank,
+            wins_for_keys: Vec::new(),
+            shadowed_keys: Vec::new(),
+            key_paths: Vec::new(),
+        }
+    }
+
+    fn skipped(
+        entry: ConfigEntry,
+        precedence_rank: usize,
+        reason: String,
+        detail: Option<String>,
+    ) -> Self {
+        Self {
+            entry,
+            loaded: false,
+            status: ConfigFileStatus::Skipped,
+            reason: Some(reason),
+            detail,
+            precedence_rank,
+            wins_for_keys: Vec::new(),
+            shadowed_keys: Vec::new(),
+            key_paths: Vec::new(),
+        }
+    }
+
+    fn load_error(
+        entry: ConfigEntry,
+        precedence_rank: usize,
+        reason: impl Into<String>,
+        detail: String,
+    ) -> Self {
+        Self {
+            entry,
+            loaded: false,
+            status: ConfigFileStatus::LoadError,
+            reason: Some(reason.into()),
+            detail: Some(detail),
+            precedence_rank,
+            wins_for_keys: Vec::new(),
+            shadowed_keys: Vec::new(),
+            key_paths: Vec::new(),
+        }
+    }
+}
+
+fn annotate_config_file_precedence(files: &mut [ConfigFileReport]) {
+    let mut winning_file_by_key = BTreeMap::new();
+    for (index, file) in files.iter().enumerate() {
+        if !file.loaded {
+            continue;
+        }
+        for key in &file.key_paths {
+            winning_file_by_key.insert(key.clone(), index);
+        }
+    }
+
+    for (index, file) in files.iter_mut().enumerate() {
+        if !file.loaded {
+            continue;
+        }
+        let mut wins_for_keys = Vec::new();
+        let mut shadowed_keys = Vec::new();
+        for key in &file.key_paths {
+            if winning_file_by_key.get(key).copied() == Some(index) {
+                wins_for_keys.push(key.clone());
+            } else {
+                shadowed_keys.push(key.clone());
+            }
+        }
+        file.wins_for_keys = wins_for_keys;
+        file.shadowed_keys = shadowed_keys;
+    }
+}
+
+fn collect_config_key_paths(object: &BTreeMap<String, JsonValue>) -> Vec<String> {
+    let mut keys = Vec::new();
+    for (key, value) in object {
+        collect_config_key_paths_for_value(key, value, &mut keys);
+    }
+    keys
+}
+
+fn collect_config_key_paths_for_value(prefix: &str, value: &JsonValue, keys: &mut Vec<String>) {
+    match value {
+        JsonValue::Object(object) if !object.is_empty() => {
+            for (key, nested) in object {
+                collect_config_key_paths_for_value(&format!("{prefix}.{key}"), nested, keys);
+            }
+        }
+        _ => keys.push(prefix.to_string()),
+    }
+}
+
+fn build_runtime_config(
+    merged: BTreeMap<String, JsonValue>,
+    loaded_entries: Vec<ConfigEntry>,
+    mcp: McpConfigCollection,
+) -> Result<RuntimeConfig, ConfigError> {
+    let merged_value = JsonValue::Object(merged.clone());
+
+    let feature_config = RuntimeFeatureConfig {
+        hooks: parse_optional_hooks_config(&merged_value)?,
+        plugins: parse_optional_plugin_config(&merged_value)?,
+        mcp,
+        oauth: parse_optional_oauth_config(&merged_value, "merged settings.oauth")?,
+        model: parse_optional_model(&merged_value),
+        aliases: parse_optional_aliases(&merged_value)?,
+        permission_mode: parse_optional_permission_mode(&merged_value)?,
+        permission_rules: parse_optional_permission_rules(&merged_value)?,
+        sandbox: parse_optional_sandbox_config(&merged_value)?,
+        provider_fallbacks: parse_optional_provider_fallbacks(&merged_value)?,
+        trusted_roots: parse_optional_trusted_roots(&merged_value)?,
+        rules_import: parse_optional_rules_import(&merged_value)?,
+    };
+
+    Ok(RuntimeConfig {
+        merged,
+        loaded_entries,
+        feature_config,
+    })
+}
+
+fn config_error_reason(error: &ConfigError) -> &'static str {
+    match error {
+        ConfigError::Io(io_error) if io_error.kind() == std::io::ErrorKind::PermissionDenied => {
+            "permission_denied"
+        }
+        ConfigError::Io(_) => "io_error",
+        ConfigError::Parse(_) => "parse_error",
     }
 }
 
@@ -511,6 +839,11 @@ impl RuntimeConfig {
         &self.feature_config.trusted_roots
     }
 
+    #[must_use]
+    pub fn rules_import(&self) -> &RulesImportConfig {
+        &self.feature_config.rules_import
+    }
+
     /// Merge config-level default trusted roots with per-call roots.
     ///
     /// Config roots are defaults and are kept first; per-call roots extend the
@@ -589,6 +922,11 @@ impl RuntimeFeatureConfig {
     #[must_use]
     pub fn trusted_roots(&self) -> &[String] {
         &self.trusted_roots
+    }
+
+    #[must_use]
+    pub fn rules_import(&self) -> &RulesImportConfig {
+        &self.rules_import
     }
 
     /// Merge this config's default trusted roots with per-call roots.
@@ -785,12 +1123,76 @@ fn write_settings_root(
     fs::write(path, format!("{rendered}\n")).map_err(ConfigError::Io)
 }
 
+impl RuntimeHookCommand {
+    #[must_use]
+    pub fn new(command: impl Into<String>) -> Self {
+        Self {
+            command: command.into(),
+            matcher: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_matcher(command: impl Into<String>, matcher: Option<String>) -> Self {
+        Self {
+            command: command.into(),
+            matcher: matcher.and_then(|value| {
+                let trimmed = value.trim();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_string())
+                }
+            }),
+        }
+    }
+
+    #[must_use]
+    pub fn command(&self) -> &str {
+        &self.command
+    }
+
+    #[must_use]
+    pub fn matcher(&self) -> Option<&str> {
+        self.matcher.as_deref()
+    }
+
+    #[must_use]
+    pub fn matches_tool(&self, tool_name: &str) -> bool {
+        self.matcher
+            .as_deref()
+            .is_none_or(|matcher| hook_matcher_matches(matcher, tool_name))
+    }
+}
+
 impl RuntimeHookConfig {
     #[must_use]
     pub fn new(
         pre_tool_use: Vec<String>,
         post_tool_use: Vec<String>,
         post_tool_use_failure: Vec<String>,
+    ) -> Self {
+        Self::from_hook_commands(
+            pre_tool_use
+                .into_iter()
+                .map(RuntimeHookCommand::new)
+                .collect(),
+            post_tool_use
+                .into_iter()
+                .map(RuntimeHookCommand::new)
+                .collect(),
+            post_tool_use_failure
+                .into_iter()
+                .map(RuntimeHookCommand::new)
+                .collect(),
+        )
+    }
+
+    #[must_use]
+    pub fn from_hook_commands(
+        pre_tool_use: Vec<RuntimeHookCommand>,
+        post_tool_use: Vec<RuntimeHookCommand>,
+        post_tool_use_failure: Vec<RuntimeHookCommand>,
     ) -> Self {
         Self {
             pre_tool_use,
@@ -800,12 +1202,22 @@ impl RuntimeHookConfig {
     }
 
     #[must_use]
-    pub fn pre_tool_use(&self) -> &[String] {
+    pub fn pre_tool_use(&self) -> Vec<String> {
+        hook_commands(&self.pre_tool_use)
+    }
+
+    #[must_use]
+    pub fn pre_tool_use_entries(&self) -> &[RuntimeHookCommand] {
         &self.pre_tool_use
     }
 
     #[must_use]
-    pub fn post_tool_use(&self) -> &[String] {
+    pub fn post_tool_use(&self) -> Vec<String> {
+        hook_commands(&self.post_tool_use)
+    }
+
+    #[must_use]
+    pub fn post_tool_use_entries(&self) -> &[RuntimeHookCommand] {
         &self.post_tool_use
     }
 
@@ -817,18 +1229,70 @@ impl RuntimeHookConfig {
     }
 
     pub fn extend(&mut self, other: &Self) {
-        extend_unique(&mut self.pre_tool_use, other.pre_tool_use());
-        extend_unique(&mut self.post_tool_use, other.post_tool_use());
-        extend_unique(
+        extend_unique_hook_commands(&mut self.pre_tool_use, other.pre_tool_use_entries());
+        extend_unique_hook_commands(&mut self.post_tool_use, other.post_tool_use_entries());
+        extend_unique_hook_commands(
             &mut self.post_tool_use_failure,
-            other.post_tool_use_failure(),
+            other.post_tool_use_failure_entries(),
         );
     }
 
     #[must_use]
-    pub fn post_tool_use_failure(&self) -> &[String] {
+    pub fn post_tool_use_failure(&self) -> Vec<String> {
+        hook_commands(&self.post_tool_use_failure)
+    }
+
+    #[must_use]
+    pub fn post_tool_use_failure_entries(&self) -> &[RuntimeHookCommand] {
         &self.post_tool_use_failure
     }
+}
+
+fn hook_commands(commands: &[RuntimeHookCommand]) -> Vec<String> {
+    commands.iter().map(|entry| entry.command.clone()).collect()
+}
+
+fn hook_matcher_matches(matcher: &str, tool_name: &str) -> bool {
+    matcher
+        .split([',', '|'])
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .any(|part| {
+            part == "*" || part.eq_ignore_ascii_case(tool_name) || wildcard_match(part, tool_name)
+        })
+}
+
+fn wildcard_match(pattern: &str, value: &str) -> bool {
+    if !pattern.contains('*') {
+        return false;
+    }
+    let pattern = pattern.to_ascii_lowercase();
+    let value = value.to_ascii_lowercase();
+    let parts = pattern.split('*').collect::<Vec<_>>();
+    let mut remainder = value.as_str();
+    let starts_with_wildcard = pattern.starts_with('*');
+    let ends_with_wildcard = pattern.ends_with('*');
+
+    if let Some(first) = parts.first().filter(|part| !part.is_empty()) {
+        if !starts_with_wildcard && !remainder.starts_with(first) {
+            return false;
+        }
+        if let Some(index) = remainder.find(first) {
+            remainder = &remainder[index + first.len()..];
+        }
+    }
+
+    for part in parts.iter().skip(1).filter(|part| !part.is_empty()) {
+        let Some(index) = remainder.find(part) else {
+            return false;
+        };
+        remainder = &remainder[index + part.len()..];
+    }
+
+    ends_with_wildcard
+        || parts
+            .last()
+            .is_none_or(|last| last.is_empty() || remainder.is_empty())
 }
 
 impl RuntimePermissionRuleConfig {
@@ -875,6 +1339,31 @@ impl McpConfigCollection {
     }
 
     #[must_use]
+    pub fn invalid_servers(&self) -> &[McpInvalidServerConfig] {
+        &self.invalid_servers
+    }
+
+    #[must_use]
+    pub fn total_configured(&self) -> usize {
+        self.total_configured
+    }
+
+    #[must_use]
+    pub fn valid_count(&self) -> usize {
+        self.servers.len()
+    }
+
+    #[must_use]
+    pub fn invalid_count(&self) -> usize {
+        self.invalid_servers.len()
+    }
+
+    #[must_use]
+    pub fn has_invalid_servers(&self) -> bool {
+        !self.invalid_servers.is_empty()
+    }
+
+    #[must_use]
     pub fn get(&self, name: &str) -> Option<&ScopedMcpServerConfig> {
         self.servers.get(name)
     }
@@ -907,16 +1396,27 @@ struct ParsedConfigFile {
     source: String,
 }
 
-fn read_optional_json_object(path: &Path) -> Result<Option<ParsedConfigFile>, ConfigError> {
+enum OptionalConfigFile {
+    Loaded(ParsedConfigFile),
+    NotFound,
+    Skipped {
+        reason: String,
+        detail: Option<String>,
+    },
+}
+
+fn read_optional_json_object(path: &Path) -> Result<OptionalConfigFile, ConfigError> {
     let is_legacy_config = path.file_name().and_then(|name| name.to_str()) == Some(".claw.json");
     let contents = match fs::read_to_string(path) {
         Ok(contents) => contents,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(OptionalConfigFile::NotFound);
+        }
         Err(error) => return Err(ConfigError::Io(error)),
     };
 
     if contents.trim().is_empty() {
-        return Ok(Some(ParsedConfigFile {
+        return Ok(OptionalConfigFile::Loaded(ParsedConfigFile {
             object: BTreeMap::new(),
             source: contents,
         }));
@@ -924,26 +1424,37 @@ fn read_optional_json_object(path: &Path) -> Result<Option<ParsedConfigFile>, Co
 
     let parsed = match JsonValue::parse(&contents) {
         Ok(parsed) => parsed,
-        Err(_error) if is_legacy_config => return Ok(None),
+        Err(error) if is_legacy_config => {
+            return Ok(OptionalConfigFile::Skipped {
+                reason: "legacy_invalid_json".to_string(),
+                detail: Some(format!("{}: {error}", path.display())),
+            });
+        }
         Err(error) => return Err(ConfigError::Parse(format!("{}: {error}", path.display()))),
     };
     let Some(object) = parsed.as_object() else {
         if is_legacy_config {
-            return Ok(None);
+            return Ok(OptionalConfigFile::Skipped {
+                reason: "legacy_non_object".to_string(),
+                detail: Some(format!(
+                    "{}: top-level legacy settings value is not a JSON object",
+                    path.display()
+                )),
+            });
         }
         return Err(ConfigError::Parse(format!(
             "{}: top-level settings value must be a JSON object",
             path.display()
         )));
     };
-    Ok(Some(ParsedConfigFile {
+    Ok(OptionalConfigFile::Loaded(ParsedConfigFile {
         object: object.clone(),
         source: contents,
     }))
 }
 
 fn merge_mcp_servers(
-    target: &mut BTreeMap<String, ScopedMcpServerConfig>,
+    target: &mut McpConfigCollection,
     source: ConfigSource,
     root: &BTreeMap<String, JsonValue>,
     path: &Path,
@@ -952,25 +1463,144 @@ fn merge_mcp_servers(
         return Ok(());
     };
     let servers = expect_object(mcp_servers, &format!("{}: mcpServers", path.display()))?;
+    target.total_configured += servers.len();
     for (name, value) in servers {
-        let parsed = parse_mcp_server_config(
-            name,
-            value,
-            &format!("{}: mcpServers.{name}", path.display()),
-        )?;
-        target.insert(
+        let context = format!("{}: mcpServers.{name}", path.display());
+        let Ok(object) = expect_object(value, &context) else {
+            let error = expect_object(value, &context).expect_err("object parse must fail");
+            target.servers.remove(name);
+            target
+                .invalid_servers
+                .push(mcp_invalid_server(name, source, path, &context, &error));
+            continue;
+        };
+        let required = match optional_bool(object, "required", &context) {
+            Ok(required) => required.unwrap_or(false),
+            Err(error) => {
+                target.servers.remove(name);
+                target
+                    .invalid_servers
+                    .push(mcp_invalid_server(name, source, path, &context, &error));
+                continue;
+            }
+        };
+        if let Err(error) = validate_mcp_server_keys(name, object, &context) {
+            target.servers.remove(name);
+            target
+                .invalid_servers
+                .push(mcp_invalid_server(name, source, path, &context, &error));
+            continue;
+        }
+        let parsed = match parse_mcp_server_config(name, value, &context) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                target.servers.remove(name);
+                target
+                    .invalid_servers
+                    .push(mcp_invalid_server(name, source, path, &context, &error));
+                continue;
+            }
+        };
+        target.servers.insert(
             name.clone(),
             ScopedMcpServerConfig {
-                required: optional_bool(
-                    expect_object(value, &format!("{}: mcpServers.{name}", path.display()))?,
-                    "required",
-                    &format!("{}: mcpServers.{name}", path.display()),
-                )?
-                .unwrap_or(false),
+                required,
                 scope: source,
                 config: parsed,
             },
         );
+    }
+    Ok(())
+}
+
+fn mcp_invalid_server(
+    name: &str,
+    source: ConfigSource,
+    path: &Path,
+    context: &str,
+    error: &ConfigError,
+) -> McpInvalidServerConfig {
+    let reason = config_error_detail(error);
+    McpInvalidServerConfig {
+        name: name.to_string(),
+        scope: source,
+        path: path.to_path_buf(),
+        error_field: mcp_error_field(name, context, &reason),
+        reason,
+    }
+}
+
+fn config_error_detail(error: &ConfigError) -> String {
+    match error {
+        ConfigError::Io(error) => error.to_string(),
+        ConfigError::Parse(reason) => reason.clone(),
+    }
+}
+
+fn mcp_error_field(name: &str, context: &str, reason: &str) -> String {
+    if let Some(field) = reason
+        .split("missing string field ")
+        .nth(1)
+        .and_then(|tail| tail.split_whitespace().next())
+    {
+        return field
+            .trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+            .to_string();
+    }
+    if let Some(field) = reason
+        .split("field ")
+        .nth(1)
+        .and_then(|tail| tail.split_whitespace().next())
+    {
+        return field
+            .trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+            .to_string();
+    }
+    reason
+        .split_once(context)
+        .and_then(|(_, tail)| tail.trim_start_matches('.').split(':').next())
+        .filter(|field| !field.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("mcpServers.{name}"))
+}
+
+fn validate_mcp_server_keys(
+    server_name: &str,
+    object: &BTreeMap<String, JsonValue>,
+    context: &str,
+) -> Result<(), ConfigError> {
+    let server_type =
+        optional_string(object, "type", context)?.unwrap_or_else(|| infer_mcp_server_type(object));
+    let allowed = match server_type {
+        "stdio" => &[
+            "type",
+            "command",
+            "args",
+            "env",
+            "toolCallTimeoutMs",
+            "required",
+        ][..],
+        "sse" | "http" => &[
+            "type",
+            "url",
+            "headers",
+            "headersHelper",
+            "oauth",
+            "required",
+        ][..],
+        "ws" => &["type", "url", "headers", "headersHelper", "required"][..],
+        "sdk" => &["type", "name", "required"][..],
+        "claudeai-proxy" => &["type", "url", "id", "required"][..],
+        other => {
+            return Err(ConfigError::Parse(format!(
+                "{context}: unsupported MCP server type for {server_name}: {other}"
+            )));
+        }
+    };
+    if let Some(key) = object.keys().find(|key| !allowed.contains(&key.as_str())) {
+        return Err(ConfigError::Parse(format!(
+            "{context}: unknown MCP server field {key}"
+        )));
     }
     Ok(())
 }
@@ -1005,9 +1635,11 @@ fn parse_optional_hooks_config_object(
     };
     let hooks = expect_object(hooks_value, context)?;
     Ok(RuntimeHookConfig {
-        pre_tool_use: optional_string_array(hooks, "PreToolUse", context)?.unwrap_or_default(),
-        post_tool_use: optional_string_array(hooks, "PostToolUse", context)?.unwrap_or_default(),
-        post_tool_use_failure: optional_string_array(hooks, "PostToolUseFailure", context)?
+        pre_tool_use: optional_hook_command_array(hooks, "PreToolUse", context)?
+            .unwrap_or_default(),
+        post_tool_use: optional_hook_command_array(hooks, "PostToolUse", context)?
+            .unwrap_or_default(),
+        post_tool_use_failure: optional_hook_command_array(hooks, "PostToolUseFailure", context)?
             .unwrap_or_default(),
     })
 }
@@ -1162,6 +1794,37 @@ fn parse_optional_trusted_roots(root: &JsonValue) -> Result<Vec<String>, ConfigE
     )
 }
 
+fn parse_optional_rules_import(root: &JsonValue) -> Result<RulesImportConfig, ConfigError> {
+    let Some(object) = root.as_object() else {
+        return Ok(RulesImportConfig::default());
+    };
+    let Some(value) = object.get("rulesImport") else {
+        return Ok(RulesImportConfig::default());
+    };
+
+    match value {
+        JsonValue::String(value) if value.eq_ignore_ascii_case("auto") => Ok(RulesImportConfig::Auto),
+        JsonValue::String(value) if value.eq_ignore_ascii_case("none") => Ok(RulesImportConfig::None),
+        JsonValue::String(value) => Err(ConfigError::Parse(format!(
+            "merged settings.rulesImport: expected \"auto\", \"none\", or an array of framework names, got \"{value}\""
+        ))),
+        JsonValue::Array(values) => values
+            .iter()
+            .map(|item| {
+                item.as_str().map(str::to_string).ok_or_else(|| {
+                    ConfigError::Parse(
+                        "merged settings.rulesImport: array entries must be strings".to_string(),
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map(RulesImportConfig::List),
+        _ => Err(ConfigError::Parse(
+            "merged settings.rulesImport: expected \"auto\", \"none\", or an array of framework names".to_string(),
+        )),
+    }
+}
+
 fn parse_filesystem_mode_label(value: &str) -> Result<FilesystemIsolationMode, ConfigError> {
     match value {
         "off" => Ok(FilesystemIsolationMode::Off),
@@ -1208,7 +1871,7 @@ fn parse_mcp_server_config(
         optional_string(object, "type", context)?.unwrap_or_else(|| infer_mcp_server_type(object));
     match server_type {
         "stdio" => Ok(McpServerConfig::Stdio(McpStdioServerConfig {
-            command: expect_string(object, "command", context)?.to_string(),
+            command: expect_non_empty_string(object, "command", context)?.to_string(),
             args: optional_string_array(object, "args", context)?.unwrap_or_default(),
             env: optional_string_map(object, "env", context)?.unwrap_or_default(),
             tool_call_timeout_ms: optional_u64(object, "toolCallTimeoutMs", context)?,
@@ -1281,6 +1944,20 @@ fn expect_object<'a>(
     value
         .as_object()
         .ok_or_else(|| ConfigError::Parse(format!("{context}: expected JSON object")))
+}
+
+fn expect_non_empty_string<'a>(
+    object: &'a BTreeMap<String, JsonValue>,
+    key: &str,
+    context: &str,
+) -> Result<&'a str, ConfigError> {
+    let value = expect_string(object, key, context)?;
+    if value.trim().is_empty() {
+        return Err(ConfigError::Parse(format!(
+            "{context}: field {key} must be a non-empty string"
+        )));
+    }
+    Ok(value)
 }
 
 fn expect_string<'a>(
@@ -1431,6 +2108,106 @@ fn optional_string_array(
     }
 }
 
+fn optional_hook_command_array(
+    object: &BTreeMap<String, JsonValue>,
+    key: &str,
+    context: &str,
+) -> Result<Option<Vec<RuntimeHookCommand>>, ConfigError> {
+    let Some(value) = object.get(key) else {
+        return Ok(None);
+    };
+    let Some(array) = value.as_array() else {
+        return Err(ConfigError::Parse(format!(
+            "{context}: field {key} must be an array"
+        )));
+    };
+
+    let mut commands = Vec::new();
+    for (index, item) in array.iter().enumerate() {
+        if let Some(command) = item.as_str() {
+            commands.push(RuntimeHookCommand::new(command.to_string()));
+            continue;
+        }
+
+        let Some(entry) = item.as_object() else {
+            return Err(ConfigError::Parse(format!(
+                "{context}: field {key}[{index}] must be a string or hook object"
+            )));
+        };
+        let matcher = optional_hook_matcher(entry, context, key, index)?;
+        let hooks = entry
+            .get("hooks")
+            .and_then(JsonValue::as_array)
+            .ok_or_else(|| {
+                ConfigError::Parse(format!(
+                    "{context}: field {key}[{index}].hooks must be an array"
+                ))
+            })?;
+        for (hook_index, hook) in hooks.iter().enumerate() {
+            let Some(hook_object) = hook.as_object() else {
+                return Err(ConfigError::Parse(format!(
+                    "{context}: field {key}[{index}].hooks[{hook_index}] must be an object"
+                )));
+            };
+            if let Some(hook_type) = hook_object.get("type") {
+                let Some(hook_type) = hook_type.as_str() else {
+                    return Err(ConfigError::Parse(format!(
+                        "{context}: field {key}[{index}].hooks[{hook_index}].type must be a string"
+                    )));
+                };
+                if hook_type != "command" {
+                    return Err(ConfigError::Parse(format!(
+                        "{context}: field {key}[{index}].hooks[{hook_index}].type must be \"command\""
+                    )));
+                }
+            }
+            let command = hook_object
+                .get("command")
+                .and_then(JsonValue::as_str)
+                .filter(|command| !command.trim().is_empty())
+                .ok_or_else(|| {
+                    ConfigError::Parse(format!(
+                        "{context}: field {key}[{index}].hooks[{hook_index}].command must be a non-empty string"
+                    ))
+                })?;
+            commands.push(RuntimeHookCommand::with_matcher(
+                command.to_string(),
+                matcher.clone(),
+            ));
+        }
+    }
+    Ok(Some(commands))
+}
+
+fn optional_hook_matcher(
+    entry: &BTreeMap<String, JsonValue>,
+    context: &str,
+    key: &str,
+    index: usize,
+) -> Result<Option<String>, ConfigError> {
+    entry
+        .get("matcher")
+        .map(|value| {
+            value.as_str().map(str::to_string).ok_or_else(|| {
+                ConfigError::Parse(format!(
+                    "{context}: field {key}[{index}].matcher must be a string"
+                ))
+            })
+        })
+        .transpose()
+}
+
+fn extend_unique_hook_commands(
+    target: &mut Vec<RuntimeHookCommand>,
+    values: &[RuntimeHookCommand],
+) {
+    for value in values {
+        if !target.iter().any(|existing| existing == value) {
+            target.push(value.clone());
+        }
+    }
+}
+
 fn optional_string_map(
     object: &BTreeMap<String, JsonValue>,
     key: &str,
@@ -1477,24 +2254,12 @@ fn deep_merge_objects(
     }
 }
 
-fn extend_unique(target: &mut Vec<String>, values: &[String]) {
-    for value in values {
-        push_unique(target, value.clone());
-    }
-}
-
-fn push_unique(target: &mut Vec<String>, value: String) {
-    if !target.iter().any(|existing| existing == &value) {
-        target.push(value);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        deep_merge_objects, parse_permission_mode_label, ConfigLoader, ConfigSource,
-        McpServerConfig, McpTransport, ResolvedPermissionMode, RuntimeFeatureConfig,
-        RuntimeHookConfig, RuntimePluginConfig, CLAW_SETTINGS_SCHEMA_NAME,
+        deep_merge_objects, parse_permission_mode_label, ConfigFileStatus, ConfigLoader,
+        ConfigSource, McpServerConfig, McpTransport, ResolvedPermissionMode, RuntimeFeatureConfig,
+        RuntimeHookCommand, RuntimeHookConfig, RuntimePluginConfig, CLAW_SETTINGS_SCHEMA_NAME,
     };
     use crate::json::JsonValue;
     use crate::sandbox::FilesystemIsolationMode;
@@ -1627,6 +2392,145 @@ mod tests {
     }
 
     #[test]
+    fn parses_object_style_hook_entries_with_matchers() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&cwd).expect("project dir");
+        fs::write(
+            home.join("settings.json"),
+            r#"{"hooks":{"PreToolUse":["legacy",{"matcher":"Bash","hooks":[{"type":"command","command":"bash-one"},{"type":"command","command":"bash-two"}]},{"matcher":"Read*","hooks":[{"command":"read-any"}]}]}}"#,
+        )
+        .expect("write settings");
+
+        let loaded = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("config should load");
+
+        assert_eq!(
+            loaded.hooks().pre_tool_use(),
+            vec![
+                "legacy".to_string(),
+                "bash-one".to_string(),
+                "bash-two".to_string(),
+                "read-any".to_string(),
+            ]
+        );
+        let entries = loaded.hooks().pre_tool_use_entries();
+        assert_eq!(entries[0], RuntimeHookCommand::new("legacy"));
+        assert_eq!(entries[1].matcher(), Some("Bash"));
+        assert!(entries[1].matches_tool("bash"));
+        assert!(!entries[1].matches_tool("Read"));
+        assert!(entries[3].matches_tool("ReadFile"));
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn rejects_object_style_hook_entries_without_command() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&cwd).expect("project dir");
+        fs::write(
+            home.join("settings.json"),
+            r#"{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command"}]}]}}"#,
+        )
+        .expect("write settings");
+
+        let error = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect_err("config should reject malformed hook entry");
+
+        assert!(error
+            .to_string()
+            .contains("command must be a non-empty string"));
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn inspect_classifies_missing_loaded_and_legacy_skipped_files() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        fs::create_dir_all(cwd.join(".claw")).expect("project config dir");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::write(cwd.join(".claw.json"), "{not json").expect("write legacy config");
+        fs::write(
+            cwd.join(".claw").join("settings.json"),
+            r#"{"model":"opus"}"#,
+        )
+        .expect("write project settings");
+
+        let inspection = ConfigLoader::new(&cwd, &home).inspect_collecting_warnings();
+
+        assert!(
+            inspection.load_error.is_none(),
+            "{:?}",
+            inspection.load_error
+        );
+        assert!(inspection.runtime_config.is_some());
+        let loaded = inspection
+            .files
+            .iter()
+            .find(|file| file.status == ConfigFileStatus::Loaded)
+            .expect("loaded file");
+        assert!(loaded.loaded);
+        assert!(loaded.reason.is_none());
+        let missing = inspection
+            .files
+            .iter()
+            .find(|file| file.status == ConfigFileStatus::NotFound)
+            .expect("missing file");
+        assert_eq!(missing.reason.as_deref(), Some("not_found"));
+        let skipped = inspection
+            .files
+            .iter()
+            .find(|file| file.status == ConfigFileStatus::Skipped)
+            .expect("skipped legacy file");
+        assert_eq!(skipped.reason.as_deref(), Some("legacy_invalid_json"));
+        assert!(!skipped.loaded);
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn inspect_reports_parse_errors_but_keeps_valid_merged_config() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        fs::create_dir_all(cwd.join(".claw")).expect("project config dir");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::write(home.join("settings.json"), r#"{"model":"sonnet"}"#)
+            .expect("write user settings");
+        fs::write(cwd.join(".claw").join("settings.json"), "{not json")
+            .expect("write invalid project settings");
+
+        let inspection = ConfigLoader::new(&cwd, &home).inspect_collecting_warnings();
+
+        assert!(inspection
+            .load_error
+            .as_deref()
+            .is_some_and(|error| error.contains("settings.json")));
+        let runtime_config = inspection.runtime_config.expect("valid files still merge");
+        assert_eq!(runtime_config.model(), Some("sonnet"));
+        let error_file = inspection
+            .files
+            .iter()
+            .find(|file| file.status == ConfigFileStatus::LoadError)
+            .expect("load error file");
+        assert_eq!(error_file.reason.as_deref(), Some("parse_error"));
+        assert!(error_file
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("settings.json")));
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
     fn parses_sandbox_config() {
         let root = temp_dir();
         let cwd = root.join("project");
@@ -1720,6 +2624,72 @@ mod tests {
         assert_eq!(chain.primary(), None);
         assert!(chain.fallbacks().is_empty());
         assert!(chain.is_empty());
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn parses_rules_import_config() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&cwd).expect("project dir");
+        fs::write(
+            home.join("settings.json"),
+            r#"{"rulesImport": ["cursor", "copilot"]}"#,
+        )
+        .expect("write settings");
+
+        let loaded = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("config should load");
+
+        assert!(loaded.rules_import().should_import("cursor"));
+        assert!(loaded.rules_import().should_import("copilot"));
+        assert!(!loaded.rules_import().should_import("windsurf"));
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn rules_import_none_disables_external_frameworks() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&cwd).expect("project dir");
+        fs::write(home.join("settings.json"), r#"{"rulesImport": "none"}"#)
+            .expect("write settings");
+
+        let loaded = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("config should load");
+
+        assert!(!loaded.rules_import().should_import("cursor"));
+        assert!(!loaded.rules_import().should_import("copilot"));
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn rejects_rules_import_array_with_non_string_entries() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&cwd).expect("project dir");
+        fs::write(
+            home.join("settings.json"),
+            r#"{"rulesImport": ["cursor", 42]}"#,
+        )
+        .expect("write settings");
+
+        let error = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect_err("config should fail");
+
+        assert!(error.to_string().contains("rulesImport"));
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
@@ -2039,7 +3009,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_invalid_mcp_server_shapes() {
+    fn records_invalid_mcp_server_shapes_without_rejecting_config_440() {
         // given
         let root = temp_dir();
         let cwd = root.join("project");
@@ -2053,14 +3023,68 @@ mod tests {
         .expect("write broken settings");
 
         // when
-        let error = ConfigLoader::new(&cwd, &home)
+        let loaded = ConfigLoader::new(&cwd, &home)
             .load()
-            .expect_err("config should fail");
+            .expect("invalid MCP entries should not block otherwise loadable config");
 
         // then
-        assert!(error
-            .to_string()
+        assert!(loaded.mcp().servers().is_empty());
+        assert_eq!(loaded.mcp().total_configured(), 1);
+        assert_eq!(loaded.mcp().invalid_count(), 1);
+        let invalid = &loaded.mcp().invalid_servers()[0];
+        assert_eq!(invalid.name, "broken");
+        assert_eq!(invalid.error_field, "url");
+        assert!(invalid
+            .reason
             .contains("mcpServers.broken: missing string field url"));
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn loads_valid_mcp_servers_and_collects_all_invalid_siblings_440() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&cwd).expect("project dir");
+        fs::write(
+            home.join("settings.json"),
+            r#"{
+              "mcpServers": {
+                "valid-server": {"command": "/bin/echo", "args": ["hello"]},
+                "missing-command": {"args": ["arg-only"]},
+                "empty-command": {"command": ""},
+                "wrong-type-command": {"command": 42},
+                "extra-unknown-field": {"command": "/bin/echo", "extra": true}
+              }
+            }"#,
+        )
+        .expect("write mixed settings");
+
+        let loaded = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("valid MCP entries should load beside invalid siblings");
+
+        assert_eq!(loaded.mcp().total_configured(), 5);
+        assert_eq!(loaded.mcp().valid_count(), 1);
+        assert_eq!(loaded.mcp().invalid_count(), 4);
+        assert!(loaded.mcp().get("valid-server").is_some());
+        let invalid_names = loaded
+            .mcp()
+            .invalid_servers()
+            .iter()
+            .map(|server| server.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            invalid_names,
+            vec![
+                "empty-command",
+                "extra-unknown-field",
+                "missing-command",
+                "wrong-type-command",
+            ]
+        );
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
@@ -2278,23 +3302,23 @@ mod tests {
         .expect("write user settings");
 
         // when
-        let error = ConfigLoader::new(&cwd, &home)
-            .load()
-            .expect_err("config should fail");
+        let (_config, warnings) = ConfigLoader::new(&cwd, &home)
+            .load_collecting_warnings()
+            .expect("unknown config keys should load with warnings");
 
         // then
-        let rendered = error.to_string();
+        let rendered = warnings.join("\n");
         assert!(
             rendered.contains(&user_settings.display().to_string()),
-            "error should include file path, got: {rendered}"
+            "warning should include file path, got: {rendered}"
         );
         assert!(
             rendered.contains("line 3"),
-            "error should include line number, got: {rendered}"
+            "warning should include line number, got: {rendered}"
         );
         assert!(
             rendered.contains("telemetry"),
-            "error should name the offending field, got: {rendered}"
+            "warning should name the offending field, got: {rendered}"
         );
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
@@ -2316,28 +3340,23 @@ mod tests {
         .expect("write user settings");
 
         // when
-        let error = ConfigLoader::new(&cwd, &home)
-            .load()
-            .expect_err("config should fail");
+        let (_config, warnings) = ConfigLoader::new(&cwd, &home)
+            .load_collecting_warnings()
+            .expect("legacy unknown config keys should load with warnings");
 
         // then
-        let rendered = error.to_string();
+        let rendered = warnings.join("\n");
         assert!(
             rendered.contains(&user_settings.display().to_string()),
-            "error should include file path, got: {rendered}"
+            "warning should include file path, got: {rendered}"
         );
         assert!(
             rendered.contains("line 3"),
-            "error should include line number, got: {rendered}"
+            "warning should include line number, got: {rendered}"
         );
         assert!(
             rendered.contains("allowedTools"),
-            "error should call out the unknown field, got: {rendered}"
-        );
-        // allowedTools is an unknown key; validator should name it in the error
-        assert!(
-            rendered.contains("allowedTools"),
-            "error should name the offending field, got: {rendered}"
+            "warning should name the offending field, got: {rendered}"
         );
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
@@ -2397,19 +3416,19 @@ mod tests {
         fs::write(&user_settings, "{\n  \"modle\": \"opus\"\n}\n").expect("write user settings");
 
         // when
-        let error = ConfigLoader::new(&cwd, &home)
-            .load()
-            .expect_err("config should fail");
+        let (_config, warnings) = ConfigLoader::new(&cwd, &home)
+            .load_collecting_warnings()
+            .expect("unknown config keys should load with warnings");
 
         // then
-        let rendered = error.to_string();
+        let rendered = warnings.join("\n");
         assert!(
             rendered.contains("modle"),
-            "error should name the offending field, got: {rendered}"
+            "warning should name the offending field, got: {rendered}"
         );
         assert!(
             rendered.contains("model"),
-            "error should suggest the closest known key, got: {rendered}"
+            "warning should suggest the closest known key, got: {rendered}"
         );
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
