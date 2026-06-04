@@ -201,30 +201,20 @@ impl GlobalToolRegistry {
             return Ok(None);
         }
 
-        let builtin_specs = mvp_tool_specs();
-        let canonical_names = builtin_specs
-            .iter()
-            .map(|spec| spec.name.to_string())
-            .chain(
-                self.plugin_tools
-                    .iter()
-                    .map(|tool| tool.definition().name.clone()),
-            )
-            .chain(self.runtime_tools.iter().map(|tool| tool.name.clone()))
-            .collect::<Vec<_>>();
-        let mut name_map = canonical_names
-            .iter()
-            .map(|name| (normalize_tool_name(name), name.clone()))
-            .collect::<BTreeMap<_, _>>();
+        let actual_names = self.actual_tool_names();
+        let canonical_names = self.canonical_allowed_tool_names();
+        let canonical_name_set = canonical_names.iter().cloned().collect::<BTreeSet<_>>();
+        let mut name_map = BTreeMap::new();
+        for actual in &actual_names {
+            let canonical = canonical_allowed_tool_name(actual);
+            name_map.insert(allowed_tool_lookup_key(actual), canonical.clone());
+            name_map.insert(allowed_tool_lookup_key(&canonical), canonical);
+        }
 
-        for (alias, canonical) in [
-            ("read", "read_file"),
-            ("write", "write_file"),
-            ("edit", "edit_file"),
-            ("glob", "glob_search"),
-            ("grep", "grep_search"),
-        ] {
-            name_map.insert(alias.to_string(), canonical.to_string());
+        for (alias, canonical) in self.allowed_tool_aliases() {
+            if canonical_name_set.contains(&canonical) {
+                name_map.insert(allowed_tool_lookup_key(&alias), canonical);
+            }
         }
 
         let mut allowed = BTreeSet::new();
@@ -233,11 +223,11 @@ impl GlobalToolRegistry {
                 .split(|ch: char| ch == ',' || ch.is_whitespace())
                 .filter(|token| !token.is_empty())
             {
-                let normalized = normalize_tool_name(token);
-                let canonical = name_map.get(&normalized).ok_or_else(|| {
+                let canonical = name_map.get(&allowed_tool_lookup_key(token)).ok_or_else(|| {
                     format!(
-                        "unsupported tool in --allowedTools: {token} (expected one of: {})",
-                        canonical_names.join(", ")
+                        "invalid_tool_name: unsupported tool in --allowedTools: {token}\nAvailable: {}\nAliases: {}\nHint: Use canonical snake_case tool names from Available or aliases from Aliases.",
+                        canonical_names.join(", "),
+                        format_allowed_tool_aliases(&self.allowed_tool_aliases())
                     )
                 })?;
                 allowed.insert(canonical.clone());
@@ -258,7 +248,10 @@ impl GlobalToolRegistry {
     pub fn definitions(&self, allowed_tools: Option<&BTreeSet<String>>) -> Vec<ToolDefinition> {
         let builtin = mvp_tool_specs()
             .into_iter()
-            .filter(|spec| allowed_tools.is_none_or(|allowed| allowed.contains(spec.name)))
+            .filter(|spec| {
+                allowed_tools
+                    .is_none_or(|allowed| allowed.contains(&canonical_allowed_tool_name(spec.name)))
+            })
             .map(|spec| ToolDefinition {
                 name: spec.name.to_string(),
                 description: Some(spec.description.to_string()),
@@ -267,7 +260,11 @@ impl GlobalToolRegistry {
         let runtime = self
             .runtime_tools
             .iter()
-            .filter(|tool| allowed_tools.is_none_or(|allowed| allowed.contains(tool.name.as_str())))
+            .filter(|tool| {
+                allowed_tools.is_none_or(|allowed| {
+                    allowed.contains(&canonical_allowed_tool_name(&tool.name))
+                })
+            })
             .map(|tool| ToolDefinition {
                 name: tool.name.clone(),
                 description: tool.description.clone(),
@@ -277,8 +274,11 @@ impl GlobalToolRegistry {
             .plugin_tools
             .iter()
             .filter(|tool| {
-                allowed_tools
-                    .is_none_or(|allowed| allowed.contains(tool.definition().name.as_str()))
+                allowed_tools.is_none_or(|allowed| {
+                    allowed.contains(&canonical_allowed_tool_name(
+                        tool.definition().name.as_str(),
+                    ))
+                })
             })
             .map(|tool| ToolDefinition {
                 name: tool.definition().name.clone(),
@@ -294,19 +294,29 @@ impl GlobalToolRegistry {
     ) -> Result<Vec<(String, PermissionMode)>, String> {
         let builtin = mvp_tool_specs()
             .into_iter()
-            .filter(|spec| allowed_tools.is_none_or(|allowed| allowed.contains(spec.name)))
+            .filter(|spec| {
+                allowed_tools
+                    .is_none_or(|allowed| allowed.contains(&canonical_allowed_tool_name(spec.name)))
+            })
             .map(|spec| (spec.name.to_string(), spec.required_permission));
         let runtime = self
             .runtime_tools
             .iter()
-            .filter(|tool| allowed_tools.is_none_or(|allowed| allowed.contains(tool.name.as_str())))
+            .filter(|tool| {
+                allowed_tools.is_none_or(|allowed| {
+                    allowed.contains(&canonical_allowed_tool_name(&tool.name))
+                })
+            })
             .map(|tool| (tool.name.clone(), tool.required_permission));
         let plugin = self
             .plugin_tools
             .iter()
             .filter(|tool| {
-                allowed_tools
-                    .is_none_or(|allowed| allowed.contains(tool.definition().name.as_str()))
+                allowed_tools.is_none_or(|allowed| {
+                    allowed.contains(&canonical_allowed_tool_name(
+                        tool.definition().name.as_str(),
+                    ))
+                })
             })
             .map(|tool| {
                 permission_mode_from_plugin(tool.required_permission())
@@ -316,6 +326,52 @@ impl GlobalToolRegistry {
         Ok(builtin.chain(runtime).chain(plugin).collect())
     }
 
+    #[must_use]
+    pub fn actual_tool_names(&self) -> Vec<String> {
+        mvp_tool_specs()
+            .iter()
+            .map(|spec| spec.name.to_string())
+            .chain(
+                self.plugin_tools
+                    .iter()
+                    .map(|tool| tool.definition().name.clone()),
+            )
+            .chain(self.runtime_tools.iter().map(|tool| tool.name.clone()))
+            .collect()
+    }
+
+    #[must_use]
+    pub fn canonical_allowed_tool_names(&self) -> Vec<String> {
+        self.actual_tool_names()
+            .into_iter()
+            .map(|name| canonical_allowed_tool_name(&name))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
+    #[must_use]
+    pub fn allowed_tool_aliases(&self) -> BTreeMap<String, String> {
+        let mut aliases = BTreeMap::from([
+            ("read".to_string(), "read_file".to_string()),
+            ("Read".to_string(), "read_file".to_string()),
+            ("write".to_string(), "write_file".to_string()),
+            ("Write".to_string(), "write_file".to_string()),
+            ("edit".to_string(), "edit_file".to_string()),
+            ("Edit".to_string(), "edit_file".to_string()),
+            ("glob".to_string(), "glob_search".to_string()),
+            ("Glob".to_string(), "glob_search".to_string()),
+            ("grep".to_string(), "grep_search".to_string()),
+            ("Grep".to_string(), "grep_search".to_string()),
+        ]);
+        for actual in self.actual_tool_names() {
+            let canonical = canonical_allowed_tool_name(&actual);
+            if actual != canonical {
+                aliases.insert(actual, canonical);
+            }
+        }
+        aliases
+    }
     #[must_use]
     pub fn has_runtime_tool(&self, name: &str) -> bool {
         self.runtime_tools.iter().any(|tool| tool.name == name)
@@ -378,8 +434,40 @@ impl GlobalToolRegistry {
     }
 }
 
-fn normalize_tool_name(value: &str) -> String {
-    value.trim().replace('-', "_").to_ascii_lowercase()
+pub fn canonical_allowed_tool_name(value: &str) -> String {
+    let trimmed = value.trim().replace('-', "_");
+    let mut output = String::new();
+    let chars = trimmed.chars().collect::<Vec<_>>();
+    for (index, ch) in chars.iter().copied().enumerate() {
+        if ch == '_' || ch.is_whitespace() {
+            output.push('_');
+            continue;
+        }
+        let previous = index.checked_sub(1).and_then(|i| chars.get(i)).copied();
+        let next = chars.get(index + 1).copied();
+        if ch.is_ascii_uppercase()
+            && index > 0
+            && !output.ends_with('_')
+            && (previous.is_some_and(|p| p.is_ascii_lowercase() || p.is_ascii_digit())
+                || next.is_some_and(|n| n.is_ascii_lowercase()))
+        {
+            output.push('_');
+        }
+        output.push(ch.to_ascii_lowercase());
+    }
+    output.trim_matches('_').to_string()
+}
+
+fn allowed_tool_lookup_key(value: &str) -> String {
+    canonical_allowed_tool_name(value).replace('_', "")
+}
+
+fn format_allowed_tool_aliases(aliases: &BTreeMap<String, String>) -> String {
+    aliases
+        .iter()
+        .map(|(alias, canonical)| format!("{alias}={canonical}"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn permission_mode_from_plugin(value: &str) -> Result<PermissionMode, String> {
@@ -514,7 +602,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                 "required": ["url", "prompt"],
                 "additionalProperties": false
             }),
-            required_permission: PermissionMode::ReadOnly,
+            required_permission: PermissionMode::DangerFullAccess,
         },
         ToolSpec {
             name: "WebSearch",
@@ -535,7 +623,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                 "required": ["query"],
                 "additionalProperties": false
             }),
-            required_permission: PermissionMode::ReadOnly,
+            required_permission: PermissionMode::DangerFullAccess,
         },
         ToolSpec {
             name: "TodoWrite",
@@ -1225,13 +1313,14 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "GitShow",
-            description: "Show a commit, tag, or tree object with its diff. Supports showing a specific file at a commit (commit:path) and stat-only mode. Use this instead of running git show via bash to get structured output.",
+            description: "Show a commit, tag, or tree object. Use format to control output: patch (default) shows the full diff, stat shows a diffstat summary, and metadata shows commit info without the diff. Supports showing a specific file at a commit (commit:path) for patch/stat output. Use this instead of running git show via bash to get structured output.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "commit": { "type": "string" },
                     "path": { "type": "string" },
-                    "stat": { "type": "boolean" }
+                    "stat": { "type": "boolean" },
+                    "format": { "type": "string", "enum": ["patch", "stat", "metadata"] },
                 },
                 "required": ["commit"],
                 "additionalProperties": false
@@ -1320,8 +1409,26 @@ fn execute_tool_with_enforcer(
             maybe_enforce_permission_check_with_mode(enforcer, name, input, required_mode)?;
             run_grep_search(grep_input)
         }
-        "WebFetch" => from_value::<WebFetchInput>(input).and_then(run_web_fetch),
-        "WebSearch" => from_value::<WebSearchInput>(input).and_then(run_web_search),
+        "WebFetch" => {
+            let web_input = from_value::<WebFetchInput>(input)?;
+            maybe_enforce_permission_check_with_mode(
+                enforcer,
+                name,
+                input,
+                PermissionMode::DangerFullAccess,
+            )?;
+            run_web_fetch(web_input)
+        }
+        "WebSearch" => {
+            let web_input = from_value::<WebSearchInput>(input)?;
+            maybe_enforce_permission_check_with_mode(
+                enforcer,
+                name,
+                input,
+                PermissionMode::DangerFullAccess,
+            )?;
+            run_web_search(web_input)
+        }
         "TodoWrite" => from_value::<TodoWriteInput>(input).and_then(run_todo_write),
         "Skill" => from_value::<SkillInput>(input).and_then(run_skill),
         "Agent" => from_value::<AgentInput>(input).and_then(run_agent),
@@ -2008,14 +2115,37 @@ fn run_git_log(input: GitLogInput) -> Result<String, String> {
     }
 }
 
-#[allow(clippy::needless_pass_by_value)]
 /// Execute `git show` for a given commit, optionally with --stat or a file path.
 /// Uses the `commit:path` syntax when a path is specified.
 fn run_git_show(input: GitShowInput) -> Result<String, String> {
     let mut args: Vec<String> = vec!["show".to_string()];
-    if input.stat.unwrap_or(false) {
-        args.push("--stat".to_string());
+
+    match input.format.as_deref() {
+        Some("metadata") if input.path.is_some() => {
+            return Err(
+                "GitShow format \"metadata\" cannot be combined with path; metadata describes a commit, not a blob. Use format \"patch\" or \"stat\" with path, or omit path."
+                    .to_string(),
+            );
+        }
+        Some("metadata") => {
+            args.push("--format=medium".to_string());
+            args.push("--no-patch".to_string());
+        }
+        Some("stat") => {
+            args.push("--stat".to_string());
+        }
+        Some("patch") | None => {
+            if input.format.is_none() && input.stat.unwrap_or(false) {
+                args.push("--stat".to_string());
+            }
+        }
+        Some(other) => {
+            return Err(format!(
+                "unknown GitShow format: \"{other}\". Supported values: \"patch\" (default), \"stat\", \"metadata\"."
+            ));
+        }
     }
+
     if let Some(ref path) = input.path {
         args.push(format!("{}:{}", input.commit, path));
     } else {
@@ -2964,6 +3094,9 @@ struct GitShowInput {
     #[serde(default)]
     /// If true, show diffstat summary instead of full diff.
     stat: Option<bool>,
+    #[serde(default)]
+    /// Output format: "patch" (default) shows the full diff, "stat" shows a diffstat summary, and "metadata" shows commit info without the diff. When set, takes priority over `stat`.
+    format: Option<String>,
 }
 
 /// Input for the GitBlame tool: shows per-line author/revision info for a file.
@@ -4165,7 +4298,7 @@ fn allowed_tools_for_subagent(subagent_type: &str) -> BTreeSet<String> {
             "PowerShell",
         ],
     };
-    tools.into_iter().map(str::to_string).collect()
+    tools.into_iter().map(canonical_allowed_tool_name).collect()
 }
 
 fn agent_permission_policy() -> PermissionPolicy {
@@ -5193,7 +5326,10 @@ impl SubagentToolExecutor {
 
 impl ToolExecutor for SubagentToolExecutor {
     fn execute(&mut self, tool_name: &str, input: &str) -> Result<String, ToolError> {
-        if !self.allowed_tools.contains(tool_name) {
+        if !self
+            .allowed_tools
+            .contains(&canonical_allowed_tool_name(tool_name))
+        {
             return Err(ToolError::new(format!(
                 "tool `{tool_name}` is not enabled for this sub-agent"
             )));
@@ -5208,7 +5344,10 @@ impl ToolExecutor for SubagentToolExecutor {
 fn tool_specs_for_allowed_tools(allowed_tools: Option<&BTreeSet<String>>) -> Vec<ToolSpec> {
     mvp_tool_specs()
         .into_iter()
-        .filter(|spec| allowed_tools.is_none_or(|allowed| allowed.contains(spec.name)))
+        .filter(|spec| {
+            allowed_tools
+                .is_none_or(|allowed| allowed.contains(&canonical_allowed_tool_name(spec.name)))
+        })
         .collect()
 }
 
@@ -6780,6 +6919,87 @@ mod tests {
     }
 
     #[test]
+    fn git_show_schema_exposes_format_enum() {
+        let spec = mvp_tool_specs()
+            .into_iter()
+            .find(|spec| spec.name == "GitShow")
+            .expect("GitShow spec");
+        assert_eq!(
+            spec.input_schema["properties"]["format"]["enum"],
+            json!(["patch", "stat", "metadata"])
+        );
+    }
+
+    #[test]
+    fn git_show_supports_patch_stat_metadata_and_rejects_metadata_path() {
+        let _guard = env_guard();
+        let root = temp_path("git-show-format");
+        init_git_repo(&root);
+        commit_file(&root, "README.md", "initial\nupdated\n", "update readme");
+        let previous = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&root).expect("set cwd");
+
+        let patch = execute_tool("GitShow", &json!({"commit": "HEAD", "format": "patch"}))
+            .expect("patch git show");
+        let patch: serde_json::Value = serde_json::from_str(&patch).expect("patch json");
+        assert!(patch["output"]
+            .as_str()
+            .expect("patch output")
+            .contains("diff --git"));
+
+        let stat = execute_tool("GitShow", &json!({"commit": "HEAD", "format": "stat"}))
+            .expect("stat git show");
+        let stat: serde_json::Value = serde_json::from_str(&stat).expect("stat json");
+        assert!(stat["output"]
+            .as_str()
+            .expect("stat output")
+            .contains("README.md"));
+
+        let legacy_stat = execute_tool("GitShow", &json!({"commit": "HEAD", "stat": true}))
+            .expect("legacy stat git show");
+        let legacy_stat: serde_json::Value =
+            serde_json::from_str(&legacy_stat).expect("legacy stat json");
+        assert!(legacy_stat["output"]
+            .as_str()
+            .expect("legacy stat output")
+            .contains("README.md"));
+
+        let metadata = execute_tool("GitShow", &json!({"commit": "HEAD", "format": "metadata"}))
+            .expect("metadata git show");
+        let metadata: serde_json::Value = serde_json::from_str(&metadata).expect("metadata json");
+        let metadata_output = metadata["output"].as_str().expect("metadata output");
+        assert!(metadata_output.contains("commit "));
+        assert!(metadata_output.contains("update readme"));
+        assert!(!metadata_output.contains("diff --git"));
+
+        let file_patch = execute_tool(
+            "GitShow",
+            &json!({"commit": "HEAD", "path": "README.md", "format": "patch"}),
+        )
+        .expect("file patch git show");
+        let file_patch: serde_json::Value =
+            serde_json::from_str(&file_patch).expect("file patch json");
+        assert_eq!(
+            file_patch["output"].as_str().expect("file patch output"),
+            "initial\nupdated"
+        );
+
+        let metadata_path = execute_tool(
+            "GitShow",
+            &json!({"commit": "HEAD", "path": "README.md", "format": "metadata"}),
+        )
+        .expect_err("metadata with path should be rejected");
+        assert!(metadata_path.contains("cannot be combined with path"));
+
+        let invalid = execute_tool("GitShow", &json!({"commit": "HEAD", "format": "bogus"}))
+            .expect_err("invalid format should be rejected");
+        assert!(invalid.contains("unknown GitShow format"));
+
+        std::env::set_current_dir(&previous).expect("restore cwd");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn rejects_unknown_tool_names() {
         let error = execute_tool("nope", &json!({})).expect_err("tool should be rejected");
         assert!(error.contains("unsupported tool"));
@@ -7475,6 +7695,29 @@ mod tests {
                 "unexpected error for {raw:?}: {err}"
             );
         }
+    }
+
+    #[test]
+    fn allowed_tools_normalize_to_canonical_snake_case_and_aliases_432() {
+        let registry = GlobalToolRegistry::builtin();
+        let allowed = registry
+            .normalize_allowed_tools(&["Read,WebFetch,MCP".to_string()])
+            .expect("aliases and legacy names should normalize")
+            .expect("allow-list should be populated");
+        assert!(allowed.contains("read_file"));
+        assert!(allowed.contains("web_fetch"));
+        assert!(allowed.contains("mcp"));
+        assert!(!allowed.contains("Read"));
+        assert!(!allowed.contains("WebFetch"));
+
+        let canonical = registry.canonical_allowed_tool_names();
+        assert!(canonical.contains(&"web_fetch".to_string()));
+        assert!(canonical.contains(&"todo_write".to_string()));
+        assert!(!canonical.contains(&"WebFetch".to_string()));
+        assert_eq!(
+            registry.allowed_tool_aliases().get("WebFetch"),
+            Some(&"web_fetch".to_string())
+        );
     }
 
     #[test]
@@ -8458,7 +8701,7 @@ mod tests {
             .expect("spawn job should be captured");
         assert_eq!(captured_job.prompt, "Check tests and outstanding work.");
         assert!(captured_job.allowed_tools.contains("read_file"));
-        assert!(!captured_job.allowed_tools.contains("Agent"));
+        assert!(!captured_job.allowed_tools.contains("agent"));
 
         let normalized = execute_tool(
             "Agent",
@@ -9058,7 +9301,7 @@ mod tests {
         let general = allowed_tools_for_subagent("general-purpose");
         assert!(general.contains("bash"));
         assert!(general.contains("write_file"));
-        assert!(!general.contains("Agent"));
+        assert!(!general.contains("agent"));
 
         let explore = allowed_tools_for_subagent("Explore");
         assert!(explore.contains("read_file"));
@@ -9066,13 +9309,13 @@ mod tests {
         assert!(!explore.contains("bash"));
 
         let plan = allowed_tools_for_subagent("Plan");
-        assert!(plan.contains("TodoWrite"));
-        assert!(plan.contains("StructuredOutput"));
-        assert!(!plan.contains("Agent"));
+        assert!(plan.contains("todo_write"));
+        assert!(plan.contains("structured_output"));
+        assert!(!plan.contains("agent"));
 
         let verification = allowed_tools_for_subagent("Verification");
         assert!(verification.contains("bash"));
-        assert!(verification.contains("PowerShell"));
+        assert!(verification.contains("power_shell"));
         assert!(!verification.contains("write_file"));
     }
 
@@ -10154,6 +10397,26 @@ printf 'pwsh:%s' "$1"
             err.contains("current mode is 'read-only'"),
             "should cite active mode: {err}"
         );
+    }
+
+    #[test]
+    fn given_workspace_write_enforcer_when_web_tools_then_denied() {
+        let registry = workspace_write_registry();
+        for (tool, input) in [
+            (
+                "WebFetch",
+                json!({"url":"https://example.com", "prompt":"summarize"}),
+            ),
+            ("WebSearch", json!({"query":"rust language"})),
+        ] {
+            let err = registry
+                .execute(tool, &input)
+                .expect_err("network tools should require explicit full access");
+            assert!(
+                err.contains("requires 'danger-full-access'"),
+                "{tool} should require elevated mode: {err}"
+            );
+        }
     }
 
     #[test]

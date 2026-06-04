@@ -104,6 +104,58 @@ async fn send_message_posts_json_and_parses_response() {
 }
 
 #[tokio::test]
+async fn send_message_strips_anthropic_routing_prefix_on_wire() {
+    let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let server = spawn_server(
+        state.clone(),
+        vec![
+            http_response("200 OK", "application/json", "{\"input_tokens\":1}"),
+            http_response(
+                "200 OK",
+                "application/json",
+                concat!(
+                    "{",
+                    "\"id\":\"msg_prefixed\",",
+                    "\"type\":\"message\",",
+                    "\"role\":\"assistant\",",
+                    "\"content\":[{\"type\":\"text\",\"text\":\"ok\"}],",
+                    "\"model\":\"claude-opus-4-6\",",
+                    "\"stop_reason\":\"end_turn\",",
+                    "\"stop_sequence\":null,",
+                    "\"usage\":{\"input_tokens\":1,\"output_tokens\":1}",
+                    "}"
+                ),
+            ),
+        ],
+    )
+    .await;
+
+    let client = AnthropicClient::new("test-key").with_base_url(server.base_url());
+    client
+        .send_message(&MessageRequest {
+            model: "anthropic/claude-opus-4-6".to_string(),
+            ..sample_request(false)
+        })
+        .await
+        .expect("request should succeed");
+
+    let captured = state.lock().await;
+    assert_eq!(
+        captured.len(),
+        2,
+        "count_tokens and messages requests should be captured"
+    );
+    let count_tokens_body: serde_json::Value =
+        serde_json::from_str(&captured[0].body).expect("count_tokens body should be json");
+    let messages_body: serde_json::Value =
+        serde_json::from_str(&captured[1].body).expect("request body should be json");
+    assert_eq!(captured[0].path, "/v1/messages/count_tokens");
+    assert_eq!(captured[1].path, "/v1/messages");
+    assert_eq!(count_tokens_body["model"], json!("claude-opus-4-6"));
+    assert_eq!(messages_body["model"], json!("claude-opus-4-6"));
+}
+
+#[tokio::test]
 async fn send_message_blocks_oversized_requests_before_the_http_call() {
     let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
     let server = spawn_server(

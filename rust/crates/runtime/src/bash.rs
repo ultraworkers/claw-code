@@ -330,20 +330,24 @@ fn prepare_tokio_command(
         prepare_sandbox_dirs(cwd);
     }
 
-    if let Some(launcher) = build_linux_sandbox_command(command, cwd, sandbox_status) {
-        let mut prepared = TokioCommand::new(launcher.program);
-        prepared.args(launcher.args);
-        prepared.current_dir(cwd);
-        prepared.envs(launcher.env);
-        return prepared;
-    }
+    let mut prepared =
+        if let Some(launcher) = build_linux_sandbox_command(command, cwd, sandbox_status) {
+            let mut cmd = TokioCommand::new(launcher.program);
+            cmd.args(launcher.args);
+            cmd.envs(launcher.env);
+            cmd
+        } else {
+            let mut cmd = TokioCommand::new("sh");
+            cmd.arg("-lc").arg(command);
+            if sandbox_status.filesystem_active {
+                cmd.env("HOME", cwd.join(".sandbox-home"));
+                cmd.env("TMPDIR", cwd.join(".sandbox-tmp"));
+            }
+            cmd
+        };
 
-    let mut prepared = TokioCommand::new("sh");
-    prepared.arg("-lc").arg(command).current_dir(cwd);
-    if sandbox_status.filesystem_active {
-        prepared.env("HOME", cwd.join(".sandbox-home"));
-        prepared.env("TMPDIR", cwd.join(".sandbox-tmp"));
-    }
+    prepared.current_dir(cwd);
+    prepared.stdin(Stdio::null());
     prepared
 }
 
@@ -418,6 +422,27 @@ mod tests {
         let structured = output.structured_content.expect("structured content");
         assert_eq!(structured[0]["event"], "test.hung");
         assert_eq!(structured[0]["data"]["provenance"], "bash.timeout");
+    }
+
+    #[test]
+    fn prevents_stdin_hangs_by_redirecting_to_null() {
+        let output = execute_bash(BashCommandInput {
+            command: String::from("cat"),
+            timeout: Some(2_000),
+            description: None,
+            run_in_background: Some(false),
+            dangerously_disable_sandbox: Some(true),
+            namespace_restrictions: None,
+            isolate_network: None,
+            filesystem_mode: None,
+            allowed_mounts: None,
+        })
+        .expect("bash command should execute cleanly");
+
+        assert!(
+            !output.interrupted,
+            "Command hung and was cut off by the timeout!"
+        );
     }
 }
 
