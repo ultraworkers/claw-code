@@ -40,6 +40,48 @@ Or provide an OAuth bearer token directly:
 export ANTHROPIC_AUTH_TOKEN="anthropic-oauth-or-proxy-bearer-token"
 ```
 
+### Local models via Ollama (WSL)
+
+Claw works with any OpenAI-compatible endpoint, including a local
+[Ollama](https://ollama.com) server. This is handy for offline use or for
+driving the CLI from WSL against models served on the Windows host.
+
+```bash
+cd rust/
+
+# 1. Build the release binary
+cargo build --release
+
+# 2. Point claw at the local Ollama OpenAI-compatible endpoint
+export OPENAI_BASE_URL="http://127.0.0.1:11434/v1"
+export OPENAI_API_KEY="ollama"   # any non-empty value works; Ollama ignores it
+
+# 3. Run. Prefix the model with `openai/` so prefix routing selects the
+#    OpenAI-compatible provider, and use the exact Ollama tag.
+./target/release/claw --model openai/qwen3.5:9b
+```
+
+**The model name must match the Ollama tag exactly.** Ollama tags use a colon
+(`name:tag`), e.g. `qwen3.5:9b` — not a hyphen (`qwen3.5-9b`), which the server
+rejects with `404 ... model not found`. Routing to the OpenAI-compatible
+provider only kicks in when `OPENAI_BASE_URL` is set and the model name contains
+a `:` or `.`, so always pass the full tag. List the installed tags with:
+
+```bash
+ollama list                                 # native view
+curl -s http://127.0.0.1:11434/v1/models    # OpenAI-compatible view
+```
+
+> **WSL note:** when Ollama runs on the Windows host, WSL 2 forwards
+> `127.0.0.1:11434` automatically. If the connection is refused, start Ollama on
+> the host (`ollama serve`) or point `OPENAI_BASE_URL` at the host IP instead of
+> `127.0.0.1`.
+
+Reasoning ("thinking") models such as Qwen3 are supported. Ollama streams the
+chain-of-thought in a `reasoning` field with an empty `content`; claw surfaces it
+as a separate thinking block so both the reasoning trace and the final answer are
+rendered.
+
 ## Mock parity harness
 
 The workspace now includes a deterministic Anthropic-compatible mock service and a clean-environment CLI harness for end-to-end parity checks.
