@@ -562,6 +562,7 @@ impl StreamState {
                 .delta
                 .reasoning_content
                 .filter(|value| !value.is_empty())
+                .or(choice.delta.reasoning.filter(|value| !value.is_empty()))
                 .or(choice
                     .delta
                     .thinking
@@ -816,6 +817,9 @@ struct ChatMessage {
     content: Option<String>,
     #[serde(default)]
     reasoning_content: Option<String>,
+    /// Ollama's Qwen3 thinking models stream chain-of-thought here with `content=""`.
+    #[serde(default)]
+    reasoning: Option<String>,
     #[serde(default)]
     tool_calls: Vec<ResponseToolCall>,
 }
@@ -890,6 +894,9 @@ struct ChunkDelta {
     /// Some providers (GLM, DeepSeek) emit reasoning in `reasoning_content`
     #[serde(default)]
     reasoning_content: Option<String>,
+    /// Ollama's Qwen3 thinking models stream tokens here with `content=""`.
+    #[serde(default)]
+    reasoning: Option<String>,
     #[serde(default)]
     thinking: Option<ThinkingDelta>,
     #[serde(default, deserialize_with = "deserialize_null_as_empty_vec")]
@@ -1500,6 +1507,7 @@ fn normalize_response(
         .message
         .reasoning_content
         .filter(|value| !value.is_empty())
+        .or_else(|| choice.message.reasoning.filter(|value| !value.is_empty()))
     {
         content.push(OutputContentBlock::Thinking {
             thinking,
@@ -1982,6 +1990,7 @@ mod tests {
                     role: "assistant".to_string(),
                     content: Some("final answer".to_string()),
                     reasoning_content: Some("hidden thought".to_string()),
+                    reasoning: None,
                     tool_calls: Vec::new(),
                 },
                 finish_reason: Some("stop".to_string()),
@@ -2008,6 +2017,112 @@ mod tests {
     }
 
     #[test]
+    fn non_streaming_response_with_ollama_reasoning_field_emits_thinking_block() {
+        // Given an Ollama-style response that carries the chain-of-thought in
+        // `reasoning` (not `reasoning_content`) — Qwen3 thinking models emit an
+        // empty `content` and put the trace in `reasoning`.
+        let response = super::ChatCompletionResponse {
+            id: "chatcmpl_ollama".to_string(),
+            model: "qwen3.5:9b".to_string(),
+            choices: vec![super::ChatChoice {
+                message: super::ChatMessage {
+                    role: "assistant".to_string(),
+                    content: Some("43".to_string()),
+                    reasoning_content: None,
+                    reasoning: Some("17 + 26 = 43".to_string()),
+                    tool_calls: Vec::new(),
+                },
+                finish_reason: Some("stop".to_string()),
+            }],
+            usage: None,
+        };
+
+        // When normalizing the provider response.
+        let normalized = normalize_response("qwen3.5:9b", response).expect("normalized");
+
+        // Then the `reasoning` text surfaces as a Thinking block before the text.
+        assert_eq!(
+            normalized.content,
+            vec![
+                OutputContentBlock::Thinking {
+                    thinking: "17 + 26 = 43".to_string(),
+                    signature: None,
+                },
+                OutputContentBlock::Text {
+                    text: "43".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn streaming_chunks_with_ollama_reasoning_field_emit_thinking_before_text() {
+        // Given Ollama Qwen3 streaming chunks carrying the chain-of-thought in
+        // the `reasoning` field with an empty `content`.
+        let mut state = StreamState::new("qwen3.5:9b".to_string());
+        let mut events = state
+            .ingest_chunk(super::ChatCompletionChunk {
+                id: "chatcmpl_ollama_stream".to_string(),
+                model: Some("qwen3.5:9b".to_string()),
+                choices: vec![super::ChunkChoice {
+                    delta: super::ChunkDelta {
+                        content: None,
+                        reasoning_content: None,
+                        reasoning: Some("thinking".to_string()),
+                        thinking: None,
+                        tool_calls: Vec::new(),
+                    },
+                    finish_reason: None,
+                }],
+                usage: None,
+            })
+            .expect("reasoning chunk");
+        events.extend(
+            state
+                .ingest_chunk(super::ChatCompletionChunk {
+                    id: "chatcmpl_ollama_stream".to_string(),
+                    model: None,
+                    choices: vec![super::ChunkChoice {
+                        delta: super::ChunkDelta {
+                            content: Some("43".to_string()),
+                            reasoning_content: None,
+                            reasoning: None,
+                            thinking: None,
+                            tool_calls: Vec::new(),
+                        },
+                        finish_reason: Some("stop".to_string()),
+                    }],
+                    usage: None,
+                })
+                .expect("text chunk"),
+        );
+        events.extend(state.finish().expect("finish"));
+
+        // Then a Thinking block (index 0) is emitted before the Text block (index 1).
+        assert!(matches!(
+            events[1],
+            StreamEvent::ContentBlockStart(ContentBlockStartEvent {
+                index: 0,
+                content_block: OutputContentBlock::Thinking { .. },
+            })
+        ));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
+                index: 0,
+                delta: ContentBlockDelta::ThinkingDelta { .. },
+            })
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamEvent::ContentBlockStart(ContentBlockStartEvent {
+                index: 1,
+                content_block: OutputContentBlock::Text { .. },
+            })
+        )));
+    }
+
+    #[test]
     fn streaming_chunks_with_reasoning_content_emit_thinking_block_events_before_text() {
         // Given streaming chunks with reasoning_content followed by text.
         let mut state = StreamState::new("deepseek-v4-pro".to_string());
@@ -2019,6 +2134,7 @@ mod tests {
                     delta: super::ChunkDelta {
                         content: None,
                         reasoning_content: Some("think".to_string()),
+                        reasoning: None,
                         thinking: None,
                         tool_calls: Vec::new(),
                     },
@@ -2036,6 +2152,7 @@ mod tests {
                         delta: super::ChunkDelta {
                             content: Some(" answer".to_string()),
                             reasoning_content: None,
+                            reasoning: None,
                             thinking: None,
                             tool_calls: Vec::new(),
                         },
