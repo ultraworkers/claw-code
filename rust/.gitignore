@@ -5,3 +5,4 @@ target/
 .claw/settings.local.json
 .claw/sessions/
 .clawhip/
+.claw/

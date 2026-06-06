@@ -29,7 +29,7 @@ impl Default for TridentConfig {
 }
 
 /// Statistics from a Trident compaction run.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct TridentStats {
     pub superseded_count: usize,
     pub collapsed_chains: usize,
@@ -39,21 +39,6 @@ pub struct TridentStats {
     pub tokens_saved_estimate: usize,
     pub original_message_count: usize,
     pub final_message_count: usize,
-}
-
-impl Default for TridentStats {
-    fn default() -> Self {
-        Self {
-            superseded_count: 0,
-            collapsed_chains: 0,
-            messages_collapsed: 0,
-            clusters_found: 0,
-            messages_clustered: 0,
-            tokens_saved_estimate: 0,
-            original_message_count: 0,
-            final_message_count: 0,
-        }
-    }
 }
 
 impl TridentStats {
@@ -192,7 +177,7 @@ fn stage1_supersede(messages: &[ConversationMessage]) -> (Vec<ConversationMessag
 
     let mut obsolete_indices: BTreeSet<usize> = BTreeSet::new();
 
-    for (_path, ops) in &file_ops {
+    for ops in file_ops.values() {
         if ops.len() < 2 {
             continue;
         }
@@ -205,11 +190,7 @@ fn stage1_supersede(messages: &[ConversationMessage]) -> (Vec<ConversationMessag
 
         if let Some(last_write) = last_write_idx {
             for op in ops {
-                if op.op_type == FileOp::Read && op.index < last_write {
-                    obsolete_indices.insert(op.index);
-                } else if (op.op_type == FileOp::Write || op.op_type == FileOp::Edit)
-                    && op.index < last_write
-                {
+                if op.index < last_write {
                     obsolete_indices.insert(op.index);
                 }
             }
@@ -325,7 +306,7 @@ fn stage2_collapse(
                     usage: None,
                 });
             } else {
-                result.extend(buffer.drain(..));
+                result.append(&mut buffer);
             }
             buffer.clear();
             result.push(msg.clone());
@@ -476,7 +457,7 @@ fn stage3_cluster(
     }
 
     let total_clustered: usize = cluster_assignments.len();
-    let clusters_found = cluster_id as usize;
+    let clusters_found = cluster_id;
 
     let mut result: Vec<ConversationMessage> = Vec::new();
     let mut cluster_buffers: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
@@ -677,7 +658,7 @@ fn truncate_text(text: &str, max_chars: usize) -> String {
 mod tests {
     use super::*;
     use crate::compact::CompactionConfig;
-    use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
+    use crate::session::{ContentBlock, ConversationMessage, Session};
 
     #[test]
     fn stage1_removes_obsolete_file_reads() {
@@ -736,7 +717,7 @@ mod tests {
     fn stage2_collapses_chatty_messages() {
         let mut messages = vec![];
         for i in 0..6 {
-            messages.push(ConversationMessage::user_text(&format!("ok {i}")));
+            messages.push(ConversationMessage::user_text(format!("ok {i}")));
             messages.push(ConversationMessage::assistant(vec![ContentBlock::Text {
                 text: format!("got {i}"),
             }]));
@@ -767,9 +748,9 @@ mod tests {
                 },
             ]));
             messages.push(ConversationMessage::tool_result(
-                &format!("read_{i}"),
+                format!("read_{i}"),
                 "read_file",
-                &format!(r#"{{"path":"src/{i}.rs","content":"data {i}"}}"#),
+                format!(r#"{{"path":"src/{i}.rs","content":"data {i}"}}"#),
                 false,
             ));
         }

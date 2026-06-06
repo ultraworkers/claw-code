@@ -1932,9 +1932,9 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         // Only reject for known top-level subcommands that don't use compact.
         let first = rest[0].as_str();
         if is_known_top_level_subcommand(first) && first != "prompt" {
-            return Err(format!(
-                "invalid_flag_value: --compact is only supported with prompt mode.\nUsage: claw --compact \"<prompt>\" or echo \"<prompt>\" | claw --compact"
-            ));
+            return Err(
+                "invalid_flag_value: --compact is only supported with prompt mode.\nUsage: claw --compact \"<prompt>\" or echo \"<prompt>\" | claw --compact".to_string()
+            );
         }
     }
 
@@ -3188,9 +3188,9 @@ fn parse_system_prompt_args(
                 })?;
                 // #99: validate --date is a plausible date string (no newlines, reasonable length)
                 if value.contains('\n') || value.contains('\r') {
-                    return Err(format!(
-                        "invalid_flag_value: --date value contains invalid characters.\nUsage: --date <YYYY-MM-DD>"
-                    ));
+                    return Err(
+                        "invalid_flag_value: --date value contains invalid characters.\nUsage: --date <YYYY-MM-DD>".to_string()
+                    );
                 }
                 if value.len() > 20 {
                     return Err(format!(
@@ -3427,11 +3427,7 @@ impl DiagnosticCheck {
 
     fn json_value(&self) -> Value {
         // Derive a stable snake_case id from the check name for machine-readable keying (#704).
-        let id = self
-            .name
-            .to_ascii_lowercase()
-            .replace(' ', "_")
-            .replace('-', "_");
+        let id = self.name.to_ascii_lowercase().replace([' ', '-'], "_");
         let mut value = Map::from_iter([
             ("id".to_string(), Value::String(id.clone())),
             (
@@ -6700,16 +6696,13 @@ fn run_resume_command(
         }
         SlashCommand::Plugins { action, target } => {
             // Only list is supported in resume mode (no runtime to reload)
-            match action.as_deref() {
-                Some(action @ ("install" | "uninstall" | "enable" | "disable" | "update")) => {
-                    // #777: use interactive_only: prefix + \n hint so #776's classify/split
-                    // emits error_kind:interactive_only + non-null hint instead of unknown+null.
-                    // Orchestrators can now detect this and switch to a live REPL instead of retrying.
-                    return Err(format!(
-                        "interactive_only: /plugins {action} requires a live session to reload the plugin runtime.\nStart `claw` and run `/plugins {action}` inside the REPL, or use `claw plugins {action}` as a direct CLI command."
-                    ).into());
-                }
-                _ => {}
+            if let Some(action @ ("install" | "uninstall" | "enable" | "disable" | "update")) =
+                action.as_deref()
+            {
+                // #777: use interactive_only: prefix + \n hint so #776's classify/split
+                // emits error_kind:interactive_only + non-null hint instead of unknown+null.
+                // Orchestrators can now detect this and switch to a live REPL instead of retrying.
+                return Err(format!("interactive_only: /plugins {action} requires a live session to reload the plugin runtime.\nStart `claw` and run `/plugins {action}` inside the REPL, or use `claw plugins {action}` as a direct CLI command.").into());
             }
             let cwd = env::current_dir()?;
             let payload = plugins_command_payload_for(
@@ -7821,8 +7814,7 @@ impl LiveCli {
                     let max_compact_rounds = 4;
                     let preserve_schedule = [4, 2, 1, 0];
 
-                    for round in 0..max_compact_rounds {
-                        let preserve = preserve_schedule[round];
+                    for (round, &preserve) in preserve_schedule.iter().enumerate() {
                         println!(
                             "  Auto-compacting session (round {}/{}, preserving {} recent messages)...",
                             round + 1,
@@ -8574,8 +8566,8 @@ impl LiveCli {
         let cwd = env::current_dir()?;
         // #803: reject flag-shaped tokens in list filter for BOTH text and JSON modes.
         // Previously the guard was JSON-only (#793); text mode silently returned empty success.
-        if action.as_deref() == Some("list") {
-            if let Some(filter) = target.as_deref() {
+        if action == Some("list") {
+            if let Some(filter) = target {
                 if filter.starts_with('-') {
                     if matches!(output_format, CliOutputFormat::Json) {
                         // ROADMAP #817: this is a handled local inventory parse error.
@@ -9540,6 +9532,7 @@ fn print_status_snapshot(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn status_json_value(
     model: Option<&str>,
     usage: StatusUsage,
@@ -10036,9 +10029,7 @@ fn sandbox_json_value(status: &runtime::SandboxStatus) -> serde_json::Value {
     //        (#731: "not supported on macOS" is a degraded state, not a hard error;
     //         filesystem_active:true means partial containment is working)
     // error = enabled but unsupported AND no filesystem sandbox either (nothing active)
-    let top_status = if !status.enabled {
-        "ok"
-    } else if status.active {
+    let top_status = if !status.enabled || status.active {
         "ok"
     } else if status.supported {
         "warn"
@@ -10404,10 +10395,7 @@ fn render_doctor_help_json() -> serde_json::Value {
     })
 }
 
-/// #683-#692: extract structured metadata from help prose
-fn extract_help_metadata(
-    topic: LocalHelpTopic,
-) -> (
+type HelpMetadata = (
     Option<String>,      // usage
     Option<String>,      // purpose
     Option<String>,      // output description
@@ -10416,7 +10404,10 @@ fn extract_help_metadata(
     Option<Vec<String>>, // aliases
     bool,                // local_only
     bool,                // requires_credentials
-) {
+);
+
+/// #683-#692: extract structured metadata from help prose
+fn extract_help_metadata(topic: LocalHelpTopic) -> HelpMetadata {
     let text = render_help_topic(topic);
     let mut usage = None;
     let mut purpose = None;
@@ -13946,6 +13937,7 @@ fn permission_policy(
 }
 
 fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
+    #[allow(clippy::unnecessary_filter_map)]
     messages
         .iter()
         .filter_map(|message| {
@@ -16920,7 +16912,7 @@ mod tests {
         for action in ["remove", "uninstall", "delete"] {
             assert_eq!(
                 parse_args(&["skills".to_string(), action.to_string()])
-                    .expect(&format!("skills {action} should parse")),
+                    .unwrap_or_else(|_| panic!("skills {action} should parse")),
                 CliAction::Skills {
                     args: Some(action.to_string()),
                     output_format: CliOutputFormat::Text,

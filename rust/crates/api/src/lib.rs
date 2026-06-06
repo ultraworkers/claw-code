@@ -1,3 +1,5 @@
+#![allow(clippy::result_large_err)]
+
 mod client;
 mod error;
 mod http_client;

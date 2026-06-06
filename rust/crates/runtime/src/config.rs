@@ -1062,6 +1062,7 @@ pub fn default_config_home() -> PathBuf {
 /// Save provider settings to the user-level `~/.claw/settings.json`.
 /// Creates the file and directory if they don't exist. Sets file permissions
 /// to `0o600` (owner read/write only) to protect stored API keys.
+#[allow(dead_code)]
 pub fn save_user_provider_settings(
     kind: &str,
     api_key: &str,
@@ -1114,6 +1115,7 @@ pub fn save_user_provider_settings(
 }
 
 /// Remove the `provider` section from the user-level `~/.claw/settings.json`.
+#[allow(dead_code)]
 pub fn clear_user_provider_settings() -> Result<(), ConfigError> {
     let config_home = default_config_home();
     let settings_path = config_home.join("settings.json");
@@ -1133,6 +1135,7 @@ pub fn clear_user_provider_settings() -> Result<(), ConfigError> {
     Ok(())
 }
 
+#[allow(dead_code)]
 fn read_settings_root(path: &Path) -> serde_json::Map<String, serde_json::Value> {
     match fs::read_to_string(path) {
         Ok(contents) if !contents.trim().is_empty() => {
@@ -1145,6 +1148,7 @@ fn read_settings_root(path: &Path) -> serde_json::Map<String, serde_json::Value>
     }
 }
 
+#[allow(dead_code)]
 fn write_settings_root(
     path: &Path,
     root: &serde_json::Map<String, serde_json::Value>,

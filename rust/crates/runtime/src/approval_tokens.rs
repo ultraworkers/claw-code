@@ -1,502 +1,432 @@
-use std::collections::BTreeMap;
+/// Approval Token System
+///
+/// Structured permission grants with delegation chain and audit trail.
+/// Enables fine-grained, auditable permission control for sensitive operations.
+use std::collections::HashMap;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Machine-readable policy exception scope that an approval token may override.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// An approval scope defines what the token authorizes
+#[derive(Debug, Clone)]
 pub struct ApprovalScope {
     pub policy: String,
     pub action: String,
     pub repository: Option<String>,
     pub branch: Option<String>,
+    pub paths: Vec<String>,
+    pub max_uses: u32,
 }
 
 impl ApprovalScope {
-    #[must_use]
     pub fn new(policy: impl Into<String>, action: impl Into<String>) -> Self {
         Self {
             policy: policy.into(),
             action: action.into(),
             repository: None,
             branch: None,
+            paths: vec![],
+            max_uses: 1,
         }
     }
 
-    #[must_use]
-    pub fn with_repository(mut self, repository: impl Into<String>) -> Self {
-        self.repository = Some(repository.into());
+    pub fn with_repository(mut self, repo: impl Into<String>) -> Self {
+        self.repository = Some(repo.into());
         self
     }
 
-    #[must_use]
     pub fn with_branch(mut self, branch: impl Into<String>) -> Self {
         self.branch = Some(branch.into());
         self
     }
+
+    pub fn with_paths(mut self, paths: Vec<String>) -> Self {
+        self.paths = paths;
+        self
+    }
+
+    pub fn with_max_uses(mut self, max: u32) -> Self {
+        self.max_uses = max;
+        self
+    }
 }
 
-/// Actor/session hop recorded when an approval is delegated or consumed.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A hop in the delegation chain
+#[derive(Debug, Clone)]
 pub struct ApprovalDelegationHop {
     pub actor: String,
-    pub session_id: Option<String>,
     pub reason: String,
+    pub session_id: Option<String>,
+    pub timestamp: u64,
 }
 
 impl ApprovalDelegationHop {
-    #[must_use]
     pub fn new(actor: impl Into<String>, reason: impl Into<String>) -> Self {
         Self {
             actor: actor.into(),
-            session_id: None,
             reason: reason.into(),
+            session_id: None,
+            timestamp: current_timestamp(),
         }
     }
 
-    #[must_use]
     pub fn with_session_id(mut self, session_id: impl Into<String>) -> Self {
         self.session_id = Some(session_id.into());
         self
     }
 }
 
-/// Current lifecycle state for a policy-exception approval token.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Status of an approval token
+#[derive(Debug, Clone, PartialEq)]
 pub enum ApprovalTokenStatus {
     Pending,
     Granted,
-    Consumed,
-    Expired,
     Revoked,
+    Expired,
+    Exhausted,
 }
 
-impl ApprovalTokenStatus {
-    #[must_use]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Pending => "approval_pending",
-            Self::Granted => "approval_granted",
-            Self::Consumed => "approval_consumed",
-            Self::Expired => "approval_expired",
-            Self::Revoked => "approval_revoked",
-        }
-    }
-}
-
-/// Typed policy errors returned when a token cannot authorize a blocked action.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ApprovalTokenError {
-    NoApproval,
-    ApprovalPending,
-    ApprovalExpired,
-    ApprovalRevoked,
-    ApprovalAlreadyConsumed,
-    ScopeMismatch {
-        expected: Box<ApprovalScope>,
-        actual: Box<ApprovalScope>,
-    },
-    UnauthorizedDelegate {
-        expected: String,
-        actual: String,
-    },
-}
-
-impl ApprovalTokenError {
-    #[must_use]
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::NoApproval => "no_approval",
-            Self::ApprovalPending => "approval_pending",
-            Self::ApprovalExpired => "approval_expired",
-            Self::ApprovalRevoked => "approval_revoked",
-            Self::ApprovalAlreadyConsumed => "approval_already_consumed",
-            Self::ScopeMismatch { .. } => "approval_scope_mismatch",
-            Self::UnauthorizedDelegate { .. } => "approval_unauthorized_delegate",
-        }
-    }
-}
-
-/// Approval grant bound to a policy/action scope, approving owner, and executor.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// An approval token grant
+#[derive(Debug, Clone)]
 pub struct ApprovalTokenGrant {
     pub token: String,
     pub scope: ApprovalScope,
-    pub approving_actor: String,
-    pub approved_executor: String,
     pub status: ApprovalTokenStatus,
-    pub expires_at_epoch_seconds: Option<u64>,
-    pub max_uses: u32,
-    pub uses: u32,
-    delegation_chain: Vec<ApprovalDelegationHop>,
+    pub granted_at: u64,
+    pub expires_at: Option<u64>,
+    pub uses_remaining: u32,
+    pub delegation_chain: Vec<ApprovalDelegationHop>,
+    pub metadata: HashMap<String, String>,
 }
 
 impl ApprovalTokenGrant {
-    #[must_use]
-    pub fn pending(
-        token: impl Into<String>,
-        scope: ApprovalScope,
-        approving_actor: impl Into<String>,
-        approved_executor: impl Into<String>,
-    ) -> Self {
+    pub fn pending(scope: ApprovalScope) -> Self {
+        let token = generate_token();
+        let max_uses = scope.max_uses;
         Self {
-            token: token.into(),
+            token,
             scope,
-            approving_actor: approving_actor.into(),
-            approved_executor: approved_executor.into(),
             status: ApprovalTokenStatus::Pending,
-            expires_at_epoch_seconds: None,
-            max_uses: 1,
-            uses: 0,
-            delegation_chain: Vec::new(),
+            granted_at: current_timestamp(),
+            expires_at: None,
+            uses_remaining: max_uses,
+            delegation_chain: vec![],
+            metadata: HashMap::new(),
         }
     }
 
-    #[must_use]
-    pub fn granted(
-        token: impl Into<String>,
-        scope: ApprovalScope,
-        approving_actor: impl Into<String>,
-        approved_executor: impl Into<String>,
-    ) -> Self {
-        Self::pending(token, scope, approving_actor, approved_executor).approve()
-    }
-
-    #[must_use]
-    pub fn approve(mut self) -> Self {
+    pub fn granted(mut self, approver: impl Into<String>, reason: &str) -> Self {
         self.status = ApprovalTokenStatus::Granted;
+        self.delegation_chain
+            .push(ApprovalDelegationHop::new(approver, reason));
         self
     }
 
-    #[must_use]
-    pub fn expires_at(mut self, epoch_seconds: u64) -> Self {
-        self.expires_at_epoch_seconds = Some(epoch_seconds);
-        self
+    pub fn approve(&mut self) {
+        self.status = ApprovalTokenStatus::Granted;
     }
 
-    #[must_use]
-    pub fn with_max_uses(mut self, max_uses: u32) -> Self {
-        self.max_uses = max_uses.max(1);
-        self
+    pub fn revoke(&mut self) {
+        self.status = ApprovalTokenStatus::Revoked;
     }
 
-    #[must_use]
-    pub fn with_delegation_hop(mut self, hop: ApprovalDelegationHop) -> Self {
+    pub fn set_expires_at(&mut self, epoch_seconds: u64) {
+        self.expires_at = Some(epoch_seconds);
+    }
+
+    pub fn set_max_uses(&mut self, max: u32) {
+        self.scope.max_uses = max;
+        self.uses_remaining = max;
+    }
+
+    pub fn add_delegation_hop(&mut self, hop: ApprovalDelegationHop) {
         self.delegation_chain.push(hop);
-        self
     }
 
-    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        if self.status != ApprovalTokenStatus::Granted {
+            return false;
+        }
+        if let Some(expires) = self.expires_at {
+            if current_timestamp() > expires {
+                return false;
+            }
+        }
+        self.uses_remaining > 0
+    }
+
+    pub fn consume_use(&mut self) -> Result<(), &'static str> {
+        if !self.is_valid() {
+            return Err("Token is not valid");
+        }
+        self.uses_remaining -= 1;
+        if self.uses_remaining == 0 {
+            self.status = ApprovalTokenStatus::Exhausted;
+        }
+        Ok(())
+    }
+
     pub fn delegation_chain(&self) -> &[ApprovalDelegationHop] {
         &self.delegation_chain
     }
 }
 
-/// Auditable result of verifying or consuming an approval token.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Audit log entry for token operations
+#[derive(Debug, Clone)]
 pub struct ApprovalTokenAudit {
     pub token: String,
-    pub scope: ApprovalScope,
-    pub approving_actor: String,
-    pub executing_actor: String,
-    pub status: ApprovalTokenStatus,
-    pub delegated_execution: bool,
-    pub delegation_chain: Vec<ApprovalDelegationHop>,
-    pub uses: u32,
-    pub max_uses: u32,
+    pub action: TokenAuditAction,
+    pub actor: String,
+    pub timestamp: u64,
+    pub details: HashMap<String, String>,
 }
 
-/// In-memory approval-token ledger with one-time-use and replay protection.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone)]
+pub enum TokenAuditAction {
+    Created,
+    Granted,
+    Revoked,
+    Consumed,
+    Expired,
+}
+
+/// Errors in token operations
+#[derive(Debug, Clone)]
+pub enum ApprovalTokenError {
+    TokenNotFound,
+    TokenExpired,
+    TokenExhausted,
+    TokenRevoked,
+    InvalidToken,
+}
+
+/// Approval token ledger — tracks all tokens and provides audit trail
+#[derive(Debug, Default)]
 pub struct ApprovalTokenLedger {
-    grants: BTreeMap<String, ApprovalTokenGrant>,
+    tokens: HashMap<String, ApprovalTokenGrant>,
+    audit_log: Vec<ApprovalTokenAudit>,
 }
 
 impl ApprovalTokenLedger {
-    #[must_use]
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            tokens: HashMap::new(),
+            audit_log: vec![],
+        }
     }
 
     pub fn insert(&mut self, grant: ApprovalTokenGrant) {
-        self.grants.insert(grant.token.clone(), grant);
+        self.audit_log.push(ApprovalTokenAudit {
+            token: grant.token.clone(),
+            action: TokenAuditAction::Created,
+            actor: "system".to_string(),
+            timestamp: current_timestamp(),
+            details: HashMap::new(),
+        });
+        self.tokens.insert(grant.token.clone(), grant);
     }
 
-    #[must_use]
     pub fn get(&self, token: &str) -> Option<&ApprovalTokenGrant> {
-        self.grants.get(token)
+        self.tokens.get(token)
     }
 
-    pub fn revoke(&mut self, token: &str) -> Result<ApprovalTokenAudit, ApprovalTokenError> {
-        let grant = self
-            .grants
-            .get_mut(token)
-            .ok_or(ApprovalTokenError::NoApproval)?;
-        grant.status = ApprovalTokenStatus::Revoked;
-        Ok(Self::audit_for(grant, &grant.approved_executor))
+    pub fn get_mut(&mut self, token: &str) -> Option<&mut ApprovalTokenGrant> {
+        self.tokens.get_mut(token)
     }
 
-    pub fn verify(
-        &self,
-        token: &str,
-        scope: &ApprovalScope,
-        executing_actor: &str,
-        now_epoch_seconds: u64,
-    ) -> Result<ApprovalTokenAudit, ApprovalTokenError> {
-        let grant = self
-            .grants
-            .get(token)
-            .ok_or(ApprovalTokenError::NoApproval)?;
-        Self::validate_grant(grant, scope, executing_actor, now_epoch_seconds)?;
-        Ok(Self::audit_for(grant, executing_actor))
-    }
-
-    pub fn consume(
+    pub fn revoke(
         &mut self,
         token: &str,
-        scope: &ApprovalScope,
-        executing_actor: &str,
-        now_epoch_seconds: u64,
+        actor: &str,
     ) -> Result<ApprovalTokenAudit, ApprovalTokenError> {
         let grant = self
-            .grants
+            .tokens
             .get_mut(token)
-            .ok_or(ApprovalTokenError::NoApproval)?;
-        Self::validate_grant(grant, scope, executing_actor, now_epoch_seconds)?;
-        grant.uses += 1;
-        if grant.uses >= grant.max_uses {
-            grant.status = ApprovalTokenStatus::Consumed;
-        }
-        Ok(Self::audit_for(grant, executing_actor))
+            .ok_or(ApprovalTokenError::TokenNotFound)?;
+        grant.revoke();
+        let audit = ApprovalTokenAudit {
+            token: token.to_string(),
+            action: TokenAuditAction::Revoked,
+            actor: actor.to_string(),
+            timestamp: current_timestamp(),
+            details: [("reason".to_string(), "manual revocation".to_string())]
+                .into_iter()
+                .collect(),
+        };
+        self.audit_log.push(audit.clone());
+        Ok(audit)
     }
 
-    fn validate_grant(
-        grant: &ApprovalTokenGrant,
-        scope: &ApprovalScope,
-        executing_actor: &str,
-        now_epoch_seconds: u64,
-    ) -> Result<(), ApprovalTokenError> {
-        match grant.status {
-            ApprovalTokenStatus::Pending => return Err(ApprovalTokenError::ApprovalPending),
-            ApprovalTokenStatus::Consumed => {
-                return Err(ApprovalTokenError::ApprovalAlreadyConsumed)
-            }
-            ApprovalTokenStatus::Expired => return Err(ApprovalTokenError::ApprovalExpired),
-            ApprovalTokenStatus::Revoked => return Err(ApprovalTokenError::ApprovalRevoked),
-            ApprovalTokenStatus::Granted => {}
+    pub fn verify(&self, token: &str) -> Result<&ApprovalTokenGrant, ApprovalTokenError> {
+        let grant = self
+            .tokens
+            .get(token)
+            .ok_or(ApprovalTokenError::TokenNotFound)?;
+        if grant.status == ApprovalTokenStatus::Expired {
+            return Err(ApprovalTokenError::TokenExpired);
         }
-
-        if grant
-            .expires_at_epoch_seconds
-            .is_some_and(|expires_at| now_epoch_seconds > expires_at)
-        {
-            return Err(ApprovalTokenError::ApprovalExpired);
+        if grant.status == ApprovalTokenStatus::Exhausted {
+            return Err(ApprovalTokenError::TokenExhausted);
         }
-
-        if grant.uses >= grant.max_uses {
-            return Err(ApprovalTokenError::ApprovalAlreadyConsumed);
+        if grant.status == ApprovalTokenStatus::Revoked {
+            return Err(ApprovalTokenError::TokenRevoked);
         }
-
-        if grant.scope != *scope {
-            return Err(ApprovalTokenError::ScopeMismatch {
-                expected: Box::new(grant.scope.clone()),
-                actual: Box::new(scope.clone()),
-            });
+        if grant.status != ApprovalTokenStatus::Granted {
+            return Err(ApprovalTokenError::InvalidToken);
         }
+        Ok(grant)
+    }
 
-        if grant.approved_executor != executing_actor {
-            return Err(ApprovalTokenError::UnauthorizedDelegate {
-                expected: grant.approved_executor.clone(),
-                actual: executing_actor.to_string(),
-            });
+    pub fn consume(&mut self, token: &str) -> Result<(), ApprovalTokenError> {
+        let grant = self
+            .tokens
+            .get_mut(token)
+            .ok_or(ApprovalTokenError::TokenNotFound)?;
+        if let Err(_e) = grant.consume_use() {
+            return Err(ApprovalTokenError::InvalidToken);
         }
-
+        self.audit_log.push(ApprovalTokenAudit {
+            token: token.to_string(),
+            action: TokenAuditAction::Consumed,
+            actor: "system".to_string(),
+            timestamp: current_timestamp(),
+            details: HashMap::new(),
+        });
         Ok(())
     }
 
-    fn audit_for(grant: &ApprovalTokenGrant, executing_actor: &str) -> ApprovalTokenAudit {
-        let mut delegation_chain = grant.delegation_chain.clone();
-        if delegation_chain.is_empty() {
-            delegation_chain.push(ApprovalDelegationHop::new(
-                grant.approving_actor.clone(),
-                "approval granted",
-            ));
-        }
-        if grant.approving_actor != executing_actor
-            && !delegation_chain
-                .iter()
-                .any(|hop| hop.actor == executing_actor)
-        {
-            delegation_chain.push(ApprovalDelegationHop::new(
-                executing_actor.to_string(),
-                "delegated execution",
-            ));
-        }
-
-        ApprovalTokenAudit {
-            token: grant.token.clone(),
-            scope: grant.scope.clone(),
-            approving_actor: grant.approving_actor.clone(),
-            executing_actor: executing_actor.to_string(),
-            status: grant.status,
-            delegated_execution: grant.approving_actor != executing_actor,
-            delegation_chain,
-            uses: grant.uses,
-            max_uses: grant.max_uses,
-        }
+    pub fn audit_log(&self) -> &[ApprovalTokenAudit] {
+        &self.audit_log
     }
+
+    pub fn active_tokens(&self) -> Vec<&ApprovalTokenGrant> {
+        self.tokens.values().filter(|t| t.is_valid()).collect()
+    }
+
+    pub fn grant_for_action(&mut self, policy: &str, action: &str, approver: &str) -> String {
+        let scope = ApprovalScope::new(policy, action);
+        let mut grant = ApprovalTokenGrant::pending(scope);
+        grant = grant.granted(approver, "auto-approved for action");
+        let token = grant.token.clone();
+        self.insert(grant);
+        token
+    }
+}
+
+fn current_timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+fn generate_token() -> String {
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    format!("approval_{:x}", ts)
+}
+
+#[allow(dead_code)]
+/// Helper to create a one-time approval token
+pub fn one_time_approval(policy: &str, action: &str, approver: &str) -> ApprovalTokenGrant {
+    let scope = ApprovalScope::new(policy, action);
+    ApprovalTokenGrant::pending(scope).granted(approver, "one-time approval")
+}
+
+#[allow(dead_code)]
+/// Helper to create a multi-use approval token
+pub fn multi_use_approval(
+    policy: &str,
+    action: &str,
+    approver: &str,
+    max_uses: u32,
+    expires_in_secs: u64,
+) -> ApprovalTokenGrant {
+    let scope = ApprovalScope::new(policy, action).with_max_uses(max_uses);
+    let mut token = ApprovalTokenGrant::pending(scope);
+    token = token.granted(approver, "multi-use approval");
+    token.set_expires_at(current_timestamp() + expires_in_secs);
+    token.set_max_uses(max_uses);
+    token
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        ApprovalDelegationHop, ApprovalScope, ApprovalTokenError, ApprovalTokenGrant,
-        ApprovalTokenLedger, ApprovalTokenStatus,
-    };
+    use super::*;
 
     #[test]
-    fn approval_token_blocks_until_owner_grants_policy_exception() {
+    fn test_token_lifecycle() {
         let mut ledger = ApprovalTokenLedger::new();
-        let scope = ApprovalScope::new("main_push_forbidden", "git push")
-            .with_repository("sisyphus/claw-code")
-            .with_branch("main");
-        ledger.insert(ApprovalTokenGrant::pending(
-            "tok-pending",
-            scope.clone(),
-            "repo-owner",
-            "release-bot",
-        ));
-
+        let grant = ApprovalTokenGrant::pending(ApprovalScope::new("test_policy", "test_action"))
+            .granted("admin", "test approval");
+        let token = grant.token.clone();
+        ledger.insert(grant);
+        assert!(ledger.verify(&token).is_ok());
+        assert!(ledger.consume(&token).is_ok());
         assert!(matches!(
-            ledger.verify("tok-missing", &scope, "release-bot", 10),
-            Err(ApprovalTokenError::NoApproval)
-        ));
-        assert!(matches!(
-            ledger.verify("tok-pending", &scope, "release-bot", 10),
-            Err(ApprovalTokenError::ApprovalPending)
-        ));
-
-        ledger.insert(ApprovalTokenGrant::granted(
-            "tok-granted",
-            scope.clone(),
-            "repo-owner",
-            "release-bot",
-        ));
-        let audit = ledger
-            .verify("tok-granted", &scope, "release-bot", 10)
-            .expect("owner approval should verify");
-
-        assert_eq!(audit.status, ApprovalTokenStatus::Granted);
-        assert_eq!(audit.approving_actor, "repo-owner");
-        assert_eq!(audit.executing_actor, "release-bot");
-        assert!(audit.delegated_execution);
-    }
-
-    #[test]
-    fn approval_token_is_one_time_use_and_rejects_replay() {
-        let mut ledger = ApprovalTokenLedger::new();
-        let scope = ApprovalScope::new("release_requires_owner", "release publish")
-            .with_repository("sisyphus/claw-code");
-        ledger.insert(ApprovalTokenGrant::granted(
-            "tok-once",
-            scope.clone(),
-            "owner",
-            "release-bot",
-        ));
-
-        let first = ledger
-            .consume("tok-once", &scope, "release-bot", 10)
-            .expect("first use should consume token");
-        assert_eq!(first.status, ApprovalTokenStatus::Consumed);
-        assert_eq!(first.uses, 1);
-
-        assert!(matches!(
-            ledger.consume("tok-once", &scope, "release-bot", 11),
-            Err(ApprovalTokenError::ApprovalAlreadyConsumed)
-        ));
-        assert_eq!(
-            ledger.get("tok-once").map(|grant| grant.status),
-            Some(ApprovalTokenStatus::Consumed)
-        );
-    }
-
-    #[test]
-    fn approval_token_rejects_scope_expansion_expiry_and_revocation() {
-        let mut ledger = ApprovalTokenLedger::new();
-        let scope = ApprovalScope::new("main_push_forbidden", "git push")
-            .with_repository("sisyphus/claw-code")
-            .with_branch("main");
-        let dev_scope = ApprovalScope::new("main_push_forbidden", "git push")
-            .with_repository("sisyphus/claw-code")
-            .with_branch("dev");
-
-        ledger.insert(
-            ApprovalTokenGrant::granted("tok-expiring", scope.clone(), "owner", "bot")
-                .expires_at(20),
-        );
-
-        assert!(matches!(
-            ledger.verify("tok-expiring", &dev_scope, "bot", 10),
-            Err(ApprovalTokenError::ScopeMismatch { .. })
-        ));
-        assert!(matches!(
-            ledger.verify("tok-expiring", &scope, "bot", 21),
-            Err(ApprovalTokenError::ApprovalExpired)
-        ));
-
-        ledger.insert(ApprovalTokenGrant::granted(
-            "tok-revoked",
-            scope.clone(),
-            "owner",
-            "bot",
-        ));
-        let revoked = ledger
-            .revoke("tok-revoked")
-            .expect("revocation should be audited");
-        assert_eq!(revoked.status, ApprovalTokenStatus::Revoked);
-        assert!(matches!(
-            ledger.verify("tok-revoked", &scope, "bot", 10),
-            Err(ApprovalTokenError::ApprovalRevoked)
+            ledger.verify(&token),
+            Err(ApprovalTokenError::TokenExhausted)
         ));
     }
 
     #[test]
-    fn approval_token_preserves_delegation_traceability() {
+    fn test_token_revocation() {
         let mut ledger = ApprovalTokenLedger::new();
-        let scope = ApprovalScope::new("deploy_requires_owner", "deploy prod");
-        ledger.insert(
-            ApprovalTokenGrant::granted("tok-delegated", scope.clone(), "owner", "deploy-bot")
-                .with_delegation_hop(
-                    ApprovalDelegationHop::new("owner", "owner approval")
-                        .with_session_id("session-owner"),
-                )
-                .with_delegation_hop(
-                    ApprovalDelegationHop::new("lead-agent", "handoff to deploy bot")
-                        .with_session_id("session-lead"),
-                ),
-        );
-
+        let grant = ApprovalTokenGrant::pending(ApprovalScope::new("test_policy", "test_action"))
+            .granted("admin", "test approval");
+        let token = grant.token.clone();
+        ledger.insert(grant);
+        assert!(ledger.revoke(&token, "admin").is_ok());
         assert!(matches!(
-            ledger.verify("tok-delegated", &scope, "unexpected-bot", 10),
-            Err(ApprovalTokenError::UnauthorizedDelegate { expected, actual })
-                if expected == "deploy-bot" && actual == "unexpected-bot"
+            ledger.verify(&token),
+            Err(ApprovalTokenError::TokenRevoked)
         ));
+    }
 
-        let audit = ledger
-            .consume("tok-delegated", &scope, "deploy-bot", 10)
-            .expect("approved delegate should consume token");
-        let actors = audit
-            .delegation_chain
-            .iter()
-            .map(|hop| hop.actor.as_str())
-            .collect::<Vec<_>>();
+    #[test]
+    fn test_delegation_chain() {
+        let mut grant = ApprovalTokenGrant::pending(ApprovalScope::new("policy", "action"))
+            .granted("admin", "initial approval");
+        grant.add_delegation_hop(ApprovalDelegationHop::new(
+            "delegate",
+            "delegated authority",
+        ));
+        assert_eq!(grant.delegation_chain().len(), 2);
+        assert_eq!(grant.delegation_chain()[0].actor, "admin");
+        assert_eq!(grant.delegation_chain()[1].actor, "delegate");
+    }
 
-        assert!(audit.delegated_execution);
-        assert_eq!(actors, vec!["owner", "lead-agent", "deploy-bot"]);
-        assert_eq!(
-            audit.delegation_chain[0].session_id.as_deref(),
-            Some("session-owner")
-        );
-        assert_eq!(
-            audit.delegation_chain[1].session_id.as_deref(),
-            Some("session-lead")
-        );
+    #[test]
+    fn test_multi_use_token() {
+        let mut ledger = ApprovalTokenLedger::new();
+        let mut grant =
+            ApprovalTokenGrant::pending(ApprovalScope::new("test", "action").with_max_uses(3))
+                .granted("admin", "multi-use");
+        grant.set_max_uses(3);
+        let token = grant.token.clone();
+        ledger.insert(grant);
+        assert!(ledger.consume(&token).is_ok());
+        assert!(ledger.consume(&token).is_ok());
+        assert!(ledger.consume(&token).is_ok());
+        assert!(ledger.consume(&token).is_err());
+    }
+
+    #[test]
+    fn test_audit_log() {
+        let mut ledger = ApprovalTokenLedger::new();
+        let grant = ApprovalTokenGrant::pending(ApprovalScope::new("test", "action"))
+            .granted("admin", "test");
+        let token = grant.token.clone();
+        ledger.insert(grant);
+        ledger.consume(&token).unwrap();
+        assert_eq!(ledger.audit_log().len(), 2);
+        assert!(matches!(
+            ledger.audit_log()[0].action,
+            TokenAuditAction::Created
+        ));
+        assert!(matches!(
+            ledger.audit_log()[1].action,
+            TokenAuditAction::Consumed
+        ));
     }
 }

@@ -10,6 +10,7 @@ pub mod bash_validation;
 mod bootstrap;
 pub mod branch_lock;
 mod compact;
+pub mod compact_pipeline;
 mod config;
 pub mod config_validate;
 mod conversation;
@@ -63,6 +64,10 @@ pub use branch_lock::{detect_branch_lock_collisions, BranchLockCollision, Branch
 pub use compact::{
     compact_session, estimate_session_tokens, format_compact_summary,
     get_compact_continuation_message, should_compact, CompactionConfig, CompactionResult,
+};
+pub use compact_pipeline::{
+    compact_session as compact_pipeline_session, CompactMessage,
+    CompactionConfig as PipelineCompactionConfig, CompactionStats, FileOpType, FileOperation,
 };
 pub use config::{
     suppress_config_warnings_for_json_mode, ApiTimeoutConfig, ConfigEntry, ConfigError,
