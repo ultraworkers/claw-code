@@ -63,9 +63,12 @@ export OPENAI_API_KEY="ollama"   # any non-empty value works; Ollama ignores it
 
 **The model name must match the Ollama tag exactly.** Ollama tags use a colon
 (`name:tag`), e.g. `qwen3.5:9b` — not a hyphen (`qwen3.5-9b`), which the server
-rejects with `404 ... model not found`. Routing to the OpenAI-compatible
-provider only kicks in when `OPENAI_BASE_URL` is set and the model name contains
-a `:` or `.`, so always pass the full tag. List the installed tags with:
+rejects with `404 ... model not found`. In the command above the `openai/`
+prefix is what selects the OpenAI-compatible provider (the prefix is stripped
+before the tag is sent to Ollama). You can also drop the prefix and pass the
+bare tag — when `OPENAI_BASE_URL` is set, claw routes a prefix-less model to the
+OpenAI-compatible endpoint as long as the name contains a `:` or `.`. Either
+way, always pass the full colon tag. List the installed tags with:
 
 ```bash
 ollama list                                 # native view
