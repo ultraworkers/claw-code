@@ -6654,6 +6654,49 @@ fn run_resume_command(
             message: Some(render_memory_report()?),
             json: Some(render_memory_json()?),
         }),
+        SlashCommand::Workspace { path } => {
+            let cwd_before = env::current_dir()?;
+            let workspace_root = session
+                .workspace_root()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| cwd_before.clone());
+            let workspace_root = canonicalize_or_clone(&workspace_root);
+            let changed = if let Some(path) = path.as_deref() {
+                let requested_path = Path::new(path);
+                let resolved_path = if requested_path.is_absolute() {
+                    requested_path.to_path_buf()
+                } else {
+                    cwd_before.join(requested_path)
+                };
+                let resolved_path = canonicalize_or_clone(&resolved_path);
+                if !resolved_path.starts_with(&workspace_root) {
+                    return Err(format!(
+                        "workspace_change_outside_root: `{}` is outside the current workspace root `{}`.\nUse `claw --cwd {}` to start a new session there.",
+                        resolved_path.display(),
+                        workspace_root.display(),
+                        resolved_path.display(),
+                    )
+                    .into());
+                }
+                env::set_current_dir(&resolved_path)?;
+                true
+            } else {
+                false
+            };
+            let cwd_after = env::current_dir()?;
+            let message =
+                render_workspace_report(&cwd_after, &workspace_root, &session.session_id, changed);
+            Ok(ResumeCommandOutcome {
+                session: session.clone(),
+                message: Some(message),
+                json: Some(workspace_report_json(
+                    &cwd_after,
+                    &workspace_root,
+                    &session.session_id,
+                    changed,
+                )),
+            })
+        }
         SlashCommand::Init => {
             // #142: run the init once, then render both text + structured JSON
             // from the same InitReport so both surfaces stay in sync.
@@ -8122,6 +8165,7 @@ impl LiveCli {
                 Self::print_config(section.as_deref())?;
                 false
             }
+            SlashCommand::Workspace { path } => self.handle_workspace_command(path.as_deref())?,
             SlashCommand::Mcp { action, target } => {
                 let args = match (action.as_deref(), target.as_deref()) {
                     (None, None) => None,
@@ -8278,6 +8322,51 @@ impl LiveCli {
                 None,
             )
         );
+    }
+
+    fn handle_workspace_command(
+        &mut self,
+        target: Option<&str>,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        let current_dir = env::current_dir()?;
+        let workspace_root = self
+            .runtime
+            .session()
+            .workspace_root()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| current_dir.clone());
+        let workspace_root = canonicalize_or_clone(&workspace_root);
+
+        if let Some(target) = target {
+            let requested_path = Path::new(target);
+            let resolved_path = if requested_path.is_absolute() {
+                requested_path.to_path_buf()
+            } else {
+                current_dir.join(requested_path)
+            };
+            let resolved_path = canonicalize_or_clone(&resolved_path);
+            if !resolved_path.starts_with(&workspace_root) {
+                return Err(format!(
+                    "workspace_change_outside_root: `{}` is outside the current workspace root `{}`.\nUse `claw --cwd {}` to start a new session there.",
+                    resolved_path.display(),
+                    workspace_root.display(),
+                    resolved_path.display(),
+                )
+                .into());
+            }
+            env::set_current_dir(&resolved_path)?;
+        }
+
+        println!(
+            "{}",
+            render_workspace_report(
+                &env::current_dir()?,
+                &workspace_root,
+                &self.session.id,
+                target.is_some(),
+            )
+        );
+        Ok(target.is_some())
     }
 
     fn record_prompt_history(&mut self, prompt: &str) {
@@ -9109,6 +9198,41 @@ fn current_session_store() -> Result<runtime::SessionStore, Box<dyn std::error::
 
 fn new_cli_session() -> Result<Session, Box<dyn std::error::Error>> {
     Ok(Session::new().with_workspace_root(env::current_dir()?))
+}
+
+fn canonicalize_or_clone(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn render_workspace_report(
+    cwd: &Path,
+    workspace_root: &Path,
+    session_id: &str,
+    changed: bool,
+) -> String {
+    let action = if changed { "change" } else { "show" };
+    format!(
+        "Workspace\n  Action           {action}\n  Session          {session_id}\n  Workspace root   {}\n  Current directory {}",
+        workspace_root.display(),
+        cwd.display(),
+    )
+}
+
+fn workspace_report_json(
+    cwd: &Path,
+    workspace_root: &Path,
+    session_id: &str,
+    changed: bool,
+) -> Value {
+    serde_json::json!({
+        "kind": "workspace",
+        "action": if changed { "change" } else { "show" },
+        "status": "ok",
+        "session_id": session_id,
+        "workspace_root": workspace_root.display().to_string(),
+        "current_directory": cwd.display().to_string(),
+        "changed": changed,
+    })
 }
 
 fn create_managed_session_handle(
