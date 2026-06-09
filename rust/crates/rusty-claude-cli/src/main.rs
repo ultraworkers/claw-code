@@ -59,9 +59,10 @@ use runtime::{
     resolve_sandbox_status, ApiClient, ApiRequest, AssistantEvent, BaseCommitState,
     CompactionConfig, ConfigFileReport, ConfigLoader, ConfigSource, ContentBlock, ContextFile,
     ConversationMessage, ConversationRuntime, McpConfigCollection, McpInvalidServerConfig,
-    McpServer, McpServerManager, McpServerSpec, McpTool, MessageRole, ModelPricing, PermissionMode,
-    PermissionPolicy, ProjectContext, PromptCacheEvent, ResolvedPermissionMode, RuntimeError,
-    RuntimeInvalidHookConfig, Session, TokenUsage, ToolError, ToolExecutor, UsageTracker,
+    McpServer, McpServerManager, McpServerSpec, McpTool, MemoryStore, MessageRole, ModelPricing,
+    PermissionMode, PermissionPolicy, ProjectContext, PromptCacheEvent, ResolvedPermissionMode,
+    RuntimeError, RuntimeInvalidHookConfig, Session, TokenUsage, ToolError, ToolExecutor,
+    UsageTracker,
 };
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -3718,6 +3719,7 @@ fn render_doctor_report(
             check_install_source_health(),
             check_workspace_health(&context),
             check_memory_health(&context),
+            check_auto_memory_health(&context.cwd),
             check_boot_preflight_health(&context),
             check_sandbox_health(&context.sandbox_status),
             check_permission_health(permission_mode),
@@ -4470,6 +4472,50 @@ fn check_memory_health(context: &StatusContext) -> DiagnosticCheck {
             json!(context.unloaded_memory_files),
         ),
     ]))
+}
+
+fn check_auto_memory_health(cwd: &Path) -> DiagnosticCheck {
+    let store = MemoryStore::for_workspace(cwd);
+    let entry_count = store.entry_count();
+    let has_index = store.index_content().is_some();
+    let mut details = vec![
+        format!("Directory       {}", store.memory_dir().display()),
+        format!("Exists          {}", store.exists()),
+        format!("Entries         {entry_count}"),
+        format!(
+            "MEMORY.md       {}",
+            if has_index { "present" } else { "absent" }
+        ),
+    ];
+
+    let level = if store.exists() && entry_count > 0 && !has_index {
+        details.push("MEMORY.md index is missing but memory entries exist".to_string());
+        DiagnosticLevel::Warn
+    } else {
+        DiagnosticLevel::Ok
+    };
+
+    let summary = if !store.exists() {
+        "auto memory not yet initialized".to_string()
+    } else if entry_count == 0 {
+        "auto memory directory exists, no entries yet".to_string()
+    } else {
+        format!("{entry_count} auto memory entries stored")
+    };
+
+    DiagnosticCheck::new("Auto-Memory", level, summary)
+        .with_hint(if level == DiagnosticLevel::Warn {
+            "Create a MEMORY.md index file in the memory directory to enable context loading at session start."
+        } else {
+            ""
+        })
+        .with_details(details)
+        .with_data(Map::from_iter([
+            ("directory".to_string(), json!(store.memory_dir().display().to_string())),
+            ("exists".to_string(), json!(store.exists())),
+            ("entry_count".to_string(), json!(entry_count)),
+            ("has_index".to_string(), json!(has_index)),
+        ]))
 }
 
 fn check_boot_preflight_health(context: &StatusContext) -> DiagnosticCheck {
@@ -10428,7 +10474,7 @@ fn render_doctor_help_json() -> serde_json::Value {
         "requires_session_resume": false,
         "mutates_workspace": false,
         "output_fields": ["kind", "action", "status", "message", "report", "has_failures", "summary", "checks", "allowed_tools"],
-        "check_names": ["auth", "config", "mcp validation", "hook validation", "install source", "workspace", "memory", "boot preflight", "sandbox", "permissions", "system"],
+        "check_names": ["auth", "base urls", "config", "mcp validation", "hook validation", "install source", "workspace", "memory", "auto-memory", "boot preflight", "sandbox", "permissions", "system"],
         "status_values": ["ok", "warn", "fail"],
         "options": [
             {
@@ -10989,6 +11035,44 @@ fn render_memory_report() -> Result<String, Box<dyn std::error::Error>> {
             ));
         }
     }
+
+    // Auto memory store
+    let store = MemoryStore::for_workspace(&cwd);
+    lines.push(String::new());
+    lines.push(format!(
+        "Auto memory
+  Directory  {}
+  Entries    {}",
+        store.memory_dir().display(),
+        store.entry_count()
+    ));
+    if store.exists() {
+        let entries = store.list_entries();
+        if entries.is_empty() {
+            lines.push("  (no memory files yet)".to_string());
+        } else {
+            for entry in &entries {
+                lines.push(format!(
+                    "  - {} (type={}, {})",
+                    entry.name,
+                    entry.memory_type.as_str(),
+                    entry.path.file_name().unwrap_or_default().to_string_lossy()
+                ));
+            }
+        }
+        match store.index_content() {
+            Some(index) => {
+                let line_count = index.lines().count();
+                lines.push(format!("  MEMORY.md index: {line_count} lines"));
+            }
+            None => {
+                lines.push("  MEMORY.md index: not yet created".to_string());
+            }
+        }
+    } else {
+        lines.push("  (directory not yet created)".to_string());
+    }
+
     Ok(lines.join(
         "
 ",
@@ -11009,6 +11093,23 @@ fn render_memory_json() -> Result<serde_json::Value, Box<dyn std::error::Error>>
             })
         })
         .collect();
+    let store = MemoryStore::for_workspace(&cwd);
+    let auto_memory_entries: Vec<_> = if store.exists() {
+        store
+            .list_entries()
+            .iter()
+            .map(|e| {
+                json!({
+                    "name": e.name,
+                    "type": e.memory_type.as_str(),
+                    "description": e.description,
+                    "path": e.path.display().to_string(),
+                })
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
     Ok(json!({
         "kind": "memory",
         "action": "list",
@@ -11016,6 +11117,13 @@ fn render_memory_json() -> Result<serde_json::Value, Box<dyn std::error::Error>>
         "cwd": cwd.display().to_string(),
         "instruction_files": files.len(),
         "files": files,
+        "auto_memory": {
+            "directory": store.memory_dir().display().to_string(),
+            "exists": store.exists(),
+            "entry_count": store.entry_count(),
+            "entries": auto_memory_entries,
+            "has_index": store.index_content().is_some(),
+        }
     }))
 }
 

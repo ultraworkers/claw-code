@@ -220,6 +220,10 @@ const TOP_LEVEL_FIELDS: &[FieldSpec] = &[
         name: "subagentModel",
         expected: FieldType::String,
     },
+    FieldSpec {
+        name: "autoMemoryEnabled",
+        expected: FieldType::Bool,
+    },
 ];
 
 const HOOKS_FIELDS: &[FieldSpec] = &[

@@ -163,6 +163,7 @@ pub struct RuntimeFeatureConfig {
     api_timeout: ApiTimeoutConfig,
     rules_import: RulesImportConfig,
     provider: RuntimeProviderConfig,
+    auto_memory_enabled: bool,
 }
 
 /// Controls which external AI coding framework rules are imported into the system prompt.
@@ -801,6 +802,7 @@ fn build_runtime_config(
         api_timeout: parse_optional_api_timeout_config(&merged_value)?,
         rules_import: parse_optional_rules_import(&merged_value)?,
         provider: parse_optional_provider_config(&merged_value)?,
+        auto_memory_enabled: parse_auto_memory_enabled(&merged_value),
     };
 
     Ok(RuntimeConfig {
@@ -826,7 +828,10 @@ impl RuntimeConfig {
         Self {
             merged: BTreeMap::new(),
             loaded_entries: Vec::new(),
-            feature_config: RuntimeFeatureConfig::default(),
+            feature_config: RuntimeFeatureConfig {
+                auto_memory_enabled: true,
+                ..RuntimeFeatureConfig::default()
+            },
         }
     }
 
@@ -1010,6 +1015,11 @@ impl RuntimeFeatureConfig {
     #[must_use]
     pub fn rules_import(&self) -> &RulesImportConfig {
         &self.rules_import
+    }
+
+    #[must_use]
+    pub fn auto_memory_enabled(&self) -> bool {
+        self.auto_memory_enabled
     }
 
     /// Merge this config's default trusted roots with per-call roots.
@@ -2170,6 +2180,13 @@ fn parse_optional_provider_config(root: &JsonValue) -> Result<RuntimeProviderCon
         base_url,
         model,
     })
+}
+
+fn parse_auto_memory_enabled(root: &JsonValue) -> bool {
+    root.as_object()
+        .and_then(|object| object.get("autoMemoryEnabled"))
+        .and_then(JsonValue::as_bool)
+        .unwrap_or(true)
 }
 
 fn parse_filesystem_mode_label(value: &str) -> Result<FilesystemIsolationMode, ConfigError> {
