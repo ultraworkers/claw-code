@@ -24,6 +24,8 @@ tokio = { version = "1", features = ["rt-multi-thread", "signal", "time"] }
 tools = { path = "../tools" }
 log = "0.4"
 
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.29", features = ["term", "poll"] }
 
 [lints]
 workspace = true

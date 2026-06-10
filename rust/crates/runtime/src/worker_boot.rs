@@ -34,6 +34,9 @@ pub enum WorkerStatus {
     ToolPermissionRequired,
     ReadyForPrompt,
     Running,
+    /// The user stopped the turn mid-run (e.g. Esc or Ctrl+C); the worker
+    /// is back at the prompt with the session intact.
+    Interrupted,
     Finished,
     Failed,
 }
@@ -46,6 +49,7 @@ impl std::fmt::Display for WorkerStatus {
             Self::ToolPermissionRequired => write!(f, "tool_permission_required"),
             Self::ReadyForPrompt => write!(f, "ready_for_prompt"),
             Self::Running => write!(f, "running"),
+            Self::Interrupted => write!(f, "interrupted"),
             Self::Finished => write!(f, "finished"),
             Self::Failed => write!(f, "failed"),
         }
@@ -82,6 +86,7 @@ pub enum WorkerEventKind {
     PromptMisdelivery,
     PromptReplayArmed,
     Running,
+    Interrupted,
     Restarted,
     Finished,
     Failed,
@@ -1460,6 +1465,23 @@ mod tests {
     use super::*;
     use std::fs;
     use std::process::Command;
+
+    #[test]
+    fn interrupted_status_serializes_and_displays_as_snake_case() {
+        assert_eq!(WorkerStatus::Interrupted.to_string(), "interrupted");
+        assert_eq!(
+            serde_json::to_string(&WorkerStatus::Interrupted).expect("should serialize"),
+            "\"interrupted\""
+        );
+        assert_eq!(
+            serde_json::from_str::<WorkerStatus>("\"interrupted\"").expect("should deserialize"),
+            WorkerStatus::Interrupted
+        );
+        assert_eq!(
+            serde_json::to_string(&WorkerEventKind::Interrupted).expect("should serialize"),
+            "\"interrupted\""
+        );
+    }
 
     #[test]
     fn allowlisted_trust_prompt_auto_resolves_then_reaches_ready_state() {
