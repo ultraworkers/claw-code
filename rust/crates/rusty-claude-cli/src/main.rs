@@ -7216,9 +7216,6 @@ fn run_tui_repl(mut cli: LiveCli) -> Result<(), Box<dyn std::error::Error>> {
                 match result {
                     Ok(()) => {
                         app.set_status("Done");
-                        if let Ok(mut ds) = dashboard_state.write() {
-                            ds.status_message.clear();
-                        }
                     }
                     Err(e) => {
                         app.push_system_message(&format!("Error: {e}"));
@@ -7235,7 +7232,8 @@ fn run_tui_repl(mut cli: LiveCli) -> Result<(), Box<dyn std::error::Error>> {
                 break;
             }
             tui::TuiReadOutcome::ProviderSwap => {
-                let _ = app.restore_terminal();
+                // Stay in alt screen, disable raw mode for wizard prompts
+                app.suspend()?;
                 setup_wizard::run_setup_wizard()?;
                 let cwd = std::env::current_dir().unwrap_or_default();
                 let config = runtime::ConfigLoader::default_for(&cwd).load().ok();
@@ -7244,9 +7242,9 @@ fn run_tui_repl(mut cli: LiveCli) -> Result<(), Box<dyn std::error::Error>> {
                 {
                     let _ = cli.set_model(Some(new_model));
                 }
-                app.push_system_message("Provider updated — restart for full effect");
-                // Re-enter TUI
-                let _ = app.suspend();
+                // Re-enter TUI — re-enables raw mode, redraws
+                app.resume()?;
+                app.push_system_message("Provider updated");
             }
             tui::TuiReadOutcome::TeamToggle => {
                 let current = std::env::var("CLAWD_AGENT_TEAMS").unwrap_or_default();
@@ -7270,20 +7268,30 @@ fn run_tui_repl(mut cli: LiveCli) -> Result<(), Box<dyn std::error::Error>> {
 fn update_dashboard(state: &tui::SharedDashboardState, cli: &LiveCli) {
     let mut session_id = None;
     let mut turn_count = 0u32;
-    let mut total_chars = 0usize;
+    let mut input_tokens = 0u32;
+    let mut output_tokens = 0u32;
+    let mut cache_creation_tokens = 0u32;
+    let mut cache_read_tokens = 0u32;
+    let mut cost_usd = 0.0f64;
 
     if let Some(rt) = cli.runtime.runtime.as_ref() {
         let session = rt.session();
         session_id = Some(session.session_id.clone());
         turn_count = session.messages.len() as u32;
-        total_chars = session.messages.iter().map(|m| {
-            m.blocks.iter().map(|b| match b {
-                runtime::ContentBlock::Text { text } => text.len(),
-                runtime::ContentBlock::ToolUse { input, .. } => input.to_string().len(),
-                runtime::ContentBlock::ToolResult { output, .. } => output.len(),
-                _ => 0,
-            }).sum::<usize>()
-        }).sum();
+
+        // Aggregate real token usage from all messages
+        let tracker = runtime::UsageTracker::from_session(session);
+        let cumulative = tracker.cumulative_usage();
+        input_tokens = cumulative.input_tokens;
+        output_tokens = cumulative.output_tokens;
+        cache_creation_tokens = cumulative.cache_creation_input_tokens;
+        cache_read_tokens = cumulative.cache_read_input_tokens;
+
+        // Estimate cost using runtime's pricing model
+        let pricing = runtime::pricing_for_model(&cli.model)
+            .unwrap_or_else(runtime::ModelPricing::default_sonnet_tier);
+        let cost = cumulative.estimate_cost_usd_with_pricing(pricing);
+        cost_usd = cost.total_cost_usd();
     }
 
     let update = tui_update::DashboardUpdate {
@@ -7291,7 +7299,11 @@ fn update_dashboard(state: &tui::SharedDashboardState, cli: &LiveCli) {
         permission_mode: &format!("{:?}", cli.permission_mode),
         session_id: session_id.as_deref(),
         turn_count,
-        total_chars,
+        input_tokens,
+        output_tokens,
+        cache_creation_tokens,
+        cache_read_tokens,
+        cost_usd,
         provider: std::env::var("CLAWD_PROVIDER").unwrap_or_else(|_| "anthropic".to_string()),
         provider_url: std::env::var("ANTHROPIC_BASE_URL")
             .or_else(|_| std::env::var("OPENAI_BASE_URL"))

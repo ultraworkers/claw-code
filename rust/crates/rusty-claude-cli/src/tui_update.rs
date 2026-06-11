@@ -114,7 +114,11 @@ pub struct DashboardUpdate<'a> {
     pub permission_mode: &'a str,
     pub session_id: Option<&'a str>,
     pub turn_count: u32,
-    pub total_chars: usize,
+    pub input_tokens: u32,
+    pub output_tokens: u32,
+    pub cache_creation_tokens: u32,
+    pub cache_read_tokens: u32,
+    pub cost_usd: f64,
     pub provider: String,
     pub provider_url: String,
 }
@@ -126,8 +130,11 @@ pub fn update_dashboard_from(state: &SharedDashboardState, update: &DashboardUpd
         ds.permission_mode = update.permission_mode.to_string();
         ds.session_id = update.session_id.map(str::to_string);
         ds.turn_count = update.turn_count;
-        // Rough token estimate: ~4 chars per token
-        ds.input_tokens = (update.total_chars / 4) as u32;
+        ds.input_tokens = update.input_tokens;
+        ds.output_tokens = update.output_tokens;
+        ds.cache_creation_tokens = update.cache_creation_tokens;
+        ds.cache_read_tokens = update.cache_read_tokens;
+        ds.cost_usd = update.cost_usd;
         ds.provider = update.provider.clone();
         ds.provider_url = update.provider_url.clone();
     }

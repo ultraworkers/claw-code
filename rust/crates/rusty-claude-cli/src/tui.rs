@@ -147,6 +147,7 @@ pub struct TuiApp {
 }
 
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const MAX_CONVERSATION_LINES: usize = 10_000;
 
 /// Key-column width for dashboard `kv()` rows.  Values start at this
 /// column so "Model", "Compactions" etc. all line up.
@@ -337,6 +338,17 @@ impl TuiApp {
     }
 
     fn auto_scroll(&mut self) {
+        // Trim conversation to prevent unbounded memory growth
+        if self.conversation.len() > MAX_CONVERSATION_LINES {
+            let drain_count = self.conversation.len() - MAX_CONVERSATION_LINES;
+            self.conversation.drain(..drain_count);
+            // Insert trim notice
+            self.conversation.insert(0, ConversationLine {
+                text: "... (earlier messages trimmed)".to_string(),
+                color: Color::DarkGray,
+                bold: false,
+            });
+        }
         self.conversation_scroll = 0;
         self.needs_redraw = true;
     }
