@@ -4,7 +4,51 @@
 // LiveCli-dependent code (update_dashboard, run_tui_repl) remains in main.rs
 // until LiveCli is made pub(crate).
 
+use std::io::Write;
+use std::panic;
+
 use crate::tui::SharedDashboardState;
+
+// ---------------------------------------------------------------------------
+// Panic hook — restores terminal state on crash
+// ---------------------------------------------------------------------------
+
+/// Install a panic hook that restores terminal state before printing the panic.
+/// Returns the previous hook so it can be restored on clean exit.
+pub fn install_panic_hook() -> Box<dyn Fn(&panic::PanicHookInfo<'_>) + Send + Sync + 'static> {
+    let prev_hook = panic::take_hook();
+
+    panic::set_hook(Box::new(|info| {
+        // Best-effort terminal cleanup — ignore errors since we're panicking
+        use crossterm::terminal::{disable_raw_mode, LeaveAlternateScreen};
+        let _ = disable_raw_mode();
+        let _ = crossterm::execute!(std::io::stdout(), LeaveAlternateScreen);
+        let _ = crossterm::execute!(std::io::stdout(), crossterm::cursor::Show);
+        let _ = std::io::stdout().flush();
+
+        let payload = if let Some(s) = info.payload().downcast_ref::<&str>() {
+            s.to_string()
+        } else if let Some(s) = info.payload().downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "Box<dyn Any>".to_string()
+        };
+
+        let location = info.location()
+            .map(|l| format!(" at {}:{}", l.file(), l.line()))
+            .unwrap_or_default();
+
+        eprintln!("\n🦀 Claw TUI crashed{location}: {payload}");
+        eprintln!("Terminal has been restored to normal mode.\n");
+    }));
+
+    prev_hook
+}
+
+/// Restore the previous panic hook on clean exit.
+pub fn restore_panic_hook(hook: Box<dyn Fn(&panic::PanicHookInfo<'_>) + Send + Sync + 'static>) {
+    panic::set_hook(hook);
+}
 
 /// Strip ANSI escape sequences from text.
 /// Handles CSI (ESC [), OSC (ESC ]...BEL/ST), and DCS/ESC sequences.

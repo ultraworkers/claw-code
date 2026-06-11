@@ -19,6 +19,7 @@ mod input;
 mod render;
 mod setup_wizard;
 mod tui;
+mod tui_error;
 mod tui_update;
 
 use std::collections::BTreeSet;
@@ -7145,6 +7146,7 @@ fn run_repl(
 /// Run the REPL inside the split-pane TUI.  Unlike the plain REPL,
 /// all output goes into the TUI conversation pane instead of stdout.
 fn run_tui_repl(mut cli: LiveCli) -> Result<(), Box<dyn std::error::Error>> {
+    let prev_hook = tui_update::install_panic_hook();
     let dashboard_state = tui::SharedDashboardState::default();
     {
         let mut ds = dashboard_state.write().unwrap();
@@ -7259,6 +7261,7 @@ fn run_tui_repl(mut cli: LiveCli) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    tui_update::restore_panic_hook(prev_hook);
     app.restore_terminal()?;
     Ok(())
 }

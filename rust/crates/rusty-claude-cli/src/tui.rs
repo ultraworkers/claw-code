@@ -252,6 +252,13 @@ impl TuiApp {
         Ok(())
     }
 
+    /// Handle terminal resize — force full re-render at new dimensions.
+    pub fn mark_resize(&mut self) {
+        // ratatui Terminal picks up new size on next draw via f.area().
+        // We just need to force a redraw so word-wrapping recalculates.
+        self.needs_redraw = true;
+    }
+
     // -------------------------------------------------------------------
     // Conversation helpers
     // -------------------------------------------------------------------
@@ -340,9 +347,15 @@ impl TuiApp {
 
     pub fn read_line(&mut self) -> io::Result<TuiReadOutcome> {
         if event::poll(std::time::Duration::from_millis(16))? {
-            if let Event::Key(key) = event::read()? {
-                self.needs_redraw = true;
-                return self.handle_key(key);
+            match event::read()? {
+                Event::Key(key) => {
+                    self.needs_redraw = true;
+                    return self.handle_key(key);
+                }
+                Event::Resize(_width, _height) => {
+                    self.mark_resize();
+                }
+                _ => {}
             }
         }
 
