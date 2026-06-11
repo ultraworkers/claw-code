@@ -148,6 +148,10 @@ pub struct TuiApp {
 
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
+/// Key-column width for dashboard `kv()` rows.  Values start at this
+/// column so "Model", "Compactions" etc. all line up.
+const KV_KEY_WIDTH: usize = 12;
+
 impl TuiApp {
     /// Enter alternate screen, enable raw mode, create Terminal.
     pub fn init(state: SharedDashboardState) -> Result<Self, Box<dyn std::error::Error>> {
@@ -507,6 +511,80 @@ fn draw_frame(
     draw_right_pane(f, main[1], dashboard, spinner_frame);
 }
 
+/// Word-wrap a single text line into visual lines that fit `width` columns.
+/// Returns a list of styled `Line` values.  Long words that exceed `width`
+/// are hard-broken to prevent overflow.
+fn wrap_line<'a>(text: &str, width: usize, style: Style) -> Vec<Line<'a>> {
+    if width == 0 {
+        return vec![Line::from(Span::styled(text.to_string(), style))];
+    }
+
+    let mut result: Vec<Line<'a>> = Vec::new();
+    let mut remaining = text;
+
+    if remaining.is_empty() {
+        result.push(Line::from(Span::styled(String::new(), style)));
+        return result;
+    }
+
+    while !remaining.is_empty() {
+        if remaining.chars().count() <= width {
+            result.push(Line::from(Span::styled(remaining.to_string(), style)));
+            break;
+        }
+
+        // Find the last space within `width` chars
+        let char_indices: Vec<(usize, char)> = remaining.char_indices().take(width).collect();
+        let mut break_pos = None;
+
+        for &(idx, ch) in char_indices.iter().rev() {
+            if ch == ' ' || ch == '-' {
+                break_pos = Some(idx + ch.len_utf8());
+                break;
+            }
+        }
+
+        let (head, tail) = match break_pos {
+            Some(pos) => (&remaining[..pos], remaining[pos..].trim_start()),
+            None => {
+                // No space found — hard-break at column boundary
+                let (idx, _) = char_indices.last().unwrap();
+                let end = *idx + remaining[*idx..].chars().next().map_or(0, |c| c.len_utf8());
+                (&remaining[..end], &remaining[end..])
+            }
+        };
+
+        result.push(Line::from(Span::styled(head.to_string(), style)));
+        remaining = tail;
+    }
+
+    result
+}
+
+/// Build the full conversation as wrapped visual lines, tracking how many
+/// logical lines each `ConversationLine` expands to (for scroll math).
+fn build_wrapped_conversation<'a>(
+    conversation: &[ConversationLine],
+    content_width: usize,
+) -> (Vec<Line<'a>>, Vec<usize>) {
+    let mut all_lines: Vec<Line<'a>> = Vec::new();
+    let mut expand_counts: Vec<usize> = Vec::new(); // visual lines per logical line
+
+    for cl in conversation {
+        let mut style = Style::default().fg(cl.color);
+        if cl.bold {
+            style = style.add_modifier(Modifier::BOLD);
+        }
+
+        let wrapped = wrap_line(&cl.text, content_width, style);
+        let count = wrapped.len().max(1);
+        expand_counts.push(count);
+        all_lines.extend(wrapped);
+    }
+
+    (all_lines, expand_counts)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn draw_left_pane(
     f: &mut Frame,
@@ -524,31 +602,22 @@ fn draw_left_pane(
         .constraints([Constraint::Min(5), Constraint::Length(7)])
         .split(area);
 
-    // --- conversation ---
-    let conv_lines: Vec<Line> = conversation
-        .iter()
-        .map(|line| {
-            let mut style = Style::default().fg(line.color);
-            if line.bold {
-                style = style.add_modifier(Modifier::BOLD);
-            }
-            Line::from(Span::styled(&line.text, style))
-        })
-        .collect();
+    // --- conversation with word-wrapping ---
+    // Subtract 1 for the top border, 2 for left/right block padding
+    let content_width = (left[0].width as usize).saturating_sub(2);
+    let (wrapped, expand_counts) = build_wrapped_conversation(conversation, content_width);
 
-    // FIFO viewport: newest content at the bottom, older above.
     let pane_rows = (left[0].height.saturating_sub(1) as usize).max(1);
-    let scroll = conversation_scroll as usize;
-    let total = conv_lines.len();
-    let max_offset = total.saturating_sub(pane_rows);
-    let offset = scroll.min(max_offset);
-    let start = total.saturating_sub(pane_rows + offset);
-    let visible: Vec<Line> = conv_lines.into_iter().skip(start).take(pane_rows).collect();
+    let total_visual = wrapped.len();
 
-    // NOTE: We intentionally do NOT enable Wrap here. The FIFO viewport
-    // counts Line items to fill the pane — if a Line soft-wraps to 2+
-    // visual rows the count is off and text misaligns. Long lines get
-    // clipped rather than wrapped, which keeps scrolling accurate.
+    // Compute how many visual rows to skip from the top (scroll offset).
+    // conversation_scroll=0 means "show newest content at the bottom".
+    let scroll = conversation_scroll as usize;
+    let max_offset = total_visual.saturating_sub(pane_rows);
+    let offset = scroll.min(max_offset);
+    let start = total_visual.saturating_sub(pane_rows + offset);
+    let visible: Vec<Line> = wrapped.into_iter().skip(start).take(pane_rows).collect();
+
     let conversation_widget = Paragraph::new(visible).block(
         Block::default()
             .borders(Borders::TOP)
@@ -559,6 +628,43 @@ fn draw_left_pane(
             )),
     );
     f.render_widget(conversation_widget, left[0]);
+
+    // Scroll indicator (e.g. "3/47") when content overflows
+    if total_visual > pane_rows {
+        let total_logical: usize = expand_counts.len();
+        let visible_logical = if offset == 0 {
+            // Bottom of conversation — count logical lines in the visible window
+            let mut used = pane_rows;
+            let mut count = 0;
+            for &exp in expand_counts.iter().rev() {
+                if used == 0 {
+                    break;
+                }
+                let take = exp.min(used);
+                used -= take;
+                count += 1;
+            }
+            count
+        } else {
+            // Simplified: just show visual line offset
+            pane_rows
+        };
+        let _ = (visible_logical, total_logical); // used below
+        let scroll_label = format!(" {}/{} ", offset, max_offset);
+        let scroll_area = Rect {
+            x: left[0].x + left[0].width.saturating_sub(scroll_label.len() as u16 + 1),
+            y: left[0].y,
+            width: scroll_label.len() as u16 + 1,
+            height: 1,
+        };
+        f.render_widget(
+            Paragraph::new(Span::styled(
+                scroll_label,
+                Style::default().fg(Color::DarkGray),
+            )),
+            scroll_area,
+        );
+    }
 
     // --- input (real TextArea widget) ---
     let input_widget = input.clone();
@@ -608,6 +714,7 @@ fn draw_right_pane(
 ) {
     let state = dashboard.read().unwrap_or_else(|e| e.into_inner());
     let mut lines: Vec<Line> = Vec::new();
+    let mut gauge_row: Option<usize> = None; // track the gauge's logical row
 
     lines.push(section("Connection"));
     lines.push(kv("Model", &state.model, Color::White));
@@ -652,7 +759,9 @@ fn draw_right_pane(
         &format!("{:.1}% of {}", pct, state.context_window),
         Color::White,
     ));
-    lines.push(Line::from(""));
+    // Reserve a row for the gauge bar — we'll overlay it after
+    gauge_row = Some(lines.len());
+    lines.push(Line::from("")); // gauge placeholder row
     lines.push(kv(
         "Compactions",
         &state.compaction_count.to_string(),
@@ -668,13 +777,7 @@ fn draw_right_pane(
                 "starting" => Color::Yellow,
                 _ => Color::Red,
             };
-            lines.push(Line::from(vec![
-                Span::styled(
-                    format!("  {} ", lsp.language),
-                    Style::default().fg(Color::White),
-                ),
-                Span::styled(lsp.status.clone(), Style::default().fg(c)),
-            ]));
+            lines.push(kv(&lsp.language, &lsp.status, c));
         }
         lines.push(Line::from(""));
     }
@@ -682,34 +785,25 @@ fn draw_right_pane(
     if let Some(ref team) = state.team {
         lines.push(section("Team"));
         lines.push(kv("Name", &team.team_name, Color::White));
-        lines.push(Line::from(vec![
-            Span::styled("  Progress ", Style::default().fg(Color::Gray)),
-            Span::styled(
-                format!("{}/{} done", team.completed_agents, team.total_agents),
-                Style::default().fg(Color::Green),
-            ),
-            Span::styled(
-                format!(", {} fail", team.failed_agents),
-                Style::default().fg(Color::Red),
-            ),
-            Span::styled(
-                format!(", {} run", team.running_agents),
-                Style::default().fg(Color::Cyan),
-            ),
-        ]));
+        let progress = format!(
+            "{}/{} done, {} fail, {} run",
+            team.completed_agents, team.total_agents, team.failed_agents, team.running_agents
+        );
+        lines.push(kv("Status", &progress, Color::Green));
         for agent in &team.agents {
             let c = match agent.status.as_str() {
                 "completed" => Color::Green,
                 "failed" => Color::Red,
                 _ => Color::Cyan,
             };
+            let label = format!("● {}", agent.name);
+            let detail = format!("({})", agent.subagent_type.as_deref().unwrap_or("?"));
             lines.push(Line::from(vec![
-                Span::styled("  ● ", Style::default().fg(c)),
-                Span::styled(&agent.name, Style::default().fg(Color::White)),
                 Span::styled(
-                    format!(" ({})", agent.subagent_type.as_deref().unwrap_or("?")),
-                    Style::default().fg(Color::Gray),
+                    format!("  {:<KV_KEY_WIDTH$}", label),
+                    Style::default().fg(c),
                 ),
+                Span::styled(detail, Style::default().fg(Color::Gray)),
             ]));
         }
         lines.push(Line::from(""));
@@ -737,11 +831,11 @@ fn draw_right_pane(
         Style::default().fg(Color::DarkGray),
     )));
     lines.push(Line::from(Span::styled(
-        "  Enter Submit  Shift+Enter Newline",
+        "  Enter Submit  Shift+Enter ↵",
         Style::default().fg(Color::DarkGray),
     )));
     lines.push(Line::from(Span::styled(
-        "  ^P Swap  ^T Team  ^C Cancel  ^D Exit",
+        "  ^P Swap  ^T Team  ^C ⊘  ^D Exit",
         Style::default().fg(Color::DarkGray),
     )));
 
@@ -757,23 +851,27 @@ fn draw_right_pane(
                         .add_modifier(Modifier::BOLD),
                 )),
         )
-        .wrap(Wrap { trim: true });
+        .wrap(Wrap { trim: false });
     f.render_widget(widget, area);
 
-    let gauge_area = Rect {
-        x: area.x + 2,
-        y: area.y + 16,
-        width: area.width.saturating_sub(4),
-        height: 1,
-    };
-    let gauge = Gauge::default()
-        .gauge_style(Style::default().fg(gauge_color).bg(Color::DarkGray))
-        .ratio(if pct > 0.0 {
-            (pct / 100.0).min(1.0)
-        } else {
-            0.0
-        });
-    f.render_widget(gauge, gauge_area);
+    // Overlay the context gauge at the tracked row (not a hard-coded offset)
+    if let Some(row) = gauge_row {
+        // +1 for the block's top border
+        let gauge_area = Rect {
+            x: area.x + 2,
+            y: area.y + 1 + row as u16,
+            width: area.width.saturating_sub(4),
+            height: 1,
+        };
+        let gauge = Gauge::default()
+            .gauge_style(Style::default().fg(gauge_color).bg(Color::DarkGray))
+            .ratio(if pct > 0.0 {
+                (pct / 100.0).min(1.0)
+            } else {
+                0.0
+            });
+        f.render_widget(gauge, gauge_area);
+    }
 }
 
 fn section<'a>(label: &str) -> Line<'a> {
@@ -785,9 +883,14 @@ fn section<'a>(label: &str) -> Line<'a> {
     ))
 }
 
+/// Key-value row with fixed-width key column so values align vertically.
+/// Key is right-padded to `KV_KEY_WIDTH` columns: `"  Model       value"`.
 fn kv<'a>(key: &str, val: &str, val_color: Color) -> Line<'a> {
     Line::from(vec![
-        Span::styled(format!("  {key} "), Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!("  {:<KV_KEY_WIDTH$}", key),
+            Style::default().fg(Color::DarkGray),
+        ),
         Span::styled(val.to_string(), Style::default().fg(val_color)),
     ])
 }
