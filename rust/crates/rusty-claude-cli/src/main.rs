@@ -7179,12 +7179,24 @@ fn run_tui_repl(mut cli: LiveCli) -> Result<(), Box<dyn std::error::Error>> {
                 update_dashboard(&dashboard_state, &cli);
                 app.set_status("Thinking...");
 
-                // Run the turn. Output goes to the alternate screen buffer (which
-                // ratatui owns) — it will be overwritten on next redraw.
-                // We capture the final assistant text from the session.
-                let result = cli.run_turn(&trimmed);
+                // Run the turn into a buffer instead of stdout.
+                // This is the KEY fix: no bytes hit the alternate screen during
+                // the turn, so nothing bleeds past the conversation pane boundary.
+                let mut buf: Vec<u8> = Vec::new();
+                let result = cli.run_turn_to(&trimmed, &mut buf, false);
 
-                // Read the last assistant message from the session for the conversation pane
+                // Feed the captured output into the conversation pane.
+                // The buffer may contain ANSI codes from TerminalRenderer —
+                // strip them before pushing.
+                let captured = String::from_utf8_lossy(&buf);
+                let plain = strip_ansi(&captured);
+                if !plain.is_empty() {
+                    app.push_output(&plain, false);
+                }
+
+                // Also read the last assistant message from the session for
+                // the conversation pane (richer content than the spinner/status
+                // lines in the buffer).
                 {
                     let messages = &cli.runtime.session().messages;
                     if let Some(msg) = messages.last() {
@@ -7275,6 +7287,35 @@ fn update_dashboard(state: &tui::SharedDashboardState, cli: &LiveCli) {
             .or_else(|_| std::env::var("OPENAI_BASE_URL"))
             .unwrap_or_default();
     }
+}
+
+/// Strip ANSI escape sequences from a string.  Used by the TUI path to
+/// clean captured output before pushing it into the conversation pane.
+fn strip_ansi(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' && chars.peek() == Some(&'[') {
+            chars.next(); // consume '['
+            // Consume the sequence: parameter bytes (0x30-0x3f),
+            // intermediate bytes (0x20-0x2f), final byte (0x40-0x7e)
+            while let Some(&b) = chars.peek() {
+                match b {
+                    '\x20'..='\x2f' | '\x30'..='\x3f' => {
+                        chars.next();
+                    }
+                    '\x40'..='\x7e' => {
+                        chars.next();
+                        break;
+                    }
+                    _ => break,
+                }
+            }
+        } else {
+            result.push(ch);
+        }
+    }
+    result
 }
 
 #[derive(Debug, Clone)]
@@ -7913,13 +7954,25 @@ impl LiveCli {
     }
 
     fn run_turn(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
-        let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(true)?;
+        self.run_turn_to(input, &mut io::stdout(), true)
+    }
+
+    /// Core turn execution with a custom output writer.
+    /// In the plain REPL, `out` is `io::stdout()`.
+    /// In TUI mode, `out` is a `Vec<u8>` buffer so no bytes hit the
+    /// real terminal — the TUI reads the buffer afterward.
+    fn run_turn_to<W: io::Write>(
+        &mut self,
+        input: &str,
+        out: &mut W,
+        emit_output: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(emit_output)?;
         let mut spinner = Spinner::new();
-        let mut stdout = io::stdout();
         spinner.tick(
             "🦀 Thinking...",
             TerminalRenderer::new().color_theme(),
-            &mut stdout,
+            out,
         )?;
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
         let result = runtime.run_turn(input, Some(&mut permission_prompter));
@@ -7930,18 +7983,19 @@ impl LiveCli {
                 spinner.finish(
                     "✨ Done",
                     TerminalRenderer::new().color_theme(),
-                    &mut stdout,
+                    out,
                 )?;
                 let final_text = final_assistant_text(&summary);
                 if !final_text.is_empty() {
-                    println!("{final_text}");
+                    writeln!(out, "{final_text}")?;
                 }
-                println!();
+                writeln!(out)?;
                 if let Some(event) = summary.auto_compaction {
-                    println!(
+                    writeln!(
+                        out,
                         "{}",
                         format_auto_compaction_notice(event.removed_message_count)
-                    );
+                    )?;
                 }
                 self.persist_session()?;
                 Ok(())
@@ -7951,34 +8005,14 @@ impl LiveCli {
                 spinner.fail(
                     "❌ Request failed",
                     TerminalRenderer::new().color_theme(),
-                    &mut stdout,
+                    out,
                 )?;
 
                 // ============================================================================
                 // Auto-compact retry on context window errors
                 // ============================================================================
-                // When the model API returns a context_window_blocked error (because the request
-                // exceeds the model's context window), we automatically:
-                // 1. Compact the session (remove old messages to free up space)
-                // 2. Retry the original request with the compacted session
-                // 3. Report results to the user
-                //
-                // This eliminates the need for users to manually run /compact when they
-                // hit context limits - the recovery happens automatically.
-                //
-                // Detection: We look for "context_window" or "Context window" in the error
-                // message, which covers error types like:
-                // - "context_window_blocked"
-                // - "Context window blocked"
-                // - "This model's maximum context length is X tokens..."
-                // ============================================================================
 
                 let error_str = error.to_string();
-                // Detect context window overflow. Some providers (e.g. OpenAI-compat backends)
-                // return 400 with "no parseable body" instead of a proper context_length_exceeded
-                // error when the request is too large to even parse — treat that as context overflow too.
-                // Also detect model-specific context error markers (e.g. llama.cpp returns
-                // "Context size has been exceeded." / "exceed_context_size_error" / "exceeds the available context size").
                 let is_context_window = error_str.contains("context_window")
                     || error_str.contains("Context window")
                     || error_str.contains("no parseable body")
@@ -7988,44 +8022,33 @@ impl LiveCli {
                         .to_ascii_lowercase()
                         .contains("context size has been exceeded");
 
-                // Also treat "assistant stream produced no content" and reqwest decode failures
-                // as recoverable errors that may benefit from auto-compaction. Some backends (e.g.
-                // llama.cpp) return a non-SSE HTTP 500 body when context overflows, causing
-                // reqwest to fail with "error decoding response body" — treat that as context overflow too.
                 let is_no_content = error_str.contains("assistant stream produced no content")
                     || error_str.contains("Failed to parse input at pos")
                     || error_str.contains("error decoding response body");
 
                 if is_context_window || is_no_content {
-                    // If the error tells us the server's actual context window, adapt our
-                    // auto-compaction threshold so future auto-compact-trigger checks are accurate.
                     if let Some(window) = extract_context_window_tokens_from_error(&error_str) {
-                        // Set threshold at 70% of the reported window to leave headroom.
                         let threshold: u32 = (window as f64 * 0.7).round() as u32;
-                        println!(
+                        writeln!(
+                            out,
                             "  Server context window: {} tokens — setting auto-compaction threshold to {}",
                             window, threshold
-                        );
+                        )?;
                         runtime.set_auto_compaction_input_tokens_threshold(threshold);
                     }
 
-                    // A single compaction pass may not free enough context space.
-                    // Progressive retry: each round preserves fewer recent messages (4→2→1→0),
-                    // trading conversation continuity for a smaller payload until it fits.
-                    // Max 4 rounds before giving up and surfacing the error to the user.
                     let max_compact_rounds = 4;
                     let preserve_schedule = [4, 2, 1, 0];
 
                     for round in 0..max_compact_rounds {
                         let preserve = preserve_schedule[round];
-                        println!(
+                        writeln!(
+                            out,
                             "  Auto-compacting session (round {}/{}, preserving {} recent messages)...",
                             round + 1,
                             max_compact_rounds,
                             preserve
-                        );
-
-                        // Run Trident pipeline then summary-based compaction
+                        )?;
                         let result = runtime::trident::trident_compact_session(
                             runtime.session(),
                             CompactionConfig {
@@ -8038,19 +8061,20 @@ impl LiveCli {
 
                         if removed == 0 && round > 0 {
                             // No more messages to compact — further rounds won't help
-                            println!("  No further compaction possible.");
+                            writeln!(out, "  No further compaction possible.")?;
                             break;
                         }
 
                         if removed > 0 {
-                            println!(
+                            writeln!(
+                                out,
                                 "{}",
                                 format_compact_report(
                                     removed,
                                     result.compacted_session.messages.len(),
                                     false
                                 )
-                            );
+                            )?;
                         }
 
                         // Without this, prepare_turn_runtime() reads from self.runtime.session()
@@ -8060,7 +8084,7 @@ impl LiveCli {
 
                         // Build a new runtime with the compacted session and retry
                         let (mut new_runtime, hook_abort_monitor) =
-                            self.prepare_turn_runtime(true)?;
+                            self.prepare_turn_runtime(emit_output)?;
                         drop(hook_abort_monitor);
 
                         let mut rp = CliPermissionPrompter::new(self.permission_mode);
@@ -8074,14 +8098,15 @@ impl LiveCli {
                                         "✨ Done (after aggressive auto-compact)"
                                     },
                                     TerminalRenderer::new().color_theme(),
-                                    &mut stdout,
+                                    out,
                                 )?;
-                                println!();
+                                writeln!(out)?;
                                 if let Some(event) = summary.auto_compaction {
-                                    println!(
+                                    writeln!(
+                                        out,
                                         "{}",
                                         format_auto_compaction_notice(event.removed_message_count)
-                                    );
+                                    )?;
                                 }
                                 self.persist_session()?;
                                 return Ok(());

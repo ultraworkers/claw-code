@@ -293,7 +293,12 @@ impl TuiApp {
         if text.is_empty() {
             return;
         }
-        for raw_line in text.lines() {
+        // Strip any ANSI escape codes that may have leaked through from the
+        // runtime's stdout rendering.  The conversation pane renders plain text
+        // with ratatui styles, so ANSI bytes would corrupt the layout and
+        // confuse wrap_line()'s character counting.
+        let clean = strip_ansi_escapes(text);
+        for raw_line in clean.lines() {
             self.conversation.push(ConversationLine {
                 text: raw_line.to_string(),
                 color: if is_error { Color::Red } else { Color::White },
@@ -301,6 +306,16 @@ impl TuiApp {
             });
         }
         self.auto_scroll();
+    }
+
+    /// Force a full TUI clear + redraw.  With Architecture C (buffered
+    /// output) this is no longer needed to clean up stdout debris, but
+    /// kept as a safety net for edge cases.
+    pub fn redraw_after_turn(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        self.terminal.clear()?;
+        self.needs_redraw = true;
+        self.draw_screen()?;
+        Ok(())
     }
 
     pub fn set_slash_completions(&mut self, completions: Vec<String>) {
@@ -894,4 +909,38 @@ fn kv<'a>(key: &str, val: &str, val_color: Color) -> Line<'a> {
         ),
         Span::styled(val.to_string(), Style::default().fg(val_color)),
     ])
+}
+
+/// Strip ANSI escape sequences from a string.
+///
+/// The runtime's stdout rendering (`TerminalRenderer::markdown_to_ansi`)
+/// produces ANSI-colored output for the full terminal width.  When that text
+/// leaks into the conversation pane (e.g. via error messages or raw captures)
+/// the ANSI bytes corrupt ratatui's character-counting and word-wrapping.
+/// This function removes them so the pane always works with plain text; styling
+/// is handled by ratatui's `Style` system instead.
+fn strip_ansi_escapes(input: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' {
+            // ESC sequence: ESC [ ... <final byte>
+            if chars.peek() == Some(&'[') {
+                chars.next(); // consume '['
+                for next in chars.by_ref() {
+                    // The final byte of a CSI sequence is 0x40..=0x7E
+                    if next.is_ascii_alphabetic() || ('@'..='~').contains(&next) {
+                        break;
+                    }
+                }
+            } else {
+                // Bare ESC without '[' — just swallow it
+            }
+        } else {
+            output.push(ch);
+        }
+    }
+
+    output
 }
