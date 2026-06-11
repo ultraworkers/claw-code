@@ -321,7 +321,7 @@ pub(super) fn parse_code_actions(value: &JsonValue) -> Vec<crate::lsp_client::Ls
         let title = item.get("title")?.as_str()?.to_owned();
         let kind = item.get("kind").and_then(JsonValue::as_str).map(str::to_owned);
         let is_preferred = item.get("isPreferred").and_then(JsonValue::as_bool).unwrap_or(false);
-        let edit = item.get("edit").and_then(|e| parse_workspace_edit(e));
+        let edit = item.get("edit").and_then(parse_workspace_edit);
         let command = item.get("command").and_then(parse_command);
         Some(crate::lsp_client::LspCodeAction { title, kind, is_preferred, edit, command })
     }).collect()
@@ -372,12 +372,12 @@ pub(super) fn parse_signature_help(value: &JsonValue) -> Option<crate::lsp_clien
             .and_then(|d| d.get("value").and_then(JsonValue::as_str).or_else(|| d.as_str()))
             .map(str::to_owned);
         let parameters = sig.get("parameters").and_then(JsonValue::as_array)
-            .map(|arr| arr.iter().filter_map(|p| {
+            .map(|arr| arr.iter().map(|p| {
                 let plabel = p.get("label").and_then(|l| l.as_str().or_else(|| l.get("value").and_then(JsonValue::as_str))).unwrap_or("").to_owned();
                 let pdoc = p.get("documentation")
                     .and_then(|d| d.get("value").and_then(JsonValue::as_str).or_else(|| d.as_str()))
                     .map(str::to_owned);
-                Some(crate::lsp_client::LspParameterInfo { label: plabel, documentation: pdoc })
+                crate::lsp_client::LspParameterInfo { label: plabel, documentation: pdoc }
             }).collect())
             .unwrap_or_default();
         let active_parameter = sig.get("activeParameter").and_then(JsonValue::as_u64).map(|v| v as u32);

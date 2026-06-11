@@ -125,22 +125,6 @@ pub struct RuntimePluginConfig {
     max_output_tokens: Option<u32>,
 }
 
-<<<<<<< HEAD
-<<<<<<< HEAD
-<<<<<<< HEAD
-=======
-=======
->>>>>>> e9582034 (feat: full LSP (Language Server Protocol) integration)
-/// Per-language LSP server configuration supplied by the user in settings.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LspServerConfig {
-    pub command: String,
-    pub args: Vec<String>,
-    pub enabled: bool,
-}
-
-<<<<<<< HEAD
->>>>>>> 1ff5617c (fix: sync all bug fixes to combined branch)
 /// API timeout and retry configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApiTimeoutConfig {
@@ -160,66 +144,27 @@ impl Default for ApiTimeoutConfig {
             max_retries: 8,
         }
     }
-=======
-/// Per-language LSP server configuration supplied by the user in settings.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LspServerConfig {
-    pub command: String,
-    pub args: Vec<String>,
-    pub enabled: bool,
-<<<<<<< HEAD
->>>>>>> 856409d3 (feat: full LSP (Language Server Protocol) integration)
-=======
-/// API timeout and retry configuration.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ApiTimeoutConfig {
-    /// Connect timeout in seconds. Defaults to 30.
-    pub connect_timeout_secs: u64,
-    /// Request timeout in seconds. Defaults to 300 (5 minutes).
-    pub request_timeout_secs: u64,
-    /// Maximum retry attempts on transient failures. Defaults to 8.
-    pub max_retries: u32,
 }
 
-impl Default for ApiTimeoutConfig {
-    fn default() -> Self {
-        Self {
-            connect_timeout_secs: 30,
-            request_timeout_secs: 300,
-            max_retries: 8,
-        }
-    }
->>>>>>> 07ce5aee (feat: API timeout config, Retry-After header support, and configurable retry)
-}
-
-=======
->>>>>>> e9582034 (feat: full LSP (Language Server Protocol) integration)
 /// Structured feature configuration consumed by runtime subsystems.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RuntimeFeatureConfig {
     hooks: RuntimeHookConfig,
     plugins: RuntimePluginConfig,
     mcp: McpConfigCollection,
     oauth: Option<OAuthConfig>,
     model: Option<String>,
-    lsp_auto_start: bool,
     aliases: BTreeMap<String, String>,
     permission_mode: Option<ResolvedPermissionMode>,
     permission_rules: RuntimePermissionRuleConfig,
     sandbox: SandboxConfig,
     provider_fallbacks: ProviderFallbackConfig,
     trusted_roots: Vec<String>,
-<<<<<<< HEAD
-<<<<<<< HEAD
-<<<<<<< HEAD
     api_timeout: ApiTimeoutConfig,
     rules_import: RulesImportConfig,
     provider: RuntimeProviderConfig,
-    lsp: BTreeMap<String, LspServerConfig>,
-    api_timeout: ApiTimeoutConfig,
 }
 
-<<<<<<< HEAD
 /// Controls which external AI coding framework rules are imported into the system prompt.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum RulesImportConfig {
@@ -241,26 +186,6 @@ impl RulesImportConfig {
             Self::List(frameworks) => frameworks
                 .iter()
                 .any(|candidate| candidate.eq_ignore_ascii_case(framework)),
-=======
-impl Default for RuntimeFeatureConfig {
-    fn default() -> Self {
-        Self {
-            hooks: RuntimeHookConfig::default(),
-            plugins: RuntimePluginConfig::default(),
-            mcp: McpConfigCollection::default(),
-            oauth: None,
-            model: None,
-            lsp_auto_start: true,
-            aliases: BTreeMap::new(),
-            permission_mode: None,
-            permission_rules: RuntimePermissionRuleConfig::default(),
-            sandbox: SandboxConfig::default(),
-            provider_fallbacks: ProviderFallbackConfig::default(),
-            trusted_roots: Vec::new(),
-            provider: RuntimeProviderConfig::default(),
-            lsp: BTreeMap::new(),
-            api_timeout: ApiTimeoutConfig::default(),
->>>>>>> 1ff5617c (fix: sync all bug fixes to combined branch)
         }
     }
 }
@@ -270,34 +195,6 @@ impl Default for RuntimeFeatureConfig {
 /// Represents the `provider` section in `~/.claw/settings.json`, used as a
 /// fallback when environment variables are absent (3-tier resolution:
 /// env var > .env file > stored config).
-=======
-    provider: RuntimeProviderConfig,
-    lsp: BTreeMap<String, LspServerConfig>,
-}
-
-impl Default for RuntimeFeatureConfig {
-    fn default() -> Self {
-        Self {
-            hooks: RuntimeHookConfig::default(),
-            plugins: RuntimePluginConfig::default(),
-            mcp: McpConfigCollection::default(),
-            oauth: None,
-            model: None,
-            lsp_auto_start: true,
-            aliases: BTreeMap::new(),
-            permission_mode: None,
-            permission_rules: RuntimePermissionRuleConfig::default(),
-            sandbox: SandboxConfig::default(),
-            provider_fallbacks: ProviderFallbackConfig::default(),
-            trusted_roots: Vec::new(),
-            provider: RuntimeProviderConfig::default(),
-            lsp: BTreeMap::new(),
-        }
-    }
-}
-
-/// Stored provider configuration from the setup wizard.
->>>>>>> e9582034 (feat: full LSP (Language Server Protocol) integration)
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RuntimeProviderConfig {
     kind: Option<String>,
@@ -326,37 +223,6 @@ impl RuntimeProviderConfig {
     pub fn model(&self) -> Option<&str> {
         self.model.as_deref()
     }
-=======
-    rules_import: RulesImportConfig,
-}
-
-/// Controls which external AI coding framework rules are auto-imported
-/// into the system prompt.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub enum RulesImportConfig {
-    /// Auto-import from all supported frameworks (Cursor, Copilot, Windsurf, Aider)
-    Auto,
-    /// No auto-import — only .claw/rules/ and CLAUDE.md files are loaded
-    None,
-    /// Import only from the listed frameworks
-    List(Vec<String>),
-    #[default]
-    /// Default: auto-import all detected frameworks
-    Default,
-}
-
-impl RulesImportConfig {
-    pub fn should_import(&self, framework: &str) -> bool {
-        match self {
-            Self::Auto | Self::Default => true,
-            Self::None => false,
-            Self::List(frameworks) => frameworks.iter().any(|f| f.eq_ignore_ascii_case(framework)),
-        }
-    }
->>>>>>> 22f948b7 (feat: project rules with .claw/rules/ and multi-framework auto-import)
-=======
-    subagent_model: Option<String>,
->>>>>>> 7e7baeaa (feat: SubAgent tool for fast sub-agent delegation)
 }
 
 /// Ordered chain of fallback model identifiers used when the primary
@@ -630,7 +496,6 @@ impl ConfigLoader {
         build_runtime_config(merged, loaded_entries, mcp)
     }
 
-<<<<<<< HEAD
     /// Like [`load`] but also returns the list of validation warnings collected during
     /// loading, without emitting them to stderr. Callers that want to surface warnings
     /// through a structured channel (e.g. the JSON config envelope) should use this.
@@ -787,50 +652,6 @@ impl ConfigLoader {
                 load_error.get_or_insert_with(|| error.to_string());
                 None
             }
-=======
-        let feature_config = RuntimeFeatureConfig {
-            hooks: parse_optional_hooks_config(&merged_value)?,
-            plugins: parse_optional_plugin_config(&merged_value)?,
-            mcp: McpConfigCollection {
-                servers: mcp_servers,
-            },
-            oauth: parse_optional_oauth_config(&merged_value, "merged settings.oauth")?,
-            model: parse_optional_model(&merged_value),
-            aliases: parse_optional_aliases(&merged_value)?,
-            permission_mode: parse_optional_permission_mode(&merged_value)?,
-            permission_rules: parse_optional_permission_rules(&merged_value)?,
-            sandbox: parse_optional_sandbox_config(&merged_value)?,
-            provider_fallbacks: parse_optional_provider_fallbacks(&merged_value)?,
-            trusted_roots: parse_optional_trusted_roots(&merged_value)?,
-<<<<<<< HEAD
-<<<<<<< HEAD
-            provider: parse_optional_provider_config(&merged_value)?,
-            lsp: parse_optional_lsp_config(&merged_value)?,
-<<<<<<< HEAD
-<<<<<<< HEAD
-<<<<<<< HEAD
->>>>>>> 856409d3 (feat: full LSP (Language Server Protocol) integration)
-=======
-=======
->>>>>>> ab3550e5 (feat(lsp): add lspAutoStart config, remove unused LSP client/process/transport modules)
-            lsp_auto_start: merged_value
-                .as_object()
-                .and_then(|o| o.get("lspAutoStart"))
-                .and_then(JsonValue::as_bool)
-                .unwrap_or(true),
-<<<<<<< HEAD
-            api_timeout: parse_optional_api_timeout_config(&merged_value)?,
->>>>>>> 07ce5aee (feat: API timeout config, Retry-After header support, and configurable retry)
-=======
->>>>>>> e9582034 (feat: full LSP (Language Server Protocol) integration)
-=======
->>>>>>> ab3550e5 (feat(lsp): add lspAutoStart config, remove unused LSP client/process/transport modules)
-=======
-            rules_import: parse_optional_rules_import(&merged_value)?,
->>>>>>> 22f948b7 (feat: project rules with .claw/rules/ and multi-framework auto-import)
-=======
-            subagent_model: parse_optional_subagent_model(&merged_value),
->>>>>>> 7e7baeaa (feat: SubAgent tool for fast sub-agent delegation)
         };
 
         ConfigInspection {
@@ -1089,23 +910,16 @@ impl RuntimeConfig {
         &self.feature_config.trusted_roots
     }
 
-<<<<<<< HEAD
-<<<<<<< HEAD
     #[must_use]
-<<<<<<< HEAD
     pub fn rules_import(&self) -> &RulesImportConfig {
         &self.feature_config.rules_import
     }
 
     #[must_use]
-=======
->>>>>>> e9582034 (feat: full LSP (Language Server Protocol) integration)
     pub fn provider(&self) -> &RuntimeProviderConfig {
         &self.feature_config.provider
     }
 
-<<<<<<< HEAD
-<<<<<<< HEAD
     /// Merge config-level default trusted roots with per-call roots.
     ///
     /// Config roots are defaults and are kept first; per-call roots extend the
@@ -1115,40 +929,7 @@ impl RuntimeConfig {
     #[must_use]
     pub fn trusted_roots_with_overrides(&self, per_call_roots: &[String]) -> Vec<String> {
         merge_trusted_roots(self.trusted_roots(), per_call_roots)
-=======
-    #[must_use]
-    pub fn lsp(&self) -> &BTreeMap<String, LspServerConfig> {
-        &self.feature_config.lsp
->>>>>>> 856409d3 (feat: full LSP (Language Server Protocol) integration)
-=======
-    #[must_use]
-    pub fn lsp(&self) -> &BTreeMap<String, LspServerConfig> {
-        &self.feature_config.lsp
->>>>>>> e9582034 (feat: full LSP (Language Server Protocol) integration)
     }
-
-    #[must_use]
-    pub fn lsp_auto_start(&self) -> bool {
-        self.feature_config.lsp_auto_start
-    }
-<<<<<<< HEAD
-=======
-    pub fn rules_import(&self) -> &RulesImportConfig {
-        &self.feature_config.rules_import
-    }
->>>>>>> 22f948b7 (feat: project rules with .claw/rules/ and multi-framework auto-import)
-=======
-=======
-
->>>>>>> 6b0af2bc (refactor: remove SubAgent tool, make Agent use subagentModel config)
-    #[must_use]
-    pub fn subagent_model(&self) -> Option<&str> {
-        self.feature_config.subagent_model.as_deref()
-    }
-<<<<<<< HEAD
->>>>>>> 7e7baeaa (feat: SubAgent tool for fast sub-agent delegation)
-=======
->>>>>>> 6b0af2bc (refactor: remove SubAgent tool, make Agent use subagentModel config)
 }
 
 impl RuntimeFeatureConfig {
@@ -1227,12 +1008,10 @@ impl RuntimeFeatureConfig {
     }
 
     #[must_use]
-<<<<<<< HEAD
     pub fn rules_import(&self) -> &RulesImportConfig {
         &self.rules_import
     }
 
-<<<<<<< HEAD
     /// Merge this config's default trusted roots with per-call roots.
     #[must_use]
     pub fn trusted_roots_with_overrides(&self, per_call_roots: &[String]) -> Vec<String> {
@@ -1248,29 +1027,6 @@ fn merge_trusted_roots(config_roots: &[String], per_call_roots: &[String]) -> Ve
         }
     }
     merged
-=======
-=======
-    pub fn provider(&self) -> &RuntimeProviderConfig {
-        &self.provider
-    }
-
->>>>>>> e9582034 (feat: full LSP (Language Server Protocol) integration)
-    #[must_use]
-    pub fn lsp(&self) -> &BTreeMap<String, LspServerConfig> {
-        &self.lsp
-    }
-<<<<<<< HEAD
-<<<<<<< HEAD
->>>>>>> 856409d3 (feat: full LSP (Language Server Protocol) integration)
-=======
->>>>>>> e9582034 (feat: full LSP (Language Server Protocol) integration)
-=======
-
-    #[must_use]
-    pub fn lsp_auto_start(&self) -> bool {
-        self.lsp_auto_start
-    }
->>>>>>> ab3550e5 (feat(lsp): add lspAutoStart config, remove unused LSP client/process/transport modules)
 }
 
 impl ProviderFallbackConfig {
@@ -1961,19 +1717,6 @@ fn parse_optional_model(root: &JsonValue) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
-fn parse_optional_subagent_model(value: &JsonValue) -> Option<String> {
-    value
-        .as_object()
-        .and_then(|object| {
-            object
-                .get("subagentModel")
-                .or_else(|| object.get("subagent_model"))
-        })
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.trim().is_empty())
-        .map(|s| s.trim().to_string())
-}
-
 fn parse_optional_aliases(root: &JsonValue) -> Result<BTreeMap<String, String>, ConfigError> {
     let Some(object) = root.as_object() else {
         return Ok(BTreeMap::new());
@@ -2357,15 +2100,8 @@ fn parse_optional_api_timeout_config(root: &JsonValue) -> Result<ApiTimeoutConfi
         return Ok(ApiTimeoutConfig::default());
     };
     let context = "merged settings.apiTimeout";
-<<<<<<< HEAD
     let connect_timeout_secs = optional_u64(obj, "connectTimeout", context)?.unwrap_or(30);
     let request_timeout_secs = optional_u64(obj, "requestTimeout", context)?.unwrap_or(300);
-=======
-    let connect_timeout_secs = optional_u64(obj, "connectTimeout", context)?
-        .unwrap_or(30);
-    let request_timeout_secs = optional_u64(obj, "requestTimeout", context)?
-        .unwrap_or(300);
->>>>>>> 07ce5aee (feat: API timeout config, Retry-After header support, and configurable retry)
     let max_retries = optional_u64(obj, "maxRetries", context)?
         .map(|v| v as u32)
         .unwrap_or(8);
@@ -2386,7 +2122,6 @@ fn parse_optional_trusted_roots(root: &JsonValue) -> Result<Vec<String>, ConfigE
     )
 }
 
-<<<<<<< HEAD
 fn parse_optional_rules_import(root: &JsonValue) -> Result<RulesImportConfig, ConfigError> {
     let Some(object) = root.as_object() else {
         return Ok(RulesImportConfig::default());
@@ -2437,36 +2172,6 @@ fn parse_optional_provider_config(root: &JsonValue) -> Result<RuntimeProviderCon
     })
 }
 
-=======
-
-fn parse_optional_rules_import(root: &JsonValue) -> Result<RulesImportConfig, ConfigError> {
-    let Some(object) = root.as_object() else {
-        return Ok(RulesImportConfig::Default);
-    };
-    let Some(value) = object.get("rulesImport") else {
-        return Ok(RulesImportConfig::Default);
-    };
-    match value {
-        JsonValue::String(s) => match s.as_str() {
-            "auto" => Ok(RulesImportConfig::Auto),
-            "none" => Ok(RulesImportConfig::None),
-            other => Err(ConfigError::Parse(format!(
-                r#"merged settings.rulesImport: expected "auto", "none", or an array, got "{other}""#
-            ))),
-        },
-        JsonValue::Array(arr) => {
-            let frameworks: Vec<String> = arr
-                .iter()
-                .filter_map(|v| v.as_str().map(str::to_owned))
-                .collect();
-            Ok(RulesImportConfig::List(frameworks))
-        }
-        _ => Err(ConfigError::Parse(format!(
-            r#"merged settings.rulesImport: expected "auto", "none", or an array"#
-        ))),
-    }
-}
->>>>>>> 22f948b7 (feat: project rules with .claw/rules/ and multi-framework auto-import)
 fn parse_filesystem_mode_label(value: &str) -> Result<FilesystemIsolationMode, ConfigError> {
     match value {
         "off" => Ok(FilesystemIsolationMode::Off),
@@ -2503,7 +2208,6 @@ fn parse_optional_oauth_config(
     }))
 }
 
-<<<<<<< HEAD
 /// #92: expand `${VAR}` environment variable references and `~/` home directory
 /// prefix in a config string value. Returns the expanded string.
 fn expand_config_value(value: &str) -> String {
@@ -2541,53 +2245,6 @@ fn expand_config_value(value: &str) -> String {
         }
     }
     result
-=======
-fn parse_optional_provider_config(root: &JsonValue) -> Result<RuntimeProviderConfig, ConfigError> {
-    let Some(provider_value) = root.as_object().and_then(|object| object.get("provider")) else {
-        return Ok(RuntimeProviderConfig::default());
-    };
-    let Some(object) = provider_value.as_object() else {
-        return Ok(RuntimeProviderConfig::default());
-    };
-    let kind = optional_string(object, "kind", "provider")?.map(str::to_string);
-    let api_key = optional_string(object, "apiKey", "provider")?.map(str::to_string);
-    let base_url = optional_string(object, "baseUrl", "provider")?.map(str::to_string);
-    let model = optional_string(object, "model", "provider")?.map(str::to_string);
-    Ok(RuntimeProviderConfig {
-        kind,
-        api_key,
-        base_url,
-        model,
-    })
->>>>>>> e9582034 (feat: full LSP (Language Server Protocol) integration)
-}
-
-fn parse_optional_lsp_config(
-    root: &JsonValue,
-) -> Result<BTreeMap<String, LspServerConfig>, ConfigError> {
-    let Some(lsp_value) = root.as_object().and_then(|object| object.get("lsp")) else {
-        return Ok(BTreeMap::new());
-    };
-    let lsp_object = expect_object(lsp_value, "merged settings.lsp")?;
-    let mut result = BTreeMap::new();
-    for (language, value) in lsp_object {
-        let entry = expect_object(value, &format!("merged settings.lsp.{language}"))?;
-        let command = expect_string(entry, "command", &format!("merged settings.lsp.{language}"))?
-            .to_string();
-        let args = optional_string_array(entry, "args", &format!("merged settings.lsp.{language}"))?
-            .unwrap_or_default();
-        let enabled = optional_bool(entry, "enabled", &format!("merged settings.lsp.{language}"))?
-            .unwrap_or(true);
-        result.insert(
-            language.clone(),
-            LspServerConfig {
-                command,
-                args,
-                enabled,
-            },
-        );
-    }
-    Ok(result)
 }
 
 fn parse_mcp_server_config(

@@ -209,44 +209,16 @@ const TOP_LEVEL_FIELDS: &[FieldSpec] = &[
         expected: FieldType::StringArray,
     },
     FieldSpec {
-<<<<<<< HEAD
-<<<<<<< HEAD
         name: "provider",
         expected: FieldType::Object,
     },
     FieldSpec {
-<<<<<<< HEAD
-<<<<<<< HEAD
         name: "rulesImport",
         expected: FieldType::RulesImport,
     },
     FieldSpec {
         name: "subagentModel",
         expected: FieldType::String,
-=======
-        name: "lsp",
-        expected: FieldType::Object,
->>>>>>> 856409d3 (feat: full LSP (Language Server Protocol) integration)
-    },
-    FieldSpec {
-        name: "lspAutoStart",
-        expected: FieldType::Bool,
-=======
-        name: "lsp",
-        expected: FieldType::Object,
->>>>>>> e9582034 (feat: full LSP (Language Server Protocol) integration)
-    },
-    FieldSpec {
-        name: "lspAutoStart",
-        expected: FieldType::Bool,
-=======
-        name: "rulesImport",
-        expected: FieldType::String,
->>>>>>> 22f948b7 (feat: project rules with .claw/rules/ and multi-framework auto-import)
-=======
-        name: "subagentModel",
-        expected: FieldType::String,
->>>>>>> 7e7baeaa (feat: SubAgent tool for fast sub-agent delegation)
     },
 ];
 
@@ -365,19 +337,22 @@ const OAUTH_FIELDS: &[FieldSpec] = &[
     },
 ];
 
-
-const LSP_FIELDS: &[FieldSpec] = &[
+const PROVIDER_FIELDS: &[FieldSpec] = &[
     FieldSpec {
-        name: "command",
+        name: "kind",
         expected: FieldType::String,
     },
     FieldSpec {
-        name: "args",
-        expected: FieldType::StringArray,
+        name: "apiKey",
+        expected: FieldType::String,
     },
     FieldSpec {
-        name: "enabled",
-        expected: FieldType::Bool,
+        name: "baseUrl",
+        expected: FieldType::String,
+    },
+    FieldSpec {
+        name: "model",
+        expected: FieldType::String,
     },
 ];
 
@@ -579,56 +554,6 @@ pub fn validate_config_file(
             source,
             &path_display,
         ));
-    }
-
-    // Validate lsp map: each value must be an object with LSP_FIELDS.
-    if let Some(lsp) = object.get("lsp").and_then(JsonValue::as_object) {
-        for (server_name, server_value) in lsp {
-            if let Some(server_obj) = server_value.as_object() {
-                result.merge(validate_object_keys(
-                    server_obj,
-                    LSP_FIELDS,
-                    &format!("lsp.{server_name}"),
-                    source,
-                    &path_display,
-                ));
-            } else {
-                result.errors.push(ConfigDiagnostic {
-                    path: path_display.clone(),
-                    field: format!("lsp.{server_name}"),
-                    line: find_key_line(source, server_name),
-                    kind: DiagnosticKind::WrongType {
-                        expected: "an object",
-                        got: json_type_label(server_value),
-                    },
-                });
-            }
-        }
-    }
-
-    // Validate lsp map: each value must be an object with LSP_FIELDS.
-    if let Some(lsp) = object.get("lsp").and_then(JsonValue::as_object) {
-        for (server_name, server_value) in lsp {
-            if let Some(server_obj) = server_value.as_object() {
-                result.merge(validate_object_keys(
-                    server_obj,
-                    LSP_FIELDS,
-                    &format!("lsp.{server_name}"),
-                    source,
-                    &path_display,
-                ));
-            } else {
-                result.errors.push(ConfigDiagnostic {
-                    path: path_display.clone(),
-                    field: format!("lsp.{server_name}"),
-                    line: find_key_line(source, server_name),
-                    kind: DiagnosticKind::WrongType {
-                        expected: "an object",
-                        got: json_type_label(server_value),
-                    },
-                });
-            }
-        }
     }
 
     result
@@ -1089,123 +1014,5 @@ mod tests {
             output,
             r#"/test/settings.json: field "permissionMode" is deprecated (line 3). Use "permissions.defaultMode" instead"#
         );
-    }
-
-    #[test]
-    fn validates_lsp_config_valid() {
-        // given
-        let source = r#"{"lsp": {"rust": {"command": "rust-analyzer", "args": [], "enabled": true}, "python": {"command": "pyright-langserver", "args": ["--stdio"], "enabled": false}}}"#;
-        let parsed = JsonValue::parse(source).expect("valid json");
-        let object = parsed.as_object().expect("object");
-
-        // when
-        let result = validate_config_file(object, source, &test_path());
-
-        // then
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn validates_lsp_config_unknown_field() {
-        // given
-        let source = r#"{"lsp": {"rust": {"command": "rust-analyzer", "port": 8080}}}"#;
-        let parsed = JsonValue::parse(source).expect("valid json");
-        let object = parsed.as_object().expect("object");
-
-        // when
-        let result = validate_config_file(object, source, &test_path());
-
-        // then
-        assert_eq!(result.errors.len(), 1);
-        assert_eq!(result.errors[0].field, "lsp.rust.port");
-        assert!(matches!(
-            result.errors[0].kind,
-            DiagnosticKind::UnknownKey { .. }
-        ));
-    }
-
-    #[test]
-    fn validates_lsp_config_wrong_type_for_command() {
-        // given
-        let source = r#"{"lsp": {"rust": {"command": 123}}}"#;
-        let parsed = JsonValue::parse(source).expect("valid json");
-        let object = parsed.as_object().expect("object");
-
-        // when
-        let result = validate_config_file(object, source, &test_path());
-
-        // then
-        assert_eq!(result.errors.len(), 1);
-        assert_eq!(result.errors[0].field, "lsp.rust.command");
-        assert!(matches!(
-            result.errors[0].kind,
-            DiagnosticKind::WrongType {
-                expected: "a string",
-                got: "a number"
-            }
-        ));
-    }
-
-    #[test]
-    fn validates_lsp_config_wrong_type_for_args() {
-        // given
-        let source = r#"{"lsp": {"rust": {"command": "rust-analyzer", "args": "wrong"}}}"#;
-        let parsed = JsonValue::parse(source).expect("valid json");
-        let object = parsed.as_object().expect("object");
-
-        // when
-        let result = validate_config_file(object, source, &test_path());
-
-        // then
-        assert_eq!(result.errors.len(), 1);
-        assert_eq!(result.errors[0].field, "lsp.rust.args");
-        assert!(matches!(
-            result.errors[0].kind,
-            DiagnosticKind::WrongType { .. }
-        ));
-    }
-
-    #[test]
-    fn validates_lsp_config_wrong_type_for_enabled() {
-        // given
-        let source = r#"{"lsp": {"rust": {"command": "rust-analyzer", "enabled": "yes"}}}"#;
-        let parsed = JsonValue::parse(source).expect("valid json");
-        let object = parsed.as_object().expect("object");
-
-        // when
-        let result = validate_config_file(object, source, &test_path());
-
-        // then
-        assert_eq!(result.errors.len(), 1);
-        assert_eq!(result.errors[0].field, "lsp.rust.enabled");
-        assert!(matches!(
-            result.errors[0].kind,
-            DiagnosticKind::WrongType {
-                expected: "a boolean",
-                got: "a string"
-            }
-        ));
-    }
-
-    #[test]
-    fn validates_lsp_server_must_be_object() {
-        // given
-        let source = r#"{"lsp": {"rust": "not-an-object"}}"#;
-        let parsed = JsonValue::parse(source).expect("valid json");
-        let object = parsed.as_object().expect("object");
-
-        // when
-        let result = validate_config_file(object, source, &test_path());
-
-        // then
-        assert_eq!(result.errors.len(), 1);
-        assert_eq!(result.errors[0].field, "lsp.rust");
-        assert!(matches!(
-            result.errors[0].kind,
-            DiagnosticKind::WrongType {
-                expected: "an object",
-                got: "a string"
-            }
-        ));
     }
 }

@@ -298,11 +298,7 @@ fn unshare_user_namespace_works() -> bool {
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
-<<<<<<< HEAD
             .is_ok_and(|status| status.success())
-=======
-            .is_ok_and(|s| s.success())
->>>>>>> 0b227b62 (fix: resolve cherry-pick conflicts and remove non-LSP artifacts)
     })
 }
 

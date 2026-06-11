@@ -68,15 +68,14 @@ impl super::LspRegistry {
         {
             let inner = self.inner.lock().expect("lsp registry lock poisoned");
             if let Some(entry) = inner.servers.get(&language) {
-                if entry.state.status == LspServerStatus::Disconnected
-                    || entry.state.status == LspServerStatus::Error
+                if (entry.state.status == LspServerStatus::Disconnected
+                    || entry.state.status == LspServerStatus::Error)
+                    && entry.process.is_none()
                 {
-                    if entry.process.is_none() {
-                        return Err(format!(
-                            "LSP server for '{}' is not connected (status: {})",
-                            language, entry.state.status
-                        ));
-                    }
+                    return Err(format!(
+                        "LSP server for '{}' is not connected (status: {})",
+                        language, entry.state.status
+                    ));
                 }
             }
         }

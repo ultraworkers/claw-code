@@ -3,9 +3,7 @@ use std::io::Write;
 use std::sync::{Arc, RwLock};
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
-use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, Clear, ClearType,
-};
+use crossterm::terminal::{disable_raw_mode, enable_raw_mode, Clear, ClearType};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
@@ -66,7 +64,9 @@ pub struct AgentInfo {
 }
 
 impl Default for DashboardState {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl DashboardState {
@@ -80,7 +80,9 @@ impl DashboardState {
             .and_then(|o| {
                 if o.status.success() {
                     Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
-                } else { None }
+                } else {
+                    None
+                }
             });
 
         Self {
@@ -171,7 +173,10 @@ impl TuiApp {
         );
         input.set_style(Style::default().fg(Color::White));
         input.set_cursor_style(
-            Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         );
 
         let mut me = Self {
@@ -259,25 +264,31 @@ impl TuiApp {
     }
 
     pub fn push_user_input(&mut self, text: &str) {
-        self.conversation.push(ConversationLine {
-            text: text.to_string(),
-            color: Color::Cyan,
-            bold: true,
-        });
+        for raw_line in text.lines() {
+            self.conversation.push(ConversationLine {
+                text: raw_line.to_string(),
+                color: Color::Cyan,
+                bold: true,
+            });
+        }
         self.auto_scroll();
     }
 
     pub fn push_system_message(&mut self, text: &str) {
-        self.conversation.push(ConversationLine {
-            text: text.to_string(),
-            color: Color::Yellow,
-            bold: false,
-        });
+        for raw_line in text.lines() {
+            self.conversation.push(ConversationLine {
+                text: raw_line.to_string(),
+                color: Color::Yellow,
+                bold: false,
+            });
+        }
         self.auto_scroll();
     }
 
     pub fn push_output(&mut self, text: &str, is_error: bool) {
-        if text.is_empty() { return; }
+        if text.is_empty() {
+            return;
+        }
         for raw_line in text.lines() {
             self.conversation.push(ConversationLine {
                 text: raw_line.to_string(),
@@ -388,11 +399,19 @@ impl TuiApp {
                 let text = lines.join("\n");
                 self.input.select_all();
                 self.input.cut();
-                if text.trim().is_empty() { return Ok(TuiReadOutcome::Pending); }
+                if text.trim().is_empty() {
+                    return Ok(TuiReadOutcome::Pending);
+                }
                 Ok(TuiReadOutcome::Submit(text))
             }
-            KeyCode::Tab => { self.handle_tab(); Ok(TuiReadOutcome::Pending) }
-            KeyCode::Esc => { self.showing_completions = false; Ok(TuiReadOutcome::Cancel) }
+            KeyCode::Tab => {
+                self.handle_tab();
+                Ok(TuiReadOutcome::Pending)
+            }
+            KeyCode::Esc => {
+                self.showing_completions = false;
+                Ok(TuiReadOutcome::Cancel)
+            }
             KeyCode::PageUp => {
                 self.conversation_scroll = self.conversation_scroll.saturating_add(5);
                 Ok(TuiReadOutcome::Pending)
@@ -414,13 +433,17 @@ impl TuiApp {
             let current_text: String = self.input.lines().join("");
             if current_text.starts_with('/') {
                 let prefix = &current_text;
-                let matches: Vec<&String> = self.slash_completions.iter()
+                let matches: Vec<&String> = self
+                    .slash_completions
+                    .iter()
                     .filter(|c| c.starts_with(prefix))
                     .collect();
                 if matches.len() == 1 {
                     self.input.select_all();
                     self.input.cut();
-                    for ch in matches[0].chars() { self.input.insert_char(ch); }
+                    for ch in matches[0].chars() {
+                        self.input.insert_char(ch);
+                    }
                     self.showing_completions = false;
                 } else if !matches.is_empty() {
                     self.showing_completions = true;
@@ -471,8 +494,15 @@ fn draw_frame(
         .split(size);
 
     draw_left_pane(
-        f, main[0], conversation, conversation_scroll,
-        input, input_lines, slash_completions, completion_index, showing_completions,
+        f,
+        main[0],
+        conversation,
+        conversation_scroll,
+        input,
+        input_lines,
+        slash_completions,
+        completion_index,
+        showing_completions,
     );
     draw_right_pane(f, main[1], dashboard, spinner_frame);
 }
@@ -495,11 +525,16 @@ fn draw_left_pane(
         .split(area);
 
     // --- conversation ---
-    let conv_lines: Vec<Line> = conversation.iter().map(|line| {
-        let mut style = Style::default().fg(line.color);
-        if line.bold { style = style.add_modifier(Modifier::BOLD); }
-        Line::from(Span::styled(&line.text, style))
-    }).collect();
+    let conv_lines: Vec<Line> = conversation
+        .iter()
+        .map(|line| {
+            let mut style = Style::default().fg(line.color);
+            if line.bold {
+                style = style.add_modifier(Modifier::BOLD);
+            }
+            Line::from(Span::styled(&line.text, style))
+        })
+        .collect();
 
     // FIFO viewport: newest content at the bottom, older above.
     let pane_rows = (left[0].height.saturating_sub(1) as usize).max(1);
@@ -510,13 +545,19 @@ fn draw_left_pane(
     let start = total.saturating_sub(pane_rows + offset);
     let visible: Vec<Line> = conv_lines.into_iter().skip(start).take(pane_rows).collect();
 
-    let conversation_widget = Paragraph::new(visible)
-        .block(
-            Block::default()
-                .borders(Borders::TOP)
-                .border_style(Style::default().fg(Color::DarkGray))
-                .title(Span::styled(" Conversation ", Style::default().fg(Color::DarkGray))),
-        );
+    // NOTE: We intentionally do NOT enable Wrap here. The FIFO viewport
+    // counts Line items to fill the pane — if a Line soft-wraps to 2+
+    // visual rows the count is off and text misaligns. Long lines get
+    // clipped rather than wrapped, which keeps scrolling accurate.
+    let conversation_widget = Paragraph::new(visible).block(
+        Block::default()
+            .borders(Borders::TOP)
+            .border_style(Style::default().fg(Color::DarkGray))
+            .title(Span::styled(
+                " Conversation ",
+                Style::default().fg(Color::DarkGray),
+            )),
+    );
     f.render_widget(conversation_widget, left[0]);
 
     // --- input (real TextArea widget) ---
@@ -526,21 +567,28 @@ fn draw_left_pane(
     // --- completions popup ---
     if showing_completions {
         let current_text: String = input_lines.join("");
-        let matches: Vec<&String> = slash_completions.iter()
+        let matches: Vec<&String> = slash_completions
+            .iter()
             .filter(|c| c.starts_with(current_text.as_str()))
             .collect();
         if !matches.is_empty() {
-            let items: Vec<ListItem> = matches.iter().enumerate().map(|(i, m)| {
-                let style = if i == completion_index % matches.len() {
-                    Style::default().bg(Color::DarkGray).fg(Color::White)
-                } else {
-                    Style::default().fg(Color::Gray)
-                };
-                ListItem::new(Line::from(Span::styled(m.as_str(), style)))
-            }).collect();
-            let list = List::new(items)
-                .block(Block::default().borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::DarkGray)));
+            let items: Vec<ListItem> = matches
+                .iter()
+                .enumerate()
+                .map(|(i, m)| {
+                    let style = if i == completion_index % matches.len() {
+                        Style::default().bg(Color::DarkGray).fg(Color::White)
+                    } else {
+                        Style::default().fg(Color::Gray)
+                    };
+                    ListItem::new(Line::from(Span::styled(m.as_str(), style)))
+                })
+                .collect();
+            let list = List::new(items).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::DarkGray)),
+            );
             let popup = Rect {
                 x: left[1].x,
                 y: left[1].y.saturating_sub(matches.len().min(8) as u16 + 2),
@@ -575,9 +623,21 @@ fn draw_right_pane(
     lines.push(kv("Turns", &state.turn_count.to_string(), Color::White));
     lines.push(kv("Input", &state.input_tokens.to_string(), Color::White));
     lines.push(kv("Output", &state.output_tokens.to_string(), Color::White));
-    lines.push(kv("Cache R", &state.cache_read_tokens.to_string(), Color::Gray));
-    lines.push(kv("Cache W", &state.cache_creation_tokens.to_string(), Color::Gray));
-    lines.push(kv("Cost", &format!("${:.4}", state.cost_usd), Color::Yellow));
+    lines.push(kv(
+        "Cache R",
+        &state.cache_read_tokens.to_string(),
+        Color::Gray,
+    ));
+    lines.push(kv(
+        "Cache W",
+        &state.cache_creation_tokens.to_string(),
+        Color::Gray,
+    ));
+    lines.push(kv(
+        "Cost",
+        &format!("${:.4}", state.cost_usd),
+        Color::Yellow,
+    ));
     lines.push(Line::from(""));
 
     let pct = state.context_percent;
@@ -587,9 +647,17 @@ fn draw_right_pane(
         _ => Color::Green,
     };
     lines.push(section("Context"));
-    lines.push(kv("Used", &format!("{:.1}% of {}", pct, state.context_window), Color::White));
+    lines.push(kv(
+        "Used",
+        &format!("{:.1}% of {}", pct, state.context_window),
+        Color::White,
+    ));
     lines.push(Line::from(""));
-    lines.push(kv("Compactions", &state.compaction_count.to_string(), Color::Gray));
+    lines.push(kv(
+        "Compactions",
+        &state.compaction_count.to_string(),
+        Color::Gray,
+    ));
     lines.push(Line::from(""));
 
     if !state.lsp_servers.is_empty() {
@@ -601,7 +669,10 @@ fn draw_right_pane(
                 _ => Color::Red,
             };
             lines.push(Line::from(vec![
-                Span::styled(format!("  {} ", lsp.language), Style::default().fg(Color::White)),
+                Span::styled(
+                    format!("  {} ", lsp.language),
+                    Style::default().fg(Color::White),
+                ),
                 Span::styled(lsp.status.clone(), Style::default().fg(c)),
             ]));
         }
@@ -613,63 +684,104 @@ fn draw_right_pane(
         lines.push(kv("Name", &team.team_name, Color::White));
         lines.push(Line::from(vec![
             Span::styled("  Progress ", Style::default().fg(Color::Gray)),
-            Span::styled(format!("{}/{} done", team.completed_agents, team.total_agents), Style::default().fg(Color::Green)),
-            Span::styled(format!(", {} fail", team.failed_agents), Style::default().fg(Color::Red)),
-            Span::styled(format!(", {} run", team.running_agents), Style::default().fg(Color::Cyan)),
+            Span::styled(
+                format!("{}/{} done", team.completed_agents, team.total_agents),
+                Style::default().fg(Color::Green),
+            ),
+            Span::styled(
+                format!(", {} fail", team.failed_agents),
+                Style::default().fg(Color::Red),
+            ),
+            Span::styled(
+                format!(", {} run", team.running_agents),
+                Style::default().fg(Color::Cyan),
+            ),
         ]));
         for agent in &team.agents {
             let c = match agent.status.as_str() {
-                "completed" => Color::Green, "failed" => Color::Red, _ => Color::Cyan,
+                "completed" => Color::Green,
+                "failed" => Color::Red,
+                _ => Color::Cyan,
             };
             lines.push(Line::from(vec![
                 Span::styled("  ● ", Style::default().fg(c)),
                 Span::styled(&agent.name, Style::default().fg(Color::White)),
-                Span::styled(format!(" ({})", agent.subagent_type.as_deref().unwrap_or("?")), Style::default().fg(Color::Gray)),
+                Span::styled(
+                    format!(" ({})", agent.subagent_type.as_deref().unwrap_or("?")),
+                    Style::default().fg(Color::Gray),
+                ),
             ]));
         }
         lines.push(Line::from(""));
     }
 
     lines.push(section("Session"));
-    lines.push(kv("ID", state.session_id.as_deref().unwrap_or("-"), Color::Gray));
+    lines.push(kv(
+        "ID",
+        state.session_id.as_deref().unwrap_or("-"),
+        Color::Gray,
+    ));
 
     if !state.status_message.is_empty() {
         let frame = SPINNER_FRAMES[spinner_frame];
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            format!("{frame} {}", state.status_message), Style::default().fg(Color::Blue),
+            format!("{frame} {}", state.status_message),
+            Style::default().fg(Color::Blue),
         )));
     }
 
     lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled("─ Keys ─", Style::default().fg(Color::DarkGray))));
-    lines.push(Line::from(Span::styled("  Enter Submit  Shift+Enter Newline", Style::default().fg(Color::DarkGray))));
-    lines.push(Line::from(Span::styled("  ^P Swap  ^T Team  ^C Cancel  ^D Exit", Style::default().fg(Color::DarkGray))));
+    lines.push(Line::from(Span::styled(
+        "─ Keys ─",
+        Style::default().fg(Color::DarkGray),
+    )));
+    lines.push(Line::from(Span::styled(
+        "  Enter Submit  Shift+Enter Newline",
+        Style::default().fg(Color::DarkGray),
+    )));
+    lines.push(Line::from(Span::styled(
+        "  ^P Swap  ^T Team  ^C Cancel  ^D Exit",
+        Style::default().fg(Color::DarkGray),
+    )));
 
     let widget = Paragraph::new(lines)
         .block(
             Block::default()
                 .borders(Borders::LEFT)
                 .border_style(Style::default().fg(Color::DarkGray))
-                .title(Span::styled(" Dashboard ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))),
+                .title(Span::styled(
+                    " Dashboard ",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                )),
         )
         .wrap(Wrap { trim: true });
     f.render_widget(widget, area);
 
     let gauge_area = Rect {
-        x: area.x + 2, y: area.y + 16,
-        width: area.width.saturating_sub(4), height: 1,
+        x: area.x + 2,
+        y: area.y + 16,
+        width: area.width.saturating_sub(4),
+        height: 1,
     };
     let gauge = Gauge::default()
         .gauge_style(Style::default().fg(gauge_color).bg(Color::DarkGray))
-        .ratio(if pct > 0.0 { (pct / 100.0).min(1.0) } else { 0.0 });
+        .ratio(if pct > 0.0 {
+            (pct / 100.0).min(1.0)
+        } else {
+            0.0
+        });
     f.render_widget(gauge, gauge_area);
 }
 
 fn section<'a>(label: &str) -> Line<'a> {
     Line::from(Span::styled(
         format!("─ {label} ─"),
-        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
     ))
 }
 

@@ -467,12 +467,8 @@ impl AnthropicClient {
                 break;
             }
 
-<<<<<<< HEAD
             let delay = if let Some(retry_after) = last_error.as_ref().and_then(|e| e.retry_after())
             {
-=======
-            let delay = if let Some(retry_after) = last_error.as_ref().and_then(|e| e.retry_after()) {
->>>>>>> 07ce5aee (feat: API timeout config, Retry-After header support, and configurable retry)
                 retry_after
             } else {
                 self.jittered_backoff_for_attempt(attempts)?
@@ -760,7 +756,11 @@ fn now_unix_timestamp() -> u64 {
 }
 
 fn read_env_non_empty(key: &str) -> Result<Option<String>, ApiError> {
-    super::read_env_or_config(key)
+    match std::env::var(key) {
+        Ok(value) if !value.is_empty() => Ok(Some(value)),
+        Ok(_) | Err(std::env::VarError::NotPresent) => Ok(super::dotenv_value(key)),
+        Err(error) => Err(ApiError::from(error)),
+    }
 }
 
 #[cfg(test)]
@@ -781,10 +781,7 @@ fn read_auth_token() -> Option<String> {
 
 #[must_use]
 pub fn read_base_url() -> String {
-    super::read_env_or_config("ANTHROPIC_BASE_URL")
-        .ok()
-        .flatten()
-        .unwrap_or_else(|| DEFAULT_BASE_URL.to_string())
+    std::env::var("ANTHROPIC_BASE_URL").unwrap_or_else(|_| DEFAULT_BASE_URL.to_string())
 }
 
 fn request_id_from_headers(headers: &reqwest::header::HeaderMap) -> Option<String> {
@@ -892,7 +889,7 @@ async fn expect_success(response: reqwest::Response) -> Result<reqwest::Response
     let request_id = request_id_from_headers(&headers);
     let body = response.text().await.unwrap_or_else(|_| String::new());
     let parsed_error = serde_json::from_str::<AnthropicErrorEnvelope>(&body).ok();
-    let retryable = is_retryable_status(status) || is_retryable_400(status, &body);
+    let retryable = is_retryable_status(status);
     let retry_after = parse_retry_after(&headers, status);
 
     Err(ApiError::Api {
@@ -911,14 +908,10 @@ async fn expect_success(response: reqwest::Response) -> Result<reqwest::Response
     })
 }
 
-<<<<<<< HEAD
 fn parse_retry_after(
     headers: &reqwest::header::HeaderMap,
     status: reqwest::StatusCode,
 ) -> Option<std::time::Duration> {
-=======
-fn parse_retry_after(headers: &reqwest::header::HeaderMap, status: reqwest::StatusCode) -> Option<std::time::Duration> {
->>>>>>> 07ce5aee (feat: API timeout config, Retry-After header support, and configurable retry)
     if status != reqwest::StatusCode::TOO_MANY_REQUESTS {
         return None;
     }
@@ -943,15 +936,10 @@ fn is_retryable_400(status: reqwest::StatusCode, body: &str) -> bool {
         return false;
     }
     let lowered = body.to_ascii_lowercase();
-    // Gateway/proxy flakes that return 400 with transient error bodies
     lowered.contains("no parseable body")
         || lowered.contains("connection reset")
         || lowered.contains("broken pipe")
         || lowered.contains("empty reply from server")
-        // Anthropic sometimes returns 400 invalid_request_error when their
-        // backend flakes — the body contains "no parseable body" in the
-        // message field of the JSON error envelope.
-        || (lowered.contains("invalid_request_error") && lowered.contains("no parseable body"))
 }
 
 /// Anthropic API keys (`sk-ant-*`) are accepted over the `x-api-key` header

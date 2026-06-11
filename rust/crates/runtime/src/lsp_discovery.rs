@@ -267,23 +267,11 @@ pub fn known_lsp_servers() -> Vec<LspServerDescriptor> {
 /// Check whether a command exists on the user's PATH by attempting to run it
 /// with `--version`. Returns `true` if the command could be spawned
 /// successfully, `false` otherwise.
-<<<<<<< HEAD
-<<<<<<< HEAD
-///
-/// Some LSP servers (like rust-analyzer via rustup) exit non-zero on --version
-/// but are still functional. We treat "spawned successfully" as found, regardless
-/// of the exit code. Only a failure to spawn (command not found) returns false.
-=======
->>>>>>> e9582034 (feat: full LSP (Language Server Protocol) integration)
-=======
->>>>>>> 353da088 (feat(lsp): install prompts, new servers, and advanced LSP features)
 #[must_use]
 pub fn command_exists_on_path(command: &str) -> bool {
     Command::new(command)
         .arg("--version")
         .output()
-<<<<<<< HEAD
-<<<<<<< HEAD
         .is_ok()
 }
 
@@ -307,16 +295,6 @@ fn rustup_component_works(component: &str) -> bool {
         .args(["run", "stable", component, "--version"])
         .output()
         .is_ok_and(|o| o.status.success())
-<<<<<<< HEAD
-=======
-        .map(|output| output.status.success())
-        .unwrap_or(false)
->>>>>>> e9582034 (feat: full LSP (Language Server Protocol) integration)
-=======
-        .is_ok()
->>>>>>> 73cc8277 (feat: auto-LSP integration with didOpen/didChange and diagnostic enrichment)
-=======
->>>>>>> ab3550e5 (feat(lsp): add lspAutoStart config, remove unused LSP client/process/transport modules)
 }
 
 /// Detect the current platform/distro for install suggestion filtering.
@@ -471,35 +449,11 @@ pub fn format_install_prompt(actions: &[LspInstallAction]) -> String {
 }
 
 /// Discover LSP servers that are actually installed on the current system.
-<<<<<<< HEAD
-///
-/// Iterates over the known server table and returns only those whose command
-<<<<<<< HEAD
-<<<<<<< HEAD
-=======
->>>>>>> ab3550e5 (feat(lsp): add lspAutoStart config, remove unused LSP client/process/transport modules)
-/// is found on `PATH` **and** is actually functional. For `rust-analyzer`,
-/// rustup ships a stub proxy that always exists on PATH but prints
-/// "Unknown binary" when the component isn't installed. We detect that
-/// case and either rewrite to `rustup run stable rust-analyzer` (when the
-/// component is installed) or skip the server entirely (when it's not).
-<<<<<<< HEAD
-=======
-/// is found on `PATH`.
->>>>>>> e9582034 (feat: full LSP (Language Server Protocol) integration)
-=======
->>>>>>> ab3550e5 (feat(lsp): add lspAutoStart config, remove unused LSP client/process/transport modules)
-=======
->>>>>>> 353da088 (feat(lsp): install prompts, new servers, and advanced LSP features)
 #[must_use]
 pub fn discover_available_servers() -> Vec<LspServerDescriptor> {
     KNOWN_LSP_SERVERS_TABLE
         .iter()
         .filter(|desc| command_exists_on_path(desc.command))
-<<<<<<< HEAD
-<<<<<<< HEAD
-=======
->>>>>>> ab3550e5 (feat(lsp): add lspAutoStart config, remove unused LSP client/process/transport modules)
         .filter_map(|desc| {
             let mut server = desc.to_descriptor();
             if desc.command == "rust-analyzer" && is_rustup_proxy("rust-analyzer") {
@@ -516,12 +470,6 @@ pub fn discover_available_servers() -> Vec<LspServerDescriptor> {
             }
             Some(server)
         })
-<<<<<<< HEAD
-=======
-        .map(StaticLspServerDescriptor::to_descriptor)
->>>>>>> e9582034 (feat: full LSP (Language Server Protocol) integration)
-=======
->>>>>>> ab3550e5 (feat(lsp): add lspAutoStart config, remove unused LSP client/process/transport modules)
         .collect()
 }
 

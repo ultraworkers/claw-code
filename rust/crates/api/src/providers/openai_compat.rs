@@ -1697,7 +1697,11 @@ fn parse_sse_frame(
 }
 
 fn read_env_non_empty(key: &str) -> Result<Option<String>, ApiError> {
-    super::read_env_or_config(key)
+    match std::env::var(key) {
+        Ok(value) if !value.is_empty() => Ok(Some(value)),
+        Ok(_) | Err(std::env::VarError::NotPresent) => Ok(super::dotenv_value(key)),
+        Err(error) => Err(ApiError::from(error)),
+    }
 }
 
 #[must_use]
@@ -1710,10 +1714,7 @@ pub fn has_api_key(key: &str) -> bool {
 
 #[must_use]
 pub fn read_base_url(config: OpenAiCompatConfig) -> String {
-    super::read_env_or_config(config.base_url_env)
-        .ok()
-        .flatten()
-        .unwrap_or_else(|| config.default_base_url.to_string())
+    std::env::var(config.base_url_env).unwrap_or_else(|_| config.default_base_url.to_string())
 }
 
 fn chat_completions_endpoint(base_url: &str) -> String {
@@ -1743,7 +1744,7 @@ async fn expect_success(response: reqwest::Response) -> Result<reqwest::Response
     let request_id = request_id_from_headers(&headers);
     let body = response.text().await.unwrap_or_default();
     let parsed_error = serde_json::from_str::<ErrorEnvelope>(&body).ok();
-    let retryable = is_retryable_status(status) || is_retryable_400(status, &body);
+    let retryable = is_retryable_status(status);
     let retry_after = parse_retry_after(&headers, status);
 
     let suggested_action = suggested_action_for_status(status);
@@ -1764,14 +1765,10 @@ async fn expect_success(response: reqwest::Response) -> Result<reqwest::Response
     })
 }
 
-<<<<<<< HEAD
 fn parse_retry_after(
     headers: &reqwest::header::HeaderMap,
     status: reqwest::StatusCode,
 ) -> Option<std::time::Duration> {
-=======
-fn parse_retry_after(headers: &reqwest::header::HeaderMap, status: reqwest::StatusCode) -> Option<std::time::Duration> {
->>>>>>> 07ce5aee (feat: API timeout config, Retry-After header support, and configurable retry)
     if status != reqwest::StatusCode::TOO_MANY_REQUESTS {
         return None;
     }

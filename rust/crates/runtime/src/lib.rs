@@ -10,7 +10,6 @@ pub mod bash_validation;
 mod bootstrap;
 pub mod branch_lock;
 mod compact;
-pub mod trident;
 mod config;
 pub mod config_validate;
 mod conversation;
@@ -69,10 +68,6 @@ pub use compact::{
     get_compact_continuation_message, should_compact, CompactionConfig, CompactionResult,
 };
 pub use config::{
-<<<<<<< HEAD
-<<<<<<< HEAD
-<<<<<<< HEAD
-<<<<<<< HEAD
     clear_user_provider_settings, default_config_home, save_user_provider_settings,
     suppress_config_warnings_for_json_mode, ApiTimeoutConfig, ConfigEntry, ConfigError,
     ConfigFileReport, ConfigFileStatus, ConfigInspection, ConfigLoader, ConfigSource,
@@ -82,49 +77,15 @@ pub use config::{
     RulesImportConfig, RuntimeConfig, RuntimeFeatureConfig, RuntimeHookCommand, RuntimeHookConfig,
     RuntimeInvalidHookConfig, RuntimePermissionRuleConfig, RuntimePluginConfig,
     RuntimeProviderConfig, ScopedMcpServerConfig, CLAW_SETTINGS_SCHEMA_NAME,
-=======
-=======
->>>>>>> e9582034 (feat: full LSP (Language Server Protocol) integration)
-    clear_user_provider_settings, save_user_provider_settings, ConfigEntry, ConfigError,
-=======
-    ConfigEntry, ConfigError,
->>>>>>> 0b227b62 (fix: resolve cherry-pick conflicts and remove non-LSP artifacts)
-    ConfigLoader, ConfigSource, LspServerConfig, McpConfigCollection, McpManagedProxyServerConfig,
-    McpOAuthConfig, McpRemoteServerConfig, McpSdkServerConfig, McpServerConfig,
-    McpStdioServerConfig, McpTransport, McpWebSocketServerConfig, OAuthConfig,
-<<<<<<< HEAD
-    ApiTimeoutConfig, ConfigEntry, ConfigError, ConfigLoader, ConfigSource, McpConfigCollection,
-=======
-    ApiTimeoutConfig, clear_user_provider_settings, save_user_provider_settings, ConfigEntry,
-    ConfigError, ConfigLoader, ConfigSource, LspServerConfig, McpConfigCollection,
->>>>>>> 1ff5617c (fix: sync all bug fixes to combined branch)
-    McpManagedProxyServerConfig, McpOAuthConfig, McpRemoteServerConfig, McpSdkServerConfig,
-    McpServerConfig, McpStdioServerConfig, McpTransport, McpWebSocketServerConfig, OAuthConfig,
-<<<<<<< HEAD
-=======
->>>>>>> e9582034 (feat: full LSP (Language Server Protocol) integration)
-    ProviderFallbackConfig, ResolvedPermissionMode, RuntimeConfig, RuntimeFeatureConfig,
-    RuntimeHookConfig, RuntimePermissionRuleConfig, RuntimePluginConfig, RuntimeProviderConfig,
-    ScopedMcpServerConfig, CLAW_SETTINGS_SCHEMA_NAME,
->>>>>>> 856409d3 (feat: full LSP (Language Server Protocol) integration)
-=======
-    ProviderFallbackConfig, ResolvedPermissionMode, RulesImportConfig, RuntimeConfig,
-    RuntimeFeatureConfig, RuntimeHookConfig, RuntimePermissionRuleConfig, RuntimePluginConfig,
-    ScopedMcpServerConfig, CLAW_SETTINGS_SCHEMA_NAME,
->>>>>>> 22f948b7 (feat: project rules with .claw/rules/ and multi-framework auto-import)
 };
 pub use config_validate::{
     check_unsupported_format, format_diagnostics, validate_config_file, ConfigDiagnostic,
     DiagnosticKind, ValidationResult,
 };
-pub use lsp_discovery::{
-    command_exists_on_path, discover_available_servers, find_server_for_file,
-    known_lsp_servers, LspServerDescriptor,
-};
 pub use conversation::{
     auto_compaction_threshold_from_env, ApiClient, ApiRequest, AssistantEvent, AutoCompactionEvent,
-    ConversationRuntime, PromptCacheEvent, RuntimeError, StaticToolExecutor, ToolCall, ToolError,
-    ToolExecutor, ToolResult, TurnProgressReporter, TurnSummary,
+    ConversationRuntime, PromptCacheEvent, RuntimeError, StaticToolExecutor, ToolError,
+    ToolExecutor, TurnSummary,
 };
 pub use file_ops::{
     edit_file, edit_file_in_workspace, glob_search, glob_search_in_workspace, grep_search,

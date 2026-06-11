@@ -1042,13 +1042,6 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         argument_hint: None,
         resume_supported: true,
     },
-    SlashCommandSpec {
-        name: "lsp",
-        aliases: &[],
-        summary: "Show or manage LSP server status",
-        argument_hint: Some("[start|stop|restart <language>]"),
-        resume_supported: true,
-    },
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1195,13 +1188,6 @@ pub enum SlashCommand {
     History {
         count: Option<String>,
     },
-    Lsp {
-        action: Option<String>,
-        target: Option<String>,
-    },
-    Team {
-        action: Option<String>,
-    },
     Unknown(String),
     Team {
         action: Option<String>,
@@ -1292,11 +1278,6 @@ impl SlashCommand {
             Self::Theme { .. } => "/theme",
             Self::Voice { .. } => "/voice",
             Self::Usage { .. } => "/usage",
-<<<<<<< HEAD
-=======
-            Self::Team { .. } => "/team",
-            Self::Setup => "/setup",
->>>>>>> 7ab899c0 (feat: agent teams with task claiming, context management, and team monitoring)
             Self::Rename { .. } => "/rename",
             Self::Copy { .. } => "/copy",
             Self::Hooks { .. } => "/hooks",
@@ -1309,15 +1290,7 @@ impl SlashCommand {
             Self::Tag { .. } => "/tag",
             Self::OutputStyle { .. } => "/output-style",
             Self::AddDir { .. } => "/add-dir",
-<<<<<<< HEAD
-<<<<<<< HEAD
             Self::Team { .. } => "/team",
-=======
-            Self::Lsp { .. } => "/lsp",
->>>>>>> 856409d3 (feat: full LSP (Language Server Protocol) integration)
-=======
-            Self::Lsp { .. } => "/lsp",
->>>>>>> e9582034 (feat: full LSP (Language Server Protocol) integration)
             Self::Sandbox => "/sandbox",
             Self::Mcp { .. } => "/mcp",
             Self::Export { .. } => "/export",
@@ -1521,11 +1494,6 @@ pub fn validate_slash_command_input(
         "theme" => SlashCommand::Theme { name: remainder },
         "voice" => SlashCommand::Voice { mode: remainder },
         "usage" => SlashCommand::Usage { scope: remainder },
-<<<<<<< HEAD
-=======
-        "team" => SlashCommand::Team { action: remainder },
-        "setup" => SlashCommand::Setup,
->>>>>>> 7ab899c0 (feat: agent teams with task claiming, context management, and team monitoring)
         "rename" => SlashCommand::Rename { name: remainder },
         "copy" => SlashCommand::Copy { target: remainder },
         "hooks" => SlashCommand::Hooks { args: remainder },
@@ -1538,10 +1506,6 @@ pub fn validate_slash_command_input(
         "tag" => SlashCommand::Tag { label: remainder },
         "output-style" => SlashCommand::OutputStyle { style: remainder },
         "add-dir" => SlashCommand::AddDir { path: remainder },
-        "lsp" => SlashCommand::Lsp {
-            action: args.first().map(|s| (*s).to_string()),
-            target: args.get(1).map(|s| (*s).to_string()),
-        },
         "history" => SlashCommand::History {
             count: optional_single_arg(command, &args, "[count]")?,
         },
@@ -5429,27 +5393,9 @@ pub fn handle_slash_command(
         | SlashCommand::OutputStyle { .. }
         | SlashCommand::AddDir { .. }
         | SlashCommand::History { .. }
-<<<<<<< HEAD
-<<<<<<< HEAD
         | SlashCommand::Team { .. }
-=======
-        | SlashCommand::Lsp { .. }
-<<<<<<< HEAD
->>>>>>> 856409d3 (feat: full LSP (Language Server Protocol) integration)
-        | SlashCommand::Setup
-=======
-        | SlashCommand::Lsp { .. }
-<<<<<<< HEAD
         | SlashCommand::Setup
         | SlashCommand::Unknown(_) => None,
->>>>>>> e9582034 (feat: full LSP (Language Server Protocol) integration)
-=======
->>>>>>> 0b227b62 (fix: resolve cherry-pick conflicts and remove non-LSP artifacts)
-        | SlashCommand::Unknown(_) => None,
-=======
-        | SlashCommand::Team { .. }
-        | SlashCommand::Setup        | SlashCommand::Unknown(_) => None,
->>>>>>> 7ab899c0 (feat: agent teams with task claiming, context management, and team monitoring)
     }
 }
 
@@ -6065,20 +6011,8 @@ mod tests {
         assert!(help.contains("aliases: /skill"));
         assert!(!help.contains("/login"));
         assert!(!help.contains("/logout"));
-<<<<<<< HEAD
-<<<<<<< HEAD
-<<<<<<< HEAD
         assert!(help.contains("/setup"));
         assert_eq!(slash_command_specs().len(), 140);
-=======
-        assert_eq!(slash_command_specs().len(), 141);
->>>>>>> 856409d3 (feat: full LSP (Language Server Protocol) integration)
-=======
-        assert_eq!(slash_command_specs().len(), 141);
->>>>>>> e9582034 (feat: full LSP (Language Server Protocol) integration)
-=======
-        assert_eq!(slash_command_specs().len(), 140);
->>>>>>> 353da088 (feat(lsp): install prompts, new servers, and advanced LSP features)
         assert!(resume_supported_slash_commands().len() >= 39);
     }
 
