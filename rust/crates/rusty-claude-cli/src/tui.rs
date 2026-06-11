@@ -714,7 +714,8 @@ fn draw_right_pane(
 ) {
     let state = dashboard.read().unwrap_or_else(|e| e.into_inner());
     let mut lines: Vec<Line> = Vec::new();
-    let mut gauge_row: Option<usize> = None; // track the gauge's logical row
+    #[allow(unused_assignments)]
+    let mut gauge_row: Option<usize> = None;
 
     lines.push(section("Connection"));
     lines.push(kv("Model", &state.model, Color::White));

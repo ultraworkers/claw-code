@@ -18,6 +18,7 @@ mod init;
 mod input;
 mod render;
 mod setup_wizard;
+mod tui;
 
 use std::collections::BTreeSet;
 use std::env;
@@ -7062,6 +7063,7 @@ fn run_repl(
         input::LineEditor::new("> ", cli.repl_completion_candidates().unwrap_or_default());
     println!("{}", cli.startup_banner());
     println!("{}", format_connected_line(&cli.model));
+    println!("\x1b[2mTip: type /tui for the split-pane dashboard view\x1b[0m");
 
     loop {
         editor.set_completions(cli.repl_completion_candidates().unwrap_or_default());
@@ -7074,6 +7076,12 @@ fn run_repl(
                 if matches!(trimmed.as_str(), "/exit" | "/quit") {
                     cli.persist_session()?;
                     break;
+                }
+                // /tui — switch to the split-pane TUI mode
+                if trimmed == "/tui" {
+                    cli.persist_session()?;
+                    drop(editor);
+                    return run_tui_repl(cli);
                 }
                 match SlashCommand::parse(&trimmed) {
                     Ok(Some(command)) => {
@@ -7131,6 +7139,142 @@ fn run_repl(
     }
 
     Ok(())
+}
+
+/// Run the REPL inside the split-pane TUI.  Unlike the plain REPL,
+/// all output goes into the TUI conversation pane instead of stdout.
+fn run_tui_repl(mut cli: LiveCli) -> Result<(), Box<dyn std::error::Error>> {
+    let dashboard_state = tui::SharedDashboardState::default();
+    {
+        let mut ds = dashboard_state.write().unwrap();
+        ds.model = cli.model.clone();
+        ds.permission_mode = format!("{:?}", cli.permission_mode);
+        if let Some(rt) = cli.runtime.runtime.as_ref() {
+            ds.session_id = Some(rt.session().session_id.clone());
+        }
+    }
+
+    let mut app = tui::TuiApp::init(dashboard_state.clone())?;
+
+    // Push startup info into conversation pane
+    app.push_banner(&[tui::BannerLine { text: "🦀 Claw Code".to_string(), color: ratatui::style::Color::Cyan }]);
+    app.push_banner(&[tui::BannerLine { text: format_connected_line(&cli.model), color: ratatui::style::Color::DarkGray }]);
+
+    loop {
+        match app.read_line()? {
+            tui::TuiReadOutcome::Pending => {}
+            tui::TuiReadOutcome::Submit(input) => {
+                let trimmed = input.trim().to_string();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if matches!(trimmed.as_str(), "/exit" | "/quit") {
+                    app.push_system_message("Bye!");
+                    cli.persist_session()?;
+                    break;
+                }
+
+                app.push_user_input(&input);
+                cli.record_prompt_history(&trimmed);
+                update_dashboard(&dashboard_state, &cli);
+                app.set_status("Thinking...");
+
+                // Run the turn. Output goes to the alternate screen buffer (which
+                // ratatui owns) — it will be overwritten on next redraw.
+                // We capture the final assistant text from the session.
+                let result = cli.run_turn(&trimmed);
+
+                // Read the last assistant message from the session for the conversation pane
+                {
+                    let messages = &cli.runtime.session().messages;
+                    if let Some(msg) = messages.last() {
+                        if msg.role == runtime::MessageRole::Assistant {
+                            for block in &msg.blocks {
+                                if let runtime::ContentBlock::Text { text } = block {
+                                    app.push_output(text, false);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                match result {
+                    Ok(()) => {
+                        app.set_status("Done");
+                        if let Ok(mut ds) = dashboard_state.write() {
+                            ds.status_message.clear();
+                        }
+                    }
+                    Err(e) => {
+                        app.push_system_message(&format!("Error: {e}"));
+                        app.set_status("");
+                    }
+                }
+                update_dashboard(&dashboard_state, &cli);
+            }
+            tui::TuiReadOutcome::Cancel => {
+                // Clear input, stay in TUI
+            }
+            tui::TuiReadOutcome::Exit => {
+                cli.persist_session()?;
+                break;
+            }
+            tui::TuiReadOutcome::ProviderSwap => {
+                let _ = app.restore_terminal();
+                setup_wizard::run_setup_wizard()?;
+                let cwd = std::env::current_dir().unwrap_or_default();
+                let config = runtime::ConfigLoader::default_for(&cwd).load().ok();
+                if let Some(new_model) =
+                    config.as_ref().and_then(|c| c.provider().model().map(str::to_string))
+                {
+                    let _ = cli.set_model(Some(new_model));
+                }
+                app.push_system_message("Provider updated — restart for full effect");
+                // Re-enter TUI
+                let _ = app.suspend();
+            }
+            tui::TuiReadOutcome::TeamToggle => {
+                let current = std::env::var("CLAWD_AGENT_TEAMS").unwrap_or_default();
+                if current == "1" {
+                    std::env::set_var("CLAWD_AGENT_TEAMS", "0");
+                    app.push_system_message("[team] Agent teams disabled");
+                } else {
+                    std::env::set_var("CLAWD_AGENT_TEAMS", "1");
+                    app.push_system_message("[team] Agent teams enabled");
+                }
+            }
+        }
+    }
+
+    app.restore_terminal()?;
+    Ok(())
+}
+
+/// Push current CLI/runtime stats into the shared dashboard state.
+fn update_dashboard(state: &tui::SharedDashboardState, cli: &LiveCli) {
+    if let Ok(mut ds) = state.write() {
+        ds.model = cli.model.clone();
+        ds.permission_mode = format!("{:?}", cli.permission_mode);
+        if let Some(rt) = cli.runtime.runtime.as_ref() {
+            let session = rt.session();
+            ds.session_id = Some(session.session_id.clone());
+            ds.turn_count = session.messages.len() as u32;
+            // Estimate token count from message text lengths (rough: ~4 chars per token)
+            let total_chars: usize = session.messages.iter().map(|m| {
+                m.blocks.iter().map(|b| match b {
+                    runtime::ContentBlock::Text { text } => text.len(),
+                    runtime::ContentBlock::ToolUse { input, .. } => input.to_string().len(),
+                    runtime::ContentBlock::ToolResult { output, .. } => output.len(),
+                    _ => 0,
+                }).sum::<usize>()
+            }).sum();
+            ds.input_tokens = (total_chars / 4) as u32;
+        }
+        ds.provider = std::env::var("CLAWD_PROVIDER").unwrap_or_else(|_| "anthropic".to_string());
+        ds.provider_url = std::env::var("ANTHROPIC_BASE_URL")
+            .or_else(|_| std::env::var("OPENAI_BASE_URL"))
+            .unwrap_or_default();
+    }
 }
 
 #[derive(Debug, Clone)]
