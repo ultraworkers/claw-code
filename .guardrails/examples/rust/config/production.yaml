@@ -1,0 +1,20 @@
+# Production Configuration
+# WARNING: This file contains production settings
+# Do NOT use for testing - use config/test.yaml instead
+
+app_name: "guardrails-example"
+environment: "production"
+debug: false
+log_level: "info"
+
+database:
+  host: "prod-db.internal.example.com"
+  port: 5432
+  name: "app_production"
+  pool_size: 20
+  ssl_mode: "require"
+
+services:
+  api_url: "https://api.example.com"
+  cache_url: "redis://prod-cache.internal.example.com:6379"
+  timeout_seconds: 30

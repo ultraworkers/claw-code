@@ -1,0 +1,615 @@
+{
+  "project_name": "direct-test-project",
+  "version": "1.0.0",
+  "updated_at": "2026-02-15T20:02:25.558987414Z",
+  "teams": [
+    {
+      "id": 10,
+      "name": "Quality Engineering (SDET)",
+      "phase": "Phase 4: Validation \u0026 Hardening",
+      "description": "Testing and quality assurance",
+      "roles": [
+        {
+          "name": "QA Architect",
+          "responsibility": "Global testing strategy",
+          "deliverables": [
+            "Test strategy",
+            "Test plans",
+            "Coverage reports"
+          ]
+        },
+        {
+          "name": "SDET",
+          "responsibility": "Automated test code",
+          "deliverables": [
+            "Test automation",
+            "Framework maintenance",
+            "CI integration"
+          ]
+        },
+        {
+          "name": "Performance/Load Engineer",
+          "responsibility": "Scale testing",
+          "deliverables": [
+            "Load test scripts",
+            "Performance baselines",
+            "Capacity reports"
+          ]
+        },
+        {
+          "name": "Manual QA / UAT Coordinator",
+          "responsibility": "User acceptance testing",
+          "deliverables": [
+            "Test cases",
+            "UAT coordination",
+            "Sign-off reports"
+          ]
+        }
+      ],
+      "exit_criteria": [
+        "Test coverage requirements met",
+        "Performance benchmarks achieved",
+        "UAT sign-off obtained"
+      ],
+      "status": "not_started"
+    },
+    {
+      "id": 12,
+      "name": "IT Operations \u0026 Support (NOC)",
+      "phase": "Phase 5: Delivery \u0026 Sustainment",
+      "description": "Production operations",
+      "roles": [
+        {
+          "name": "NOC Analyst",
+          "responsibility": "24/7 monitoring",
+          "deliverables": [
+            "Monitoring dashboards",
+            "Alert triage",
+            "Incident tickets"
+          ]
+        },
+        {
+          "name": "Change Manager",
+          "responsibility": "Deployment approval",
+          "deliverables": [
+            "Change requests",
+            "Deployment windows",
+            "CAB approval"
+          ]
+        },
+        {
+          "name": "Release Manager",
+          "responsibility": "Go/No-Go coordination",
+          "deliverables": [
+            "Release plans",
+            "Rollback procedures",
+            "Coordination"
+          ]
+        },
+        {
+          "name": "L3 Support Engineer",
+          "responsibility": "Production bug escalation",
+          "deliverables": [
+            "Root cause analysis",
+            "Hotfix coordination",
+            "KB articles"
+          ]
+        }
+      ],
+      "exit_criteria": [
+        "Change approved",
+        "Release deployed",
+        "Support handoff complete"
+      ],
+      "status": "not_started"
+    },
+    {
+      "id": 11,
+      "name": "Site Reliability Engineering (SRE)",
+      "phase": "Phase 5: Delivery \u0026 Sustainment",
+      "description": "Reliability and observability",
+      "roles": [
+        {
+          "name": "SRE Lead",
+          "responsibility": "Error budget and uptime SLA",
+          "deliverables": [
+            "SLOs",
+            "Error budgets",
+            "Reliability reports"
+          ]
+        },
+        {
+          "name": "Observability Engineer",
+          "responsibility": "Monitoring and logging",
+          "deliverables": [
+            "Dashboards",
+            "Alerts",
+            "Log aggregation",
+            "Traces"
+          ]
+        },
+        {
+          "name": "Chaos Engineer",
+          "responsibility": "Resiliency testing",
+          "deliverables": [
+            "Chaos experiments",
+            "Failure scenarios",
+            "Recovery tests"
+          ]
+        },
+        {
+          "name": "Incident Manager",
+          "responsibility": "War room leadership",
+          "deliverables": [
+            "Incident response",
+            "Post-mortems",
+            "Runbook updates"
+          ]
+        }
+      ],
+      "exit_criteria": [
+        "Monitoring in place",
+        "Alerts configured",
+        "Runbooks complete",
+        "Error budget healthy"
+      ],
+      "status": "not_started"
+    },
+    {
+      "id": 5,
+      "name": "Platform Engineering",
+      "phase": "Phase 2: Platform \u0026 Foundation",
+      "description": "The 'Internal Tools' - Developer experience platform",
+      "roles": [
+        {
+          "name": "Platform Product Manager",
+          "responsibility": "Developer experience as product",
+          "deliverables": [
+            "Platform roadmap",
+            "DX metrics",
+            "Adoption reports"
+          ]
+        },
+        {
+          "name": "CI/CD Architect",
+          "responsibility": "Golden pipelines",
+          "deliverables": [
+            "Pipeline templates",
+            "Build configs",
+            "Deployment strategies"
+          ]
+        },
+        {
+          "name": "Kubernetes Administrator",
+          "responsibility": "Cluster management",
+          "deliverables": [
+            "Cluster configs",
+            "Resource quotas",
+            "Ingress rules"
+          ]
+        },
+        {
+          "name": "Developer Advocate",
+          "responsibility": "Dev squad adoption",
+          "deliverables": [
+            "Onboarding guides",
+            "Training materials",
+            "Feedback loops"
+          ]
+        }
+      ],
+      "exit_criteria": [
+        "Platform services ready",
+        "CI/CD pipelines functional",
+        "Developer onboarding complete"
+      ],
+      "status": "not_started"
+    },
+    {
+      "id": 7,
+      "name": "Core Feature Squad",
+      "phase": "Phase 3: The Build Squads",
+      "description": "The 'Devs' - Feature implementation",
+      "roles": [
+        {
+          "name": "Technical Lead",
+          "responsibility": "Final word on implementation",
+          "deliverables": [
+            "Code reviews",
+            "Architecture decisions",
+            "Technical guidance"
+          ]
+        },
+        {
+          "name": "Senior Backend Engineer",
+          "responsibility": "Logic, APIs, microservices",
+          "deliverables": [
+            "Backend services",
+            "API endpoints",
+            "Business logic"
+          ]
+        },
+        {
+          "name": "Senior Frontend Engineer",
+          "responsibility": "Design system, state management",
+          "deliverables": [
+            "UI components",
+            "Frontend architecture",
+            "State logic"
+          ]
+        },
+        {
+          "name": "Accessibility (A11y) Expert",
+          "responsibility": "WCAG compliance",
+          "deliverables": [
+            "A11y audits",
+            "Remediation plans",
+            "Testing reports"
+          ]
+        },
+        {
+          "name": "Technical Writer",
+          "responsibility": "Internal/external docs",
+          "deliverables": [
+            "API docs",
+            "User guides",
+            "Runbooks"
+          ]
+        }
+      ],
+      "exit_criteria": [
+        "Features implemented",
+        "Code reviewed and approved",
+        "Documentation complete",
+        "A11y requirements met"
+      ],
+      "status": "not_started"
+    },
+    {
+      "id": 3,
+      "name": "GRC (Governance, Risk, \u0026 Compliance)",
+      "phase": "Phase 1: Strategy, Governance \u0026 Planning",
+      "description": "Compliance and risk management",
+      "roles": [
+        {
+          "name": "Compliance Officer",
+          "responsibility": "SOX/HIPAA/GDPR adherence",
+          "deliverables": [
+            "Compliance checklists",
+            "Audit reports"
+          ]
+        },
+        {
+          "name": "Internal Auditor",
+          "responsibility": "Pre-production mock audits",
+          "deliverables": [
+            "Audit findings",
+            "Remediation plans"
+          ]
+        },
+        {
+          "name": "Privacy Engineer",
+          "responsibility": "Data masking and PII",
+          "deliverables": [
+            "Privacy impact assessments",
+            "Data flow diagrams"
+          ]
+        },
+        {
+          "name": "Policy Manager",
+          "responsibility": "Maintains SOPs",
+          "deliverables": [
+            "Standard operating procedures",
+            "Policy updates"
+          ]
+        }
+      ],
+      "exit_criteria": [
+        "Compliance review passed",
+        "Risk assessment complete",
+        "Privacy requirements met",
+        "Policies acknowledged"
+      ],
+      "status": "not_started"
+    },
+    {
+      "id": 8,
+      "name": "Middleware \u0026 Integration",
+      "phase": "Phase 3: The Build Squads",
+      "description": "APIs and system integrations",
+      "roles": [
+        {
+          "name": "API Product Manager",
+          "responsibility": "API lifecycle and versioning",
+          "deliverables": [
+            "API specs",
+            "Versioning strategy",
+            "Deprecation plans"
+          ]
+        },
+        {
+          "name": "Integration Engineer",
+          "responsibility": "SAP/Oracle/Mainframe connections",
+          "deliverables": [
+            "Integration specs",
+            "Data mappings",
+            "Error handling"
+          ]
+        },
+        {
+          "name": "Messaging Engineer",
+          "responsibility": "Kafka/RabbitMQ management",
+          "deliverables": [
+            "Topic design",
+            "Message schemas",
+            "Consumer groups"
+          ]
+        },
+        {
+          "name": "IAM Specialist",
+          "responsibility": "Okta/AD integration",
+          "deliverables": [
+            "Auth flows",
+            "Permission models",
+            "Access policies"
+          ]
+        }
+      ],
+      "exit_criteria": [
+        "APIs documented and tested",
+        "Integrations verified",
+        "Auth flows functional"
+      ],
+      "status": "not_started"
+    },
+    {
+      "id": 1,
+      "name": "Business \u0026 Product Strategy",
+      "phase": "Phase 1: Strategy, Governance \u0026 Planning",
+      "description": "The 'Why' - Business case and product strategy",
+      "roles": [
+        {
+          "name": "Business Relationship Manager",
+          "responsibility": "Connects IT to C-suite",
+          "deliverables": [
+            "Strategic alignment docs",
+            "Executive briefings"
+          ]
+        },
+        {
+          "name": "Lead Product Manager",
+          "responsibility": "Owns long-term roadmap",
+          "deliverables": [
+            "Product roadmap",
+            "OKRs",
+            "Feature prioritization"
+          ]
+        },
+        {
+          "name": "Business Systems Analyst",
+          "responsibility": "Translates business to technical",
+          "deliverables": [
+            "Requirements specs",
+            "User stories",
+            "Acceptance criteria"
+          ]
+        },
+        {
+          "name": "Financial Controller (FinOps)",
+          "responsibility": "Approves budget and cloud spend",
+          "deliverables": [
+            "Budget forecasts",
+            "Cost projections",
+            "Spend reports"
+          ]
+        }
+      ],
+      "exit_criteria": [
+        "Business case approved",
+        "Budget allocated",
+        "Roadmap defined",
+        "Success metrics established"
+      ],
+      "status": "not_started"
+    },
+    {
+      "id": 2,
+      "name": "Enterprise Architecture",
+      "phase": "Phase 1: Strategy, Governance \u0026 Planning",
+      "description": "The 'Standards' - Technology vision and standards",
+      "roles": [
+        {
+          "name": "Chief Architect",
+          "responsibility": "Sets 5-year tech vision",
+          "deliverables": [
+            "Architecture vision",
+            "Tech radar",
+            "Strategic plans"
+          ]
+        },
+        {
+          "name": "Domain Architect",
+          "responsibility": "Specialized stack expertise",
+          "deliverables": [
+            "Domain-specific patterns",
+            "Best practices guides"
+          ]
+        },
+        {
+          "name": "Solution Architect",
+          "responsibility": "Maps projects to standards",
+          "deliverables": [
+            "Solution designs",
+            "Architecture decision records"
+          ]
+        },
+        {
+          "name": "Standards Lead",
+          "responsibility": "Manages Approved Tech List",
+          "deliverables": [
+            "Technology standards",
+            "Evaluation criteria",
+            "Approved list"
+          ]
+        }
+      ],
+      "exit_criteria": [
+        "Architecture approved",
+        "Technology choices validated",
+        "Standards compliance verified"
+      ],
+      "status": "not_started"
+    },
+    {
+      "id": 4,
+      "name": "Infrastructure \u0026 Cloud Ops",
+      "phase": "Phase 2: Platform \u0026 Foundation",
+      "description": "Cloud infrastructure and networking",
+      "roles": [
+        {
+          "name": "Cloud Architect",
+          "responsibility": "VPC and network design",
+          "deliverables": [
+            "Network diagrams",
+            "Security groups",
+            "Routing tables"
+          ]
+        },
+        {
+          "name": "IaC Engineer",
+          "responsibility": "Provisions the 'metal'",
+          "deliverables": [
+            "Terraform modules",
+            "Ansible playbooks",
+            "Infrastructure code"
+          ]
+        },
+        {
+          "name": "Network Security Engineer",
+          "responsibility": "Firewalls, VPNs, Direct Connect",
+          "deliverables": [
+            "Security rules",
+            "Network policies",
+            "Access controls"
+          ]
+        },
+        {
+          "name": "Storage Engineer",
+          "responsibility": "S3/SAN management",
+          "deliverables": [
+            "Storage policies",
+            "Backup strategies",
+            "Archival rules"
+          ]
+        }
+      ],
+      "exit_criteria": [
+        "Infrastructure provisioned",
+        "Network connectivity verified",
+        "Security rules applied",
+        "Monitoring enabled"
+      ],
+      "status": "not_started"
+    },
+    {
+      "id": 9,
+      "name": "Cybersecurity (AppSec)",
+      "phase": "Phase 4: Validation \u0026 Hardening",
+      "description": "Application security",
+      "roles": [
+        {
+          "name": "Security Architect",
+          "responsibility": "Threat model review",
+          "deliverables": [
+            "Threat models",
+            "Security architecture",
+            "Risk assessments"
+          ]
+        },
+        {
+          "name": "Vulnerability Researcher",
+          "responsibility": "SAST/DAST/SCA scanners",
+          "deliverables": [
+            "Scan reports",
+            "Vulnerability triage",
+            "Fix verification"
+          ]
+        },
+        {
+          "name": "Penetration Tester",
+          "responsibility": "Manual security testing",
+          "deliverables": [
+            "Pen test reports",
+            "Exploit verification",
+            "Remediation"
+          ]
+        },
+        {
+          "name": "DevSecOps Engineer",
+          "responsibility": "Security in CI/CD",
+          "deliverables": [
+            "Security gates",
+            "Pipeline integration",
+            "Compliance checks"
+          ]
+        }
+      ],
+      "exit_criteria": [
+        "Security review passed",
+        "Vulnerabilities remediated or accepted",
+        "Pen testing complete",
+        "Security gates passing"
+      ],
+      "status": "not_started"
+    },
+    {
+      "id": 6,
+      "name": "Data Governance \u0026 Analytics",
+      "phase": "Phase 2: Platform \u0026 Foundation",
+      "description": "Enterprise data management",
+      "roles": [
+        {
+          "name": "Data Architect",
+          "responsibility": "Enterprise data model",
+          "deliverables": [
+            "Data models",
+            "Schema designs",
+            "Lineage documentation"
+          ]
+        },
+        {
+          "name": "DBA",
+          "responsibility": "Production database performance",
+          "deliverables": [
+            "Query optimization",
+            "Index tuning",
+            "Backup verification"
+          ]
+        },
+        {
+          "name": "Data Privacy Officer",
+          "responsibility": "Retention and deletion rules",
+          "deliverables": [
+            "Data retention policies",
+            "Deletion workflows"
+          ]
+        },
+        {
+          "name": "ETL Developer",
+          "responsibility": "Data flow management",
+          "deliverables": [
+            "ETL pipelines",
+            "Data quality checks",
+            "Transformation logic"
+          ]
+        }
+      ],
+      "exit_criteria": [
+        "Data models defined",
+        "Pipelines operational",
+        "Privacy controls implemented"
+      ],
+      "status": "not_started"
+    }
+  ]
+}

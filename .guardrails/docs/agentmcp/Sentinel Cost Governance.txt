@@ -1,0 +1,26 @@
+Project Sentinel: Financial Governance & Cost GuardrailsVersion: 3.0.0-EnterpriseModule: 44-Standard-CostMaps to: sentinel.toml (Cost Section)Scope: Budget enforcement, efficient context usage, and financial circuit breakers.1. The FinOps PhilosophyIn traditional computing, CPU cycles are cheap. In Agentic computing, "Cognitive Cycles" (Tokens) are expensive. A runaway loop reading a 10MB log file can cost $10.00 in minutes.Sentinel treats Cost as a first-class constraint, equal to Security and Correctness.1.1 The "Token Budget" ModelEvery unit of work has a budget.Global Budget: A daily cap for the entire project (e.g., $20/day).Sprint Budget: A cap for a specific sprint (e.g., $50/sprint).Task Budget: A heuristic cap for a single task (e.g., $5/task).1.2 Hierarchy of EnforcementForecasting (Soft): Sentinel warns the Agent: "This file is 5MB. Reading it will cost $1.50. Are you sure?"Budgeting (Hard): Sentinel blocks the action: "Daily Limit Reached. Execution Suspended."Optimization (Systemic): Sentinel actively manages the Context Window to unload stale documents, saving tokens on every turn.2. Configuration (sentinel.toml)Budget rules are defined in the repository configuration.[cost]
+  # Global Caps
+  daily_limit_usd = 20.00
+  sprint_limit_usd = 100.00
+
+  # Per-Action Thresholds (Requires Confirmation)
+  # If a single tool call exceeds this, HITL is triggered.
+  max_single_action_usd = 0.50
+
+  # Rate Cards (Optional overrides)
+  [cost.rates]
+    input_per_m = 3.00
+    output_per_m = 15.00
+2.1 Override ProtocolIf an Agent hits a budget limit during a critical hotfix:Developer Action: Can run sentinel override --budget=50 to add $50 to the daily cap.Agent Action: The Agent cannot override its own budget. It must ask the user: "I have hit the daily limit. Please authorize an override."3. Efficient Context usageSentinel enforces "Context Hygiene" to save money.3.1 The "Grep First" RuleAnti-Pattern: Reading server.log (50MB) to find an error.Sentinel Enforcement:If read_file target > 100KB:Block: "File too large for cost-effective reading."Suggestion: "Use run_command('grep "ERROR" server.log') instead."3.2 Dynamic Context UnloadingMechanism: The Sentinel Context Engine (Module 02) tracks which docs are "Active".Optimization: When switching from profile:backend to profile:frontend:Sentinel Unmounts 10k tokens of Go documentation.Savings: If the chat continues for 50 more turns, that 10k reduction saves 500k total tokens (~$1.50).4. Reporting & AuditingSentinel provides transparency into where the money went.4.1 The Cost ReportCommand: sentinel cost reportFINANCIAL REPORT: Sprint-24
+---------------------------
+Total Spend:      $12.45 / $50.00 (24%)
+Status:           UNDER BUDGET
+
+Top Spenders (Tasks):
+1. T-101 (Auth):  $4.50 (High churn in tests)
+2. T-102 (UI):    $2.10
+3. T-103 (DB):    $0.85
+
+Efficiency Score: 88/100
+(Based on tokens spent vs lines of code committed)
+4.2 ROI AnalysisSentinel attempts to calculate "Cost per Line of Code" (CpL).Formula: TotalCost / (LinesAdded + LinesModified).Benchmark: If CpL > $0.50, the Agent is "Thrashing" (rewriting code repeatedly). Sentinel flags these tasks for review.5. Circuit Breakers (Financial)5.1 The "Runaway" BreakerScenario: Agent enters a loop: Edit -> Error -> Edit -> Error.Cost Impact: Rapid token consumption.Trigger: If Sentinel detects > $1.00 spent in 5 minutes on a single file without a successful test pass.Action: PAUSE.Message: "Financial Circuit Breaker. High velocity spend detected with no progress. Pausing for human review."5.2 The "Large Context" WarningScenario: Agent keeps adding files to context without removing old ones.Trigger: Context usage > 80% of model limit.Action: Sentinel injects a system prompt: "Context is 80% full. Please call release_context() or finish_task() to reset."

@@ -1,0 +1,35 @@
+Project Sentinel: Polyglot Toolchain AbstractionVersion: 3.0.0-EnterpriseModule: 21-Setup-PolyglotMaps to: examples/ (Language Directories)Scope: How Sentinel abstracts run_tests and build across Go, Python, TypeScript, Rust, and Java.1. The Abstraction LayerThe AI Agent should not need to know the nuances of pytest flags vs go test flags. It should simply call run_tests(). Sentinel acts as the Build Engineer, translating abstract intents into concrete shell commands based on the project structure.1.1 The Translation MatrixAbstract ToolGo ImplementationPython ImplementationNode/TS Implementationrun_testsgo test -v ./...pytest -vnpm testrun_lintgolangci-lint runflake8 .eslint .buildgo build -o apppython -m compileall .npm run buildinstall_depsgo mod downloadpip install -r req.txtnpm install2. Auto-Detection LogicOn startup (sentinel init), the system scans the repository root to determine the primary language.2.1 HeuristicsGo: Presence of go.mod.Node: Presence of package.json.Python: Presence of requirements.txt, pyproject.toml, or Pipfile.Rust: Presence of Cargo.toml.Java: Presence of pom.xml or build.gradle.2.2 The toolchain.json StateOnce detected, Sentinel freezes the decision into .sentinel/toolchain.json.{
+  "detected_language": "typescript",
+  "framework": "nextjs",
+  "package_manager": "pnpm",
+  "commands": {
+    "test": "pnpm test",
+    "lint": "pnpm lint"
+  }
+}
+Note: The user can manually edit this file if the auto-detection is wrong (e.g., a Monorepo).3. Monorepo SupportEnterprise repos often mix languages (Go Backend + React Frontend). Sentinel handles this via Context Profiles.3.1 Directory-Bound ToolchainsIn a monorepo, sentinel.toml can define overrides based on the working directory.[toolchain]
+  # Default fallback
+  mode = "hybrid"
+
+[[toolchain.overrides]]
+  path = "backend/"
+  language = "go"
+  test_cmd = "go test ./..."
+
+[[toolchain.overrides]]
+  path = "frontend/"
+  language = "typescript"
+  test_cmd = "npm test"
+3.2 Dynamic SwitchingScenario: Agent is working on frontend/src/App.tsx.Logic:Agent calls run_tests().Sentinel detects Agent's logical focus is frontend/.Sentinel executes cd frontend && npm test.Sentinel streams output back to Agent.4. Containerized Execution (Sandbox V2)For maximum safety, Sentinel can execute toolchains inside Docker instead of the host shell.4.1 Configuration[toolchain.container]
+  enabled = true
+  image = "node:20-alpine"
+  mount_root = "/app"
+4.2 Execution FlowAgent calls run_tests().Sentinel constructs Docker command:docker run --rm -v $(pwd):/app -w /app node:20-alpine npm test
+Benefit: Even if the Agent tries rm -rf / or installs a malicious NPM package, it only affects the ephemeral container, not the developer's laptop.5. Custom Scripts & MakefilesIf your project uses make or complex scripts, Sentinel can defer to them.5.1 The make AdapterIf Makefile is present, Sentinel prefers standard targets:run_tests -> make testbuild -> make builddeploy -> make deploy5.2 Scripts DirectoryYou can place custom scripts in .sentinel/scripts/.Example: .sentinel/scripts/custom_test.shConfig: test_cmd = "./.sentinel/scripts/custom_test.sh"Security: These scripts are Read-Only to the Agent. The Agent can execute them but cannot modify them to bypass checks.6. Output NormalizationDifferent languages output errors differently. Sentinel parses them into a standard format for the Agent.6.1 The Error ParserInput (Go): undefined: MyVarInput (Python): NameError: name 'MyVar' is not definedSentinel Output (Standardized):{
+  "status": "FAIL",
+  "file": "main.go",
+  "line": 14,
+  "error_type": "COMPILATION",
+  "message": "Variable 'MyVar' is undefined."
+}
+Why? This standardized JSON helps the Agent reason about the error without needing to understand the specific text format of every compiler in existence.

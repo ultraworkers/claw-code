@@ -1,0 +1,28 @@
+# Production Configuration
+# This file contains production environment settings.
+# NEVER commit secrets here - use environment variables.
+
+app_name: "ConfigLoader Example"
+version: "1.0.0"
+
+database:
+  host: "prod-db.example.com"
+  port: 5432
+  name: "app_production"
+  pool_size: 25
+  ssl: true
+
+cache:
+  enabled: true
+  host: "prod-cache.example.com"
+  port: 6379
+  ttl: 3600
+
+logging:
+  level: "info"
+  format: "json"
+
+features:
+  rate_limiting: true
+  analytics: true
+  debug_mode: false

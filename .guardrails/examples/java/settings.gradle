@@ -1,0 +1,4 @@
+/*
+ * Gradle settings for Java Config Loader Example
+ */
+rootProject.name = 'config-loader-example'

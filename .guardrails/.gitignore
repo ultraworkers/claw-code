@@ -1,0 +1,53 @@
+# Dependencies
+node_modules/
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# Build outputs
+dist/
+build/
+*.egg-info/
+target/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Environment
+.env
+.env.local
+*.local
+
+# Logs
+*.log
+logs/
+
+# Testing
+.coverage
+htmlcov/
+.pytest_cache/
+
+# Secrets (NEVER commit these)
+*.pem
+*.key
+credentials.json
+secrets.json
+.aider*
+
+# Ignore build artifacts and binaries
+mcp-server/server
+mcp-server/bin/guardrail-mcp
+
+# Ignore test artifacts
+mcp-server/internal/mcp/*_test.go
+
+# Vision pipeline (NEVER commit real config or DBs)
+mcp-server/config/vision.yaml
+*.db
+screenshots/
+vision_data/

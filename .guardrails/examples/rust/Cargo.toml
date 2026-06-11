@@ -1,0 +1,15 @@
+[package]
+name = "guardrails-config-example"
+version = "1.0.0"
+edition = "2021"
+description = "Rust sample demonstrating guardrails-compliant testing patterns for config loading"
+license = "MIT"
+keywords = ["guardrails", "config", "rust", "testing"]
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_yaml = "0.9"
+thiserror = "1.0"
+
+[dev-dependencies]
+tempfile = "3.10"

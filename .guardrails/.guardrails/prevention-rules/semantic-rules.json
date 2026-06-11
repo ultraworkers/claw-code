@@ -1,0 +1,147 @@
+{
+  "$schema": "./semantic-rules.schema.json",
+  "description": "Semantic/AST-based prevention rules for complex regression detection",
+  "version": "2.0.0",
+  "rules": [
+    {
+      "rule_id": "SEMANTIC-001",
+      "name": "Unhandled promise rejection",
+      "enabled": true,
+      "language": "javascript",
+      "ast_pattern": {
+        "type": "CallExpression",
+        "callee": {
+          "type": "MemberExpression",
+          "object": { "type": "CallExpression" },
+          "property": { "name": "then" }
+        },
+        "missing": "catch"
+      },
+      "message": "Promise chain missing .catch() handler",
+      "severity": "warning",
+      "suggestion": "Add .catch() handler or use try/catch with async/await"
+    },
+    {
+      "rule_id": "SEMANTIC-002",
+      "name": "Resource leak - unclosed file",
+      "enabled": true,
+      "language": "python",
+      "ast_pattern": {
+        "type": "CallExpression",
+        "callee": { "name": "open" },
+        "missing": "context_manager"
+      },
+      "message": "File opened without context manager (with statement)",
+      "severity": "warning",
+      "suggestion": "Use 'with open(...) as f:' pattern to ensure file is closed"
+    },
+    {
+      "rule_id": "SEMANTIC-003",
+      "name": "Missing auth decorator",
+      "enabled": true,
+      "language": "python",
+      "ast_pattern": {
+        "type": "FunctionDefinition",
+        "route_decorator": true,
+        "missing_decorators": ["login_required", "require_auth", "authenticated"]
+      },
+      "message": "Route handler missing authentication decorator",
+      "severity": "error",
+      "suggestion": "Add @login_required or appropriate auth decorator"
+    },
+    {
+      "rule_id": "SEMANTIC-004",
+      "name": "Godot: @onready reference to missing node",
+      "enabled": true,
+      "language": "gdscript",
+      "ast_pattern": {
+        "type": "OnreadyVar",
+        "node_path": "$*",
+        "check": "node_exists_in_scene"
+      },
+      "message": "@onready reference to node that doesn't exist in scene tree",
+      "severity": "error",
+      "suggestion": "Verify node path matches scene tree structure"
+    },
+    {
+      "rule_id": "SEMANTIC-005",
+      "name": "React: useEffect missing dependency",
+      "enabled": true,
+      "language": "typescript",
+      "ast_pattern": {
+        "type": "CallExpression",
+        "callee": { "name": "useEffect" },
+        "check": "exhaustive_deps"
+      },
+      "message": "useEffect has missing or incorrect dependencies",
+      "severity": "warning",
+      "suggestion": "Add all referenced variables to the dependency array"
+    },
+    {
+      "rule_id": "SEMANTIC-006",
+      "name": "Go: defer in loop",
+      "enabled": true,
+      "language": "go",
+      "ast_pattern": {
+        "type": "DeferStatement",
+        "parent": "ForStatement"
+      },
+      "message": "defer in loop — deferred calls won't run until function returns, may leak resources",
+      "severity": "warning",
+      "suggestion": "Wrap loop body in a function or call .Close() directly"
+    },
+    {
+      "rule_id": "SEMANTIC-007",
+      "name": "Rust: unreachable pattern in match",
+      "enabled": true,
+      "language": "rust",
+      "ast_pattern": {
+        "type": "MatchExpression",
+        "check": "unreachable_arm"
+      },
+      "message": "Match arm is unreachable due to earlier pattern",
+      "severity": "error",
+      "suggestion": "Reorder match arms or remove redundant pattern"
+    },
+    {
+      "rule_id": "SEMANTIC-008",
+      "name": "Godot: Signal connection to non-existent method",
+      "enabled": true,
+      "language": "gdscript",
+      "ast_pattern": {
+        "type": "SignalConnection",
+        "check": "target_method_exists"
+      },
+      "message": "Signal connected to method that doesn't exist in the target script",
+      "severity": "error",
+      "suggestion": "Add the method or fix the signal connection path"
+    },
+    {
+      "rule_id": "SEMANTIC-009",
+      "name": "Python: Function with too many arguments",
+      "enabled": true,
+      "language": "python",
+      "ast_pattern": {
+        "type": "FunctionDefinition",
+        "check": "argument_count > 7"
+      },
+      "message": "Function has more than 7 arguments — consider using a dataclass or config object",
+      "severity": "info",
+      "suggestion": "Group related arguments into a dataclass or TypedDict"
+    },
+    {
+      "rule_id": "SEMANTIC-010",
+      "name": "TypeScript: useState with any",
+      "enabled": true,
+      "language": "typescript",
+      "ast_pattern": {
+        "type": "CallExpression",
+        "callee": { "name": "useState" },
+        "generic_type": "any"
+      },
+      "message": "useState<any>() defeats TypeScript's type checking",
+      "severity": "error",
+      "suggestion": "Define a proper type: useState<User | null>(null)"
+    }
+  ]
+}

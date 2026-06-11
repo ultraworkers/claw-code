@@ -1,0 +1,20 @@
+{
+  "_comment": "EXAMPLE ENTRY - This is a template showing a typical failure registry entry",
+  "failure_id": "FAIL-abc123de",
+  "timestamp": "2026-02-07T14:30:00Z",
+  "category": "runtime",
+  "severity": "high",
+  "error_message": "TypeError: Cannot read property 'length' of undefined",
+  "root_cause": "Missing null check after JSON.parse - assumed valid JSON would always return an object",
+  "affected_files": [
+    "src/utils/parser.js",
+    "src/api/handlers/dataHandler.js"
+  ],
+  "fix_commit": "a1b2c3d4e5f6789012345678abcdef1234567890",
+  "regression_pattern": "JSON\\.parse\\([^)]+\\)\\s*\\.\\w+",
+  "prevention_rule": "Always null-check the result of JSON.parse before accessing properties. Use try/catch for parsing and validate the result.",
+  "status": "active",
+  "reporter": "agent-claude-code",
+  "resolution_notes": null,
+  "related_failures": ["FAIL-xyz789ab"]
+}

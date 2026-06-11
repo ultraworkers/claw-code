@@ -1,0 +1,19 @@
+# Test Configuration
+# Safe for automated testing - uses isolated test infrastructure
+
+app_name: "guardrails-example"
+environment: "test"
+debug: true
+log_level: "debug"
+
+database:
+  host: "localhost"
+  port: 5433
+  name: "app_test"
+  pool_size: 2
+  ssl_mode: "disable"
+
+services:
+  api_url: "http://localhost:8080"
+  cache_url: "redis://localhost:6380"
+  timeout_seconds: 5

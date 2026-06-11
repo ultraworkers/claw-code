@@ -1,0 +1,1046 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Guardrail MCP Server</title>
+    <style>
+        :root {
+            --primary: #667eea;
+            --primary-dark: #5a67d8;
+            --secondary: #764ba2;
+            --success: #10b981;
+            --warning: #f59e0b;
+            --error: #ef4444;
+            --info: #3b82f6;
+            --bg-dark: #0f172a;
+            --bg-card: #1e293b;
+            --bg-hover: #334155;
+            --text-primary: #f1f5f9;
+            --text-secondary: #94a3b8;
+            --border: #334155;
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+            line-height: 1.6;
+            color: var(--text-primary);
+            background: var(--bg-dark);
+            min-height: 100vh;
+        }
+
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 1.5rem;
+        }
+
+        header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 1rem 0 2rem;
+            border-bottom: 1px solid var(--border);
+            margin-bottom: 2rem;
+        }
+
+        .header-left h1 {
+            font-size: 1.75rem;
+            font-weight: 700;
+            background: linear-gradient(135deg, var(--primary) 0%, var(--secondary) 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+
+        .header-left p {
+            color: var(--text-secondary);
+            font-size: 0.875rem;
+            margin-top: 0.25rem;
+        }
+
+        .header-right {
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+        }
+
+        .connection-status {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            padding: 0.5rem 1rem;
+            background: var(--bg-card);
+            border-radius: 9999px;
+            font-size: 0.875rem;
+        }
+
+        .status-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: var(--error);
+            transition: background 0.3s;
+        }
+
+        .status-dot.connected {
+            background: var(--success);
+            animation: pulse 2s infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+
+        .version-badge {
+            padding: 0.25rem 0.75rem;
+            background: var(--bg-card);
+            border-radius: 9999px;
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+            font-family: monospace;
+        }
+
+        .tabs {
+            display: flex;
+            gap: 0.5rem;
+            margin-bottom: 2rem;
+            border-bottom: 1px solid var(--border);
+            padding-bottom: 1px;
+        }
+
+        .tab {
+            padding: 0.75rem 1.5rem;
+            background: transparent;
+            border: none;
+            color: var(--text-secondary);
+            cursor: pointer;
+            font-size: 0.875rem;
+            font-weight: 500;
+            border-radius: 0.5rem 0.5rem 0 0;
+            transition: all 0.2s;
+            position: relative;
+        }
+
+        .tab:hover {
+            color: var(--text-primary);
+            background: var(--bg-hover);
+        }
+
+        .tab.active {
+            color: var(--primary);
+            background: var(--bg-card);
+        }
+
+        .tab.active::after {
+            content: '';
+            position: absolute;
+            bottom: -1px;
+            left: 0;
+            right: 0;
+            height: 2px;
+            background: var(--primary);
+        }
+
+        .tab-content {
+            display: none;
+        }
+
+        .tab-content.active {
+            display: block;
+            animation: fadeIn 0.3s ease;
+        }
+
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+            gap: 1.5rem;
+            margin-bottom: 2rem;
+        }
+
+        .stat-card {
+            background: var(--bg-card);
+            border-radius: 12px;
+            padding: 1.5rem;
+            border: 1px solid var(--border);
+            transition: transform 0.2s, border-color 0.2s;
+        }
+
+        .stat-card:hover {
+            transform: translateY(-2px);
+            border-color: var(--primary);
+        }
+
+        .stat-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 1rem;
+        }
+
+        .stat-icon {
+            width: 40px;
+            height: 40px;
+            border-radius: 10px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1.25rem;
+        }
+
+        .stat-icon.documents { background: rgba(59, 130, 246, 0.2); }
+        .stat-icon.rules { background: rgba(16, 185, 129, 0.2); }
+        .stat-icon.projects { background: rgba(245, 158, 11, 0.2); }
+        .stat-icon.failures { background: rgba(239, 68, 68, 0.2); }
+
+        .stat-label {
+            font-size: 0.875rem;
+            color: var(--text-secondary);
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }
+
+        .stat-value {
+            font-size: 2rem;
+            font-weight: 700;
+            color: var(--text-primary);
+            margin-top: 0.5rem;
+        }
+
+        .card {
+            background: var(--bg-card);
+            border-radius: 12px;
+            border: 1px solid var(--border);
+            overflow: hidden;
+        }
+
+        .card-header {
+            padding: 1.25rem 1.5rem;
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .card-title {
+            font-size: 1.125rem;
+            font-weight: 600;
+        }
+
+        .card-actions {
+            display: flex;
+            gap: 0.5rem;
+        }
+
+        .btn {
+            padding: 0.5rem 1rem;
+            border-radius: 6px;
+            font-size: 0.875rem;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.2s;
+            border: none;
+            display: inline-flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .btn-primary {
+            background: var(--primary);
+            color: white;
+        }
+
+        .btn-primary:hover {
+            background: var(--primary-dark);
+        }
+
+        .btn-secondary {
+            background: var(--bg-hover);
+            color: var(--text-primary);
+        }
+
+        .btn-secondary:hover {
+            background: var(--border);
+        }
+
+        .btn-sm {
+            padding: 0.375rem 0.75rem;
+            font-size: 0.75rem;
+        }
+
+        .table-container {
+            overflow-x: auto;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+
+        th, td {
+            padding: 1rem 1.5rem;
+            text-align: left;
+            font-size: 0.875rem;
+        }
+
+        th {
+            font-weight: 600;
+            color: var(--text-secondary);
+            text-transform: uppercase;
+            font-size: 0.75rem;
+            letter-spacing: 0.05em;
+            background: rgba(255, 255, 255, 0.02);
+        }
+
+        tbody tr {
+            border-top: 1px solid var(--border);
+            transition: background 0.2s;
+        }
+
+        tbody tr:hover {
+            background: rgba(255, 255, 255, 0.02);
+        }
+
+        .badge {
+            display: inline-flex;
+            align-items: center;
+            padding: 0.25rem 0.75rem;
+            border-radius: 9999px;
+            font-size: 0.75rem;
+            font-weight: 600;
+            text-transform: uppercase;
+        }
+
+        .badge-error {
+            background: rgba(239, 68, 68, 0.2);
+            color: #fca5a5;
+        }
+
+        .badge-warning {
+            background: rgba(245, 158, 11, 0.2);
+            color: #fcd34d;
+        }
+
+        .badge-success {
+            background: rgba(16, 185, 129, 0.2);
+            color: #6ee7b7;
+        }
+
+        .badge-info {
+            background: rgba(59, 130, 246, 0.2);
+            color: #93c5fd;
+        }
+
+        .toggle {
+            position: relative;
+            display: inline-block;
+            width: 44px;
+            height: 24px;
+        }
+
+        .toggle input {
+            opacity: 0;
+            width: 0;
+            height: 0;
+        }
+
+        .slider {
+            position: absolute;
+            cursor: pointer;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: var(--bg-hover);
+            transition: 0.3s;
+            border-radius: 24px;
+        }
+
+        .slider:before {
+            position: absolute;
+            content: "";
+            height: 18px;
+            width: 18px;
+            left: 3px;
+            bottom: 3px;
+            background: white;
+            transition: 0.3s;
+            border-radius: 50%;
+        }
+
+        input:checked + .slider {
+            background: var(--success);
+        }
+
+        input:checked + .slider:before {
+            transform: translateX(20px);
+        }
+
+        .loading {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 3rem;
+            color: var(--text-secondary);
+        }
+
+        .spinner {
+            width: 24px;
+            height: 24px;
+            border: 2px solid var(--border);
+            border-top-color: var(--primary);
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            margin-right: 0.75rem;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+
+        .error-message {
+            background: rgba(239, 68, 68, 0.1);
+            border: 1px solid rgba(239, 68, 68, 0.3);
+            color: #fca5a5;
+            padding: 1rem 1.5rem;
+            border-radius: 8px;
+            margin: 1rem 0;
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+        }
+
+        .empty-state {
+            text-align: center;
+            padding: 3rem;
+            color: var(--text-secondary);
+        }
+
+        .empty-state-icon {
+            font-size: 3rem;
+            margin-bottom: 1rem;
+            opacity: 0.5;
+        }
+
+        .toast-container {
+            position: fixed;
+            bottom: 2rem;
+            right: 2rem;
+            display: flex;
+            flex-direction: column;
+            gap: 0.75rem;
+            z-index: 1000;
+        }
+
+        .toast {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 1rem 1.5rem;
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+            box-shadow: 0 10px 40px rgba(0, 0, 0, 0.3);
+            animation: slideIn 0.3s ease;
+            min-width: 300px;
+        }
+
+        @keyframes slideIn {
+            from {
+                opacity: 0;
+                transform: translateX(100%);
+            }
+            to {
+                opacity: 1;
+                transform: translateX(0);
+            }
+        }
+
+        .toast-success { border-left: 3px solid var(--success); }
+        .toast-error { border-left: 3px solid var(--error); }
+        .toast-warning { border-left: 3px solid var(--warning); }
+
+        .filters {
+            display: flex;
+            gap: 1rem;
+            margin-bottom: 1.5rem;
+            flex-wrap: wrap;
+        }
+
+        .filter-group {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .filter-label {
+            font-size: 0.875rem;
+            color: var(--text-secondary);
+        }
+
+        select, input[type="text"] {
+            padding: 0.5rem 0.75rem;
+            background: var(--bg-dark);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            color: var(--text-primary);
+            font-size: 0.875rem;
+        }
+
+        select:focus, input:focus {
+            outline: none;
+            border-color: var(--primary);
+        }
+
+        .code-block {
+            background: var(--bg-dark);
+            padding: 0.5rem 0.75rem;
+            border-radius: 6px;
+            font-family: monospace;
+            font-size: 0.8rem;
+            color: var(--text-secondary);
+            max-width: 300px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        footer {
+            text-align: center;
+            padding: 2rem;
+            color: var(--text-secondary);
+            font-size: 0.875rem;
+            border-top: 1px solid var(--border);
+            margin-top: 3rem;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <div class="header-left">
+                <h1>Guardrail MCP Server</h1>
+                <p>AI Agent Safety & Compliance Platform</p>
+            </div>
+            <div class="header-right">
+                <div class="connection-status">
+                    <div class="status-dot" id="status-dot"></div>
+                    <span id="connection-text">Disconnected</span>
+                </div>
+                <div class="version-badge" id="version-badge">v--</div>
+            </div>
+        </header>
+
+        <nav class="tabs">
+            <button class="tab active" data-tab="dashboard">Dashboard</button>
+            <button class="tab" data-tab="rules">Rules</button>
+            <button class="tab" data-tab="projects">Projects</button>
+            <button class="tab" data-tab="failures">Failures</button>
+        </nav>
+
+        <div id="dashboard" class="tab-content active">
+            <div class="stats-grid">
+                <div class="stat-card">
+                    <div class="stat-header">
+                        <div>
+                            <div class="stat-label">Documents</div>
+                            <div class="stat-value" id="stat-documents">--</div>
+                        </div>
+                        <div class="stat-icon documents">📄</div>
+                    </div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-header">
+                        <div>
+                            <div class="stat-label">Rules</div>
+                            <div class="stat-value" id="stat-rules">--</div>
+                        </div>
+                        <div class="stat-icon rules">🛡️</div>
+                    </div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-header">
+                        <div>
+                            <div class="stat-label">Projects</div>
+                            <div class="stat-value" id="stat-projects">--</div>
+                        </div>
+                        <div class="stat-icon projects">📁</div>
+                    </div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-header">
+                        <div>
+                            <div class="stat-label">Failures</div>
+                            <div class="stat-value" id="stat-failures">--</div>
+                        </div>
+                        <div class="stat-icon failures">⚠️</div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-header">
+                    <h3 class="card-title">System Overview</h3>
+                    <div class="card-actions">
+                        <button class="btn btn-secondary btn-sm" onclick="refreshDashboard()">🔄 Refresh</button>
+                    </div>
+                </div>
+                <div class="card-body" style="padding: 1.5rem;">
+                    <p style="color: var(--text-secondary); margin-bottom: 1rem;">
+                        The Guardrail MCP Server provides AI agent safety and compliance enforcement. 
+                        Monitor your prevention rules, track failures, and manage project guardrails from this dashboard.
+                    </p>
+                    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 1rem;">
+                        <div style="padding: 1rem; background: var(--bg-dark); border-radius: 8px;">
+                            <div style="font-size: 0.75rem; color: var(--text-secondary); text-transform: uppercase;">Server Time</div>
+                            <div id="server-time" style="font-size: 1.125rem; font-weight: 600; margin-top: 0.25rem;">--</div>
+                        </div>
+                        <div style="padding: 1rem; background: var(--bg-dark); border-radius: 8px;">
+                            <div style="font-size: 0.75rem; color: var(--text-secondary); text-transform: uppercase;">Last Updated</div>
+                            <div id="last-updated" style="font-size: 1.125rem; font-weight: 600; margin-top: 0.25rem;">--</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div id="rules" class="tab-content">
+            <div class="filters">
+                <div class="filter-group">
+                    <span class="filter-label">Category:</span>
+                    <select id="rules-filter-category" onchange="loadRules()">
+                        <option value="">All</option>
+                        <option value="git">Git</option>
+                        <option value="bash">Bash</option>
+                        <option value="security">Security</option>
+                        <option value="general">General</option>
+                    </select>
+                </div>
+                <div class="filter-group">
+                    <span class="filter-label">Status:</span>
+                    <select id="rules-filter-status" onchange="loadRules()">
+                        <option value="">All</option>
+                        <option value="true">Enabled</option>
+                        <option value="false">Disabled</option>
+                    </select>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-header">
+                    <h3 class="card-title">Prevention Rules</h3>
+                    <div class="card-actions">
+                        <button class="btn btn-primary btn-sm" onclick="loadRules()">🔄 Refresh</button>
+                    </div>
+                </div>
+                <div class="table-container">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Rule ID</th>
+                                <th>Name</th>
+                                <th>Pattern</th>
+                                <th>Category</th>
+                                <th>Severity</th>
+                                <th>Status</th>
+                            </tr>
+                        </thead>
+                        <tbody id="rules-table-body">
+                            <tr><td colspan="6" class="loading"><div class="spinner"></div>Loading rules...</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <div id="projects" class="tab-content">
+            <div class="card">
+                <div class="card-header">
+                    <h3 class="card-title">Projects</h3>
+                    <div class="card-actions">
+                        <button class="btn btn-primary btn-sm" onclick="loadProjects()">🔄 Refresh</button>
+                    </div>
+                </div>
+                <div class="table-container">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Name</th>
+                                <th>Slug</th>
+                                <th>Active Rules</th>
+                                <th>Created</th>
+                            </tr>
+                        </thead>
+                        <tbody id="projects-table-body">
+                            <tr><td colspan="4" class="loading"><div class="spinner"></div>Loading projects...</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <div id="failures" class="tab-content">
+            <div class="filters">
+                <div class="filter-group">
+                    <span class="filter-label">Status:</span>
+                    <select id="failures-filter-status" onchange="loadFailures()">
+                        <option value="">All</option>
+                        <option value="active">Active</option>
+                        <option value="resolved">Resolved</option>
+                        <option value="deprecated">Deprecated</option>
+                    </select>
+                </div>
+                <div class="filter-group">
+                    <span class="filter-label">Category:</span>
+                    <select id="failures-filter-category" onchange="loadFailures()">
+                        <option value="">All</option>
+                        <option value="deployment">Deployment</option>
+                        <option value="security">Security</option>
+                        <option value="runtime">Runtime</option>
+                        <option value="test">Test</option>
+                    </select>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-header">
+                    <h3 class="card-title">Failure Registry</h3>
+                    <div class="card-actions">
+                        <button class="btn btn-primary btn-sm" onclick="loadFailures()">🔄 Refresh</button>
+                    </div>
+                </div>
+                <div class="table-container">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>ID</th>
+                                <th>Category</th>
+                                <th>Severity</th>
+                                <th>Error Message</th>
+                                <th>Status</th>
+                                <th>Created</th>
+                            </tr>
+                        </thead>
+                        <tbody id="failures-table-body">
+                            <tr><td colspan="6" class="loading"><div class="spinner"></div>Loading failures...</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <footer>
+            <p>Guardrail MCP Server &copy; 2026 | Secure AI Agent Operations</p>
+        </footer>
+    </div>
+
+    <div class="toast-container" id="toast-container"></div>
+
+    <script>
+        const API_BASE_URL = '';
+        let refreshInterval;
+
+        // Tab switching
+        document.querySelectorAll('.tab').forEach(tab => {
+            tab.addEventListener('click', () => {
+                document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+                document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+                
+                tab.classList.add('active');
+                document.getElementById(tab.dataset.tab).classList.add('active');
+                
+                // Load data for the active tab
+                if (tab.dataset.tab === 'rules') loadRules();
+                if (tab.dataset.tab === 'projects') loadProjects();
+                if (tab.dataset.tab === 'failures') loadFailures();
+            });
+        });
+
+        // Toast notifications
+        function showToast(message, type = 'success') {
+            const container = document.getElementById('toast-container');
+            const toast = document.createElement('div');
+            toast.className = `toast toast-${type}`;
+            toast.innerHTML = `
+                <span>${type === 'success' ? '✓' : type === 'error' ? '✗' : '⚠'}</span>
+                <span>${message}</span>
+            `;
+            container.appendChild(toast);
+            
+            setTimeout(() => {
+                toast.style.opacity = '0';
+                toast.style.transform = 'translateX(100%)';
+                setTimeout(() => toast.remove(), 300);
+            }, 4000);
+        }
+
+        // Fetch with retry logic
+        async function fetchWithRetry(url, options = {}, retries = 3) {
+            for (let i = 0; i < retries; i++) {
+                try {
+                    const response = await fetch(url, options);
+                    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                    return response;
+                } catch (error) {
+                    if (i === retries - 1) throw error;
+                    await new Promise(r => setTimeout(r, 1000 * (i + 1)));
+                }
+            }
+        }
+
+        // Update connection status
+        function updateConnectionStatus(connected, version = '--') {
+            const dot = document.getElementById('status-dot');
+            const text = document.getElementById('connection-text');
+            const versionBadge = document.getElementById('version-badge');
+            
+            if (connected) {
+                dot.classList.add('connected');
+                text.textContent = 'Connected';
+                versionBadge.textContent = version;
+            } else {
+                dot.classList.remove('connected');
+                text.textContent = 'Disconnected';
+                versionBadge.textContent = 'v--';
+            }
+        }
+
+        // Fetch server status
+        async function fetchStatus() {
+            try {
+                const response = await fetchWithRetry(`${API_BASE_URL}/health/ready`);
+                const data = await response.json();
+                
+                updateConnectionStatus(true, data.version);
+                document.getElementById('server-time').textContent = new Date(data.timestamp).toLocaleString();
+                
+                return data;
+            } catch (error) {
+                updateConnectionStatus(false);
+                console.error('Failed to fetch status:', error);
+                return null;
+            }
+        }
+
+        // Fetch and display stats
+        async function fetchStats() {
+            try {
+                const response = await fetchWithRetry(`${API_BASE_URL}/api/stats`);
+                const data = await response.json();
+                
+                document.getElementById('stat-documents').textContent = data.documents_count || 0;
+                document.getElementById('stat-rules').textContent = data.rules_count || 0;
+                document.getElementById('stat-projects').textContent = data.projects_count || 0;
+                document.getElementById('stat-failures').textContent = data.failures_count || 0;
+                document.getElementById('last-updated').textContent = new Date().toLocaleTimeString();
+            } catch (error) {
+                console.error('Failed to fetch stats:', error);
+            }
+        }
+
+        // Load rules
+        async function loadRules() {
+            const tbody = document.getElementById('rules-table-body');
+            tbody.innerHTML = '<tr><td colspan="6" class="loading"><div class="spinner"></div>Loading rules...</td></tr>';
+            
+            try {
+                const category = document.getElementById('rules-filter-category').value;
+                const enabled = document.getElementById('rules-filter-status').value;
+                
+                let url = `${API_BASE_URL}/api/rules?limit=100`;
+                if (category) url += `&category=${category}`;
+                if (enabled) url += `&enabled=${enabled}`;
+                
+                const response = await fetchWithRetry(url);
+                const data = await response.json();
+                
+                if (!data.data || data.data.length === 0) {
+                    tbody.innerHTML = `
+                        <tr>
+                            <td colspan="6" class="empty-state">
+                                <div class="empty-state-icon">🛡️</div>
+                                <div>No rules found</div>
+                            </td>
+                        </tr>
+                    `;
+                    return;
+                }
+                
+                tbody.innerHTML = data.data.map(rule => `
+                    <tr>
+                        <td><code>${rule.rule_id}</code></td>
+                        <td>${rule.name}</td>
+                        <td><div class="code-block" title="${rule.pattern}">${rule.pattern}</div></td>
+                        <td><span class="badge badge-info">${rule.category}</span></td>
+                        <td><span class="badge badge-${rule.severity === 'error' ? 'error' : rule.severity === 'warning' ? 'warning' : 'info'}">${rule.severity}</span></td>
+                        <td>
+                            <label class="toggle">
+                                <input type="checkbox" ${rule.enabled ? 'checked' : ''} onchange="toggleRule('${rule.id}', this.checked)">
+                                <span class="slider"></span>
+                            </label>
+                        </td>
+                    </tr>
+                `).join('');
+            } catch (error) {
+                tbody.innerHTML = `
+                    <tr>
+                        <td colspan="6">
+                            <div class="error-message">
+                                <span>⚠</span>
+                                <span>Failed to load rules: ${error.message}</span>
+                            </div>
+                        </td>
+                    </tr>
+                `;
+            }
+        }
+
+        // Toggle rule
+        async function toggleRule(id, enabled) {
+            try {
+                const response = await fetch(`${API_BASE_URL}/api/rules/${id}`, {
+                    method: 'PATCH',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ enabled })
+                });
+                
+                if (!response.ok) throw new Error('Failed to update rule');
+                
+                showToast(`Rule ${enabled ? 'enabled' : 'disabled'} successfully`);
+            } catch (error) {
+                showToast('Failed to update rule: ' + error.message, 'error');
+                loadRules(); // Reload to reset toggle
+            }
+        }
+
+        // Load projects
+        async function loadProjects() {
+            const tbody = document.getElementById('projects-table-body');
+            tbody.innerHTML = '<tr><td colspan="4" class="loading"><div class="spinner"></div>Loading projects...</td></tr>';
+            
+            try {
+                const response = await fetchWithRetry(`${API_BASE_URL}/api/projects?limit=100`);
+                const data = await response.json();
+                
+                if (!data.data || data.data.length === 0) {
+                    tbody.innerHTML = `
+                        <tr>
+                            <td colspan="4" class="empty-state">
+                                <div class="empty-state-icon">📁</div>
+                                <div>No projects found</div>
+                            </td>
+                        </tr>
+                    `;
+                    return;
+                }
+                
+                tbody.innerHTML = data.data.map(project => `
+                    <tr>
+                        <td><strong>${project.name}</strong></td>
+                        <td><code>${project.slug}</code></td>
+                        <td>${project.active_rules ? project.active_rules.length : 0} rules</td>
+                        <td>${new Date(project.created_at).toLocaleDateString()}</td>
+                    </tr>
+                `).join('');
+            } catch (error) {
+                tbody.innerHTML = `
+                    <tr>
+                        <td colspan="4">
+                            <div class="error-message">
+                                <span>⚠</span>
+                                <span>Failed to load projects: ${error.message}</span>
+                            </div>
+                        </td>
+                    </tr>
+                `;
+            }
+        }
+
+        // Load failures
+        async function loadFailures() {
+            const tbody = document.getElementById('failures-table-body');
+            tbody.innerHTML = '<tr><td colspan="6" class="loading"><div class="spinner"></div>Loading failures...</td></tr>';
+            
+            try {
+                const status = document.getElementById('failures-filter-status').value;
+                const category = document.getElementById('failures-filter-category').value;
+                
+                let url = `${API_BASE_URL}/api/failures?limit=100`;
+                if (status) url += `&status=${status}`;
+                if (category) url += `&category=${category}`;
+                
+                const response = await fetchWithRetry(url);
+                const data = await response.json();
+                
+                if (!data.data || data.data.length === 0) {
+                    tbody.innerHTML = `
+                        <tr>
+                            <td colspan="6" class="empty-state">
+                                <div class="empty-state-icon">✓</div>
+                                <div>No failures found</div>
+                            </td>
+                        </tr>
+                    `;
+                    return;
+                }
+                
+                tbody.innerHTML = data.data.map(failure => `
+                    <tr>
+                        <td><code>${failure.failure_id}</code></td>
+                        <td><span class="badge badge-info">${failure.category}</span></td>
+                        <td><span class="badge badge-${failure.severity === 'critical' || failure.severity === 'high' ? 'error' : failure.severity === 'medium' ? 'warning' : 'info'}">${failure.severity}</span></td>
+                        <td>${failure.error_message}</td>
+                        <td><span class="badge badge-${failure.status === 'active' ? 'error' : failure.status === 'resolved' ? 'success' : 'warning'}">${failure.status}</span></td>
+                        <td>${new Date(failure.created_at).toLocaleDateString()}</td>
+                    </tr>
+                `).join('');
+            } catch (error) {
+                tbody.innerHTML = `
+                    <tr>
+                        <td colspan="6">
+                            <div class="error-message">
+                                <span>⚠</span>
+                                <span>Failed to load failures: ${error.message}</span>
+                            </div>
+                        </td>
+                    </tr>
+                `;
+            }
+        }
+
+        // Refresh dashboard
+        async function refreshDashboard() {
+            await fetchStatus();
+            await fetchStats();
+            showToast('Dashboard refreshed');
+        }
+
+        // Initialize
+        async function init() {
+            await fetchStatus();
+            await fetchStats();
+            
+            // Set up auto-refresh
+            refreshInterval = setInterval(async () => {
+                await fetchStatus();
+                await fetchStats();
+            }, 30000);
+        }
+
+        // Start
+        init();
+    </script>
+</body>
+</html>

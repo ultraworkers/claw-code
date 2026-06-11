@@ -1,0 +1,310 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: guardrail-mcp-server
+  namespace: guardrail
+  labels:
+    app: guardrail-mcp-server
+    version: "${VERSION}"
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: guardrail-mcp-server
+  template:
+    metadata:
+      labels:
+        app: guardrail-mcp-server
+        version: "${VERSION}"
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8081"
+        prometheus.io/path: "/metrics"
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+      containers:
+        - name: mcp-server
+          image: guardrail-mcp:${VERSION}
+          imagePullPolicy: Always
+          ports:
+            - name: mcp
+              containerPort: 8080
+              protocol: TCP
+            - name: web
+              containerPort: 8081
+              protocol: TCP
+          env:
+            - name: MCP_PORT
+              value: "8080"
+            - name: WEB_PORT
+              value: "8081"
+            - name: LOG_LEVEL
+              value: "${LOG_LEVEL:-info}"
+            - name: REQUEST_TIMEOUT
+              value: "${REQUEST_TIMEOUT:-30s}"
+            - name: SHUTDOWN_TIMEOUT
+              value: "${SHUTDOWN_TIMEOUT:-30s}"
+            - name: PPROF_ENABLED
+              value: "${PPROF_ENABLED:-false}"
+            - name: PRODUCTION_MODE
+              value: "${PRODUCTION_MODE:-true}"
+            - name: CIRCUIT_BREAKER_ENABLED
+              value: "${CIRCUIT_BREAKER_ENABLED:-true}"
+            - name: HEALTH_CHECK_TIMEOUT
+              value: "${HEALTH_CHECK_TIMEOUT:-3s}"
+            - name: DB_HOST
+              valueFrom:
+                secretKeyRef:
+                  name: guardrail-db-credentials
+                  key: host
+            - name: DB_PORT
+              valueFrom:
+                secretKeyRef:
+                  name: guardrail-db-credentials
+                  key: port
+            - name: DB_NAME
+              valueFrom:
+                secretKeyRef:
+                  name: guardrail-db-credentials
+                  key: database
+            - name: DB_USER
+              valueFrom:
+                secretKeyRef:
+                  name: guardrail-db-credentials
+                  key: username
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: guardrail-db-credentials
+                  key: password
+            - name: DB_SSLMODE
+              value: "${DB_SSLMODE:-require}"
+            - name: REDIS_HOST
+              valueFrom:
+                secretKeyRef:
+                  name: guardrail-redis-credentials
+                  key: host
+            - name: REDIS_PORT
+              valueFrom:
+                secretKeyRef:
+                  name: guardrail-redis-credentials
+                  key: port
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: guardrail-redis-credentials
+                  key: password
+            - name: REDIS_USE_TLS
+              value: "${REDIS_USE_TLS:-true}"
+            - name: MCP_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: guardrail-api-keys
+                  key: mcp-api-key
+            - name: IDE_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: guardrail-api-keys
+                  key: ide-api-key
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: guardrail-jwt-secret
+                  key: secret
+            - name: JWT_ISSUER
+              value: "${JWT_ISSUER:-guardrail-mcp}"
+            - name: JWT_EXPIRY
+              value: "${JWT_EXPIRY:-15m}"
+            - name: RATE_LIMIT_MCP
+              value: "${RATE_LIMIT_MCP:-1000}"
+            - name: RATE_LIMIT_IDE
+              value: "${RATE_LIMIT_IDE:-500}"
+            - name: RATE_LIMIT_SESSION
+              value: "${RATE_LIMIT_SESSION:-100}"
+            - name: VERSION
+              value: "${VERSION}"
+            - name: BUILD_TIME
+              value: "${BUILD_TIME}"
+            - name: GIT_COMMIT
+              value: "${GIT_COMMIT}"
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "500m"
+            limits:
+              memory: "2Gi"
+              cpu: "2000m"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          livenessProbe:
+            exec:
+              command:
+                - /server
+                - --health-check
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: web
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          startupProbe:
+            httpGet:
+              path: /health/live
+              port: web
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 12
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 100Mi
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: app
+                      operator: In
+                      values:
+                        - guardrail-mcp-server
+                topologyKey: kubernetes.io/hostname
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: guardrail-mcp-server
+  namespace: guardrail
+  labels:
+    app: guardrail-mcp-server
+spec:
+  type: ClusterIP
+  ports:
+    - name: mcp
+      port: 8080
+      targetPort: mcp
+      protocol: TCP
+    - name: web
+      port: 8081
+      targetPort: web
+      protocol: TCP
+  selector:
+    app: guardrail-mcp-server
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: guardrail-mcp-server
+  namespace: guardrail
+spec:
+  podSelector:
+    matchLabels:
+      app: guardrail-mcp-server
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              name: ingress-nginx
+      ports:
+        - protocol: TCP
+          port: 8080
+        - protocol: TCP
+          port: 8081
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app: postgres
+      ports:
+        - protocol: TCP
+          port: 5432
+    - to:
+        - podSelector:
+            matchLabels:
+              app: redis
+      ports:
+        - protocol: TCP
+          port: 6379
+    - to: []
+      ports:
+        - protocol: TCP
+          port: 53
+        - protocol: UDP
+          port: 53
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: guardrail-mcp-server
+  namespace: guardrail
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: guardrail-mcp-server
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 60
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 15
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Percent
+          value: 10
+          periodSeconds: 60
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: guardrail-mcp-server
+  namespace: guardrail
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: guardrail-mcp-server

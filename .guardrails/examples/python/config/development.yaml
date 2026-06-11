@@ -1,0 +1,23 @@
+# Development Configuration
+# This file contains development environment settings.
+# Uses local or development infrastructure.
+
+environment: development
+
+database:
+  host: localhost
+  port: 5432
+  name: dev_db
+  user: dev_user
+  password: dev_password
+
+services:
+  api: http://localhost:8080
+  auth: http://localhost:8081
+  storage: http://localhost:8082
+
+# Application settings
+app:
+  debug: true
+  log_level: DEBUG
+  max_connections: 5

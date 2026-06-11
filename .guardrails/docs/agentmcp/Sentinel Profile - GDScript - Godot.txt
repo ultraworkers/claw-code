@@ -1,0 +1,227 @@
+Project Sentinel: GDScript / Godot Language Profile
+Version: 3.0.0-Enterprise
+Module: 40-Lang-GDScript
+Maps to: examples/godot/
+Scope: Active enforcement of Godot 4.x best practices, scene integrity, export validation, and mobile/game-specific guardrails.
+
+---
+
+1. The Godot Toolchain Adapter
+
+Sentinel detects a Godot project by the presence of `project.godot`. It wraps the Godot CLI to enforce build integrity and scene validation.
+
+1.1 The Headless Validation Guard
+
+Rule: Every commit must pass headless validation.
+
+Enforcement:
+- Sentinel intercepts `git commit` when `.gd` or `.tscn` files are staged.
+- It runs `godot --headless --path <project> --quit-after 100` to validate scripts and scenes parse correctly.
+- If any SCRIPT ERROR or Parse Error appears in output, the commit is BLOCKED.
+- Message: "Godot Validation Violation: Script parse error in player.gd:42. Fix before committing."
+
+1.2 Export Presets Integrity
+
+Rule: export_presets.cfg must be valid for all target platforms.
+
+Enforcement:
+- Sentinel checks `export_presets.cfg` exists when project.godot is detected.
+- It validates the file is parseable TOML/CFG format.
+- If Android export is configured, it checks for keystore path, package name, and minimum SDK version.
+- If iOS export is configured, it checks for bundle identifier and provisioning profile references.
+- Action: Warning if export presets are missing or misconfigured.
+
+2. Scene File Guardrails
+
+Scene files (.tscn, .esc) are Godot's lifeblood. Broken scenes cause silent failures.
+
+2.1 Scene Header Validation
+
+Rule: Every .tscn file must have a valid header.
+
+Enforcement:
+- Sentinel scans commits that modify `.tscn` files.
+- Check: File starts with `[gd_scene` or `[gd_resource`.
+- Check: `load_steps` count is reasonable (< 1000).
+- Check: No orphaned node references (sub_resource references that don't exist).
+- Action: BLOCKED if scene header is malformed.
+
+2.2 Signal Connection Integrity
+
+Rule: Signal connections in scenes must resolve to valid methods.
+
+Enforcement:
+- Sentinel parses .tscn files for `[connection]` entries.
+- Check: The target method exists in the attached script (if any).
+- Common bug: Renaming a method but forgetting to update the scene connection.
+- Action: Warning if signal target method not found in script.
+
+3. GDScript Code Standards
+
+3.1 The `extends` Mandate
+
+Rule: Every GDScript must declare `extends` (except @tool scripts).
+
+Enforcement:
+- Sentinel scans modified `.gd` files.
+- Check: File contains `extends <Type>` or `@tool` directive.
+- Action: Warning for missing extends. Game scripts must extend a node type.
+
+3.2 Type Hinting (Godot 4.x)
+
+Rule: Use explicit type hints for variables and function signatures.
+
+Enforcement:
+- Sentinel recommends Godot 4.x typed syntax.
+- BAD: `var speed = 200` → GOOD: `var speed: float = 200.0`
+- BAD: `func get_score():` → GOOD: `func get_score() -> int:`
+- Action: Warning if >50% of recent .gd edits lack type hints.
+
+3.3 The `_process` Performance Guard
+
+Rule: Don't do expensive operations in `_process()` or `_physics_process()`.
+
+Enforcement:
+- Sentinel scans for patterns in `_process` functions:
+  - File I/O (FileAccess.open)
+  - HTTP requests (HTTPRequest.request)
+  - Object instantiation (load/preload in _process)
+  - Heavy math (no iteration limits)
+- Action: Warning if expensive operations detected in process callbacks.
+
+3.4 Node Path Safety
+
+Rule: Don't use hardcoded node paths; prefer `@onready` with `$` or `%`.
+
+Enforcement:
+- Sentinel scans for string-based `get_node()` calls.
+- BAD: `get_node("PlayerPaddle/Sprite2D")` (breaks if scene tree changes)
+- GOOD: `@onready var sprite = $Sprite2D` (editor-validated)
+- GOOD: `@onready var sprite = %UniqueSprite` (unique node reference)
+- Action: Warning for string-literal get_node calls.
+
+4. Game-Specific Guardrails
+
+4.1 The Mobile Performance Budget
+
+Rule: Texture sizes must fit target device constraints.
+
+Enforcement:
+- On commit of image assets (.png, .jpg, .webp):
+  - Sentinel checks file dimensions.
+  - Mobile limit: 2048x2048 max for any single texture.
+  - Atlas limit: 4096x4096 max for texture atlases.
+  - VRAM estimate: Total texture VRAM should not exceed 512MB for mobile.
+- Action: Warning if texture budget exceeded.
+
+4.2 The Input Map Guard
+
+Rule: Godot Input Map must define all required actions before code references them.
+
+Enforcement:
+- Sentinel scans `.gd` files for `Input.is_action_pressed()` calls.
+- It cross-references with `project.godot` [input] section.
+- If an action is referenced but not defined in Input Map, Sentinel warns.
+- Action: Warning for undefined input actions.
+
+4.3 The Save Game Integrity Guard
+
+Rule: Save data must be versioned and validated on load.
+
+Enforcement:
+- Sentinel detects save/load patterns (FileAccess, JSON.parse in save context).
+- Check: Save data includes a version field.
+- Check: Load function validates data before applying.
+- Action: Warning if save/load lacks versioning or validation.
+
+5. Asset Pipeline Guardrails
+
+5.1 Import Preset Consistency
+
+Rule: `.import` files should not be committed unless intentional.
+
+Enforcement:
+- Sentinel checks if `.import/` directory is in git.
+- Recommendation: Add `.import/` to `.gitignore`.
+- Exception: If team explicitly wants to share import settings.
+- Action: Info-level notice if import files are staged.
+
+5.2 Resource Path Consistency
+
+Rule: Resource paths in scenes must be relative (res://), never absolute.
+
+Enforcement:
+- Sentinel scans .tscn files for absolute paths.
+- BAD: `C:/Users/dev/project/assets/sprite.png`
+- GOOD: `res://assets/sprite.png`
+- Action: BLOCKED if absolute paths detected.
+
+6. Test Integration
+
+6.1 Headless Test Runner
+
+Rule: Game projects should have headless test scripts.
+
+Enforcement:
+- Sentinel checks for `test_runner.gd` or `tests/` directory.
+- Recommended pattern: `extends SceneTree` with `✅ PASS:` / `❌ FAIL:` output.
+- If no test scripts exist, Sentinel adds a warning to pre-work check.
+- Integration: `guardrail_validate_game_build` MCP tool runs these tests.
+
+6.2 GdUnit4 Support
+
+Rule: For unit testing, prefer GdUnit4 over custom test harnesses.
+
+Enforcement:
+- Sentinel detects `addons/gdUnit4/` in project structure.
+- If present, test commands route through GdUnit4 test runner.
+- If absent and project has > 10 scripts, recommend GdUnit4 installation.
+
+7. Anti-Pattern Detection
+
+7.1 The "God Script" Warning
+
+Rule: No single GDScript should exceed 500 lines.
+
+Enforcement:
+- Sentinel monitors `.gd` file sizes.
+- If a script exceeds 500 lines, it warns about maintainability.
+- Suggestion: "Split into multiple scripts using composition or autoloads."
+
+7.2 The `_ready` Dependency Chain
+
+Rule: Avoid circular `@onready` dependencies between scenes.
+
+Enforcement:
+- Sentinel detects patterns where Scene A references Scene B which references Scene A.
+- This causes null references at runtime.
+- Action: Warning if circular @onready chains detected.
+
+7.3 The Missing `queue_free` Guard
+
+Rule: Objects removed from tree must use `queue_free()`, not `free()`.
+
+Enforcement:
+- Sentinel scans for direct `.free()` calls on nodes.
+- BAD: `node.free()` (can crash if node is in tree)
+- GOOD: `node.queue_free()` (safe deferred deletion)
+- Action: Warning for direct .free() on Node types.
+
+---
+
+## Quick Reference
+
+| Rule | Severity | Pattern | Action |
+|------|----------|---------|--------|
+| Headless Validation | error | Godot parse errors | BLOCK |
+| Scene Header | error | Invalid .tscn header | BLOCK |
+| Extends Mandate | warning | Missing extends | WARN |
+| Type Hints | warning | Untyped vars/funcs | WARN |
+| Process Performance | warning | Heavy ops in _process | WARN |
+| Node Paths | warning | String get_node() | WARN |
+| Texture Budget | warning | >2048px textures | WARN |
+| Input Map | warning | Undefined actions | WARN |
+| Save Versioning | warning | Unversioned saves | WARN |
+| Absolute Paths | error | Non-res:// paths | BLOCK |
+| God Script | warning | >500 lines | WARN |
+| Direct .free() | warning | node.free() | WARN |

@@ -1,0 +1,15 @@
+{
+  "rate_limiting": {
+    "enabled": true,
+    "requests_per_window": 100,
+    "window_seconds": 60,
+    "per_user": true
+  },
+  "security": {
+    "path_traversal_protection": true,
+    "encryption_at_rest": {
+      "enabled": false,
+      "requires_env_key": "TEAM_ENCRYPTION_KEY"
+    }
+  }
+}

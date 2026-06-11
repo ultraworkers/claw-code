@@ -1,0 +1,170 @@
+Project Sentinel: AI/ML Engineering Profile
+Version: 3.0.0-Enterprise
+Module: 42-Lang-AI-ML
+Maps to: examples/ai-ml/
+Scope: Active enforcement of model safety, training data integrity, prompt injection prevention, and responsible AI practices.
+
+---
+
+1. Model Training Guardrails
+
+Sentinel detects ML projects via `requirements.txt` (with torch/tensorflow/sklearn), `pyproject.toml` (with ml deps), or `train*.py` files.
+
+1.1 The Reproducibility Mandate
+
+Rule: All training runs must use fixed random seeds and deterministic operations.
+
+Enforcement:
+- Sentinel scans training scripts for `torch.manual_seed()`, `np.random.seed()`, `random.seed()`.
+- If seeds are set, check that `torch.backends.cudnn.deterministic = True` is also set.
+- If no seeds found, warning issued.
+- Action: Warning for non-reproducible training.
+
+1.2 The Data Versioning Guard
+
+Rule: Training data references must be versioned.
+
+Enforcement:
+- Sentinel checks for hardcoded data paths without version references.
+- BAD: `data_path = "/data/training.csv"`
+- GOOD: `data_path = dagshub.dataset("owner/repo", version="v2.1")`
+- GOOD: `data_path = f"s3://bucket/data/v{VERSION}/train.parquet"`
+- Action: Warning for unversioned data paths.
+
+1.3 The Train/Test Leakage Guard
+
+Rule: No test data leakage into training pipeline.
+
+Enforcement:
+- Sentinel scans for test data references in training code.
+- Pattern: Load test set before or during training for feature engineering.
+- Check: `train_test_split` is called with `random_state` set.
+- Action: Error if test data appears to influence training.
+
+2. Model Safety Guardrails
+
+2.1 The Output Filter Mandate
+
+Rule: LLM outputs must be filtered for harmful content before user exposure.
+
+Enforcement:
+- Sentinel scans API/endpoint code that serves model outputs.
+- Check: Output passes through a content filter or moderation API before returning.
+- If raw model output is returned directly to users, warning issued.
+- Action: Warning for unfiltered LLM outputs.
+
+2.2 The Prompt Injection Guard
+
+Rule: User inputs must be separated from system prompts.
+
+Enforcement:
+- Sentinel scans for string interpolation in prompt templates.
+- BAD: `prompt = f"System: {system_msg}\nUser: {user_input}"`
+- GOOD: Use structured message format with clear role separation.
+- Check: User input is never placed in the system message role.
+- Action: Error if user input is interpolated into system prompts.
+
+2.3 The Token Limit Guard
+
+Rule: API calls must enforce token limits.
+
+Enforcement:
+- Sentinel scans LLM API calls for max_tokens parameter.
+- If no max_tokens set, warning issued.
+- Default recommendation: Set reasonable max_tokens for each endpoint.
+- Action: Warning for unlimited token generation.
+
+3. Data Privacy Guardrails
+
+3.1 The PII Training Data Guard
+
+Rule: Training datasets must not contain unmasked PII.
+
+Enforcement:
+- Sentinel scans data loading code for PII columns.
+- Pattern: Load CSV with columns like email, ssn, phone, address, name.
+- If PII columns are loaded without masking/anonymization, error.
+- Action: Error if PII loaded without masking.
+
+3.2 The Model Memorization Guard
+
+Rule: Verify models don't memorize training data.
+
+Enforcement:
+- Sentinel checks for extraction attack testing in model evaluation.
+- If no memorization testing found, info notice.
+- Recommendation: Add membership inference and extraction tests.
+- Action: Info notice for missing memorization tests.
+
+4. MLOps Guardrails
+
+4.1 The Model Versioning Guard
+
+Rule: All deployed models must be versioned.
+
+Enforcement:
+- Sentinel scans model serving code for version tracking.
+- Check: Model path includes version (v1, v2, timestamp, hash).
+- BAD: `model = load_model("model.pt")`
+- GOOD: `model = load_model(f"models/{MODEL_NAME}/v{VERSION}/model.pt")`
+- Action: Warning for unversioned model loading.
+
+4.2 The Feature Store Consistency Guard
+
+Rule: Training and inference features must be computed identically.
+
+Enforcement:
+- Sentinel detects feature computation code used in both training and serving.
+- Check: Feature transform functions are shared (not duplicated).
+- If separate feature pipelines exist for train and serve, warning.
+- Action: Warning for duplicated feature pipelines.
+
+4.3 The GPU Memory Guard
+
+Rule: Batch size must fit within available GPU memory.
+
+Enforcement:
+- Sentinel scans training configs for excessive batch sizes.
+- If batch_size * model_size > typical GPU VRAM, warning issued.
+- Also check for gradient accumulation as an alternative.
+- Action: Warning for potentially OOM-inducing batch sizes.
+
+5. Responsible AI Guardrails
+
+5.1 The Bias Testing Mandate
+
+Rule: Model evaluation must include fairness metrics.
+
+Enforcement:
+- Sentinel scans evaluation scripts for fairness/bias metrics.
+- Check: Demographic parity, equalized odds, or disparate impact reported.
+- If no fairness metrics in evaluation, info notice.
+- Action: Info notice for missing fairness evaluation.
+
+5.2 The Hallucination Guard
+
+Rule: Grounded generation must cite sources.
+
+Enforcement:
+- For RAG/generation systems, check that outputs include source references.
+- If LLM generates without retrieval-augmented grounding, warning.
+- Action: Warning for ungrounded generation in production.
+
+---
+
+## Quick Reference
+
+| Rule | Severity | Pattern | Action |
+|------|----------|---------|--------|
+| Reproducibility | warning | Missing random seeds | WARN |
+| Data Versioning | warning | Unversioned data paths | WARN |
+| Train/Test Leak | error | Test data in training | BLOCK |
+| Output Filter | warning | No content moderation | WARN |
+| Prompt Injection | error | User input in system prompt | BLOCK |
+| Token Limit | warning | No max_tokens set | WARN |
+| PII in Training | error | Unmasked PII columns | BLOCK |
+| Model Versioning | warning | Unversioned model loading | WARN |
+| Feature Consistency | warning | Duplicated feature pipelines | WARN |
+| GPU Memory | warning | Potentially OOM batch size | WARN |
+| Bias Testing | info | Missing fairness metrics | INFO |
+| Hallucination | warning | Ungrounded generation | WARN |

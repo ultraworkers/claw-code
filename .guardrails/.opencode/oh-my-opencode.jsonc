@@ -1,0 +1,66 @@
+{
+  "$schema": "https://raw.githubusercontent.com/code-yeongyu/oh-my-opencode/master/assets/oh-my-opencode.schema.json",
+  "agents": {
+    "guardrails-enforcer": {
+      "model": "anthropic/claude-sonnet-4",
+      "temperature": 0.1,
+      "prompt_append": "You are the Guardrails Enforcement Agent. Before ANY operation verify: 1) File has been read, 2) Scope is authorized, 3) Rollback is known, 4) No forbidden patterns. HALT and ask if uncertain. Reference: docs/AGENT_GUARDRAILS.md",
+      "permissions": {
+        "edit": "ask",
+        "bash": "ask",
+        "webfetch": "allow",
+        "read": "allow"
+      }
+    },
+    "guardrails-auditor": {
+      "model": "anthropic/claude-sonnet-4",
+      "temperature": 0.1,
+      "prompt_append": "You are a Guardrails Auditor. Review completed work for compliance with AGENT_GUARDRAILS.md. Report any violations found.",
+      "permissions": {
+        "edit": "deny",
+        "bash": "deny",
+        "read": "allow"
+      }
+    },
+    "doc-indexer": {
+      "model": "anthropic/claude-haiku-4",
+      "temperature": 0.0,
+      "prompt_append": "You are the Documentation Indexer. When documents change update INDEX_MAP.md and HEADER_MAP.md to maintain accurate navigation.",
+      "permissions": {
+        "edit": "allow",
+        "bash": "deny",
+        "read": "allow"
+      }
+    }
+  },
+  "categories": {
+    "quick": {
+      "model": "anthropic/claude-haiku-4"
+    },
+    "unspecified-low": {
+      "model": "anthropic/claude-sonnet-4"
+    }
+  },
+  "skills": {
+    "sources": [
+      {"path": "./.opencode/skills", "recursive": true}
+    ],
+    "enable": [
+      "guardrails-enforcer",
+      "commit-validator",
+      "env-separator",
+      "scope-validator",
+      "production-first",
+      "three-strikes",
+      "error-recovery"
+    ]
+  },
+  "permissions": {
+    "defaults": {
+      "edit": "ask",
+      "bash": "ask",
+      "webfetch": "allow",
+      "read": "allow"
+    }
+  }
+}

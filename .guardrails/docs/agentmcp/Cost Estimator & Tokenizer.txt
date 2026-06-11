@@ -1,0 +1,162 @@
+/*
+PACKAGE: sentinel/cost
+MODULE 2: PRE-FLIGHT ESTIMATOR & TOKENIZER
+VERSION: 3.0.0-Enterprise
+
+OVERVIEW:
+LLMs charge by the token. Agents often lack "Token Sense"—they will happily read
+a 5MB webpack bundle into context, costing $2.00 in a single API call, only to
+realize it wasn't the file they needed.
+
+This module provides "Pre-Flight" checks. Before any Sentinel Tool executes,
+it estimates the token impact.
+
+FEATURES:
+1. Local Tokenization: Uses a BPE (Byte Pair Encoding) approximation locally to avoid API calls.
+2. Heuristic Costing: Estimates cost based on file size and character count.
+3. Middleware Injection: Wraps `read_file` and `run_command` tools.
+
+ALGORITHM:
+We use the "Rule of Thumb": ~4 characters = 1 token.
+While not perfect, it is sufficient for order-of-magnitude guardrails (OOM).
+For specific code files, we apply a multiplier (Code is denser in tokens than text).
+*/
+
+package cost
+
+import (
+	"fmt"
+	"math"
+	"os"
+	"strings"
+)
+
+// Estimator handles the math of token prediction.
+type Estimator struct {
+	Rates RateCard
+}
+
+func NewEstimator(rates RateCard) *Estimator {
+	return &Estimator{Rates: rates}
+}
+
+// EstimateFileRead calculates the cost of reading a file into the Context Window.
+func (e *Estimator) EstimateFileRead(path string) (int, float64, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return 0, 0, err
+	}
+
+	// 1. Calculate Tokens
+	// Heuristic: Code files (~3.5 chars/token), Text files (~4 chars/token)
+	charCount := info.Size()
+	
+	multiplier := 3.5
+	if isTextFile(path) {
+		multiplier = 4.0
+	}
+	
+	tokens := int(math.Ceil(float64(charCount) / multiplier))
+
+	// 2. Calculate Cost (Input Tokens only)
+	// We assume reading a file adds it to Input context.
+	cost := (float64(tokens) / 1_000_000.0) * e.Rates.InputPricePerM
+
+	return tokens, cost, nil
+}
+
+// EstimateCommandOutput calculates the cost of feeding command output to the Agent.
+// Warning: This is tricky because we don't know the output size until we run it.
+// We use a "Budget" approach: The Agent authorizes a max budget for the output.
+func (e *Estimator) EstimateMaxCost(maxTokens int) float64 {
+	return (float64(maxTokens) / 1_000_000.0) * e.Rates.InputPricePerM
+}
+
+// CheckThreshold determines if an action requires explicit user confirmation
+// due to high cost.
+func (e *Estimator) CheckThreshold(cost float64, threshold float64) (bool, string) {
+	if cost > threshold {
+		return true, fmt.Sprintf(
+			"HIGH COST WARNING: This action estimates $%.4f (Threshold: $%.4f). "+
+			"This usually happens when reading large files or logs. "+
+			"Use `grep` or `read_file_chunk` instead.", 
+			cost, threshold,
+		)
+	}
+	return false, ""
+}
+
+// =============================================================================
+// HELPER UTILITIES
+// =============================================================================
+
+func isTextFile(path string) bool {
+	ext := strings.ToLower(strings.TrimPrefix(filepath.Ext(path), "."))
+	textExts := map[string]bool{
+		"md": true, "txt": true, "json": true, "csv": true, "log": true,
+	}
+	return textExts[ext]
+}
+
+// TokenizeApproximation is a fast, offline tokenizer.
+// Real BPE is slow and requires large vocab files. 
+// For guardrails, we accept 10% error margin.
+func TokenizeApproximation(text string) int {
+	// 1. Split by whitespace (approx words)
+	words := len(strings.Fields(text))
+	
+	// 2. Adjust for code syntax (brackets, symbols are tokens)
+	// Simple heuristic: Count special chars
+	specialChars := countSpecialChars(text)
+	
+	// 3. Formula
+	// Tokens ~= Words * 1.3 + SpecialChars
+	return int(float64(words)*1.3) + specialChars
+}
+
+func countSpecialChars(s string) int {
+	count := 0
+	for _, r := range s {
+		if r < '0' || (r > '9' && r < 'A') || (r > 'Z' && r < 'a') || r > 'z' {
+			count++
+		}
+	}
+	return count
+}
+
+// =============================================================================
+// INTERCEPTOR LOGIC (Middleware)
+// =============================================================================
+
+// VerifyCost is called by the Kernel before executing a tool.
+func (e *Estimator) VerifyCost(toolName string, args map[string]interface{}, ledger *Ledger) error {
+	var estimatedCost float64
+
+	switch toolName {
+	case "read_file":
+		path, _ := args["path"].(string)
+		_, cost, err := e.EstimateFileRead(path)
+		if err != nil {
+			return nil // Skip check if file not found (Tool will fail anyway)
+		}
+		estimatedCost = cost
+
+	case "run_tests":
+		// Tests generate large output logs.
+		// We assume average test run output is ~2k tokens ($0.006)
+		estimatedCost = 0.006 
+	}
+
+	// 1. Check if cost is trivial
+	if estimatedCost < 0.01 {
+		return nil
+	}
+
+	// 2. Check Ledger Budget
+	// We use a blank sprint ID for now, assuming GLOBAL context
+	if err := ledger.CheckBudget(estimatedCost, ""); err != nil {
+		return err // Block execution
+	}
+
+	return nil
+}

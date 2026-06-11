@@ -1,0 +1,224 @@
+name: Regression Guard
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  push:
+    branches: [main, master]
+
+jobs:
+  regression-check:
+    runs-on: ubuntu-latest
+    name: Check for Potential Regressions
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Run Regression Check
+        id: regression_check
+        run: |
+          echo "::group::Regression Check Output"
+          python scripts/regression_check.py --all --json > regression_report.json || true
+          python scripts/regression_check.py --all || true
+          echo "::endgroup::"
+
+      - name: Analyze PR for Bug Fix Commits
+        id: check_bug_fixes
+        if: github.event_name == 'pull_request'
+        run: |
+          echo "Checking for bug fix commits..."
+
+          # Get commit messages in PR
+          git log --format=%s "origin/${{ github.base_ref }}..HEAD" > commit_messages.txt
+
+          # Check for conventional commit bug fix markers
+          BUG_FIX_COUNT=$(grep -cE "^(fix|bugfix|hotfix)(\(.+\))?:" commit_messages.txt || true)
+
+          echo "bug_fix_count=$BUG_FIX_COUNT" >> $GITHUB_OUTPUT
+
+          if [ "$BUG_FIX_COUNT" -gt 0 ]; then
+            echo "Detected $BUG_FIX_COUNT bug fix commit(s)"
+            echo "commits=$(cat commit_messages.txt)" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Check for Regression Tests
+        id: check_regression_tests
+        if: steps.check_bug_fixes.outputs.bug_fix_count > 0
+        run: |
+          echo "Checking for regression tests in tests/regression/..."
+
+          # Check if tests/regression/ directory exists and has new files
+          if [ -d "tests/regression" ]; then
+            NEW_REGRESSION_TESTS=$(git diff --name-only --diff-filter=A "origin/${{ github.base_ref }}..HEAD" -- "tests/regression/**" | wc -l)
+            echo "new_regression_tests=$NEW_REGRESSION_TESTS" >> $GITHUB_OUTPUT
+
+            if [ "$NEW_REGRESSION_TESTS" -eq 0 ]; then
+              echo "::warning::Bug fix commits detected but no new regression tests found in tests/regression/"
+              echo "Consider adding a regression test for the bug fix."
+            else
+              echo "Found $NEW_REGRESSION_TESTS new regression test(s)"
+            fi
+          else
+            echo "new_regression_tests=0" >> $GITHUB_OUTPUT
+            echo "::warning::tests/regression/ directory not found"
+          fi
+
+      - name: Check Failure Registry
+        id: check_registry
+        run: |
+          REGISTRY_FILE=".guardrails/failure-registry.jsonl"
+
+          if [ -f "$REGISTRY_FILE" ]; then
+            ACTIVE_FAILURES=$(grep -v "^#" "$REGISTRY_FILE" | grep '"status":"active"' | wc -l)
+            echo "active_failures=$ACTIVE_FAILURES" >> $GITHUB_OUTPUT
+            echo "Found $ACTIVE_FAILURES active failure(s) in registry"
+          else
+            echo "active_failures=0" >> $GITHUB_OUTPUT
+            echo "No failure registry found"
+          fi
+
+      - name: Check Modified Files Against Registry
+        id: check_modified_files
+        if: github.event_name == 'pull_request'
+        run: |
+          # Get list of modified files
+          MODIFIED_FILES=$(git diff --name-only "origin/${{ github.base_ref }}..HEAD")
+
+          if [ -f ".guardrails/failure-registry.jsonl" ]; then
+            echo "Checking modified files against failure registry..."
+
+            HIGH_RISK_FILES=""
+            for file in $MODIFIED_FILES; do
+              # Check if file appears in any active failure entry
+              MATCHES=$(grep -v "^#" .guardrails/failure-registry.jsonl | \
+                       grep '"status":"active"' | \
+                       grep "\"$file\"" | \
+                       jq -r '.failure_id' 2>/dev/null || true)
+
+              if [ -n "$MATCHES" ]; then
+                HIGH_RISK_FILES="$HIGH_RISK_FILES\n- $file (related to: $MATCHES)"
+              fi
+            done
+
+            if [ -n "$HIGH_RISK_FILES" ]; then
+              echo "high_risk_files<<EOF" >> $GITHUB_OUTPUT
+              echo -e "$HIGH_RISK_FILES" >> $GITHUB_OUTPUT
+              echo "EOF" >> $GITHUB_OUTPUT
+            fi
+          fi
+
+      - name: Comment PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+
+            let report = '## Regression Guard Report\n\n';
+
+            // Active failures count
+            const activeFailures = '${{ steps.check_registry.outputs.active_failures }}';
+            report += `### Failure Registry Status\n`;
+            report += `- **Active failures in registry:** ${activeFailures}\n\n`;
+
+            // Bug fix commits
+            const bugFixCount = parseInt('${{ steps.check_bug_fixes.outputs.bug_fix_count }}' || '0');
+            report += `### Bug Fix Detection\n`;
+            if (bugFixCount > 0) {
+              report += `⚠️ **${bugFixCount} bug fix commit(s) detected**\n\n`;
+
+              // Regression tests check
+              const newTests = parseInt('${{ steps.check_regression_tests.outputs.new_regression_tests }}' || '0');
+              if (newTests === 0) {
+                report += `🔴 **Warning:** No new regression tests found in \`tests/regression/\`\n`;
+                report += `> Bug fixes should include regression tests to prevent reintroduction.\n\n`;
+              } else {
+                report += `✅ ${newTests} new regression test(s) added\n\n`;
+              }
+            } else {
+              report += `✅ No bug fix commits detected\n\n`;
+            }
+
+            // High risk files
+            const highRiskFiles = `${{ steps.check_modified_files.outputs.high_risk_files }}`;
+            if (highRiskFiles && highRiskFiles !== 'undefined') {
+              report += `### ⚠️ Files with Known Bug History\n`;
+              report += `The following modified files have active failures in the registry:\n`;
+              report += highRiskFiles + '\n\n';
+              report += `> Please review the failure registry before merging.\n\n`;
+            }
+
+            // Prevention rules status
+            if (fs.existsSync('.guardrails/prevention-rules/pattern-rules.json')) {
+              const rules = JSON.parse(fs.readFileSync('.guardrails/prevention-rules/pattern-rules.json', 'utf8'));
+              const enabledRules = rules.rules.filter(r => r.enabled).length;
+              report += `### Prevention Rules\n`;
+              report += `- ${enabledRules} pattern rule(s) active\n\n`;
+            }
+
+            report += `---\n`;
+            report += `*Run \`python scripts/regression_check.py\` locally for detailed output.*\n`;
+
+            // Find existing comment
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number
+            });
+
+            const botComment = comments.find(comment =>
+              comment.user.type === 'Bot' &&
+              comment.body.includes('Regression Guard Report')
+            );
+
+            if (botComment) {
+              // Update existing comment
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: botComment.id,
+                body: report
+              });
+            } else {
+              // Create new comment
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: report
+              });
+            }
+
+      - name: Fail on Critical Issues
+        if: github.event_name == 'pull_request'
+        run: |
+          # Check if any critical patterns were matched
+          if [ -f "regression_report.json" ]; then
+            CRITICAL_COUNT=$(cat regression_report.json | jq '[.issues[].violations[] | select(.severity == "critical")] | length' || echo "0")
+
+            if [ "$CRITICAL_COUNT" -gt 0 ]; then
+              echo "::error::$CRITICAL_COUNT critical regression pattern(s) detected!"
+              echo "Review the regression check output above."
+              exit 1
+            fi
+          fi
+
+          # Fail if bug fix without regression test
+          BUG_FIX_COUNT=${{ steps.check_bug_fixes.outputs.bug_fix_count || 0 }}
+          NEW_TESTS=${{ steps.check_regression_tests.outputs.new_regression_tests || 0 }}
+
+          if [ "$BUG_FIX_COUNT" -gt 0 ] && [ "$NEW_TESTS" -eq 0 ]; then
+            echo "::warning::Bug fix commits require regression tests."
+            # Uncomment to make this a hard fail:
+            # exit 1
+          fi
+
+          exit 0

@@ -1,0 +1,234 @@
+version: "3.8"
+
+services:
+  redis:
+    image: docker.io/library/redis:7-alpine
+    container_name: guardrail-redis
+    restart: unless-stopped
+    # Use config file instead of command line for password security
+    command: >
+      sh -c "
+        echo 'requirepass '$${REDIS_PASSWORD} > /usr/local/etc/redis/redis.conf &&
+        echo 'maxmemory 256mb' >> /usr/local/etc/redis/redis.conf &&
+        echo 'maxmemory-policy allkeys-lru' >> /usr/local/etc/redis/redis.conf &&
+        redis-server /usr/local/etc/redis/redis.conf
+      "
+    environment:
+      - REDIS_PASSWORD=${REDIS_PASSWORD}
+    volumes:
+      - redis_data:/data
+    networks:
+      - backend
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - SETGID
+      - SETUID
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+        reservations:
+          cpus: '0.25'
+          memory: 256M
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  postgres:
+    image: docker.io/library/postgres:16-alpine
+    container_name: guardrail-postgres
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=${DB_USER}
+      - POSTGRES_PASSWORD=${DB_PASSWORD}
+      - POSTGRES_DB=${DB_NAME}
+      # Performance tuning
+      - PGDATA=/var/lib/postgresql/data/pgdata
+    command: >
+      postgres
+        -c max_connections=100
+        -c shared_buffers=256MB
+        -c effective_cache_size=768MB
+        -c maintenance_work_mem=64MB
+        -c checkpoint_completion_target=0.9
+        -c wal_buffers=16MB
+        -c default_statistics_target=100
+        -c random_page_cost=1.1
+        -c effective_io_concurrency=200
+        -c work_mem=1310kB
+        -c min_wal_size=1GB
+        -c max_wal_size=4GB
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    networks:
+      - backend
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER} -d ${DB_NAME}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  mcp-server:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      args:
+        - VERSION=${VERSION:-dev}
+        - BUILD_TIME=${BUILD_TIME:-unknown}
+        - GIT_COMMIT=${GIT_COMMIT:-unknown}
+    image: guardrail-mcp:${VERSION:-latest}
+    container_name: guardrail-mcp-server
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:${MCP_PORT:-8080}:8080"  # MCP - localhost only
+      - "127.0.0.1:${WEB_PORT:-8081}:8081"  # Web UI - localhost only
+    environment:
+      # Server Configuration
+      - MCP_PORT=8080
+      - WEB_PORT=8081
+      - WEB_ENABLED=${WEB_ENABLED:-true}
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+      - REQUEST_TIMEOUT=${REQUEST_TIMEOUT:-30s}
+      - SHUTDOWN_TIMEOUT=${SHUTDOWN_TIMEOUT:-30s}
+      # Profiling (disabled by default)
+      - PPROF_ENABLED=${PPROF_ENABLED:-false}
+      - PPROF_PORT=${PPROF_PORT:-6060}
+      # Health Check Configuration
+      - HEALTH_CHECK_TIMEOUT=${HEALTH_CHECK_TIMEOUT:-3s}
+      # Production Mode
+      - PRODUCTION_MODE=${PRODUCTION_MODE:-false}
+      # Circuit Breaker Configuration
+      - CIRCUIT_BREAKER_ENABLED=${CIRCUIT_BREAKER_ENABLED:-true}
+      - CIRCUIT_BREAKER_FAILURE_THRESHOLD=${CIRCUIT_BREAKER_FAILURE_THRESHOLD:-5}
+      - CIRCUIT_BREAKER_SUCCESS_THRESHOLD=${CIRCUIT_BREAKER_SUCCESS_THRESHOLD:-2}
+      - CIRCUIT_BREAKER_TIMEOUT=${CIRCUIT_BREAKER_TIMEOUT:-30s}
+      - CIRCUIT_BREAKER_MAX_REQUESTS=${CIRCUIT_BREAKER_MAX_REQUESTS:-3}
+      - CIRCUIT_BREAKER_INTERVAL=${CIRCUIT_BREAKER_INTERVAL:-10s}
+      # Database Configuration
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_NAME=${DB_NAME}
+      - DB_USER=${DB_USER}
+      - DB_PASSWORD=${DB_PASSWORD}
+      - DB_SSLMODE=${DB_SSLMODE:-disable}
+      # Redis Configuration
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_PASSWORD=${REDIS_PASSWORD}
+      - REDIS_USE_TLS=${REDIS_USE_TLS:-false}
+      # Security Configuration
+      - MCP_API_KEY=${MCP_API_KEY}
+      - IDE_API_KEY=${IDE_API_KEY}
+      # JWT Configuration
+      - JWT_SECRET=${JWT_SECRET}
+      - JWT_ISSUER=${JWT_ISSUER:-guardrail-mcp}
+      - JWT_EXPIRY=${JWT_EXPIRY:-15m}
+      - JWT_ROTATION_HOURS=${JWT_ROTATION_HOURS:-168}
+      # Rate Limiting Configuration
+      - RATE_LIMIT_MCP=${RATE_LIMIT_MCP:-1000}
+      - RATE_LIMIT_IDE=${RATE_LIMIT_IDE:-500}
+      - RATE_LIMIT_SESSION=${RATE_LIMIT_SESSION:-100}
+      - RATE_LIMIT_WINDOW=${RATE_LIMIT_WINDOW:-1m}
+      - RATE_LIMIT_BURST_FACTOR=${RATE_LIMIT_BURST_FACTOR:-1.5}
+      # Cache TTL Configuration
+      - CACHE_TTL_RULES=${CACHE_TTL_RULES:-5m}
+      - CACHE_TTL_DOCS=${CACHE_TTL_DOCS:-10m}
+      - CACHE_TTL_SEARCH=${CACHE_TTL_SEARCH:-2m}
+      # Feature Flags
+      - ENABLE_VALIDATION=${ENABLE_VALIDATION:-true}
+      - ENABLE_METRICS=${ENABLE_METRICS:-true}
+      - ENABLE_AUDIT_LOGGING=${ENABLE_AUDIT_LOGGING:-true}
+      - ENABLE_CACHE=${ENABLE_CACHE:-true}
+      # CORS Configuration
+      - CORS_ALLOWED_ORIGINS=${CORS_ALLOWED_ORIGINS:-*}
+      - CORS_MAX_AGE=${CORS_MAX_AGE:-86400}
+      # Version info (passed at runtime)
+      - VERSION=${VERSION:-dev}
+      - BUILD_TIME=${BUILD_TIME:-unknown}
+      - GIT_COMMIT=${GIT_COMMIT:-unknown}
+    read_only: true
+    user: "65532:65532"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    networks:
+      - frontend
+      - backend
+    tmpfs:
+      - /tmp:noexec,nosuid,size=100m,mode=1777
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 2G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+        max_attempts: 3
+        window: 120s
+    # Health check using wget (available in distroless via busybox)
+    # Note: distroless doesn't have curl, but has wget
+    healthcheck:
+      test: ["CMD", "/server", "--health-check"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    # Logging configuration
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+        labels: "service,environment"
+        env: "VERSION,GIT_COMMIT"
+
+volumes:
+  pg_data:
+    driver: local
+  redis_data:
+    driver: local
+
+networks:
+  frontend:
+    internal: false
+    driver: bridge
+  backend:
+    internal: true
+    driver: bridge

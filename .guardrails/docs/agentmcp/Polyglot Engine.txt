@@ -1,0 +1,282 @@
+/*
+PACKAGE: sentinel/toolchain
+MODULE 2: POLYGLOT EXECUTOR & CONTAINER RUNNER
+
+OVERVIEW:
+This module abstracts the operating system and language toolchain.
+It allows the Agent to call `run_tests()` without knowing if it's running
+on Arch Linux (pacman), MacOS (brew), or Windows (winget).
+It also handles the "Sandbox V2" logic using Docker or Podman.
+*/
+
+package toolchain
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io/ioutil"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"time"
+)
+
+// LanguageProfile defines how Sentinel interacts with a specific stack.
+type LanguageProfile struct {
+	Name        string
+	TestCmd     []string
+	BuildCmd    []string
+	LintCmd     []string
+	InstallCmd  []string
+	LockFile    string
+	PackageFile string
+}
+
+// ToolchainManager handles detection and execution.
+type ToolchainManager struct {
+	Root        string
+	OS          string // "linux", "windows", "darwin"
+	UseContainer bool
+	ContainerImg string
+	ActiveProfile *LanguageProfile
+}
+
+// NewToolchain creates a manager aware of the host OS.
+func NewToolchain(root string) *ToolchainManager {
+	return &ToolchainManager{
+		Root: root,
+		OS:   runtime.GOOS,
+	}
+}
+
+// =============================================================================
+// SECTION 1: AUTO-DETECTION LOGIC
+// =============================================================================
+
+// DetectLanguage scans the repo root to identify the stack.
+func (tm *ToolchainManager) DetectLanguage() (*LanguageProfile, error) {
+	// Go Detection
+	if _, err := os.Stat(filepath.Join(tm.Root, "go.mod")); err == nil {
+		return &LanguageProfile{
+			Name:       "go",
+			TestCmd:    []string{"go", "test", "-v", "-race", "./..."},
+			BuildCmd:   []string{"go", "build", "./..."},
+			LintCmd:    []string{"golangci-lint", "run"},
+			InstallCmd: []string{"go", "mod", "download"},
+			LockFile:   "go.sum",
+		}, nil
+	}
+
+	// Node/TS Detection
+	if _, err := os.Stat(filepath.Join(tm.Root, "package.json")); err == nil {
+		// Detect package manager
+		pm := "npm"
+		testCmd := []string{"npm", "test"}
+		if _, err := os.Stat(filepath.Join(tm.Root, "pnpm-lock.yaml")); err == nil {
+			pm = "pnpm"
+			testCmd = []string{"pnpm", "test"}
+		}
+		
+		return &LanguageProfile{
+			Name:       "node",
+			TestCmd:    testCmd,
+			BuildCmd:   []string{pm, "run", "build"},
+			LintCmd:    []string{pm, "run", "lint"},
+			InstallCmd: []string{pm, "install"},
+			LockFile:   "package-lock.json", // Simplified
+		}, nil
+	}
+
+	// Rust Detection
+	if _, err := os.Stat(filepath.Join(tm.Root, "Cargo.toml")); err == nil {
+		return &LanguageProfile{
+			Name:       "rust",
+			TestCmd:    []string{"cargo", "test"},
+			BuildCmd:   []string{"cargo", "build", "--release"},
+			LintCmd:    []string{"cargo", "clippy", "--", "-D", "warnings"},
+			InstallCmd: []string{"cargo", "fetch"},
+			LockFile:   "Cargo.lock",
+		}, nil
+	}
+	
+	// Nix Flake Fallback (NixOS / Custom Environments)
+	if _, err := os.Stat(filepath.Join(tm.Root, "flake.nix")); err == nil {
+		return &LanguageProfile{
+			Name:       "nix",
+			TestCmd:    []string{"nix", "develop", "-c", "check"},
+			BuildCmd:   []string{"nix", "build"},
+			LintCmd:    []string{"nix", "develop", "-c", "lint"},
+			InstallCmd: []string{"nix", "develop"}, // or direnv
+		}, nil
+	}
+
+	// Godot / GDScript Detection
+	if _, err := os.Stat(filepath.Join(tm.Root, "project.godot")); err == nil {
+		return &LanguageProfile{
+			Name:       "godot",
+			TestCmd:    []string{"godot", "--headless", "--path", tm.Root, "--script", "test_runner.gd"},
+			BuildCmd:   []string{"godot", "--headless", "--path", tm.Root, "--export-debug", "Linux/X11"},
+			LintCmd:    []string{"gdformat", "--check", tm.Root},
+			InstallCmd: []string{}, // Godot is self-contained
+			LockFile:   "",           // Godot doesn't use lockfiles
+			PackageFile: "project.godot",
+		}, nil
+	}
+
+	return nil, fmt.Errorf("language auto-detection failed. Please configure sentinel.toml manually")
+}
+
+// =============================================================================
+// SECTION 2: CROSS-PLATFORM EXECUTOR
+// =============================================================================
+
+// ExecuteCommand runs a command securely, handling OS differences.
+// On Windows, it wraps via cmd.exe.
+// On Linux/Mac, it executes directly or via sh.
+func (tm *ToolchainManager) ExecuteCommand(ctx context.Context, cmdParts []string) (string, error) {
+	if len(cmdParts) == 0 {
+		return "", fmt.Errorf("empty command")
+	}
+
+	var cmd *exec.Cmd
+
+	if tm.UseContainer {
+		return tm.executeInContainer(ctx, cmdParts)
+	}
+
+	// Host Execution Logic
+	if tm.OS == "windows" {
+		// Windows: We must be careful with argument escaping
+		// For complex commands, it's safer to run via PowerShell or CMD
+		args := append([]string{"/C"}, cmdParts...)
+		cmd = exec.CommandContext(ctx, "cmd.exe", args...)
+	} else {
+		// Linux / Darwin
+		cmd = exec.CommandContext(ctx, cmdParts[0], cmdParts[1:]...)
+	}
+
+	cmd.Dir = tm.Root
+	// Sanitized Environment
+	cmd.Env = tm.sanitizeEnv(os.Environ())
+
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	err := cmd.Run()
+	output := stdout.String() + "\n" + stderr.String()
+
+	if err != nil {
+		return output, fmt.Errorf("execution failed: %v", err)
+	}
+
+	return output, nil
+}
+
+// executeInContainer runs the tool inside Docker/Podman for isolation.
+func (tm *ToolchainManager) executeInContainer(ctx context.Context, cmdParts []string) (string, error) {
+	// 1. Construct Docker run command
+	// -v $(pwd):/app  -> Mount source code
+	// -w /app         -> Set working dir
+	// --rm            -> Cleanup container after run
+	// --network none  -> Sandbox network (unless installing deps)
+	
+	dockerArgs := []string{
+		"run", "--rm",
+		"-v", fmt.Sprintf("%s:/app", tm.Root),
+		"-w", "/app",
+	}
+
+	// Pass through important env vars (but scrub secrets)
+	if apiKey := os.Getenv("OPENAI_API_KEY"); apiKey != "" {
+		// In a real scenario, we might NOT want to pass this unless needed for the tool.
+		// Sentinel strictly controls secret injection.
+	}
+
+	dockerArgs = append(dockerArgs, tm.ContainerImg)
+	dockerArgs = append(dockerArgs, cmdParts...)
+
+	cmd := exec.CommandContext(ctx, "docker", dockerArgs...)
+	
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &out
+	
+	err := cmd.Run()
+	return out.String(), err
+}
+
+// sanitizeEnv removes dangerous environment variables before passing to child process.
+func (tm *ToolchainManager) sanitizeEnv(currentEnv []string) []string {
+	safeEnv := []string{}
+	denylist := []string{"AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "GH_TOKEN", "GITHUB_TOKEN"}
+
+	for _, e := range currentEnv {
+		isBlocked := false
+		for _, denied := range denylist {
+			if strings.HasPrefix(e, denied+"=") {
+				isBlocked = true
+				break
+			}
+		}
+		if !isBlocked {
+			safeEnv = append(safeEnv, e)
+		}
+	}
+	
+	// Force CI=true for Sentinel runs to prevent interactive prompts
+	safeEnv = append(safeEnv, "CI=true")
+	safeEnv = append(safeEnv, "SENTINEL_ACTIVE=true")
+	
+	return safeEnv
+}
+
+// =============================================================================
+// SECTION 3: NIXOS / FLAKE SUPPORT
+// =============================================================================
+
+// NixFlakeTemplate provides a reproducible environment definition.
+const NixFlakeTemplate = `{
+  description = "Sentinel Reproducible Environment";
+
+  inputs = {
+    nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
+    flake-utils.url = "github:numtide/flake-utils";
+  };
+
+  outputs = { self, nixpkgs, flake-utils }:
+    flake-utils.lib.eachDefaultSystem (system:
+      let
+        pkgs = nixpkgs.legacyPackages.${system};
+      in
+      {
+        devShells.default = pkgs.mkShell {
+          buildInputs = with pkgs; [
+            go
+            nodejs
+            python3
+            # Sentinel Binary (Self-Reference in real scenario)
+          ];
+          
+          shellHook = ''
+            echo "Sentinel Guarded Shell Active"
+            export SENTINEL_MODE=nix
+          '';
+        };
+      }
+    );
+}
+`
+
+// GenerateFlake writes the flake.nix if requested.
+func (tm *ToolchainManager) GenerateFlake() error {
+	path := filepath.Join(tm.Root, "flake.nix")
+	if _, err := os.Stat(path); err == nil {
+		return nil // Already exists
+	}
+	return ioutil.WriteFile(path, []byte(NixFlakeTemplate), 0644)
+}

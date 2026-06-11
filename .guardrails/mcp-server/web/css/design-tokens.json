@@ -1,0 +1,352 @@
+{
+  "version": "1.0.0",
+  "generated": "2026-03-14",
+  "tokens": {
+    "theme": {
+      "mode": {
+        "value": "dark",
+        "description": "Default theme mode, override with [data-theme='light']"
+      }
+    },
+    "color": {
+      "primary": {
+        "dark": {
+          "base": "#3b82f6",
+          "dark": "#2563eb",
+          "light": "#60a5fa",
+          "subtle": "rgba(59, 130, 246, 0.1)"
+        },
+        "light": {
+          "base": "#2563eb",
+          "dark": "#1e40af",
+          "light": "#60a5fa",
+          "subtle": "rgba(37, 99, 235, 0.1)"
+        }
+      },
+      "semantic": {
+        "success": {
+          "dark": "#10b981",
+          "darkTheme": "#059669",
+          "light": "#059669",
+          "subtle": "rgba(16, 185, 129, 0.1)"
+        },
+        "warning": {
+          "dark": "#f59e0b",
+          "darkTheme": "#d97706",
+          "light": "#d97706",
+          "subtle": "rgba(245, 158, 11, 0.1)"
+        },
+        "error": {
+          "dark": "#ef4444",
+          "darkTheme": "#dc2626",
+          "light": "#dc2626",
+          "subtle": "rgba(239, 68, 68, 0.1)"
+        },
+        "info": {
+          "dark": "#06b6d4",
+          "darkTheme": "#0891b2",
+          "light": "#0891b2",
+          "subtle": "rgba(6, 182, 212, 0.1)"
+        }
+      },
+      "background": {
+        "dark": {
+          "primary": "#0f172a",
+          "secondary": "#1e293b",
+          "tertiary": "#334155",
+          "elevated": "#1e293b"
+        },
+        "light": {
+          "primary": "#ffffff",
+          "secondary": "#f8fafc",
+          "tertiary": "#f1f5f9",
+          "elevated": "#ffffff"
+        }
+      },
+      "surface": {
+        "dark": {
+          "base": "#1e293b",
+          "hover": "#334155",
+          "active": "#475569"
+        },
+        "light": {
+          "base": "#f8fafc",
+          "hover": "#f1f5f9",
+          "active": "#e2e8f0"
+        }
+      },
+      "border": {
+        "dark": {
+          "base": "#334155",
+          "light": "#475569",
+          "dark": "#1e293b"
+        },
+        "light": {
+          "base": "#e2e8f0",
+          "light": "#cbd5e1",
+          "dark": "#f1f5f9"
+        }
+      },
+      "text": {
+        "dark": {
+          "primary": "#f1f5f9",
+          "secondary": "#94a3b8",
+          "tertiary": "#64748b",
+          "muted": "#475569"
+        },
+        "light": {
+          "primary": "#0f172a",
+          "secondary": "#475569",
+          "tertiary": "#64748b",
+          "muted": "#94a3b8"
+        }
+      },
+      "game": {
+        "rarity": {
+          "common": {
+            "base": "#78716c",
+            "dark": "#5c5550",
+            "light": "#a8a39e"
+          },
+          "rare": {
+            "base": "#3b82f6",
+            "dark": "#2563eb",
+            "light": "#60a5fa"
+          },
+          "epic": {
+            "base": "#a855f7",
+            "dark": "#9333ea",
+            "light": "#c084fc"
+          },
+          "legendary": {
+            "base": "#f59e0b",
+            "dark": "#d97706",
+            "light": "#fbbf24"
+          }
+        },
+        "resource": {
+          "health": {
+            "base": "#ef4444",
+            "dark": "#dc2626",
+            "light": "#f87171"
+          },
+          "mana": {
+            "base": "#3b82f6",
+            "dark": "#2563eb",
+            "light": "#60a5fa"
+          },
+          "energy": {
+            "base": "#f59e0b",
+            "dark": "#d97706",
+            "light": "#fbbf24"
+          },
+          "stamina": {
+            "base": "#10b981",
+            "dark": "#059669",
+            "light": "#34d399"
+          }
+        },
+        "status": {
+          "buff": {
+            "base": "#10b981",
+            "dark": "#059669",
+            "light": "#34d399"
+          },
+          "debuff": {
+            "base": "#ef4444",
+            "dark": "#dc2626",
+            "light": "#f87171"
+          },
+          "dot": {
+            "base": "#8b5cf6",
+            "dark": "#7c3aed",
+            "light": "#a78bfa"
+          },
+          "hot": {
+            "base": "#f59e0b",
+            "dark": "#d97706",
+            "light": "#fbbf24"
+          }
+        },
+        "faction": {
+          "alliance": {
+            "base": "#3b82f6",
+            "dark": "#1e40af",
+            "light": "#60a5fa",
+            "glow": "0 0 16px rgba(59, 130, 246, 0.6)"
+          },
+          "horde": {
+            "base": "#ef4444",
+            "dark": "#dc2626",
+            "light": "#f87171",
+            "glow": "0 0 16px rgba(239, 68, 68, 0.6)"
+          },
+          "neutral": {
+            "base": "#78716c",
+            "dark": "#5c5550",
+            "light": "#a8a39e"
+          }
+        }
+      }
+    },
+    "typography": {
+      "fontFamily": {
+        "base": "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif",
+        "mono": "'Monaco', 'Menlo', 'Ubuntu Mono', 'Consolas', monospace"
+      },
+      "fontSize": {
+        "xs": "0.75rem",
+        "sm": "0.875rem",
+        "base": "1rem",
+        "lg": "1.125rem",
+        "xl": "1.25rem",
+        "2xl": "1.5rem",
+        "3xl": "1.875rem",
+        "4xl": "2.25rem"
+      },
+      "fontWeight": {
+        "normal": 400,
+        "medium": 500,
+        "semibold": 600,
+        "bold": 700
+      },
+      "lineHeight": {
+        "tight": 1.25,
+        "normal": 1.5,
+        "relaxed": 1.625
+      }
+    },
+    "spacing": {
+      "scale": {
+        "0": "0rem",
+        "0.5": "0.125rem",
+        "1": "0.25rem",
+        "1.5": "0.375rem",
+        "2": "0.5rem",
+        "2.5": "0.625rem",
+        "3": "0.75rem",
+        "4": "1rem",
+        "5": "1.25rem",
+        "6": "1.5rem",
+        "8": "2rem",
+        "10": "2.5rem",
+        "12": "3rem",
+        "16": "4rem",
+        "20": "5rem",
+        "24": "6rem"
+      }
+    },
+    "container": {
+      "inlineSize": "100%",
+      "blockSize": "auto",
+      "minSize": "min(100%, 1440px)",
+      "maxSize": "1440px"
+    },
+    "borderRadius": {
+      "sm": "0.25rem",
+      "md": "0.375rem",
+      "lg": "0.5rem",
+      "xl": "0.75rem",
+      "2xl": "1rem",
+      "full": "9999px"
+    },
+    "shadow": {
+      "sm": "0 1px 2px 0 rgba(0, 0, 0, 0.3)",
+      "md": "0 4px 6px -1px rgba(0, 0, 0, 0.4), 0 2px 4px -2px rgba(0, 0, 0, 0.4)",
+      "lg": "0 10px 15px -3px rgba(0, 0, 0, 0.5), 0 4px 6px -4px rgba(0, 0, 0, 0.5)",
+      "xl": "0 20px 25px -5px rgba(0, 0, 0, 0.5), 0 8px 10px -6px rgba(0, 0, 0, 0.5)"
+    },
+    "easing": {
+      "outExpo": "cubic-bezier(0.19, 1, 0.22, 1)",
+      "outCirc": "cubic-bezier(0.075, 0.82, 0.165, 1)",
+      "inOut": "cubic-bezier(0.4, 0, 0.2, 1)",
+      "outSpring": "cubic-bezier(0.175, 0.885, 0.32, 1.275)",
+      "inExpo": "cubic-bezier(0.95, 0.05, 0.795, 0.105)",
+      "outSoft": "cubic-bezier(0.25, 1, 0.5, 1)"
+    },
+    "transition": {
+      "fast": "150ms ease-in-out",
+      "normal": "250ms ease-in-out",
+      "slow": "350ms ease-in-out"
+    },
+    "zIndex": {
+      "dropdown": 100,
+      "sticky": 200,
+      "modalBackdrop": 300,
+      "modal": 400,
+      "popover": 500,
+      "tooltip": 600,
+      "toast": 700
+    },
+    "layout": {
+      "sidebarWidth": "260px",
+      "sidebarWidthMobile": "280px",
+      "sidebarCollapsedWidth": "64px",
+      "headerHeight": "64px",
+      "containerMaxWidth": "1440px"
+    },
+    "form": {
+      "inputHeight": "2.5rem",
+      "buttonHeight": "2.5rem",
+      "buttonHeightSm": "2rem",
+      "buttonHeightLg": "3rem"
+    },
+    "accessibility": {
+      "focusRing": {
+        "width": "2px",
+        "offset": "2px",
+        "color": "var(--color-primary)",
+        "style": "solid"
+      },
+      "reducedMotion": {
+        "reduced": "reduce",
+        "normal": "prefer-reduced-motion"
+      },
+      "highContrast": {
+        "borderWidth": "2px",
+        "borderStyle": "solid",
+        "borderColor": "#ffffff",
+        "textPrimary": "#ffffff",
+        "textSecondary": "#e2e8f0",
+        "bgPrimary": "#000000",
+        "bgSecondary": "#1a1a1a"
+      }
+    },
+    "effects": {
+      "glassmorphism": {
+        "bg": "rgba(30, 41, 59, 0.7)",
+        "bgLight": "rgba(248, 250, 252, 0.7)",
+        "border": "rgba(148, 163, 184, 0.2)",
+        "borderLight": "rgba(203, 213, 224, 0.3)",
+        "shadow": "0 8px 32px 0 rgba(0, 0, 0, 0.3)",
+        "shadowLight": "0 8px 32px 0 rgba(0, 0, 0, 0.1)",
+        "blur": "12px"
+      },
+      "glow": {
+        "common": "0 0 8px rgba(120, 113, 108, 0.5)",
+        "rare": "0 0 12px rgba(59, 130, 246, 0.6)",
+        "epic": "0 0 16px rgba(168, 85, 247, 0.7)",
+        "legendary": "0 0 20px rgba(245, 158, 11, 0.8)",
+        "primary": "0 0 12px rgba(59, 130, 246, 0.5)",
+        "success": "0 0 12px rgba(16, 185, 129, 0.5)",
+        "error": "0 0 12px rgba(239, 68, 68, 0.5)",
+        "warning": "0 0 12px rgba(245, 158, 11, 0.5)"
+      },
+      "gradient": {
+        "primary": "linear-gradient(135deg, #3b82f6 0%, #2563eb 100%)",
+        "success": "linear-gradient(135deg, #10b981 0%, #059669 100%)",
+        "error": "linear-gradient(135deg, #ef4444 0%, #dc2626 100%)",
+        "warning": "linear-gradient(135deg, #f59e0b 0%, #d97706 100%)",
+        "epic": "linear-gradient(135deg, #a855f7 0%, #9333ea 100%)",
+        "legendary": "linear-gradient(135deg, #f59e0b 0%, #fbbf24 100%)",
+        "rainbow": "linear-gradient(135deg, #3b82f6, #a855f7, #f59e0b, #ef4444)"
+      }
+    }
+  },
+  "wcagCompliance": {
+    "level": "AA/AAA",
+    "contrastRatioMinimum": 4.5,
+    "lightThemeColors": "Designed for WCAG AA compliance with dark text on light backgrounds",
+    "darkThemeColors": "Designed for WCAG AA compliance with light text on dark backgrounds"
+  }
+}

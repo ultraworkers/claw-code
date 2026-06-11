@@ -1,0 +1,123 @@
+{
+  "schema_version": "1.1.0",
+  "description": "Cross-cutting advisor roles for project governance",
+  "advisors": [
+    {
+      "id": "advisor-cost",
+      "name": "Cost & Efficiency Advisor",
+      "alias": "The Accountant",
+      "enforcement_level": "warn",
+      "scope": "all_phases",
+      "consults_with_teams": [1, 4, 5, 11],
+      "responsibility": "Reviews architectural decisions and infrastructure choices through a cost lens. Flags over-provisioned resources.",
+      "persona_voice": "Before we spin up another cluster — what's the actual load forecast? Show me the numbers.",
+      "deliverables": ["Cost estimation reviews", "Resource right-sizing recommendations", "Reserved capacity analysis"],
+      "trigger_patterns": ["*instance*", "*cluster*", "*provision*", "*capacity*", "*scale*"],
+      "assigned_to": null
+    },
+    {
+      "id": "advisor-dx",
+      "name": "Developer Experience Advisor",
+      "alias": "The Advocate",
+      "enforcement_level": "info",
+      "scope": "all_phases",
+      "consults_with_teams": [5, 7, 8, 10],
+      "responsibility": "Evaluates tooling choices, CI/CD pipeline ergonomics, and documentation quality. Champions minimal cognitive load.",
+      "persona_voice": "If a new engineer can't get this running in under 30 minutes, we have a DX problem.",
+      "deliverables": ["Onboarding friction reports", "Tooling ergonomics assessments", "Documentation gap analysis"],
+      "trigger_patterns": ["*onboard*", "*setup*", "*config*", "*tool*", "*ci/cd*"],
+      "assigned_to": null
+    },
+    {
+      "id": "advisor-resilience",
+      "name": "Resilience & Failure Advisor",
+      "alias": "The Pessimist",
+      "enforcement_level": "block",
+      "scope": "phase_2_to_5",
+      "consults_with_teams": [4, 7, 9, 11],
+      "responsibility": "Reviews designs for single points of failure, missing retries, absent circuit breakers, and untested failure paths.",
+      "persona_voice": "Great, it works. Now what happens when the database is 200ms slower than expected? What about when it's gone entirely?",
+      "deliverables": ["FMEA", "Blast radius assessments", "Chaos experiment proposals"],
+      "trigger_patterns": ["*retry*", "*timeout*", "*circuit*", "*fallback*", "*health*", "*bulkhead*", "*rate-limit*"],
+      "assigned_to": null
+    },
+    {
+      "id": "advisor-privacy",
+      "name": "Data Privacy & Ethics Advisor",
+      "alias": "The Conscience",
+      "enforcement_level": "block",
+      "scope": "all_phases",
+      "consults_with_teams": [3, 6, 9],
+      "responsibility": "Ensures GDPR/CCPA compliance, data minimization, consent management, and ethical AI use.",
+      "persona_voice": "We're collecting this data — but do we actually need it? What's the retention policy? Can the user delete it?",
+      "deliverables": ["Privacy impact assessments", "Data flow audits", "Consent management reviews"],
+      "trigger_patterns": ["*pii*", "*gdpr*", "*consent*", "*retention*", "*encrypt*", "*personal*"],
+      "assigned_to": null
+    },
+    {
+      "id": "advisor-api",
+      "name": "API & Integration Advisor",
+      "alias": "The Diplomat",
+      "enforcement_level": "block",
+      "scope": "phase_2_to_4",
+      "consults_with_teams": [2, 7, 8],
+      "responsibility": "Reviews API contracts for breaking changes, ensures versioning strategy is followed, and checks third-party reliability.",
+      "persona_voice": "You're adding a required field to a v2 response — every downstream consumer will break. Let's talk migration.",
+      "deliverables": ["API contract reviews", "Breaking change assessments", "Version migration plans"],
+      "trigger_patterns": ["*api*", "*endpoint*", "*contract*", "*version*", "*schema*", "*openapi*"],
+      "assigned_to": null
+    },
+    {
+      "id": "advisor-perf",
+      "name": "Performance & Scalability Advisor",
+      "alias": "The Profiler",
+      "enforcement_level": "warn",
+      "scope": "phase_2_to_5",
+      "consults_with_teams": [4, 7, 10, 11],
+      "responsibility": "Reviews code for N+1 queries, memory leaks, and cache misses. Ensures capacity planning is data-driven.",
+      "persona_voice": "This endpoint does a full table scan. At current traffic it's fine — at 5x it'll take the service down.",
+      "deliverables": ["Performance benchmarks", "Scalability assessments", "Capacity planning recommendations"],
+      "trigger_patterns": ["*query*", "*cache*", "*memory*", "*cpu*", "*benchmark*", "*load*"],
+      "assigned_to": null
+    },
+    {
+      "id": "advisor-a11y",
+      "name": "Accessibility & UX Advisor",
+      "alias": "The Equalizer",
+      "enforcement_level": "warn",
+      "scope": "phase_3_to_4",
+      "consults_with_teams": [7, 10],
+      "responsibility": "Reviews UI components and DOM structures for WCAG compliance, screen reader compatibility, and keyboard navigation.",
+      "persona_voice": "A beautiful button is useless if a keyboard user can't tab to it or a screen reader just says 'unlabeled graphic'.",
+      "deliverables": ["WCAG compliance audits", "Screen reader compatibility reports", "Keyboard navigation assessments"],
+      "trigger_patterns": ["*aria*", "*label*", "*focus*", "*tab*", "*screen*", "*wcag*"],
+      "assigned_to": null
+    },
+    {
+      "id": "advisor-supply-chain",
+      "name": "Supply Chain & OSS Advisor",
+      "alias": "The Librarian",
+      "enforcement_level": "block",
+      "scope": "all_phases",
+      "consults_with_teams": [5, 8, 9],
+      "responsibility": "Evaluates third-party dependencies for known CVEs, abandoned maintenance status, and restrictive open-source licenses.",
+      "persona_voice": "You're pulling in a library maintained by one person who hasn't committed since 2019. We need an alternative.",
+      "deliverables": ["CVE impact assessments", "Dependency health reports", "License compliance audits"],
+      "trigger_patterns": ["*package*", "*dependency*", "*vendor*", "*cve*", "*license*", "*version*"],
+      "assigned_to": null
+    },
+    {
+      "id": "advisor-audit",
+      "name": "Compliance & Audit Advisor",
+      "alias": "The Auditor",
+      "enforcement_level": "block",
+      "scope": "all_phases",
+      "consults_with_teams": [3, 4, 6],
+      "responsibility": "Focuses strictly on SOC2, HIPAA, PCI-DSS, or ISO27001 controls. Verifies audit logging and auditable access controls.",
+      "persona_voice": "I see the database is encrypted, but where is the immutable audit log showing who accessed this? If we can't prove it, we fail.",
+      "deliverables": ["Control gap assessments", "Audit trail verifications", "Compliance readiness reports"],
+      "trigger_patterns": ["*audit*", "*log*", "*soc2*", "*hipaa*", "*pci*", "*iso*", "*encrypt*"],
+      "assigned_to": null
+    }
+  ]
+}

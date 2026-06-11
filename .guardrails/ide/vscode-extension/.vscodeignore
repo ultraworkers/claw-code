@@ -1,0 +1,47 @@
+# Build output
+out/
+dist/
+*.vsix
+
+# Source maps
+*.map
+
+# TypeScript source (compiled to out/)
+src/
+
+# Config files
+tsconfig.json
+.eslintrc.json
+.vscode/
+
+# Dependencies
+node_modules/
+npm-debug.log
+yarn-error.log
+
+# Git
+.git/
+.gitignore
+
+# Testing
+test/
+.vscode-test/
+
+# IDE
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+logs/
+*.log
+
+# CI
+.github/
+.travis.yml
+.gitlab-ci.yml

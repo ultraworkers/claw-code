@@ -1,0 +1,15 @@
+# Production configuration
+# Used when APP_ENV=production
+
+database:
+  host: "prod-db.example.com"
+  port: 5432
+  name: "production_db"
+  ssl_mode: "require"
+  max_connections: 100
+
+services:
+  api_url: "https://api.example.com"
+  cache_host: "prod-cache.example.com:6379"
+  timeout_seconds: 30
+  retry_attempts: 3

@@ -1,0 +1,15 @@
+Project Sentinel: Sprint Governance & Task ManagementVersion: 3.0.0-EnterpriseModule: 18-Sprint-GovernanceMaps to: docs/sprints/SPRINT_TEMPLATE.mdScope: Strict enforcement of the Agile process, Definition of Done (DoD), and automated retrospective generation.1. The Sprint ConstitutionIn Sentinel, a "Sprint" is not just a timebox; it is a Database Object that enforces the rules of engagement.1.1 The Planning Phase (Locked State)State: PLANNING.Goal: Define work before doing work.Constraints:write_code: DISABLED.run_tests: DISABLED.add_task: ENABLED.Transition Rule: To move to ACTIVE state, the Agent must call start_sprint().Validation: Sentinel checks:Are there > 0 tasks?Do all tasks have a complexity estimate?Are Sprint Goals defined?1.2 The Active Phase (The Dependency Graph)State: ACTIVE.Enforcement:Sequential Execution: Agent can only have 1 task in in_progress at a time.Blocker Awareness: If Task B depends on Task A, Sentinel rejects start_task(B) until Task A is DONE.Context Binding: When Task A is active, Sentinel creates a context_id. Audit logs and Git branches are tagged with this ID.2. The Definition of Done (DoD)Sentinel acts as the "Bad Cop" that refuses to accept sloppy work.2.1 Automated DoD VerificationTrigger: Agent calls complete_task(id="T-101").Checklist:Code: Git status clean?Tests: New tests added? (Heuristic: modified *_test.go).Docs: Comments added? (Heuristic: godoc coverage).Build: go build passes?Outcome:Pass: Status -> DONE.Fail: Status -> IN_PROGRESS. Error: "DoD Violation: No new tests detected for this feature."2.2 The "Zombie Task" PreventionScenario: Agent starts a task, gets stuck, and leaves it hanging.Mechanism: Sentinel monitors "Idle Time" on active tasks.Alert: If a task is in_progress for > 4 hours with no commits:Sentinel prompts: "Task T-101 appears stalled. Move to BLOCKED or ask for help?"3. The Automated RetrospectiveSentinel writes the Sprint Review so you don't have to.3.1 Data AggregationWhen archive_sprint() is called, Sentinel queries the audit_log and tasks table.Metrics:Planned vs. Actual Tasks."Churn Rate" (Lines of code rewritten)."Error Rate" (Number of failed tool calls)."Security Incidents" (Number of blocked actions).3.2 Generating the ArtifactSentinel creates docs/sprints/archive/2026-01-Sprint/RETROSPECTIVE.md.Template:# Sprint Retrospective: Sprint-24
+**Status:** Success with Warnings
+**Velocity:** 12 Tasks / 3 Days
+
+## The Good
+* Completed critical Auth module (Task T-105).
+* Zero production secrets leaked.
+
+## The Bad
+* High failure rate on `run_tests` (45% failure rate).
+* Agent attempted to edit `.env` 3 times (Blocked).
+
+## Action Items
+* Review `TESTING_VALIDATION.md` to reduce test churn.
+Value: This provides an objective, data-driven view of the Agent's performance, allowing the human user to tune the prompts or config for the next cycle.

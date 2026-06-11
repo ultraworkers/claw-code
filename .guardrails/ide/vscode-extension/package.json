@@ -1,0 +1,165 @@
+{
+  "name": "guardrail-vscode",
+  "displayName": "Guardrail",
+  "description": "Real-time guardrail validation for AI-assisted coding",
+  "version": "1.0.0",
+  "publisher": "TheArchitectit",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/TheArchitectit/agent-guardrails-template"
+  },
+  "bugs": {
+    "url": "https://github.com/TheArchitectit/agent-guardrails-template/issues"
+  },
+  "homepage": "https://github.com/TheArchitectit/agent-guardrails-template/tree/main/ide/vscode-extension",
+  "license": "BSD-3-Clause",
+  "engines": {
+    "vscode": "^1.60.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Linters",
+    "Machine Learning",
+    "Testing"
+  ],
+  "keywords": [
+    "guardrails",
+    "ai",
+    "validation",
+    "safety",
+    "mcp"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "guardrail.validateFile",
+        "title": "Validate File",
+        "category": "Guardrail"
+      },
+      {
+        "command": "guardrail.validateSelection",
+        "title": "Validate Selection",
+        "category": "Guardrail"
+      },
+      {
+        "command": "guardrail.configure",
+        "title": "Configure Connection",
+        "category": "Guardrail",
+        "icon": "$(gear)"
+      },
+      {
+        "command": "guardrail.showOutput",
+        "title": "Show Output",
+        "category": "Guardrail"
+      },
+      {
+        "command": "guardrail.testConnection",
+        "title": "Test Connection",
+        "category": "Guardrail"
+      }
+    ],
+    "menus": {
+      "commandPalette": [
+        {
+          "command": "guardrail.validateFile",
+          "group": "Guardrail"
+        },
+        {
+          "command": "guardrail.validateSelection",
+          "group": "Guardrail"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "guardrail.validateSelection",
+          "group": "9_cutcopypaste@5",
+          "when": "editorHasSelection"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Guardrail",
+      "properties": {
+        "guardrail.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable Guardrail validation",
+          "scope": "resource"
+        },
+        "guardrail.serverUrl": {
+          "type": "string",
+          "default": "http://localhost:8095",
+          "description": "Guardrail MCP server URL",
+          "scope": "resource"
+        },
+        "guardrail.apiKey": {
+          "type": "string",
+          "default": "",
+          "description": "API key for MCP server authentication",
+          "scope": "application"
+        },
+        "guardrail.projectSlug": {
+          "type": "string",
+          "default": "",
+          "description": "Project slug for context-aware validation",
+          "scope": "resource"
+        },
+        "guardrail.validateOnSave": {
+          "type": "boolean",
+          "default": true,
+          "description": "Validate file on save",
+          "scope": "resource"
+        },
+        "guardrail.validateOnType": {
+          "type": "boolean",
+          "default": false,
+          "description": "Validate while typing (may impact performance)",
+          "scope": "resource"
+        },
+        "guardrail.severityThreshold": {
+          "type": "string",
+          "enum": [
+            "error",
+            "warning",
+            "info"
+          ],
+          "default": "warning",
+          "description": "Minimum severity to report",
+          "scope": "resource"
+        }
+      }
+    },
+    "keybindings": [
+      {
+        "command": "guardrail.validateFile",
+        "key": "ctrl+shift+g",
+        "mac": "cmd+shift+g",
+        "when": "editorTextFocus"
+      }
+    ]
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "pretest": "npm run compile && npm run lint",
+    "lint": "eslint src --ext ts",
+    "test": "node ./out/test/runTest.js",
+    "package": "vsce package",
+    "publish": "vsce publish"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.60.0",
+    "@types/node": "16.x",
+    "@typescript-eslint/eslint-plugin": "^5.31.0",
+    "@typescript-eslint/parser": "^5.31.0",
+    "eslint": "^8.20.0",
+    "typescript": "^4.7.4",
+    "vsce": "^2.10.0"
+  },
+  "dependencies": {}
+}

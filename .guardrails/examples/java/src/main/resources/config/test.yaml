@@ -1,0 +1,16 @@
+# Test Configuration
+# Safe for automated testing - uses isolated test database.
+# NEVER connect tests to production database.
+
+app_name: "config-loader-example"
+environment: "test"
+debug: true
+log_level: "DEBUG"
+
+database:
+  host: "localhost"
+  port: 5433
+  name: "app_test"
+  username: "test_user"
+  pool_size: 5
+  connection_timeout: 1000

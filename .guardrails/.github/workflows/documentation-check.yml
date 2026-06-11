@@ -1,0 +1,176 @@
+name: Documentation Standards Check
+
+on:
+  pull_request:
+    paths:
+      - 'docs/**'
+      - '*.md'
+      - '.github/**/*.md'
+
+permissions:
+  contents: read
+
+jobs:
+  check-doc-length:
+    name: Check Document Length (500-line max)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Check line counts
+        run: |
+          echo "Checking documentation files for 500-line limit..."
+          echo ""
+
+          MAX_LINES=500
+          VIOLATIONS=""
+
+          # Find all markdown files
+          for file in $(find . -name "*.md" -type f | grep -v node_modules | grep -v .git); do
+            lines=$(wc -l < "$file")
+
+            if [ "$lines" -gt "$MAX_LINES" ]; then
+              VIOLATIONS="$VIOLATIONS$file: $lines lines (over $MAX_LINES limit)"$'\n'
+              echo "FAIL: $file has $lines lines (max $MAX_LINES)"
+            else
+              echo "OK:   $file has $lines lines"
+            fi
+          done
+
+          echo ""
+
+          if [ -n "$VIOLATIONS" ]; then
+            echo "=========================================="
+            echo "VIOLATIONS FOUND:"
+            echo "$VIOLATIONS"
+            echo ""
+            echo "Please split documents exceeding $MAX_LINES lines."
+            echo "See docs/standards/MODULAR_DOCUMENTATION.md for guidance."
+            exit 1
+          else
+            echo "All documents are within the $MAX_LINES line limit."
+          fi
+
+  check-required-sections:
+    name: Check Required Sections
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Check for required sections
+        run: |
+          echo "Checking for required sections in documentation..."
+          echo ""
+
+          WARNINGS=""
+
+          # Check docs/ files for required sections
+          for file in $(find docs -name "*.md" -type f 2>/dev/null || true); do
+            # Skip INDEX files (different structure)
+            if [[ "$file" == *"INDEX.md" ]]; then
+              continue
+            fi
+
+            # Check for Overview section
+            if ! grep -q "^## Overview" "$file"; then
+              WARNINGS="$WARNINGS$file: Missing '## Overview' section"$'\n'
+            fi
+
+            # Check for Quick Reference section (optional but recommended)
+            if ! grep -q "^## Quick Reference" "$file"; then
+              echo "NOTE: $file doesn't have '## Quick Reference' section (recommended)"
+            fi
+
+            # Check for Last Updated
+            if ! grep -q "Last Updated:" "$file"; then
+              WARNINGS="$WARNINGS$file: Missing 'Last Updated:' footer"$'\n'
+            fi
+          done
+
+          if [ -n "$WARNINGS" ]; then
+            echo "=========================================="
+            echo "WARNINGS:"
+            echo "$WARNINGS"
+            echo ""
+            echo "Consider adding missing sections for consistency."
+          else
+            echo "All required sections present."
+          fi
+
+  check-broken-links:
+    name: Check Internal Links
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Check markdown links
+        run: |
+          echo "Checking for broken internal links..."
+          echo ""
+
+          BROKEN_LINKS=""
+
+          # Find all markdown links
+          for file in $(find . -name "*.md" -type f | grep -v node_modules); do
+            # Extract relative .md links
+            links=$(grep -oE '\[.*\]\([^)]+\.md[^)]*\)' "$file" 2>/dev/null | grep -oE '\([^)]+\)' | tr -d '()' || true)
+
+            for link in $links; do
+              # Remove anchor (#...) from link
+              link_path=$(echo "$link" | cut -d'#' -f1)
+
+              # Skip external links
+              if [[ "$link_path" == http* ]]; then
+                continue
+              fi
+
+              # Resolve relative path
+              dir=$(dirname "$file")
+              full_path="$dir/$link_path"
+
+              # Normalize path
+              full_path=$(realpath -m "$full_path" 2>/dev/null || echo "$full_path")
+
+              if [ ! -f "$full_path" ]; then
+                BROKEN_LINKS="$BROKEN_LINKS$file: broken link to $link_path"$'\n'
+              fi
+            done
+          done
+
+          if [ -n "$BROKEN_LINKS" ]; then
+            echo "=========================================="
+            echo "BROKEN LINKS FOUND:"
+            echo "$BROKEN_LINKS"
+            exit 1
+          else
+            echo "All internal links are valid."
+          fi
+
+  check-trailing-whitespace:
+    name: Check Formatting
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Check for trailing whitespace
+        run: |
+          echo "Checking for trailing whitespace..."
+
+          FILES_WITH_TRAILING=$(find . -name "*.md" -type f | xargs grep -l " $" 2>/dev/null | grep -v node_modules || true)
+
+          if [ -n "$FILES_WITH_TRAILING" ]; then
+            echo "Files with trailing whitespace:"
+            echo "$FILES_WITH_TRAILING"
+            echo ""
+            echo "Consider removing trailing whitespace for cleaner diffs."
+          else
+            echo "No trailing whitespace found."
+          fi

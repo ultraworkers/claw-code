@@ -1,0 +1,91 @@
+<idea-plugin>
+    <id>com.guardrail.plugin</id>
+    <name>Guardrail</name>
+    <version>1.0.0</version>
+    <vendor url="https://github.com/TheArchitectit" email="support@guardrail.dev">TheArchitectit</vendor>
+    <description><![CDATA[
+        <h2>Guardrail IDE Integration</h2>
+        <p>Real-time guardrail validation for AI-assisted coding.</p>
+        <p>Features:</p>
+        <ul>
+            <li>Validate code on save and in real-time</li>
+            <li>Inline error highlighting with severity levels</li>
+            <li>Quick fixes for common violations</li>
+            <li>Connection to Guardrail MCP server</li>
+        </ul>
+    ]]></description>
+
+    <idea-version since-build="223"/>
+
+    <depends>com.intellij.modules.platform</depends>
+
+    <extensions defaultExtensionNs="com.intellij">
+        <!-- Configuration -->
+        <projectConfigurable
+            parentId="tools"
+            instance="com.guardrail.plugin.GuardrailConfigurable"
+            id="com.guardrail.plugin.config"
+            displayName="Guardrail"
+            nonDefaultProject="true"/>
+
+        <!-- External Annotator -->
+        <externalAnnotator
+            language=""
+            implementationClass="com.guardrail.plugin.GuardrailAnnotator"/>
+
+        <!-- Inspection Tool -->
+        <localInspection
+            language=""
+            displayName="Guardrail Validation"
+            groupPath="Guardrail"
+            groupName="Validation"
+            enabledByDefault="true"
+            level="WARNING"
+            implementationClass="com.guardrail.plugin.GuardrailInspection"/>
+
+        <!-- Status Bar Widget -->
+        <statusBarWidgetFactory
+            implementation="com.guardrail.plugin.GuardrailStatusBarWidgetFactory"
+            id="GuardrailStatusBar"/>
+
+        <!-- Notification Group -->
+        <notificationGroup
+            id="Guardrail Notifications"
+            displayType="BALLOON"/>
+    </extensions>
+
+    <actions>
+        <action
+            id="Guardrail.ValidateFile"
+            class="com.guardrail.plugin.actions.ValidateFileAction"
+            text="Validate File"
+            description="Validate current file with Guardrail"
+            icon="AllIcons.Actions.Refresh">
+            <add-to-group group-id="CodeMenu" anchor="last"/>
+            <keyboard-shortcut keymap="$default" first-keystroke="ctrl shift G"/>
+            <keyboard-shortcut keymap="Mac OS X" first-keystroke="meta shift G"/>
+        </action>
+
+        <action
+            id="Guardrail.ValidateSelection"
+            class="com.guardrail.plugin.actions.ValidateSelectionAction"
+            text="Validate Selection"
+            description="Validate selected code with Guardrail">
+            <add-to-group group-id="CodeMenu" anchor="last"/>
+        </action>
+
+        <action
+            id="Guardrail.TestConnection"
+            class="com.guardrail.plugin.actions.TestConnectionAction"
+            text="Test Connection"
+            description="Test connection to Guardrail server">
+            <add-to-group group-id="ToolsMenu" anchor="last"/>
+        </action>
+    </actions>
+
+    <projectListeners>
+        <listener
+            class="com.guardrail.plugin.GuardrailProjectListener"
+            topic="com.intellij.openapi.project.ProjectManagerListener"/>
+    </projectListeners>
+</idea-plugin>

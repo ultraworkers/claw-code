@@ -1,0 +1,28 @@
+# Test Configuration
+# This file contains test environment settings.
+# Used for automated testing - isolated from production.
+
+app_name: "ConfigLoader Example"
+version: "1.0.0-test"
+
+database:
+  host: "localhost"
+  port: 5432
+  name: "app_test"
+  pool_size: 5
+  ssl: false
+
+cache:
+  enabled: false
+  host: "localhost"
+  port: 6379
+  ttl: 60
+
+logging:
+  level: "debug"
+  format: "text"
+
+features:
+  rate_limiting: false
+  analytics: false
+  debug_mode: true

@@ -1,0 +1,19 @@
+# Development Configuration
+# Local development settings with verbose logging
+
+app_name: "guardrails-example"
+environment: "development"
+debug: true
+log_level: "debug"
+
+database:
+  host: "localhost"
+  port: 5432
+  name: "app_development"
+  pool_size: 5
+  ssl_mode: "prefer"
+
+services:
+  api_url: "http://localhost:3000"
+  cache_url: "redis://localhost:6379"
+  timeout_seconds: 10

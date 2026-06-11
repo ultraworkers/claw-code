@@ -1,0 +1,178 @@
+{
+  "$schema": "../../.guardrails/prevention-rules/pattern-rules.schema.json",
+  "description": "Example pattern-based prevention rules for regression detection. These examples are DISABLED (enabled: false) and serve as templates for creating new rules.",
+  "version": "1.0.0",
+  "rules": [
+    {
+      "rule_id": "PREVENT-EX-001",
+      "failure_id": "FAIL-WEB-001",
+      "name": "Direct property access on JSON.parse result",
+      "description": "Catches dangerous pattern of accessing properties on JSON.parse result without null/undefined check. Based on FAIL-WEB-001 where webhook payload parsing caused production outage.",
+      "enabled": false,
+      "pattern": "JSON\\.parse\\s*\\(.*\\)\\s*\\.\\s*\\w+",
+      "forbidden_context": "(if\\s*\\(|\\?\\.|try\\s*\\{)",
+      "message": "REGRESSION RISK: Direct property access on JSON.parse result without null check. Previous bug (FAIL-WEB-001) caused production outage when external API returned malformed JSON.",
+      "severity": "error",
+      "file_glob": ["*.js", "*.ts", "*.jsx", "*.tsx"],
+      "suggestion": "Add null check: const data = JSON.parse(input); if (data && data.property) { ... } OR use optional chaining: JSON.parse(input)?.property",
+      "examples": {
+        "bad": ["const amount = JSON.parse(payload).amount;", "return JSON.parse(data).items.map(...);"],
+        "good": ["const parsed = JSON.parse(payload); if (parsed && parsed.amount) { ... }", "return JSON.parse(data)?.items?.map(...);"]
+      }
+    },
+    {
+      "rule_id": "PREVENT-EX-002",
+      "failure_id": "FAIL-DB-001",
+      "name": "SQL injection via string concatenation",
+      "description": "Detects potential SQL injection vulnerabilities from string concatenation in database queries. Based on FAIL-DB-001 security vulnerability.",
+      "enabled": false,
+      "pattern": "(execute|query|exec|raw|run)\\s*\\(\\s*['\"].*\\{.*\\}.*['\"]\\s*\\)|\\.query\\s*\\(\\s*[^,)]*\\+",
+      "forbidden_context": "(f-string|format\\s*\\(|%\\s*\\(|\\$\\{)",
+      "message": "CRITICAL: Potential SQL injection via string concatenation or interpolation. Based on FAIL-DB-001 which was a critical security vulnerability.",
+      "severity": "critical",
+      "file_glob": ["*.py", "*.js", "*.ts", "*.rb", "*.java", "*.php"],
+      "suggestion": "Use parameterized queries: db.query('SELECT * FROM users WHERE id = ?', [userId]) instead of string concatenation",
+      "examples": {
+        "bad": ["db.query('SELECT * FROM users WHERE name = \\' + name + \\'');", "cursor.execute(f'SELECT * FROM users WHERE id = {user_id}')"],
+        "good": ["db.query('SELECT * FROM users WHERE name = ?', [name]);", "cursor.execute('SELECT * FROM users WHERE id = %s', (user_id,))"]
+      }
+    },
+    {
+      "rule_id": "PREVENT-EX-003",
+      "failure_id": "FAIL-CFG-001",
+      "name": "Unvalidated environment variable access",
+      "description": "Catches unvalidated access to environment variables that could cause runtime crashes. Based on FAIL-CFG-001 where missing DATABASE_URL caused production outage.",
+      "enabled": false,
+      "pattern": "os\\.environ\\[[^,\\]]+\\]|os\\.getenv\\([^,)]+\\)(?!\\s*,\\s*['\"])",
+      "forbidden_context": "(validate|check|assert|or\\s*['\"])",
+      "message": "REGRESSION RISK: Unvalidated environment variable access. Previous bug (FAIL-CFG-001) caused service crash when required env var was missing.",
+      "severity": "warning",
+      "file_glob": ["*.py", "*.js", "*.ts", "*.rb"],
+      "suggestion": "Use validation helper: const dbUrl = requireEnv('DATABASE_URL'); or provide default: os.getenv('DEBUG', 'false')",
+      "examples": {
+        "bad": ["db_url = os.environ['DATABASE_URL']", "const apiKey = process.env.API_KEY;"],
+        "good": ["db_url = os.environ.get('DATABASE_URL') or raise ConfigError('DATABASE_URL required')", "const apiKey = requireEnv('API_KEY');"]
+      }
+    },
+    {
+      "rule_id": "PREVENT-EX-004",
+      "failure_id": "FAIL-UI-001",
+      "name": "Event listener without cleanup in useEffect",
+      "description": "Detects React useEffect hooks that add event listeners but don't remove them. Based on FAIL-UI-001 memory leak that caused OOM crashes.",
+      "enabled": false,
+      "pattern": "useEffect\\s*\\(\\s*\\(\\s*\\)\\s*=>\\s*\\{[^}]*addEventListener",
+      "forbidden_context": "return\\s*\\(\\s*\\)\\s*=>[^}]*removeEventListener",
+      "message": "MEMORY LEAK: Event listener added in useEffect without cleanup function. Based on FAIL-UI-001 which caused service OOM after 24 hours.",
+      "severity": "warning",
+      "file_glob": ["*.jsx", "*.tsx", "*.js", "*.ts"],
+      "suggestion": "Return cleanup function: useEffect(() => { window.addEventListener('resize', handler); return () => window.removeEventListener('resize', handler); }, []);",
+      "examples": {
+        "bad": ["useEffect(() => { window.addEventListener('resize', handleResize); }, []);"],
+        "good": ["useEffect(() => { window.addEventListener('resize', handleResize); return () => window.removeEventListener('resize', handleResize); }, []);"]
+      }
+    },
+    {
+      "rule_id": "PREVENT-EX-005",
+      "failure_id": "FAIL-CACHE-001",
+      "name": "Non-atomic cache read-modify-write",
+      "description": "Detects cache operations that read, modify, then write without locking. Based on FAIL-CACHE-001 race condition causing stale data.",
+      "enabled": false,
+      "pattern": "(cache\\.get|get_cache|redis\\.get).*\\n.*(modify|update|\\+|=).*\\n.*(cache\\.set|set_cache|redis\\.set)",
+      "forbidden_context": "(lock|atomic|transaction|pipeline|watch)",
+      "message": "RACE CONDITION: Non-atomic cache update pattern detected. Based on FAIL-CACHE-001 where concurrent updates caused data inconsistency.",
+      "severity": "warning",
+      "file_glob": ["*.py", "*.js", "*.ts", "*.rb", "*.java"],
+      "suggestion": "Use atomic operations: redis.set(key, value, nx=True) or distributed locks: with cache_lock(key): ...",
+      "examples": {
+        "bad": ["value = cache.get(key); value += 1; cache.set(key, value);"],
+        "good": ["cache.incr(key)", "with redis.pipeline() as pipe: pipe.watch(key); ... pipe.multi(); pipe.set(key, new_value); pipe.execute();"]
+      }
+    },
+    {
+      "rule_id": "PREVENT-EX-006",
+      "failure_id": "FAIL-API-001",
+      "name": "Unsafe array assumption on API response",
+      "description": "Catches code that assumes API response is always an array without validation. Based on FAIL-API-001 where .map() failed on non-array response.",
+      "enabled": false,
+      "pattern": "(fetch|axios|request|get)\\(.*\\)\\.then\\(.*=>\\s*.*\\.map\\(|await\\s*(fetch|axios|request|get)\\(.*\\)[^;]*\\n.*\\.map\\(",
+      "forbidden_context": "(Array\\.isArray|\\.length\\s*===|typeof.*===\\s*['\"]array['\"])",
+      "message": "TYPE ERROR RISK: Calling .map() on API response without array validation. Based on FAIL-API-001 which caused frontend crashes.",
+      "severity": "error",
+      "file_glob": ["*.js", "*.ts", "*.jsx", "*.tsx"],
+      "suggestion": "Validate response type: const data = await fetch('/api/users'); if (!Array.isArray(data)) throw new Error('Expected array');",
+      "examples": {
+        "bad": ["const users = await fetch('/api/users').then(r => r.json()); return users.map(...);"],
+        "good": ["const users = await fetch('/api/users').then(r => r.json()); if (!Array.isArray(users)) throw new TypeError('Expected array'); return users.map(...);"]
+      }
+    },
+    {
+      "rule_id": "PREVENT-EX-007",
+      "failure_id": null,
+      "name": "Hardcoded credentials or secrets",
+      "description": "Detects potential hardcoded credentials in source code. General security best practice, not from specific failure.",
+      "enabled": false,
+      "pattern": "(password|passwd|secret|api_key|apikey|token|auth)\\s*[=:]\\s*['\"][^'\"]{8,}['\"]",
+      "forbidden_context": "(example|placeholder|test|mock|dummy|fake|process\\.env|os\\.environ|config\\[)",
+      "message": "SECURITY: Possible hardcoded credential detected. Never commit secrets to version control.",
+      "severity": "critical",
+      "file_glob": ["*"],
+      "suggestion": "Use environment variables: const apiKey = process.env.API_KEY; or secret management: const secret = await secrets.get('api-key');",
+      "examples": {
+        "bad": ["const password = 'SuperSecret123!';", "api_key = 'sk-abc123xyz789'"],
+        "good": ["const password = process.env.DB_PASSWORD;", "api_key = config.get('api_key')  // from secure config store"]
+      }
+    },
+    {
+      "rule_id": "PREVENT-EX-008",
+      "failure_id": null,
+      "name": "Console.log left in production code",
+      "description": "Detects debug console.log statements that should not be in production code. General code quality rule.",
+      "enabled": false,
+      "pattern": "console\\.(log|debug|info|warn|error)\\s*\\(",
+      "forbidden_context": "(TODO|FIXME|DEBUG|eslint-disable|logger\\.)",
+      "message": "CODE QUALITY: console.log statement detected. Use proper logging framework for production code.",
+      "severity": "warning",
+      "file_glob": ["*.js", "*.ts", "*.jsx", "*.tsx"],
+      "suggestion": "Replace with logger: logger.info('Message') or logger.debug('Debug info'). Configure logger to handle different environments.",
+      "examples": {
+        "bad": ["console.log('Debug:', data);", "console.error('Error occurred');"],
+        "good": ["logger.debug('Debug:', data);", "logger.error('Error occurred', { error });"]
+      }
+    },
+    {
+      "rule_id": "PREVENT-EX-009",
+      "failure_id": null,
+      "name": "Unsafe eval or Function constructor",
+      "description": "Detects use of eval() or new Function() which can lead to code injection vulnerabilities. Security best practice.",
+      "enabled": false,
+      "pattern": "\\beval\\s*\\(|new\\s+Function\\s*\\(",
+      "forbidden_context": "(safe-eval|sandbox|trusted)",
+      "message": "CRITICAL SECURITY: eval() or Function constructor detected. These can execute arbitrary code and are almost never necessary.",
+      "severity": "critical",
+      "file_glob": ["*.js", "*.ts", "*.jsx", "*.tsx"],
+      "suggestion": "Use safer alternatives: JSON.parse() for JSON, new URL() for URLs, or structured parsing libraries. If absolutely necessary, use a sandboxed environment.",
+      "examples": {
+        "bad": ["const result = eval(userInput);", "const fn = new Function('x', 'y', userCode);"],
+        "good": ["const result = JSON.parse(userInput);", "const url = new URL(userInput);"]
+      }
+    },
+    {
+      "rule_id": "PREVENT-EX-010",
+      "failure_id": null,
+      "name": "Deprecated React class component lifecycle methods",
+      "description": "Warns about deprecated React lifecycle methods that will be removed in future versions. Prevents technical debt.",
+      "enabled": false,
+      "pattern": "componentWillMount|componentWillReceiveProps|componentWillUpdate",
+      "forbidden_context": "(UNSAFE_|eslint-disable|legacy)",
+      "message": "DEPRECATED: Using deprecated React lifecycle method. These will be removed in future React versions.",
+      "severity": "warning",
+      "file_glob": ["*.jsx", "*.tsx", "*.js"],
+      "suggestion": "Migrate to modern alternatives: componentDidMount instead of componentWillMount, static getDerivedStateFromProps instead of componentWillReceiveProps, getSnapshotBeforeUpdate instead of componentWillUpdate. Consider functional components with hooks.",
+      "examples": {
+        "bad": ["componentWillMount() { this.initialize(); }", "componentWillReceiveProps(nextProps) { ... }"],
+        "good": ["componentDidMount() { this.initialize(); }", "static getDerivedStateFromProps(nextProps, prevState) { ... }"]
+      }
+    }
+  ],
+  "_comment": "HOW TO USE THESE EXAMPLES: 1) Copy a rule that matches your bug pattern. 2) Change rule_id to be unique (e.g., PREVENT-042). 3) Set failure_id to reference your bug. 4) Update pattern to match your specific case. 5) Set enabled: true. 6) Add to .guardrails/prevention-rules/pattern-rules.json"
+}

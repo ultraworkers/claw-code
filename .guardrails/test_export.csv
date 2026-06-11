@@ -1,0 +1,50 @@
+team_id,team_name,role_name,assigned_to,status
+1,Business & Product Strategy,Business Relationship Manager,Alice,not_started
+1,Business & Product Strategy,Lead Product Manager,Bob,not_started
+1,Business & Product Strategy,Business Systems Analyst,,not_started
+1,Business & Product Strategy,Financial Controller (FinOps),,not_started
+2,Enterprise Architecture,Chief Architect,,not_started
+2,Enterprise Architecture,Domain Architect,,not_started
+2,Enterprise Architecture,Solution Architect,,not_started
+2,Enterprise Architecture,Standards Lead,,not_started
+3,"GRC (Governance, Risk, & Compliance)",Compliance Officer,,not_started
+3,"GRC (Governance, Risk, & Compliance)",Internal Auditor,,not_started
+3,"GRC (Governance, Risk, & Compliance)",Privacy Engineer,,not_started
+3,"GRC (Governance, Risk, & Compliance)",Policy Manager,,not_started
+4,Infrastructure & Cloud Ops,Cloud Architect,,not_started
+4,Infrastructure & Cloud Ops,IaC Engineer,,not_started
+4,Infrastructure & Cloud Ops,Network Security Engineer,,not_started
+4,Infrastructure & Cloud Ops,Storage Engineer,,not_started
+5,Platform Engineering,Platform Product Manager,,not_started
+5,Platform Engineering,CI/CD Architect,,not_started
+5,Platform Engineering,Kubernetes Administrator,,not_started
+5,Platform Engineering,Developer Advocate,,not_started
+6,Data Governance & Analytics,Data Architect,,not_started
+6,Data Governance & Analytics,DBA,,not_started
+6,Data Governance & Analytics,Data Privacy Officer,,not_started
+6,Data Governance & Analytics,ETL Developer,,not_started
+7,Core Feature Squad,Technical Lead,,not_started
+7,Core Feature Squad,Senior Backend Engineer,,not_started
+7,Core Feature Squad,Senior Frontend Engineer,,not_started
+7,Core Feature Squad,Accessibility (A11y) Expert,,not_started
+7,Core Feature Squad,Technical Writer,,not_started
+8,Middleware & Integration,API Product Manager,,not_started
+8,Middleware & Integration,Integration Engineer,,not_started
+8,Middleware & Integration,Messaging Engineer,,not_started
+8,Middleware & Integration,IAM Specialist,,not_started
+9,Cybersecurity (AppSec),Security Architect,,not_started
+9,Cybersecurity (AppSec),Vulnerability Researcher,,not_started
+9,Cybersecurity (AppSec),Penetration Tester,,not_started
+9,Cybersecurity (AppSec),DevSecOps Engineer,,not_started
+10,Quality Engineering (SDET),QA Architect,,not_started
+10,Quality Engineering (SDET),SDET,,not_started
+10,Quality Engineering (SDET),Performance/Load Engineer,,not_started
+10,Quality Engineering (SDET),Manual QA / UAT Coordinator,,not_started
+11,Site Reliability Engineering (SRE),SRE Lead,,not_started
+11,Site Reliability Engineering (SRE),Observability Engineer,,not_started
+11,Site Reliability Engineering (SRE),Chaos Engineer,,not_started
+11,Site Reliability Engineering (SRE),Incident Manager,,not_started
+12,IT Operations & Support (NOC),NOC Analyst,,not_started
+12,IT Operations & Support (NOC),Change Manager,,not_started
+12,IT Operations & Support (NOC),Release Manager,,not_started
+12,IT Operations & Support (NOC),L3 Support Engineer,,not_started

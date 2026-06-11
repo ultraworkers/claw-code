@@ -1,0 +1,24 @@
+# Test Configuration
+# This file contains test environment settings.
+# Uses completely separate infrastructure from production.
+
+environment: test
+
+database:
+  host: test-db.example.com
+  port: 5432
+  name: test_db
+  user: test_user
+  # Password should be provided via TEST_DB_PASSWORD environment variable
+  # password: ${TEST_DB_PASSWORD}
+
+services:
+  api: https://api.test.example.com
+  auth: https://auth.test.example.com
+  storage: https://storage.test.example.com
+
+# Application settings
+app:
+  debug: true
+  log_level: DEBUG
+  max_connections: 10

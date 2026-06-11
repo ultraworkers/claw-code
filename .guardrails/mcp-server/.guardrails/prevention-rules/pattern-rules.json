@@ -1,0 +1,43 @@
+{
+  "$schema": "./pattern-rules.schema.json",
+  "description": "Pattern-based prevention rules for regression detection",
+  "version": "1.0.0",
+  "rules": [
+    {
+      "rule_id": "PREVENT-001",
+      "failure_id": null,
+      "name": "Example: Null check after async parse",
+      "enabled": false,
+      "pattern": "JSON\\.parse\\(.*\\)\\s*\\.\\w+",
+      "forbidden_context": "without.*null.*check",
+      "message": "Previous bug: Direct property access on JSON.parse without null check caused runtime error",
+      "severity": "error",
+      "file_glob": ["*.js", "*.ts", "*.jsx", "*.tsx"],
+      "suggestion": "Add null check: const data = JSON.parse(...); if (data) { ... }"
+    },
+    {
+      "rule_id": "PREVENT-002",
+      "failure_id": null,
+      "name": "Example: SQL injection risk",
+      "enabled": false,
+      "pattern": "(execute|query|exec)\\s*\\(.*\\+.*\\)",
+      "forbidden_context": null,
+      "message": "Potential SQL injection: String concatenation in SQL query",
+      "severity": "critical",
+      "file_glob": ["*.py", "*.js", "*.ts", "*.rb", "*.java"],
+      "suggestion": "Use parameterized queries or prepared statements"
+    },
+    {
+      "rule_id": "PREVENT-003",
+      "failure_id": null,
+      "name": "Example: Hardcoded credentials",
+      "enabled": false,
+      "pattern": "(password|secret|api_key|token)\\s*=\\s*[\"'][^\"']+[\"']",
+      "forbidden_context": "(example|placeholder|test|mock)",
+      "message": "Possible hardcoded credential detected",
+      "severity": "critical",
+      "file_glob": ["*"],
+      "suggestion": "Use environment variables or secret management system"
+    }
+  ]
+}

@@ -1,0 +1,482 @@
+/**
+ * Design System Variables
+ * Colors, typography, spacing, and other design tokens
+ */
+
+:root {
+  /* Theme Mode - defaults to dark, override with [data-theme="light"] */
+  --theme-mode: dark;
+
+  /* Primary Colors - Dark Theme */
+  --color-primary: #3b82f6;
+  --color-primary-dark: #2563eb;
+  --color-primary-light: #60a5fa;
+  --color-primary-subtle: rgba(59, 130, 246, 0.1);
+
+  /* Semantic Colors - Dark Theme */
+  --color-success: #10b981;
+  --color-success-dark: #059669;
+  --color-success-subtle: rgba(16, 185, 129, 0.1);
+
+  --color-warning: #f59e0b;
+  --color-warning-dark: #d97706;
+  --color-warning-subtle: rgba(245, 158, 11, 0.1);
+
+  --color-error: #ef4444;
+  --color-error-dark: #dc2626;
+  --color-error-subtle: rgba(239, 68, 68, 0.1);
+
+  --color-info: #06b6d4;
+  --color-info-dark: #0891b2;
+  --color-info-subtle: rgba(6, 182, 212, 0.1);
+
+  /* Background Colors - Dark Theme */
+  --color-bg-primary: #0f172a;
+  --color-bg-secondary: #1e293b;
+  --color-bg-tertiary: #334155;
+  --color-bg-elevated: #1e293b;
+
+  /* Surface Colors - Dark Theme */
+  --color-surface: #1e293b;
+  --color-surface-hover: #334155;
+  --color-surface-active: #475569;
+
+  /* Border Colors - Dark Theme */
+  --color-border: #334155;
+  --color-border-light: #475569;
+  --color-border-dark: #1e293b;
+
+  /* Text Colors - Dark Theme */
+  --color-text-primary: #f1f5f9;
+  --color-text-secondary: #94a3b8;
+  --color-text-tertiary: #64748b;
+  --color-text-muted: #475569;
+
+  /* Primary Colors - Light Theme (WCAG AA/AAA compliant) */
+  --color-primary-light-theme: #2563eb;
+  --color-primary-dark-light-theme: #1e40af;
+  --color-primary-light-light-theme: #60a5fa;
+  --color-primary-subtle-light-theme: rgba(37, 99, 235, 0.1);
+
+  /* Semantic Colors - Light Theme */
+  --color-success-light-theme: #059669;
+  --color-success-dark-light-theme: #047856;
+  --color-success-subtle-light-theme: rgba(5, 150, 105, 0.1);
+
+  --color-warning-light-theme: #d97706;
+  --color-warning-dark-light-theme: #b55d04;
+  --color-warning-subtle-light-theme: rgba(217, 119, 6, 0.1);
+
+  --color-error-light-theme: #dc2626;
+  --color-error-dark-light-theme: #c41919;
+  --color-error-subtle-light-theme: rgba(220, 38, 38, 0.1);
+
+  --color-info-light-theme: #0891b2;
+  --color-info-dark-light-theme: #077a96;
+  --color-info-subtle-light-theme: rgba(8, 145, 178, 0.1);
+
+  /* Background Colors - Light Theme */
+  --color-bg-primary-light-theme: #ffffff;
+  --color-bg-secondary-light-theme: #f8fafc;
+  --color-bg-tertiary-light-theme: #f1f5f9;
+  --color-bg-elevated-light-theme: #ffffff;
+
+  /* Surface Colors - Light Theme */
+  --color-surface-light-theme: #f8fafc;
+  --color-surface-hover-light-theme: #f1f5f9;
+  --color-surface-active-light-theme: #e2e8f0;
+
+  /* Border Colors - Light Theme */
+  --color-border-light-theme: #e2e8f0;
+  --color-border-light-light-theme: #cbd5e1;
+  --color-border-dark-light-theme: #f1f5f9;
+
+  /* Text Colors - Light Theme */
+  --color-text-primary-light-theme: #0f172a;
+  --color-text-secondary-light-theme: #475569;
+  --color-text-tertiary-light-theme: #64748b;
+  --color-text-muted-light-theme: #94a3b8;
+
+  /* Typography */
+  --font-family-base: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+  --font-family-mono: 'Monaco', 'Menlo', 'Ubuntu Mono', 'Consolas', monospace;
+
+  /* Font Sizes */
+  --text-xs: 0.75rem;
+  --text-sm: 0.875rem;
+  --text-base: 1rem;
+  --text-lg: 1.125rem;
+  --text-xl: 1.25rem;
+  --text-2xl: 1.5rem;
+  --text-3xl: 1.875rem;
+  --text-4xl: 2.25rem;
+
+  /* Font Weights */
+  --font-normal: 400;
+  --font-medium: 500;
+  --font-semibold: 600;
+  --font-bold: 700;
+
+  /* Line Heights */
+  --leading-tight: 1.25;
+  --leading-normal: 1.5;
+  --leading-relaxed: 1.625;
+
+  /* Spacing */
+  --space-0: 0rem;
+  --space-0.5: 0.125rem;
+  --space-1: 0.25rem;
+  --space-1.5: 0.375rem;
+  --space-2: 0.5rem;
+  --space-2.5: 0.625rem;
+  --space-3: 0.75rem;
+  --space-4: 1rem;
+  --space-5: 1.25rem;
+  --space-6: 1.5rem;
+  --space-8: 2rem;
+  --space-10: 2.5rem;
+  --space-12: 3rem;
+  --space-16: 4rem;
+  --space-20: 5rem;
+  --space-24: 6rem;
+
+  /* Container Query Support Variables */
+  --container-inline-size: 100%;
+  --container-block-size: auto;
+  --container-min-size: min(100%, 1440px);
+  --container-max-size: 1440px;
+
+  /* Border Radius */
+  --radius-sm: 0.25rem;
+  --radius-md: 0.375rem;
+  --radius-lg: 0.5rem;
+  --radius-xl: 0.75rem;
+  --radius-2xl: 1rem;
+  --radius-full: 9999px;
+
+  /* Shadows */
+  --shadow-sm: 0 1px 2px 0 rgba(0, 0, 0, 0.3);
+  --shadow-md: 0 4px 6px -1px rgba(0, 0, 0, 0.4), 0 2px 4px -2px rgba(0, 0, 0, 0.4);
+  --shadow-lg: 0 10px 15px -3px rgba(0, 0, 0, 0.5), 0 4px 6px -4px rgba(0, 0, 0, 0.5);
+  --shadow-xl: 0 20px 25px -5px rgba(0, 0, 0, 0.5), 0 8px 10px -6px rgba(0, 0, 0, 0.5);
+
+  /* Transitions */
+  --transition-fast: 150ms ease-in-out;
+  --transition-normal: 250ms ease-in-out;
+  --transition-slow: 350ms ease-in-out;
+
+  /* Modern Easing Curves - cubic-bezier for animations */
+  --ease-out-expo: cubic-bezier(0.19, 1, 0.22, 1);
+  --ease-out-circ: cubic-bezier(0.075, 0.82, 0.165, 1);
+  --ease-in-out: cubic-bezier(0.4, 0, 0.2, 1);
+  --ease-out-spring: cubic-bezier(0.175, 0.885, 0.32, 1.275);
+  --ease-in-expo: cubic-bezier(0.95, 0.05, 0.795, 0.105);
+  --ease-out-soft: cubic-bezier(0.25, 1, 0.5, 1);
+
+  /* Z-index Scale */
+  --z-dropdown: 100;
+  --z-sticky: 200;
+  --z-modal-backdrop: 300;
+  --z-modal: 400;
+  --z-popover: 500;
+  --z-tooltip: 600;
+  --z-toast: 700;
+
+  /* Layout */
+  --sidebar-width: 260px;
+  --sidebar-width-mobile: 280px;
+  --sidebar-collapsed-width: 64px;
+  --header-height: 64px;
+  --container-max-width: 1440px;
+
+  /* Form Elements */
+  --input-height: 2.5rem;
+  --button-height: 2.5rem;
+  --button-height-sm: 2rem;
+  --button-height-lg: 3rem;
+
+  /* Game Design Color Variables - Rarity */
+  --rarity-common: #78716c;
+  --rarity-common-dark: #5c5550;
+  --rarity-common-light: #a8a39e;
+  --rarity-rare: #3b82f6;
+  --rarity-rare-dark: #2563eb;
+  --rarity-rare-light: #60a5fa;
+  --rarity-epic: #a855f7;
+  --rarity-epic-dark: #9333ea;
+  --rarity-epic-light: #c084fc;
+  --rarity-legendary: #f59e0b;
+  --rarity-legendary-dark: #d97706;
+  --rarity-legendary-light: #fbbf24;
+
+  /* Game Design Color Variables - Resources */
+  --resource-health: #ef4444;
+  --resource-health-dark: #dc2626;
+  --resource-health-light: #f87171;
+  --resource-mana: #3b82f6;
+  --resource-mana-dark: #2563eb;
+  --resource-mana-light: #60a5fa;
+  --resource-energy: #f59e0b;
+  --resource-energy-dark: #d97706;
+  --resource-energy-light: #fbbf24;
+  --resource-stamina: #10b981;
+  --resource-stamina-dark: #059669;
+  --resource-stamina-light: #34d399;
+
+  /* Game Design Color Variables - Status Effects */
+  --status-buff: #10b981;
+  --status-buff-dark: #059669;
+  --status-buff-light: #34d399;
+  --status-debuff: #ef4444;
+  --status-debuff-dark: #dc2626;
+  --status-debuff-light: #f87171;
+  --status-dot: #8b5cf6;
+  --status-dot-dark: #7c3aed;
+  --status-dot-light: #a78bfa;
+  --status-hot: #f59e0b;
+  --status-hot-dark: #d97706;
+  --status-hot-light: #fbbf24;
+
+  /* Accessibility Variables - Focus Ring */
+  --focus-ring-width: 2px;
+  --focus-ring-offset: 2px;
+  --focus-ring-color: var(--color-primary);
+  --focus-ring-style: solid;
+  --focus-ring: var(--focus-ring-width) var(--focus-ring-style) var(--focus-ring-color);
+  --focus-ring-offset-shadow: 0 0 0 var(--focus-ring-offset) var(--color-bg-primary);
+
+  /* Accessibility Variables - Reduced Motion */
+  --motion-reduced: reduce;
+  --motion-normal: prefer-reduced-motion;
+
+  /* Accessibility Variables - High Contrast Mode */
+  --contrast-border-width: 2px;
+  --contrast-border-style: solid;
+  --contrast-border-color: #ffffff;
+  --contrast-text-primary: #ffffff;
+  --contrast-text-secondary: #e2e8f0;
+  --contrast-bg-primary: #000000;
+  --contrast-bg-secondary: #1a1a1a;
+
+  /* Glassmorphism Variables */
+  --glass-bg: rgba(30, 41, 59, 0.7);
+  --glass-bg-light: rgba(248, 250, 252, 0.7);
+  --glass-border: rgba(148, 163, 184, 0.2);
+  --glass-border-light: rgba(203, 213, 224, 0.3);
+  --glass-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.3);
+  --glass-shadow-light: 0 8px 32px 0 rgba(0, 0, 0, 0.1);
+  --glass-blur: 12px;
+  --glass-backdrop-filter: blur(12px);
+  --glass-gradient: linear-gradient(180deg, rgba(30, 41, 59, 0.8) 0%, rgba(30, 41, 59, 0.6) 100%);
+  --glass-gradient-light: linear-gradient(180deg, rgba(248, 250, 252, 0.9) 0%, rgba(248, 250, 252, 0.7) 100%);
+
+  /* Border Glow Effects */
+  --glow-common: 0 0 8px rgba(120, 113, 108, 0.5);
+  --glow-rare: 0 0 12px rgba(59, 130, 246, 0.6);
+  --glow-epic: 0 0 16px rgba(168, 85, 247, 0.7);
+  --glow-legendary: 0 0 20px rgba(245, 158, 11, 0.8);
+  --glow-primary: 0 0 12px rgba(59, 130, 246, 0.5);
+  --glow-success: 0 0 12px rgba(16, 185, 129, 0.5);
+  --glow-error: 0 0 12px rgba(239, 68, 68, 0.5);
+  --glow-warning: 0 0 12px rgba(245, 158, 11, 0.5);
+
+  /* Noise Texture Backgrounds */
+  --noise-bg: url('data:image/svg+xml,%3Csvg viewBox="0 0 200 200" xmlns="http://www.w3.org/2000/2000/svg"%3E%3Cfilter id="noise"%3E%3CfeTurbulence type="fractalNoise" baseFrequency="0.65" numOctaves="3" stitchTiles="stitch"/%3E%3C/filter%3E%3Crect width="200" height="200" filter="url(%23noise)"%3E%3C/rect%3E%3C/svg%3E');
+  --noise-opacity: 0.03;
+  --noise-blend: multiply;
+
+  /* Gradient Accents */
+  --gradient-primary: linear-gradient(135deg, #3b82f6 0%, #2563eb 100%);
+  --gradient-success: linear-gradient(135deg, #10b981 0%, #059669 100%);
+  --gradient-error: linear-gradient(135deg, #ef4444 0%, #dc2626 100%);
+  --gradient-warning: linear-gradient(135deg, #f59e0b 0%, #d97706 100%);
+  --gradient-epic: linear-gradient(135deg, #a855f7 0%, #9333ea 100%);
+  --gradient-legendary: linear-gradient(135deg, #f59e0b 0%, #fbbf24 100%);
+  --gradient-rainbow: linear-gradient(135deg, #3b82f6, #a855f7, #f59e0b, #ef4444);
+
+  /* Faction/Alliance Theme Colors */
+  --faction-alliance: #3b82f6;
+  --faction-alliance-dark: #1e40af;
+  --faction-alliance-light: #60a5fa;
+  --faction-alliance-glow: 0 0 16px rgba(59, 130, 246, 0.6);
+  --faction-horde: #ef4444;
+  --faction-horde-dark: #dc2626;
+  --faction-horde-light: #f87171;
+  --faction-horde-glow: 0 0 16px rgba(239, 68, 68, 0.6);
+  --faction-neutral: #78716c;
+  --faction-neutral-dark: #5c5550;
+  --faction-neutral-light: #a8a39e;
+
+  /* Damage Number Typography */
+  --damage-font: var(--font-family-scifi);
+  --damage-color: #ffffff;
+  --damage-glow: 0 0 8px rgba(255, 255, 255, 0.5);
+  --damage-crit-color: #f59e0b;
+  --damage-crit-glow: 0 0 16px rgba(245, 158, 11, 0.8);
+  --damage-crit-scale: 1.5;
+
+  /* Quest Text Readability */
+  --quest-text-bg: rgba(15, 23, 42, 0.85);
+  --quest-text-border: rgba(148, 163, 184, 0.3);
+  --quest-text-shadow: 0 2px 4px rgba(0, 0, 0, 0.5);
+  --quest-title-font: var(--font-family-fantasy);
+  --quest-body-font: var(--font-family-base);
+
+  /* App Design Pattern Variables */
+  --product-card-min-width: 280px;
+  --product-card-max-width: 320px;
+  --product-card-border-radius: var(--radius-xl);
+  --product-card-shadow: var(--shadow-lg);
+
+  --feature-table-header-bg: rgba(59, 130, 246, 0.1);
+  --feature-table-border: var(--color-border);
+  --feature-table-highlight: rgba(59, 130, 246, 0.05);
+
+  --kpi-card-bg: var(--color-surface);
+  --kpi-card-border: var(--color-border-light);
+  --kpi-accent-color: var(--color-primary);
+
+  --social-feed-card-bg: var(--color-surface);
+  --social-feed-card-border: var(--color-border);
+  --social-feed-avatar-size: 48px;
+
+  --gacha-card-width: 200px;
+  --gacha-card-height: 350px;
+  --gacha-rarity-indicator-height: 4px;
+  --collector-grid-gap: var(--space-4);
+
+  --battle-pass-track-height: 60px;
+  --battle-pass-progress-bar-height: 8px;
+  --battle-pass-tier-indicator-size: 40px;
+}
+
+/* Severity Color Mapping */
+[data-severity="error"],
+.severity-error {
+  --severity-color: var(--color-error);
+  --severity-bg: var(--color-error-subtle);
+}
+
+[data-severity="warning"],
+.severity-warning {
+  --severity-color: var(--color-warning);
+  --severity-bg: var(--color-warning-subtle);
+}
+
+[data-severity="info"],
+.severity-info {
+  --severity-color: var(--color-info);
+  --severity-bg: var(--color-info-subtle);
+}
+
+[data-severity="success"],
+.severity-success {
+  --severity-color: var(--color-success);
+  --severity-bg: var(--color-success-subtle);
+}
+
+/* Status Color Mapping */
+[data-status="active"],
+.status-active {
+  --status-color: var(--color-success);
+  --status-bg: var(--color-success-subtle);
+}
+
+[data-status="resolved"],
+.status-resolved {
+  --status-color: var(--color-info);
+  --status-bg: var(--color-info-subtle);
+}
+
+[data-status="deprecated"],
+.status-deprecated {
+  --status-color: var(--color-text-tertiary);
+  --status-bg: var(--color-bg-tertiary);
+}
+
+[data-status="disabled"],
+.status-disabled {
+  --status-color: var(--color-text-tertiary);
+  --status-bg: var(--color-bg-tertiary);
+}
+
+/* Theme Switching - Light Theme Override */
+[data-theme="light"] {
+  --color-primary: var(--color-primary-light-theme);
+  --color-primary-dark: var(--color-primary-dark-light-theme);
+  --color-primary-light: var(--color-primary-light-light-theme);
+  --color-primary-subtle: var(--color-primary-subtle-light-theme);
+
+  --color-success: var(--color-success-light-theme);
+  --color-success-dark: var(--color-success-dark-light-theme);
+  --color-success-subtle: var(--color-success-subtle-light-theme);
+
+  --color-warning: var(--color-warning-light-theme);
+  --color-warning-dark: var(--color-warning-dark-light-theme);
+  --color-warning-subtle: var(--color-warning-subtle-light-theme);
+
+  --color-error: var(--color-error-light-theme);
+  --color-error-dark: var(--color-error-dark-light-theme);
+  --color-error-subtle: var(--color-error-subtle-light-theme);
+
+  --color-info: var(--color-info-light-theme);
+  --color-info-dark: var(--color-info-dark-light-theme);
+  --color-info-subtle: var(--color-info-subtle-light-theme);
+
+  --color-bg-primary: var(--color-bg-primary-light-theme);
+  --color-bg-secondary: var(--color-bg-secondary-light-theme);
+  --color-bg-tertiary: var(--color-bg-tertiary-light-theme);
+  --color-bg-elevated: var(--color-bg-elevated-light-theme);
+
+  --color-surface: var(--color-surface-light-theme);
+  --color-surface-hover: var(--color-surface-hover-light-theme);
+  --color-surface-active: var(--color-surface-active-light-theme);
+
+  --color-border: var(--color-border-light-theme);
+  --color-border-light: var(--color-border-light-light-theme);
+  --color-border-dark: var(--color-border-dark-light-theme);
+
+  --color-text-primary: var(--color-text-primary-light-theme);
+  --color-text-secondary: var(--color-text-secondary-light-theme);
+  --color-text-tertiary: var(--color-text-tertiary-light-theme);
+  --color-text-muted: var(--color-text-muted-light-theme);
+
+  --theme-mode: light;
+}
+
+/* Accessibility - Reduced Motion */
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --transition-fast: 0ms;
+    --transition-normal: 0ms;
+    --transition-slow: 0ms;
+  }
+}
+
+/* Accessibility - High Contrast Mode */
+@media (prefers-contrast: more) {
+  :root {
+    --color-border: var(--contrast-border-color);
+    --color-border-light: var(--contrast-border-color);
+    --color-border-dark: var(--contrast-border-color);
+    --color-text-primary: var(--contrast-text-primary);
+    --color-text-secondary: var(--contrast-text-secondary);
+    --color-bg-primary: var(--contrast-bg-primary);
+    --color-bg-secondary: var(--contrast-bg-secondary);
+  }
+}
+
+/* Focus Visibility - Always show focus ring */
+:focus {
+  outline: var(--focus-ring);
+  outline-offset: var(--focus-ring-offset);
+}
+
+:focus:not(:focus-visible) {
+  outline: none;
+}
+
+:focus-visible {
+  outline: var(--focus-ring);
+  outline-offset: var(--focus-ring-offset);
+}

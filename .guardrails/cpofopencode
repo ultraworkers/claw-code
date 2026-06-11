@@ -1,0 +1,469 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "agent": {
+    "field": {
+      "description": "Field agent powered by GitHub Copilot with Mission Control tracking. Use for tasks that need to be logged and tracked in the dashboard.",
+      "mode": "subagent",
+      "model": "synthetic/qwen3-235b-thinking",
+      "prompt": "You are a field agent. Track your work using Mission Control tools (unified-mcp). Create sessions, log events, and record any failures you encounter. Be methodical and report progress."
+    },
+    "logician": {
+      "description": "Specialist in logical analysis, proofs, and formal reasoning. Use for tasks requiring rigorous logical thinking and deduction.",
+      "mode": "subagent",
+      "model": "synthetic/qwen3-235b-thinking",
+      "prompt": "You are a logician specialist. You excel at logical analysis, formal reasoning, and constructing rigorous proofs. Break down complex arguments, identify logical fallacies, and provide clear, structured reasoning."
+    },
+    "strategist": {
+      "description": "Long-term planning and strategic thinking specialist. Use for architectural decisions and project planning.",
+      "mode": "subagent",
+      "model": "synthetic/deepseek-r1",
+      "prompt": "You are a strategist. You excel at long-term planning, strategic thinking, and architectural design. Consider scalability, maintainability, and future implications in your recommendations."
+    },
+    "manager": {
+      "description": "Task coordination and project management specialist. Use for breaking down complex projects and coordinating workflows.",
+      "mode": "subagent",
+      "model": "synthetic/llama-3.3-70b",
+      "prompt": "You are a project manager. You excel at task coordination, breaking down complex projects into manageable pieces, and organizing workflows efficiently. Be clear, organized, and action-oriented."
+    },
+    "drafter": {
+      "description": "Template generation and boilerplate code specialist. Use for scaffolding and generating starter code.",
+      "mode": "subagent",
+      "model": "synthetic/qwen3-coder-480b",
+      "prompt": "You are a drafter. You excel at creating templates, boilerplate code, and starter projects. Generate clean, well-structured scaffolding that follows best practices and modern conventions."
+    },
+    "builder": {
+      "description": "Code implementation specialist. Use for actual code writing and feature implementation.",
+      "mode": "subagent",
+      "model": "synthetic/qwen3-coder-480b",
+      "prompt": "You are a builder. You excel at writing clean, efficient, and maintainable code. Follow best practices, write comprehensive comments, and ensure code quality. You are a coding specialist."
+    },
+    "specialist": {
+      "description": "Domain expertise and deep technical analysis. Use for complex technical challenges requiring specialized knowledge.",
+      "mode": "subagent",
+      "model": "synthetic/deepseek-v3.2",
+      "prompt": "You are a domain specialist. You provide deep technical expertise and advanced problem-solving. Analyze complex systems, identify edge cases, and provide expert-level insights."
+    },
+    "competitor": {
+      "description": "Alternative perspectives and critical analysis. Use for code review and exploring different approaches.",
+      "mode": "subagent",
+      "model": "synthetic/minimax-m2.1",
+      "prompt": "You are a competitor analyst. You provide alternative perspectives, challenge assumptions, and explore different approaches. Be constructively critical and suggest improvements."
+    },
+    "fixer": {
+      "description": "Debugging and bug fixing specialist. Use for identifying and resolving issues in code.",
+      "mode": "subagent",
+      "model": "synthetic/deepseek-v3.2",
+      "prompt": "You are a bug fix specialist. You excel at debugging, root cause analysis, and implementing robust fixes. Analyze error messages, trace execution flow, and provide thorough solutions."
+    },
+    "math_whiz": {
+      "description": "Mathematical analysis and algorithmic optimization specialist. Use for complex algorithms and mathematical problems.",
+      "mode": "subagent",
+      "model": "synthetic/qwen3-235b-thinking",
+      "prompt": "You are a mathematical specialist. You excel at mathematical analysis, algorithm design, and optimization. Provide rigorous mathematical reasoning and efficient algorithmic solutions."
+    },
+    "planner": {
+      "description": "Technical project planning and task breakdown. Use for planning implementation steps.",
+      "mode": "subagent",
+      "model": "synthetic/deepseek-r1",
+      "prompt": "You are a technical planner. Break down complex tasks into clear, actionable steps. Create detailed implementation plans with milestones and dependencies."
+    },
+    "developer": {
+      "description": "Senior software developer for code implementation. Use for writing production code.",
+      "mode": "subagent",
+      "model": "synthetic/qwen3-coder-480b",
+      "prompt": "You are a senior software developer. Write clean, maintainable code following best practices. Consider edge cases, error handling, and code quality."
+    },
+    "architect": {
+      "description": "Software architect for system design and architecture. Use for designing scalable systems.",
+      "mode": "subagent",
+      "model": "synthetic/deepseek-v3.2",
+      "prompt": "You are a software architect. Design scalable, maintainable systems with clear abstractions. Consider performance, security, and maintainability in your designs."
+    },
+    "reviewer": {
+      "description": "Code reviewer for quality assurance. Use for reviewing code and identifying issues.",
+      "mode": "subagent",
+      "model": "synthetic/llama-3.3-70b",
+      "prompt": "You are a code reviewer. Find bugs, security issues, and improvements. Be thorough and constructive. Provide actionable feedback and suggestions."
+    },
+    "tester": {
+      "description": "QA specialist for testing and validation. Use for creating tests and validating functionality.",
+      "mode": "subagent",
+      "model": "synthetic/qwen3-coder-480b",
+      "prompt": "You are a QA specialist. Design comprehensive tests and validate functionality. Consider edge cases, integration tests, and test coverage."
+    },
+    "documenter": {
+      "description": "Technical writer for documentation. Use for creating clear, comprehensive documentation.",
+      "mode": "subagent",
+      "model": "synthetic/qwen3-coder-480b",
+      "prompt": "You are a technical writer. Create clear, concise documentation. Write for your audience, include examples, and ensure completeness."
+    }
+  },
+  "plugin": [
+    "file:///home/user001/.config/opencode/plugin/opencode-google-antigravity-auth",
+    "oh-my-opencode@latest"
+  ],
+  "model": "synthetic/kimi-k2.5-nvfp4-thinking",
+  "mcp": {
+    "unified-mcp": {
+      "type": "remote",
+      "url": "http://100.81.234.111:8080/mcp/stream/",
+      "headers": {
+        "X-API-Key": "mcp_zdentd2cy5igvk5t7j0fd4tlrx9jb889"
+      }
+    },
+    "mission-control-mcp": {
+      "type": "remote",
+      "url": "http://100.81.234.111:8081/mcp/stream/",
+      "headers": {
+        "X-API-Key": "mcp_zdentd2cy5igvk5t7j0fd4tlrx9jb889"
+      }
+    },
+    "radical-mcp": {
+      "type": "remote",
+      "url": "http://100.99.118.48:8081/mcp/stream/",
+      "headers": {
+        "X-API-Key": "secret"
+      }
+    },
+    "guardrails": {
+      "type": "remote",
+      "url": "http://100.96.49.42:8096/mcp/v1/sse",
+      "headers": {
+        "Authorization": "Bearer token",
+        "X-API-Key": "your-api-key-here"
+      }
+    }
+  },
+  "provider": {
+    "synthetic": {
+      "name": "Synthetic.new (Multi-Provider AI)",
+      "npm": "@ai-sdk/openai-compatible",
+      "options": {
+        "baseURL": "http://100.96.49.42:4001/openai/v1"
+        "apiKey": "ah-927a1830b3e9e855a6d6061985b7019045a7ca5006b9b2aa5d9828bd7fd81669"
+      },
+      "models": {
+        "qwen3-coder-480b": {
+          "id": "hf:Qwen/Qwen3-Coder-480B-A35B-Instruct",
+          "name": "Qwen3 Coder 480B (Code Specialist)"
+        },
+        "qwen3-235b-thinking": {
+          "id": "hf:Qwen/Qwen3-235B-A22B-Thinking-2507",
+          "name": "Qwen3 235B Thinking (Reasoning)"
+        },
+        "qwen3-235b-instruct": {
+          "id": "hf:Qwen/Qwen3-235B-A22B-Instruct-2507",
+          "name": "Qwen3 235B Instruct (General)"
+        },
+        "deepseek-v3.2": {
+          "id": "hf:deepseek-ai/DeepSeek-V3.2",
+          "name": "DeepSeek V3.2 (Latest, Powerful)"
+        },
+        "deepseek-r1": {
+          "id": "hf:deepseek-ai/DeepSeek-R1-0528",
+          "name": "DeepSeek R1 (Advanced Reasoning)"
+        },
+        "llama-3.3-70b": {
+          "id": "hf:meta-llama/Llama-3.3-70B-Instruct",
+          "name": "Llama 3.3 70B (Balanced)"
+        },
+        "llama-4-maverick": {
+          "id": "hf:meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8",
+          "name": "Llama 4 Maverick 17B (Fast, Multimodal)"
+        },
+        "gpt-oss-120b": {
+          "id": "hf:openai/gpt-oss-120b",
+          "name": "GPT-OSS 120B (Fast Generation)"
+        },
+        "minimax-m2.1": {
+          "id": "hf:MiniMaxAI/MiniMax-M2.1",
+          "name": "MiniMax M2.1 (Alternative Perspective)"
+        },
+        "kimi-k2-thinking": {
+          "id": "hf:moonshotai/Kimi-K2-Thinking",
+          "name": "Kimi K2 Thinking (Reasoning)"
+        },
+        "glm-4.7": {
+          "id": "hf:zai-org/GLM-4.7",
+          "name": "GLM 4.7 (Balanced)"
+        }
+ "models": {
+        "kimi-k2.5-nvfp4-thinking": {
+          "id": "hf:nvidia/Kimi-K2.5-NVFP4",
+          "name": "Kimi K2.5 NVFP4 (Thinking)",
+          "options": {
+            "temperature": 1.0
+          }
+}
+    },
+    "api-gateway": {
+      "name": "API Gateway (Kimi K2.5 NVFP4)",
+      "npm": "@ai-sdk/openai-compatible",
+      "options": {
+        "baseURL": "http://100.96.49.42:4001/openai/v1",
+        "apiKey": "ah-927a1830b3e9e855a6d6061985b7019045a7ca5006b9b2aa5d9828bd7fd81669"
+      },
+      "models": {
+        "kimi-k2.5-nvfp4-thinking": {
+          "id": "hf:nvidia/Kimi-K2.5-NVFP4",
+          "name": "Kimi K2.5 NVFP4 (Thinking)",
+          "options": {
+            "temperature": 1.0
+          }
+        }
+      }
+    },
+    "local": {
+      "name": "Remote Desktop (NixOS Plasma 4080)",
+      "npm": "@ai-sdk/openai-compatible",
+      "options": {
+        "baseURL": "http://100.81.234.111:11434/v1"
+      },
+      "models": {
+        "qwen2.5-coder:1.5b": {
+          "name": "Qwen 2.5 Coder 1.5B (Ultra Fast)"
+        },
+        "qwen2.5-coder:3b": {
+          "name": "Qwen 2.5 Coder 3B (Fast - MCP Default)"
+        },
+        "qwen2.5-coder:7b": {
+          "name": "Qwen 2.5 Coder 7B (Balanced)"
+        },
+        "qwen2.5-coder:14b": {
+          "name": "Qwen 2.5 Coder 14B (Heavy Tier)"
+        },
+        "qwen2.5-coder:32b": {
+          "name": "Qwen 2.5 Coder 32B (Max Quality)"
+        },
+        "architect-nemotron-30b": {
+          "name": "01. The Agent (Nemotron-3 30B)"
+        },
+        "qwen3:32b": {
+          "name": "02. The Logician (Qwen3 32B)"
+        },
+        "architect-yi-34b": {
+          "name": "03. The Strategist (Yi 1.5 34B)"
+        },
+        "architect-command-r-32b": {
+          "name": "04. The Manager (Command R 32B)"
+        },
+        "codegpt-oss-patched": {
+          "name": "05. The Drafter (CodeGPT OSS 20B)"
+        },
+        "qwen3-thinking-30b": {
+          "name": "06. The Builder (Qwen 3 Thinking 30B)"
+        },
+        "deepkat-32b": {
+          "name": "07. The Specialist (DeepKAT 32B)"
+        },
+        "kwaicoder-23b": {
+          "name": "08. The Competitor (KwaiCoder 23B)"
+        },
+        "kiteresolve-20b": {
+          "name": "09. The Fixer (KiteResolve 20B)"
+        },
+        "qwen3-griffon-14b": {
+          "name": "10. The Math Whiz (Griffon 14B)"
+        }
+      }
+    },
+    "google": {
+      "npm": "@ai-sdk/google",
+      "options": {
+        "antigravity": true
+      },
+      "models": {
+        "gemini-3-pro-preview": {
+          "id": "gemini-3-pro-preview",
+          "name": "Gemini 3 Pro Preview",
+          "release_date": "2025-11-18",
+          "reasoning": true,
+          "limit": {
+            "context": 1000000,
+            "output": 64000
+          },
+          "cost": {
+            "input": 2,
+            "output": 12,
+            "cache_read": 0.2
+          },
+          "modalities": {
+            "input": [
+              "text",
+              "image",
+              "video",
+              "audio",
+              "pdf"
+            ],
+            "output": [
+              "text"
+            ]
+          }
+        },
+        "gemini-3-pro-high": {
+          "id": "gemini-3-pro-preview",
+          "name": "Gemini 3 Pro Preview (High Thinking)",
+          "options": {
+            "thinkingConfig": {
+              "thinkingLevel": "high",
+              "includeThoughts": true
+            }
+          }
+        },
+        "gemini-3-pro-medium": {
+          "id": "gemini-3-pro-preview",
+          "name": "Gemini 3 Pro Preview (Medium Thinking)",
+          "options": {
+            "thinkingConfig": {
+              "thinkingLevel": "medium",
+              "includeThoughts": true
+            }
+          }
+        },
+        "gemini-3-flash": {
+          "id": "gemini-3-flash",
+          "name": "Gemini 3 Flash",
+          "release_date": "2025-12-17",
+          "reasoning": true,
+          "limit": {
+            "context": 1048576,
+            "output": 65536
+          },
+          "cost": {
+            "input": 0.5,
+            "output": 3,
+            "cache_read": 0.05
+          },
+          "modalities": {
+            "input": [
+              "text",
+              "image",
+              "video",
+              "audio",
+              "pdf"
+            ],
+            "output": [
+              "text"
+            ]
+          }
+        },
+        "gemini-3-flash-high": {
+          "id": "gemini-3-flash",
+          "name": "Gemini 3 Flash (High Thinking)",
+          "options": {
+            "thinkingConfig": {
+              "thinkingLevel": "high",
+              "includeThoughts": true
+            }
+          }
+        },
+        "gemini-2.5-flash": {
+          "id": "gemini-2.5-flash",
+          "name": "Gemini 2.5 Flash",
+          "limit": {
+            "context": 1048576,
+            "output": 65536
+          },
+          "cost": {
+            "input": 0.3,
+            "output": 2.5
+          },
+          "modalities": {
+            "input": [
+              "text",
+              "image",
+              "audio",
+              "video",
+              "pdf"
+            ],
+            "output": [
+              "text"
+            ]
+          }
+        },
+        "gemini-claude-sonnet-4-5-thinking-high": {
+          "id": "gemini-claude-sonnet-4-5-thinking",
+          "name": "Claude Sonnet 4.5 (High Thinking)",
+          "release_date": "2025-11-18",
+          "reasoning": true,
+          "limit": {
+            "context": 200000,
+            "output": 64000
+          },
+          "cost": {
+            "input": 3,
+            "output": 15,
+            "cache_read": 0.3
+          },
+          "modalities": {
+            "input": [
+              "text",
+              "image",
+              "pdf"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "options": {
+            "thinkingConfig": {
+              "thinkingBudget": 32000,
+              "includeThoughts": true
+            }
+          }
+        },
+        "gemini-claude-opus-4-5-thinking-high": {
+          "id": "gemini-claude-opus-4-5-thinking",
+          "name": "Claude Opus 4.5 (High Thinking)",
+          "release_date": "2025-11-24",
+          "reasoning": true,
+          "limit": {
+            "context": 200000,
+            "output": 64000
+          },
+          "cost": {
+            "input": 5,
+            "output": 25,
+            "cache_read": 0.5
+          },
+          "modalities": {
+            "input": [
+              "text",
+              "image",
+              "pdf"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "options": {
+            "thinkingConfig": {
+              "thinkingBudget": 32000,
+              "includeThoughts": false
+            }
+          }
+        },
+        "gemini-claude-opus-4-5-thinking-medium": {
+          "id": "gemini-claude-opus-4-5-thinking",
+          "name": "Claude Opus 4.5 (Medium Thinking)",
+          "options": {
+            "thinkingConfig": {
+              "thinkingBudget": 16000,
+              "includeThoughts": false
+            }
+          }
+        },
+        "gemini-claude-opus-4-5-thinking-low": {
+          "id": "gemini-claude-opus-4-5-thinking",
+          "name": "Claude Opus 4.5 (Low Thinking)",
+          "options": {
+            "thinkingConfig": {
+              "thinkingBudget": 4000,
+              "includeThoughts": false
+            }
+          }
+        }
+      }
+    }
+  }
+}

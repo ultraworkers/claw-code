@@ -1,0 +1,150 @@
+# Failure Registry Examples
+# ============================================================================
+# These are EXAMPLE entries demonstrating the failure registry format.
+# They are commented out (lines start with #) to prevent them from being
+# parsed as actual registry entries.
+#
+# To use: Copy relevant example, remove comment markers, update values,
+# and append to .guardrails/failure-registry.jsonl
+#
+# Use: python scripts/log_failure.py --interactive
+# ============================================================================
+
+# =============================================================================
+# EXAMPLE 1: Null Check After JSON Parse (Runtime Error)
+# =============================================================================
+# Scenario: API endpoint parsing webhook payload crashes when data is malformed
+# Impact: Production payments failing, customer complaints
+# Root Cause: Direct property access on JSON.parse result without null check
+#
+# Files Modified: src/webhooks/payment.js
+# Fix: Added validation layer with null checks
+# Regression Test: tests/regression/test_payment_regression_FAIL_WEB_001.js
+#
+# {"failure_id": "FAIL-WEB-001", "timestamp": "2026-01-15T14:32:00Z", "category": "runtime", "severity": "high", "error_message": "TypeError: Cannot read property 'amount' of undefined", "root_cause": "Missing null check after JSON.parse on webhook payload - assumed external API always returns valid JSON", "affected_files": ["src/webhooks/payment.js", "src/webhooks/handlers.js"], "fix_commit": "a1b2c3d4e5f6789012345678", "regression_pattern": "JSON\\.parse\\(.*\\)\\s*\\.\\w+", "prevention_rule": "Always validate external payloads before property access - use schema validation for webhooks", "status": "active"}
+
+# =============================================================================
+# EXAMPLE 2: SQL Injection via String Concatenation (Security)
+# =============================================================================
+# Scenario: User search endpoint vulnerable to SQL injection
+# Impact: Potential data breach, security audit finding
+# Root Cause: String concatenation used in SQL query instead of parameterized queries
+#
+# Files Modified: src/db/queries.py
+# Fix: Replaced with parameterized queries using placeholders
+# Regression Test: tests/regression/test_db_regression_FAIL_DB_001.py
+#
+# {"failure_id": "FAIL-DB-001", "timestamp": "2026-01-20T09:15:00Z", "category": "runtime", "severity": "critical", "error_message": "SQL injection vulnerability detected in search endpoint", "root_cause": "Direct string concatenation in SQL query: query = \"SELECT * FROM users WHERE name = '\" + user_input + \"'\"", "affected_files": ["src/db/queries.py", "src/api/search.py"], "fix_commit": "b2c3d4e5f6a7890123456789", "regression_pattern": "(execute|query|exec)\\s*\\(.*\\+.*\\)", "prevention_rule": "Use parameterized queries for ALL database operations - never concatenate user input into SQL", "status": "active"}
+
+# =============================================================================
+# EXAMPLE 3: Race Condition in Cache Update (Concurrency)
+# =============================================================================
+# Scenario: Cache returns stale data under high load
+# Impact: Users see outdated information, data inconsistency
+# Root Cause: Non-atomic read-modify-write cycle in cache update
+#
+# Files Modified: src/cache/manager.py
+# Fix: Added distributed locking with Redis SET NX
+# Regression Test: tests/regression/test_cache_regression_FAIL_CACHE_001.py
+#
+# {"failure_id": "FAIL-CACHE-001", "timestamp": "2026-01-25T11:45:00Z", "category": "runtime", "severity": "medium", "error_message": "Cache inconsistency: old value returned after update", "root_cause": "Race condition between concurrent cache reads and writes - no locking mechanism", "affected_files": ["src/cache/manager.py"], "fix_commit": "c3d4e5f6a7b8901234567890", "regression_pattern": "(get.*modify.*set|read.*write.*cache)", "prevention_rule": "Use atomic operations or distributed locks for cache updates in concurrent environments", "status": "active"}
+
+# =============================================================================
+# EXAMPLE 4: Missing Environment Variable (Configuration)
+# =============================================================================
+# Scenario: Service crashes on startup in production
+# Impact: Deployment rollback, service downtime
+# Root Cause: Required environment variable not validated at startup
+#
+# Files Modified: src/config/loader.py
+# Fix: Added startup validation with clear error messages
+# Regression Test: tests/regression/test_config_regression_FAIL_CFG_001.py
+#
+# {"failure_id": "FAIL-CFG-001", "timestamp": "2026-02-01T08:00:00Z", "category": "config", "severity": "high", "error_message": "KeyError: 'DATABASE_URL' not found", "root_cause": "Missing startup validation for required environment variables - crash occurs on first database access", "affected_files": ["src/config/loader.py", "src/main.py"], "fix_commit": "d4e5f6a7b8c9012345678901", "regression_pattern": "os\\.environ\\[.*\\]|os\\.getenv\\(.*\\)(?!\\s*,)", "prevention_rule": "Validate all required environment variables at startup with descriptive error messages", "status": "active"}
+
+# =============================================================================
+# EXAMPLE 5: Memory Leak in Event Handler (Resource Leak)
+# =============================================================================
+# Scenario: Service memory usage grows over time until OOM crash
+# Impact: Service restarts every 24 hours, monitoring alerts
+# Root Cause: Event listeners not removed when components unmount
+#
+# Files Modified: src/components/DataTable.jsx
+# Fix: Added cleanup in useEffect return function
+# Regression Test: tests/regression/test_ui_regression_FAIL_UI_001.jsx
+#
+# {"failure_id": "FAIL-UI-001", "timestamp": "2026-02-03T16:20:00Z", "category": "runtime", "severity": "medium", "error_message": "JavaScript heap out of memory", "root_cause": "Event listeners accumulated without cleanup - useEffect missing return cleanup function", "affected_files": ["src/components/DataTable.jsx", "src/hooks/useEventSource.js"], "fix_commit": "e5f6a7b8c9d0123456789012", "regression_pattern": "addEventListener.*useEffect(?!.*return)", "prevention_rule": "Always remove event listeners in useEffect cleanup - match every addEventListener with removeEventListener", "status": "active"}
+
+# =============================================================================
+# EXAMPLE 6: Type Mismatch in API Response (Type System)
+# =============================================================================
+# Scenario: Frontend crashes when API returns unexpected type
+# Impact: Blank page for users, JavaScript errors in console
+# Root Cause: No runtime type checking on API responses
+#
+# Files Modified: src/api/client.ts, src/types/api.ts
+# Fix: Added Zod schema validation for all API responses
+# Regression Test: tests/regression/test_api_regression_FAIL_API_001.ts
+#
+# {"failure_id": "FAIL-API-001", "timestamp": "2026-02-05T10:30:00Z", "category": "type", "severity": "high", "error_message": "TypeError: response.map is not a function", "root_cause": "Assumed API always returns array but backend returned single object on empty result - no runtime type validation", "affected_files": ["src/api/client.ts", "src/types/api.ts", "src/components/UserList.tsx"], "fix_commit": "f6a7b8c9d0e1234567890123", "regression_pattern": "\\.map\\(.*\\)\\s*\\.\\w+|as\\s+\\w+\\[\\]", "prevention_rule": "Use runtime type validation (Zod/io-ts) for all external API responses - never assume types", "status": "active"}
+
+# =============================================================================
+# EXAMPLE 7: Deprecated Library Usage (Build Error)
+# =============================================================================
+# Scenario: Build fails after dependency update
+# Impact: CI/CD pipeline blocked, cannot deploy
+# Root Cause: Using deprecated API from updated library
+#
+# Files Modified: src/utils/logger.js
+# Fix: Migrated to new API with backward compatibility
+# Regression Test: tests/regression/test_build_regression_FAIL_BUILD_001.py
+#
+# {"failure_id": "FAIL-BUILD-001", "timestamp": "2026-02-06T13:00:00Z", "category": "build", "severity": "medium", "error_message": "DeprecationWarning: logger.warn() is deprecated, use logger.warning()", "root_cause": "Used deprecated logging.warn() instead of logging.warning() - breaks build with -Werror flag", "affected_files": ["src/utils/logger.js", "src/services/auth.js"], "fix_commit": "a7b8c9d0e1f2345678901234", "regression_pattern": "\\.warn\\(\\s*["']", "prevention_rule": "Use logger.warning() instead of logger.warn() - configure linter to catch deprecated API usage", "status": "resolved"}
+
+# =============================================================================
+# EXAMPLE 8: Previously Fixed Bug Reintroduced (Regression)
+# =============================================================================
+# Scenario: Fixed bug returns after major refactor
+# Impact: Same production issue as 3 months ago
+# Root Cause: Refactor did not include regression test, pattern reintroduced
+#
+# Files Modified: src/validation/user.py (again)
+# Fix: Applied same fix as before + added stronger prevention rule
+# Regression Test: tests/regression/test_validation_regression_FAIL_REG_001.py (strengthened)
+#
+# {"failure_id": "FAIL-REG-001", "timestamp": "2026-02-07T09:00:00Z", "category": "regression", "severity": "high", "error_message": "ValidationError: email format not checked", "root_cause": "Previously fixed email validation bug reintroduced during refactor - regression test was missing", "affected_files": ["src/validation/user.py"], "fix_commit": "b8c9d0e1f2a3456789012345", "regression_pattern": "validate_email.*(?!.*regex|.*pattern)", "prevention_rule": "Always include regression tests when fixing bugs - run regression check before merging refactors", "status": "active", "original_failure_id": "FAIL-VAL-001"}
+
+# =============================================================================
+# Status Transition Examples
+# =============================================================================
+#
+# When a bug is resolved (no longer a risk):
+# {"failure_id": "FAIL-XXX-001", "timestamp": "2026-01-01T00:00:00Z", "category": "runtime", "severity": "medium", "error_message": "Example", "root_cause": "Example", "affected_files": ["example.js"], "fix_commit": "abc123", "regression_pattern": "example", "prevention_rule": "Example rule", "status": "resolved", "resolved_at": "2026-03-01T00:00:00Z", "resolution_notes": "Pattern no longer applicable after architecture change to new framework"}
+#
+# When a bug is deprecated (no longer relevant):
+# {"failure_id": "FAIL-XXX-002", "timestamp": "2026-01-01T00:00:00Z", "category": "build", "severity": "low", "error_message": "Example", "root_cause": "Example", "affected_files": ["legacy.py"], "fix_commit": "def456", "regression_pattern": "example", "prevention_rule": "Example rule", "status": "deprecated", "deprecated_at": "2026-03-01T00:00:00Z", "deprecation_reason": "Module removed in v2.0, no longer maintained"}
+
+# =============================================================================
+# How to Add a New Entry
+# =============================================================================
+#
+# Option 1: Use the interactive CLI (RECOMMENDED)
+#   python scripts/log_failure.py --interactive
+#
+# Option 2: Quick entry from error message
+#   python scripts/log_failure.py \
+#     --from-error "TypeError: Cannot read property 'x' of undefined" \
+#     --category runtime \
+#     --severity high \
+#     --root-cause "Missing null check" \
+#     --affected-files src/parser.js \
+#     --fix-commit abc1234
+#
+# Option 3: Manual append (copy example, edit, append to registry)
+#   1. Copy relevant example above
+#   2. Remove comment markers (#)
+#   3. Update all values
+#   4. Append to .guardrails/failure-registry.jsonl
+#
+# IMPORTANT: NEVER edit existing entries - only append new ones or update status
+# =============================================================================

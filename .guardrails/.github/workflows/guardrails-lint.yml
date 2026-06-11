@@ -1,0 +1,222 @@
+name: Guardrails Compliance Check
+
+on:
+  pull_request:
+    branches: [main, develop]
+
+permissions:
+  contents: read
+
+jobs:
+  check-scope-boundaries:
+    name: Check Change Scope
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Analyze changed files
+        run: |
+          echo "Analyzing scope of changes in this PR..."
+          echo ""
+
+          # Get list of changed files
+          CHANGED_FILES=$(git diff --name-only origin/main...HEAD 2>/dev/null || git diff --name-only HEAD~1)
+
+          echo "Changed files:"
+          echo "$CHANGED_FILES"
+          echo ""
+
+          # Count changes by category
+          DOC_CHANGES=$(echo "$CHANGED_FILES" | grep -E "\.md$|docs/" | wc -l || echo "0")
+          CODE_CHANGES=$(echo "$CHANGED_FILES" | grep -E "\.(py|js|ts|go|rs|java)$" | wc -l || echo "0")
+          CONFIG_CHANGES=$(echo "$CHANGED_FILES" | grep -E "\.(json|yaml|yml|toml)$" | wc -l || echo "0")
+          WORKFLOW_CHANGES=$(echo "$CHANGED_FILES" | grep -E "\.github/workflows" | wc -l || echo "0")
+
+          echo "Change summary:"
+          echo "  Documentation: $DOC_CHANGES files"
+          echo "  Code: $CODE_CHANGES files"
+          echo "  Config: $CONFIG_CHANGES files"
+          echo "  Workflows: $WORKFLOW_CHANGES files"
+          echo ""
+
+          # Flag potentially large scope changes
+          TOTAL_FILES=$(echo "$CHANGED_FILES" | wc -l)
+          if [ "$TOTAL_FILES" -gt 20 ]; then
+            echo "WARNING: Large change scope ($TOTAL_FILES files)"
+            echo "Consider splitting into smaller PRs for easier review."
+          fi
+
+  check-forbidden-files:
+    name: Check for Forbidden Files
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check for forbidden file changes
+        run: |
+          echo "Checking for changes to protected files..."
+          echo ""
+
+          CHANGED_FILES=$(git diff --name-only origin/main...HEAD 2>/dev/null || git diff --name-only HEAD~1)
+
+          FORBIDDEN_PATTERNS=(
+            ".env"
+            "*.pem"
+            "*.key"
+            "credentials.json"
+            "secrets.json"
+          )
+
+          VIOLATIONS=""
+
+          for pattern in "${FORBIDDEN_PATTERNS[@]}"; do
+            MATCHES=$(echo "$CHANGED_FILES" | grep -E "$pattern" || true)
+            if [ -n "$MATCHES" ]; then
+              VIOLATIONS="$VIOLATIONS$MATCHES"$'\n'
+            fi
+          done
+
+          if [ -n "$VIOLATIONS" ]; then
+            echo "FORBIDDEN FILES DETECTED:"
+            echo "$VIOLATIONS"
+            echo ""
+            echo "These files should not be committed:"
+            echo "  - .env files (use .env.example instead)"
+            echo "  - Private keys (*.pem, *.key)"
+            echo "  - Credential files"
+            echo ""
+            exit 1
+          else
+            echo "No forbidden files in changes."
+          fi
+
+  validate-commit-messages:
+    name: Validate Commit Messages
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check commit message format
+        run: |
+          echo "Validating commit messages..."
+          echo ""
+
+          # Get commits in this PR
+          COMMITS=$(git log origin/main..HEAD --pretty=format:"%h %s" 2>/dev/null || git log -5 --pretty=format:"%h %s")
+
+          echo "Commits to validate:"
+          echo "$COMMITS"
+          echo ""
+
+          # Conventional commit regex
+          # Format: type(scope): description
+          VALID_TYPES="feat|fix|docs|style|refactor|perf|test|chore|security|build|ci"
+
+          INVALID_COMMITS=""
+
+          while IFS= read -r line; do
+            HASH=$(echo "$line" | cut -d' ' -f1)
+            MSG=$(echo "$line" | cut -d' ' -f2-)
+
+            # Check if message follows conventional commit format
+            if ! echo "$MSG" | grep -qE "^($VALID_TYPES)(\(.+\))?: .+"; then
+              # Allow merge commits
+              if ! echo "$MSG" | grep -qE "^Merge "; then
+                INVALID_COMMITS="$INVALID_COMMITS$HASH: $MSG"$'\n'
+              fi
+            fi
+          done <<< "$COMMITS"
+
+          if [ -n "$INVALID_COMMITS" ]; then
+            echo "INVALID COMMIT MESSAGES:"
+            echo "$INVALID_COMMITS"
+            echo ""
+            echo "Commit messages should follow conventional commit format:"
+            echo "  type(scope): description"
+            echo ""
+            echo "Valid types: $VALID_TYPES"
+            echo ""
+            echo "Examples:"
+            echo "  feat(auth): add OAuth2 support"
+            echo "  fix(parser): handle null input"
+            echo "  docs(readme): update installation steps"
+            # Warning only, not failing
+          else
+            echo "All commit messages follow conventional format."
+          fi
+
+  check-ai-attribution:
+    name: Check AI Attribution
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check for AI Attribution
+        run: |
+          echo "Checking for AI attribution..."
+          echo ""
+
+          # Get full commit messages
+          COMMIT_BODIES=$(git log origin/main..HEAD --pretty=format:"%B---COMMIT_SEP---" 2>/dev/null || git log -5 --pretty=format:"%B---COMMIT_SEP---")
+
+          # Check if any commits mention AI tools but lack attribution
+          AI_KEYWORDS="Claude|GPT|Gemini|AI|LLM|Copilot|agent"
+
+          MISSING_ATTRIBUTION=""
+
+          while IFS= read -r commit; do
+            # Check if commit mentions AI
+            if echo "$commit" | grep -qiE "$AI_KEYWORDS"; then
+              # Check if it has AI attribution
+              if ! echo "$commit" | grep -qi "Authored by TheArchitectit"; then
+                HASH=$(git log --pretty=format:"%h" -1)
+                MISSING_ATTRIBUTION="$MISSING_ATTRIBUTION- Commit may need AI attribution"$'\n'
+              fi
+            fi
+          done <<< "$(echo "$COMMIT_BODIES" | tr '---COMMIT_SEP---' '\n')"
+
+          if [ -n "$MISSING_ATTRIBUTION" ]; then
+            echo "NOTE: Some commits may need AI attribution:"
+            echo "$MISSING_ATTRIBUTION"
+            echo ""
+            echo "If AI assisted with these commits, add:"
+            echo "  Authored by TheArchitectit"
+          else
+            echo "Attribution check complete."
+          fi
+
+  guardrails-summary:
+    name: Generate Compliance Summary
+    runs-on: ubuntu-latest
+    needs: [check-scope-boundaries, check-forbidden-files, validate-commit-messages, check-ai-attribution]
+    if: always()
+
+    steps:
+      - name: Generate summary
+        run: |
+          echo "## Guardrails Compliance Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Check | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Scope Boundaries | ${{ needs.check-scope-boundaries.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Forbidden Files | ${{ needs.check-forbidden-files.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Commit Messages | ${{ needs.validate-commit-messages.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| AI Attribution | ${{ needs.check-ai-attribution.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "See [Agent Guardrails](docs/AGENT_GUARDRAILS.md) for compliance requirements." >> $GITHUB_STEP_SUMMARY

@@ -1,0 +1,126 @@
+# WINDSURF GUARDRAILS
+
+These rules apply to ALL code generation, edits, and suggestions in this project.
+
+## The Four Laws of Agent Safety
+
+1. **Read Before Editing** - Never modify code without reading it first. Always use the Read tool before any edit.
+2. **Stay in Scope** - Only touch files explicitly authorized. No "while I'm here" fixes.
+3. **Verify Before Committing** - Test and check all changes. Run relevant tests.
+4. **Halt When Uncertain** - Ask for clarification instead of guessing.
+
+## Pre-Operation Checklist (MANDATORY)
+
+Before ANY file modification:
+- [ ] Read target file(s) completely
+- [ ] Verify operation is within authorized scope
+- [ ] Identify the rollback procedure
+- [ ] Check for test/production separation requirements
+
+## Forbidden Actions (NEVER DO)
+
+1. Modifying code without reading it first
+2. Mixing test and production environments
+3. Force pushing to main/master
+4. Committing secrets, credentials, or .env files
+5. Running untested code in production
+6. Modifying unread code
+7. Working outside authorized scope
+
+## Halt Conditions (STOP and Ask User)
+
+- Attempting to modify code you haven't read
+- No rollback procedure exists or is unclear
+- Production impact is uncertain
+- User authorization is ambiguous
+- Test and production environments may mix
+- Uncertain about ANY aspect of the task
+- Operation has failed 3 times
+
+## Three Strikes Rule
+
+- **Strike 1**: Retry with adjusted approach
+- **Strike 2**: Try alternative approach
+- **Strike 3**: HALT and escalate to user
+
+Never continue beyond 3 failures. Continuing wastes tokens, contaminates context, and rarely succeeds.
+
+## Production-First Rule
+
+Production code MUST be created before test code or infrastructure code.
+
+Order:
+1. Production implementation
+2. Production validation (lint, type check, compile)
+3. Tests for the production code
+4. Infrastructure/deployment config
+
+## Scope Rules
+
+Only touch files within the authorized scope:
+1. Explicit file list from user (highest authority)
+2. Files identified in the task description
+3. Direct dependencies of target files (with approval)
+4. When uncertain: HALT and ask user
+
+## Architecture Patterns (Go/MCP Server)
+
+When working on `mcp-server/`:
+
+### Clean Architecture Layers
+
+```
+Domain → Application → Adapters → Interface
+```
+
+- **Domain** (`internal/domain/`) — Interfaces, value objects. ZERO deps.
+- **Application** — Command/query handlers. Depends on Domain only.
+- **Adapters** (`internal/adapters/`) — DB, cache, external services.
+- **Interface** (`internal/mcp/`) — MCP handlers. Depends on Domain.
+
+### Dependency Rule
+
+Outer layers can depend on inner, never reverse. Domain has no imports.
+
+### CQRS
+
+- **Commands** (write): CreateRule, UpdateRule, LogViolation
+- **Queries** (read): Evaluate, List, Get — cache-friendly
+
+Commands publish events → cache subscribes → invalidates on rule changes.
+
+### Vertical Slices
+
+Each guardrail type is self-contained:
+
+```
+internal/guardrails/
+├── bash/           ← model + evaluator + handler
+├── git/            ← all git-related code
+└── fileedit/       ← all file edit code
+```
+
+### SOLID
+
+- **S**: One responsibility per type
+- **O**: Add new evaluator (interface), don't modify engine
+- **L**: Implement interface fully or not at all
+- **I**: Small interfaces (3 methods max)
+- **D**: Depend on abstraction (interface), not concrete
+
+### Never Do (Architecture)
+
+- Import database packages in domain types
+- Put concrete implementations in domain layer
+- Create cross-layer circular dependencies
+- Add infrastructure logic to handlers
+
+## References
+
+- `skills/shared-prompts/four-laws.md` - The Four Laws (canonical)
+- `skills/shared-prompts/halt-conditions.md` - Full halt conditions
+- `skills/shared-prompts/three-strikes.md` - Full strike tracking
+- `skills/shared-prompts/production-first.md` - Full production-first rules
+- `skills/shared-prompts/clean-architecture.md` - Clean Architecture patterns
+- `skills/shared-prompts/cqrs.md` - CQRS command/query separation
+- `docs/AGENT_GUARDRAILS.md` - Core safety protocols

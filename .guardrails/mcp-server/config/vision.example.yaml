@@ -1,0 +1,37 @@
+# Vision Pipeline Configuration Example
+# Copy this file to vision.yaml and set values via environment variables.
+# vision.yaml is in .gitignore — never commit real secrets.
+
+inference:
+  local_url: "${LOCAL_LLAMA_URL}"          # e.g. http://localhost:8080/v1
+  local_model: "nemotron-vision-local"
+
+  # Hosted fallback — used when local fails or confidence is too low
+  fallback_provider: "anthropic"           # or "openai"
+  fallback_model: "claude-3-5-sonnet"
+  fallback_api_key: "${FALLBACK_API_KEY}"  # loaded from env
+  fallback_max_tokens: 4096
+
+  # llama-server tuning (for documentation/reference)
+  mmproj_path: "/mnt/data/models/nemotron-30b-a3b/mmproj-F16.gguf"
+  context_size: 120000
+  kv_cache_quantization: "q4_1"
+  flash_attention: true
+
+capture:
+  watch_dir: "${SCREENSHOT_DIR}"             # e.g. /home/user001/godot_screenshots
+  auto_review: true
+  trigger_interval_seconds: 30
+
+review:
+  max_iterations: 3
+  confidence_threshold: 0.75
+  system_prompt: |
+    You are a 3D game QA engineer. Analyze the provided screenshot and report
+    issues related to visual quality, performance, and adherence to game
+    design standards. Output findings as a JSON array with fields:
+    category, severity (info/warning/critical), description.
+  fallback_prompt: |
+    Re-examine this image focusing on any issues you may have missed.
+    Be specific about visual artifacts, lighting problems, UI inconsistencies,
+    or performance indicators.

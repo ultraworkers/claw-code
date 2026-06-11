@@ -1,0 +1,142 @@
+{
+  "name": "Team Layout Compliance",
+  "version": "1.0",
+  "description": "Enforces standardized team structure across all projects",
+  "applies_to": ["all"],
+  "rules": [
+    {
+      "id": "TEAM-001",
+      "name": "Team Initialization Required",
+      "severity": "error",
+      "check": "Project must initialize team structure before work begins",
+      "command": "python scripts/team_manager.py --project {project_name} init",
+      "message": "Run team initialization before starting work"
+    },
+    {
+      "id": "TEAM-002",
+      "name": "Phase 1 Completion Required",
+      "severity": "error",
+      "check": "Architecture review must be complete before infrastructure work",
+      "command": "python scripts/team_manager.py --project {project_name} status --phase 'Phase 1'",
+      "message": "Phase 1 (Strategy, Governance & Planning) must be 100% complete"
+    },
+    {
+      "id": "TEAM-003",
+      "name": "Phase 2 Completion Required",
+      "severity": "error",
+      "check": "Platform must be ready before development begins",
+      "command": "python scripts/team_manager.py --project {project_name} status --phase 'Phase 2'",
+      "message": "Phase 2 (Platform & Foundation) must be 100% complete"
+    },
+    {
+      "id": "TEAM-004",
+      "name": "Security Review Gate",
+      "severity": "critical",
+      "check": "Team 9 (Cybersecurity) must approve before production",
+      "command": "python scripts/team_manager.py --project {project_name} status --phase 'Phase 4'",
+      "message": "Security review (Team 9) must be complete"
+    },
+    {
+      "id": "TEAM-005",
+      "name": "QA Sign-off Gate",
+      "severity": "critical",
+      "check": "Team 10 (Quality Engineering) must approve before release",
+      "command": "python scripts/team_manager.py --project {project_name} status --phase 'Phase 4'",
+      "message": "QA sign-off (Team 10) must be complete"
+    },
+    {
+      "id": "TEAM-006",
+      "name": "Role Assignment Required",
+      "severity": "warning",
+      "check": "Active teams should have roles assigned",
+      "command": "python scripts/team_manager.py --project {project_name} list",
+      "message": "Assign people to team roles before starting work"
+    },
+    {
+      "id": "TEAM-007",
+      "name": "Team Size Compliance",
+      "severity": "error",
+      "check": "All teams must have 4-6 members",
+      "command": "python scripts/team_manager.py --project {project_name} validate-size",
+      "message": "Teams must have between 4 and 6 members (inclusive). Current team size outside valid range."
+    }
+  ],
+  "phase_gates": {
+    "1_to_2": {
+      "name": "Architecture Review Board",
+      "required_teams": [1, 2, 3],
+      "approval_required": [2],
+      "deliverables": ["Architecture Decision Records", "Approved Tech List", "Compliance Checklist"]
+    },
+    "2_to_3": {
+      "name": "Environment Readiness",
+      "required_teams": [4, 5, 6],
+      "approval_required": [4, 5],
+      "deliverables": ["Infrastructure Provisioned", "CI/CD Pipelines", "Data Models"]
+    },
+    "3_to_4": {
+      "name": "Feature Complete + Code Review",
+      "required_teams": [7, 8],
+      "approval_required": [7],
+      "deliverables": ["Features Implemented", "Code Reviewed", "Documentation Complete"]
+    },
+    "4_to_5": {
+      "name": "Security + QA Sign-off",
+      "required_teams": [9, 10],
+      "approval_required": [9, 10],
+      "deliverables": ["Security Review Passed", "Test Coverage Met", "UAT Sign-off"]
+    }
+  },
+  "agent_mapping": {
+    "planner": {
+      "team": 2,
+      "roles": ["Solution Architect", "Business Systems Analyst"],
+      "phase": "Phase 1"
+    },
+    "architect": {
+      "team": 2,
+      "roles": ["Chief Architect", "Domain Architect"],
+      "phase": "Phase 1"
+    },
+    "infrastructure": {
+      "team": 4,
+      "roles": ["Cloud Architect", "IaC Engineer"],
+      "phase": "Phase 2"
+    },
+    "platform": {
+      "team": 5,
+      "roles": ["CI/CD Architect", "Kubernetes Administrator"],
+      "phase": "Phase 2"
+    },
+    "backend": {
+      "team": 7,
+      "roles": ["Senior Backend Engineer", "Technical Lead"],
+      "phase": "Phase 3"
+    },
+    "frontend": {
+      "team": 7,
+      "roles": ["Senior Frontend Engineer", "Accessibility Expert"],
+      "phase": "Phase 3"
+    },
+    "security": {
+      "team": 9,
+      "roles": ["Security Architect", "Vulnerability Researcher"],
+      "phase": "Phase 4"
+    },
+    "qa": {
+      "team": 10,
+      "roles": ["QA Architect", "SDET"],
+      "phase": "Phase 4"
+    },
+    "sre": {
+      "team": 11,
+      "roles": ["SRE Lead", "Observability Engineer"],
+      "phase": "Phase 5"
+    },
+    "ops": {
+      "team": 12,
+      "roles": ["Release Manager", "NOC Analyst"],
+      "phase": "Phase 5"
+    }
+  }
+}

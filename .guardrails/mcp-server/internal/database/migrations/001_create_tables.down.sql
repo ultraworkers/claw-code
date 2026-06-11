@@ -1,0 +1,6 @@
+-- Drop all tables
+DROP TABLE IF EXISTS audit_log CASCADE;
+DROP TABLE IF EXISTS failure_registry CASCADE;
+DROP TABLE IF EXISTS prevention_rules CASCADE;
+DROP TABLE IF EXISTS projects CASCADE;
+DROP TABLE IF EXISTS documents CASCADE;

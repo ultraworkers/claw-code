@@ -1,0 +1,56 @@
+{
+  "$schema": "./semantic-rules.schema.json",
+  "description": "Semantic/AST-based prevention rules for complex regression detection",
+  "version": "1.0.0",
+  "rules": [
+    {
+      "rule_id": "SEMANTIC-001",
+      "failure_id": null,
+      "name": "Example: Unhandled promise rejection",
+      "enabled": false,
+      "language": "javascript",
+      "ast_pattern": {
+        "type": "CallExpression",
+        "callee": {
+          "type": "MemberExpression",
+          "object": { "type": "CallExpression" },
+          "property": { "name": "then" }
+        },
+        "missing": "catch"
+      },
+      "message": "Promise chain missing .catch() handler",
+      "severity": "warning",
+      "suggestion": "Add .catch() handler or use try/catch with async/await"
+    },
+    {
+      "rule_id": "SEMANTIC-002",
+      "failure_id": null,
+      "name": "Example: Resource leak - unclosed file",
+      "enabled": false,
+      "language": "python",
+      "ast_pattern": {
+        "type": "CallExpression",
+        "callee": { "name": "open" },
+        "missing": "context_manager"
+      },
+      "message": "File opened without context manager (with statement)",
+      "severity": "warning",
+      "suggestion": "Use 'with open(...) as f:' pattern to ensure file is closed"
+    },
+    {
+      "rule_id": "SEMANTIC-003",
+      "failure_id": null,
+      "name": "Example: Missing auth decorator",
+      "enabled": false,
+      "language": "python",
+      "ast_pattern": {
+        "type": "FunctionDefinition",
+        "route_decorator": true,
+        "missing_decorators": ["login_required", "require_auth"]
+      },
+      "message": "Route handler missing authentication decorator",
+      "severity": "error",
+      "suggestion": "Add @login_required or appropriate auth decorator"
+    }
+  ]
+}

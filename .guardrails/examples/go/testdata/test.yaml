@@ -1,0 +1,15 @@
+# Test configuration
+# Used when APP_ENV=test
+
+database:
+  host: "localhost"
+  port: 5432
+  name: "test_db"
+  ssl_mode: "disable"
+  max_connections: 5
+
+services:
+  api_url: "http://localhost:8080"
+  cache_host: "localhost:6379"
+  timeout_seconds: 5
+  retry_attempts: 1

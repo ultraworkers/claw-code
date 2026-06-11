@@ -1,0 +1,24 @@
+# Production Configuration
+# This file contains production environment settings.
+# NEVER use these settings for testing.
+
+environment: production
+
+database:
+  host: prod-db.example.com
+  port: 5432
+  name: production_db
+  user: prod_user
+  # Password should be provided via PROD_DB_PASSWORD environment variable
+  # password: ${PROD_DB_PASSWORD}
+
+services:
+  api: https://api.production.example.com
+  auth: https://auth.production.example.com
+  storage: https://storage.production.example.com
+
+# Application settings
+app:
+  debug: false
+  log_level: WARNING
+  max_connections: 100

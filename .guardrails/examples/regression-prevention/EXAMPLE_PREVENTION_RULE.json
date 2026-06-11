@@ -1,0 +1,23 @@
+{
+  "_comment": "EXAMPLE RULE - This shows how to add a custom prevention rule",
+  "rule_id": "PREVENT-004",
+  "failure_id": "FAIL-abc123de",
+  "name": "Require null check after JSON.parse",
+  "enabled": true,
+  "description": "Detects direct property access on JSON.parse results without null check",
+  "pattern": "JSON\\.parse\\([^)]+\\)\\s*\\.\\w+",
+  "forbidden_context": null,
+  "allowed_context": "(if\\s*\\([^)]*result\\s*!==\\s*(null|undefined)",
+  "message": "Potential regression: Direct property access on JSON.parse without null check. Previous bug FAIL-abc123de.",
+  "severity": "error",
+  "file_glob": [
+    "*.js",
+    "*.ts",
+    "*.jsx",
+    "*.tsx"
+  ],
+  "suggestion": "Add null check: const result = JSON.parse(data); if (result) { result.property }",
+  "references": [
+    "https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/JSON/parse"
+  ]
+}

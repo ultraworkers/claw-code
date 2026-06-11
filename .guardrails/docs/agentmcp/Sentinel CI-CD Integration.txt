@@ -1,0 +1,57 @@
+Project Sentinel: CI/CD Pipeline IntegrationVersion: 3.0.0-EnterpriseModule: 22-Setup-CICDMaps to: .github/workflows/guardrails-lint.yml, .github/workflows/secret-validation.ymlScope: Running Sentinel in "Headless Mode" to enforce guardrails in GitHub Actions, GitLab CI, and Jenkins.1. The "Gatekeeper" PhilosophyWhile Sentinel runs locally on the Agent's machine to provide immediate feedback, we cannot trust that the local environment hasn't been tampered with. The CI/CD pipeline acts as the Final Authority.In this architecture, Sentinel replaces multiple fragmented linter scripts with a single binary execution: sentinel audit.2. GitHub Actions Integration2.1 The Workflow FileCreate .github/workflows/sentinel-gate.yml:name: Sentinel Gatekeeper
+
+on:
+  pull_request:
+    branches: [ "main", "release/*" ]
+  push:
+    branches: [ "main" ]
+
+jobs:
+  sentinel-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Required for git history analysis
+
+      - name: Install Sentinel
+        run: |
+          curl -L [https://releases.project-sentinel.io/v3.0.0/sentinel-linux-amd64](https://releases.project-sentinel.io/v3.0.0/sentinel-linux-amd64) -o sentinel
+          chmod +x sentinel
+
+      - name: Run Sentinel Audit
+        run: ./sentinel audit --mode=ci --target=${{ github.event.pull_request.head.sha }}
+        env:
+          SENTINEL_API_KEY: ${{ secrets.SENTINEL_API_KEY }} # Optional: for cloud telemetry
+2.2 What sentinel audit ChecksWhen running in CI mode, Sentinel performs a rigorous forensic analysis of the PR:The "Ghost Code" Check:Sentinel compares the PR diff against the audit_log (if synced).Logic: If code appears in the PR that was not logged as a write_file operation by an authorized Agent session, it flags it.Purpose: Detects manual bypasses where a user manually edited files to circumvent guardrails.The "Sycophant" Check:Sentinel analyzes the commit messages.Fail: "wip", "fix", "update".Pass: "feat(auth): implement jwt validation".The "Leak" Scan (Deep Mode):Re-runs the PII/Secret regex engine on the entire diff.This is a fail-safe in case the local Sentinel regex was outdated.3. GitLab CI / Jenkins IntegrationSentinel is agnostic. It simply returns exit code 0 (Pass) or exit code 1 (Fail) with a JSON report.3.1 Jenkins Pipelinestage('Sentinel Gate') {
+    steps {
+        sh './bin/sentinel audit --format=junit > sentinel-report.xml'
+    }
+    post {
+        always {
+            junit 'sentinel-report.xml'
+        }
+    }
+}
+3.2 The JSON Report ArtifactSentinel generates a detailed compliance report (sentinel-report.json) useful for compliance auditing.{
+  "session_id": "ci-run-8821",
+  "status": "FAILED",
+  "violations": [
+    {
+      "severity": "BLOCKER",
+      "file": "src/config/database.go",
+      "line": 45,
+      "rule": "no-hardcoded-passwords",
+      "message": "Detected high-entropy string assigned to 'dbPass'."
+    },
+    {
+      "severity": "WARNING",
+      "file": "docs/README.md",
+      "rule": "doc-parity",
+      "message": "Documentation freshness score is 65% (Stale)."
+    }
+  ]
+}
+4. Gating DeploymentsSentinel can also block deployments based on "Sprint Hygiene."4.1 The "Clean Sprint" RuleIn the deployment pipeline:./sentinel verify-release --version=v1.2.0
+Logic:Connects to the remote Sentinel State (e.g., S3/GCS bucket or SQL replica).Verifies that all Tasks linked to v1.2.0 are status DONE.Verifies that the Pre-Release checklist (Unit Tests, E2E Tests, Security Scan) is complete.Result: If any task is IN_PROGRESS, the deploy fails.4.2 Emergency BypassIf the pipeline is blocked during a critical outage:Command: ./sentinel verify-release --force --reason="SEV-1 OUTAGE"Audit: This event is logged with Severity: CRITICAL and triggers an alert to the Engineering Manager.5. Artifact SigningTo prevent supply-chain attacks, Sentinel can sign the build artifacts.Command: sentinel sign --artifact=./bin/appMechanism: Uses a private key stored in GitHub Secrets.Verification: The Production Agent (running on the server) verifies the signature before starting the app.

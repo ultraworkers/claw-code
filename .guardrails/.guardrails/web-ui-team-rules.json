@@ -1,0 +1,40 @@
+{
+  "name": "Web UI Team Rules",
+  "version": "1.0",
+  "description": "Team layout rules specific to Web UI components",
+  "applies_to": ["web", "frontend", "ui"],
+  "rules": [
+    {
+      "id": "WEB-TEAM-001",
+      "name": "A11y Expert Required",
+      "severity": "error",
+      "check": "UI changes must be reviewed by Team 7 A11y Expert",
+      "trigger": "files_changed",
+      "patterns": ["**/*.tsx", "**/*.jsx", "**/*.vue", "**/*.svelte"],
+      "message": "Accessibility review required from Team 7 A11y Expert"
+    },
+    {
+      "id": "WEB-TEAM-002",
+      "name": "Design System Compliance",
+      "severity": "warning",
+      "check": "UI components must follow design system standards",
+      "trigger": "files_changed",
+      "patterns": ["**/components/**", "**/ui/**"],
+      "message": "Verify compliance with design system standards"
+    },
+    {
+      "id": "WEB-TEAM-003",
+      "name": "Technical Writer Review",
+      "severity": "warning",
+      "check": "UI changes affecting user flows need docs review",
+      "trigger": "files_changed",
+      "patterns": ["**/pages/**", "**/views/**", "**/screens/**"],
+      "message": "Notify Team 7 Technical Writer of user-facing changes"
+    }
+  ],
+  "team_7_required_approvals": {
+    "ui_changes": ["Senior Frontend Engineer", "Accessibility (A11y) Expert"],
+    "component_changes": ["Senior Frontend Engineer"],
+    "page_changes": ["Senior Frontend Engineer", "Technical Writer"]
+  }
+}

@@ -1,0 +1,15 @@
+# Development Configuration
+# Local development settings with verbose logging.
+
+app_name: "config-loader-example"
+environment: "development"
+debug: true
+log_level: "DEBUG"
+
+database:
+  host: "localhost"
+  port: 5432
+  name: "app_development"
+  username: "dev_user"
+  pool_size: 10
+  connection_timeout: 10000

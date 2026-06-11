@@ -1,0 +1,429 @@
+{
+  "$schema": "./pattern-rules.schema.json",
+  "description": "Pattern-based prevention rules for regression detection",
+  "version": "2.1.0",
+  "rules": [
+    {
+      "rule_id": "PREVENT-001",
+      "name": "JSON.parse without null check",
+      "enabled": true,
+      "pattern": "JSON\\.parse\\(.*\\)\\s*\\.\\w+",
+      "forbidden_context": "without.*null.*check",
+      "message": "Direct property access on JSON.parse result without null check",
+      "severity": "error",
+      "file_glob": [
+        "*.js",
+        "*.ts",
+        "*.jsx",
+        "*.tsx"
+      ],
+      "suggestion": "Add null check: const data = JSON.parse(...); if (data) { ... }"
+    },
+    {
+      "rule_id": "PREVENT-002",
+      "name": "SQL injection risk via string concatenation",
+      "enabled": true,
+      "pattern": "(execute|query|exec)\\s*\\(.*\\+.*\\)",
+      "forbidden_context": null,
+      "message": "Potential SQL injection: String concatenation in SQL query",
+      "severity": "critical",
+      "file_glob": [
+        "*.py",
+        "*.js",
+        "*.ts",
+        "*.rb",
+        "*.java",
+        "*.go"
+      ],
+      "suggestion": "Use parameterized queries or prepared statements"
+    },
+    {
+      "rule_id": "PREVENT-003",
+      "name": "Hardcoded credentials",
+      "enabled": true,
+      "pattern": "(password|secret|api_key|token|apikey)\\s*[,=:]\\s*[\"'][^\"']+[\"']",
+      "forbidden_context": "(example|placeholder|test|mock|sample|dummy|fake)",
+      "message": "Possible hardcoded credential detected",
+      "severity": "critical",
+      "file_glob": [
+        "*"
+      ],
+      "suggestion": "Use environment variables or secret management system"
+    },
+    {
+      "rule_id": "PREVENT-004",
+      "name": "Godot: Direct .free() on Node",
+      "enabled": true,
+      "pattern": "\\.free\\(\\)",
+      "forbidden_context": "(queue_free|is_queued_for_deletion|Object\\.)",
+      "message": "Direct .free() on Node can crash. Use queue_free() instead.",
+      "severity": "error",
+      "file_glob": [
+        "*.gd"
+      ],
+      "suggestion": "Use node.queue_free() for safe deferred deletion"
+    },
+    {
+      "rule_id": "PREVENT-005",
+      "name": "Godot: Absolute resource paths",
+      "enabled": true,
+      "pattern": "(C:\\\\|/home/|/Users/|/mnt/)[^\\s\"']+\\.(png|jpg|wav|ogg|tscn|gd)",
+      "forbidden_context": null,
+      "message": "Absolute file path detected. Use res:// paths in Godot.",
+      "severity": "critical",
+      "file_glob": [
+        "*.tscn",
+        "*.gd",
+        "*.tres",
+        "*.cfg"
+      ],
+      "suggestion": "Replace with res://path/to/resource"
+    },
+    {
+      "rule_id": "PREVENT-006",
+      "name": "Godot: String-based get_node()",
+      "enabled": true,
+      "pattern": "get_node\\([\"'][^\"']+[\"']\\)",
+      "forbidden_context": null,
+      "message": "String-based get_node() is fragile. Use @onready with $ or % syntax.",
+      "severity": "warning",
+      "file_glob": [
+        "*.gd"
+      ],
+      "suggestion": "Use @onready var node = $Path or %UniqueName"
+    },
+    {
+      "rule_id": "PREVENT-007",
+      "name": "Python: Bare except clause",
+      "enabled": true,
+      "pattern": "except\\s*:",
+      "forbidden_context": "(Exception|BaseException|ValueError|TypeError|RuntimeError|KeyError)",
+      "message": "Bare except catches SystemExit and KeyboardInterrupt. Use except Exception: at minimum.",
+      "severity": "error",
+      "file_glob": [
+        "*.py"
+      ],
+      "suggestion": "Use 'except Exception as e:' or catch specific exceptions"
+    },
+    {
+      "rule_id": "PREVENT-008",
+      "name": "Python: Mutable default arguments",
+      "enabled": true,
+      "pattern": "def\\s+\\w+\\([^)]*\\b\\w+\\s*[:=]\\s*(\\[\\]|\\{\\}|set\\(\\))",
+      "forbidden_context": null,
+      "message": "Mutable default argument (list/dict/set) — shared across calls, causes subtle bugs",
+      "severity": "error",
+      "file_glob": [
+        "*.py"
+      ],
+      "suggestion": "Use None as default and initialize inside the function"
+    },
+    {
+      "rule_id": "PREVENT-009",
+      "name": "Go: Ignored error return",
+      "enabled": true,
+      "pattern": "_\\s*,?\\s*=\\s*\\w+\\(",
+      "forbidden_context": "(range|ok|type|assert|select)",
+      "message": "Error return value ignored. Always check errors in Go.",
+      "severity": "error",
+      "file_glob": [
+        "*.go"
+      ],
+      "suggestion": "Handle the error: if err != nil { return err }"
+    },
+    {
+      "rule_id": "PREVENT-010",
+      "name": "Go: goroutine without context",
+      "enabled": true,
+      "pattern": "go\\s+func",
+      "forbidden_context": "context",
+      "message": "Goroutine launched without context — cannot be cancelled or tracked",
+      "severity": "warning",
+      "file_glob": [
+        "*.go"
+      ],
+      "suggestion": "Pass context.Context to goroutine for cancellation"
+    },
+    {
+      "rule_id": "PREVENT-011",
+      "name": "TypeScript: any type usage",
+      "enabled": true,
+      "pattern": "(:\\s*any|as\\s+any)",
+      "forbidden_context": "(//\\s*@ts-ignore|eslint-disable)",
+      "message": "Usage of 'any' type defeats TypeScript's type safety",
+      "severity": "error",
+      "file_glob": [
+        "*.ts",
+        "*.tsx"
+      ],
+      "suggestion": "Define a proper interface or use 'unknown' with type narrowing"
+    },
+    {
+      "rule_id": "PREVENT-012",
+      "name": "TypeScript/JS: console.log in production",
+      "enabled": true,
+      "pattern": "console\\.(log|debug|info)",
+      "forbidden_context": "(test|spec|mock|__tests__)",
+      "message": "console.log left in production code",
+      "severity": "warning",
+      "file_glob": [
+        "*.ts",
+        "*.tsx",
+        "*.js",
+        "*.jsx"
+      ],
+      "suggestion": "Remove console.log or replace with proper logging library"
+    },
+    {
+      "rule_id": "PREVENT-013",
+      "name": "Rust: unwrap() in non-test code",
+      "enabled": true,
+      "pattern": "\\.unwrap\\(\\)",
+      "forbidden_context": "(test|tests|spec|bench)",
+      "message": "unwrap() can panic. Use proper error handling in production.",
+      "severity": "warning",
+      "file_glob": [
+        "*.rs"
+      ],
+      "suggestion": "Use match, ?, or expect() with a descriptive message"
+    },
+    {
+      "rule_id": "PREVENT-014",
+      "name": "Docker: latest tag in production",
+      "enabled": true,
+      "pattern": "FROM\\s+\\S+:latest",
+      "forbidden_context": null,
+      "message": "Using :latest tag is non-deterministic. Pin to a specific version.",
+      "severity": "error",
+      "file_glob": [
+        "Dockerfile",
+        "Dockerfile.*",
+        "*.dockerfile"
+      ],
+      "suggestion": "Pin image version: FROM node:22.1.0-alpine"
+    },
+    {
+      "rule_id": "PREVENT-015",
+      "name": "Shell: Command injection via unsanitized input",
+      "enabled": true,
+      "pattern": "(exec|system|os\\.system|subprocess\\.call|subprocess\\.Popen)\\([^)]*\\+",
+      "forbidden_context": "(shlex|quote|shell=False)",
+      "message": "Potential command injection via string concatenation",
+      "severity": "critical",
+      "file_glob": [
+        "*.py",
+        "*.js",
+        "*.ts",
+        "*.rb",
+        "*.go"
+      ],
+      "suggestion": "Use array form for subprocess or shlex.quote() for shell commands"
+    },
+    {
+      "rule_id": "PREVENT-016",
+      "name": "Kotlin/Java: Thread.sleep()",
+      "enabled": true,
+      "pattern": "Thread\\.sleep",
+      "forbidden_context": "(test|mock)",
+      "message": "Thread.sleep() is fragile. Use coroutines (delay) or proper synchronization.",
+      "severity": "warning",
+      "file_glob": [
+        "*.kt",
+        "*.java"
+      ],
+      "suggestion": "In Kotlin use delay(), in Java use CompletableFuture or ScheduledExecutor"
+    },
+    {
+      "rule_id": "PREVENT-017",
+      "name": "GDScript: Heavy operations in _process",
+      "enabled": true,
+      "pattern": "(_process|_physics_process)[\\s\\S]{0,500}(FileAccess|HTTPRequest|ResourceLoader|load\\()",
+      "forbidden_context": null,
+      "message": "File I/O or resource loading detected in _process. Move to _ready() or background thread.",
+      "severity": "warning",
+      "file_glob": [
+        "*.gd"
+      ],
+      "suggestion": "Preload resources in _ready() or use ResourceLoader.load_threaded()"
+    },
+    {
+      "rule_id": "PREVENT-018",
+      "name": "AWS/Azure/GCP: Hardcoded cloud credentials",
+      "enabled": true,
+      "pattern": "(AKIA|AZURE_SUBSCRIPTION|AIza)[0-9a-zA-Z]{16,}",
+      "forbidden_context": null,
+      "message": "Cloud provider access key detected in source code",
+      "severity": "critical",
+      "file_glob": [
+        "*"
+      ],
+      "suggestion": "Use IAM roles, managed identities, or environment variables"
+    },
+    {
+      "rule_id": "PREVENT-019",
+      "name": "GDScript: Missing type hints",
+      "enabled": true,
+      "pattern": "var\\s+\\w+\\s*=",
+      "forbidden_context": "(var\\s+\\w+\\s*:|export|@export|@onready)",
+      "message": "Untyped variable declaration. Use 'var name: Type = value' for clarity.",
+      "severity": "info",
+      "file_glob": [
+        "*.gd"
+      ],
+      "suggestion": "Add explicit type: var speed: float = 200.0"
+    },
+    {
+      "rule_id": "PREVENT-020",
+      "name": "All: TODO/FIXME/HACK without ticket reference",
+      "enabled": true,
+      "pattern": "(TODO|FIXME|HACK|XXX|WORKAROUND)[^\\d]*$",
+      "forbidden_context": "(#[0-9]|issue|ticket|JIRA)",
+      "message": "TODO/FIXME without ticket reference — will be forgotten",
+      "severity": "info",
+      "file_glob": [
+        "*"
+      ],
+      "suggestion": "Add ticket reference: TODO(#123) or FIXME(RAD-456)"
+    },
+    {
+      "rule_id": "PREVENT-021",
+      "name": "OWASP A03: Command injection risk",
+      "enabled": true,
+      "pattern": "(eval|Function\\(|setTimeout|setInterval)\\s*\\(\\s*[\"'].*\\+",
+      "forbidden_context": "(sanitized|escaped|encoded)",
+      "message": "Potential command injection via eval/setTimeout with string concatenation",
+      "severity": "critical",
+      "file_glob": [
+        "*.js",
+        "*.ts",
+        "*.jsx",
+        "*.tsx"
+      ],
+      "suggestion": "Use function references instead of strings: setTimeout(() => { ... }, 0)"
+    },
+    {
+      "rule_id": "PREVENT-022",
+      "name": "OWASP A05: Debug mode in production",
+      "enabled": true,
+      "pattern": "(DEBUG|debug)\\s*[:=]\\s*(True|true|1|yes)",
+      "forbidden_context": "(test|spec|development|staging|__debug__|if DEBUG)",
+      "message": "Debug mode enabled in non-test code",
+      "severity": "error",
+      "file_glob": [
+        "*.py",
+        "*.js",
+        "*.ts",
+        "*.rb",
+        "*.go",
+        "*.yaml",
+        "*.yml",
+        "*.json",
+        "*.env"
+      ],
+      "suggestion": "Use environment variables: DEBUG = os.environ.get(\"DEBUG\", \"false\").lower() == \"true\""
+    },
+    {
+      "rule_id": "PREVENT-023",
+      "name": "OWASP A05: CORS wildcard",
+      "enabled": true,
+      "pattern": "Access-Control-Allow-Origin\\s*[:*]\\s*\\*",
+      "forbidden_context": null,
+      "message": "CORS wildcard detected — allows any origin to access the API",
+      "severity": "error",
+      "file_glob": [
+        "*.py",
+        "*.js",
+        "*.ts",
+        "*.go",
+        "*.rb",
+        "*.java",
+        "*.yaml",
+        "*.yml"
+      ],
+      "suggestion": "Specify allowed origins explicitly instead of using wildcard"
+    },
+    {
+      "rule_id": "PREVENT-024",
+      "name": "AI: Hallucinated package import",
+      "enabled": true,
+      "pattern": "(import|from|require|use)\\s+[a-z_]+_[a-z]+_[a-z]+",
+      "forbidden_context": "(std|core|builtin|internal|github.com)",
+      "message": "Triple-underscored package name may be AI-hallucinated. Verify it exists on the registry.",
+      "severity": "warning",
+      "file_glob": [
+        "*.py",
+        "*.js",
+        "*.ts",
+        "*.rs",
+        "*.go",
+        "*.rb",
+        "*.java"
+      ],
+      "suggestion": "Verify the package exists: pip search, npm view, cargo search, etc."
+    },
+    {
+      "rule_id": "PREVENT-025",
+      "name": "Security: Weak hash for passwords",
+      "enabled": true,
+      "pattern": "(md5|sha1|SHA1|MD5)\\s*\\(.*password",
+      "forbidden_context": null,
+      "message": "Weak hash algorithm used for passwords. Use bcrypt, scrypt, or argon2.",
+      "severity": "critical",
+      "file_glob": [
+        "*.py",
+        "*.js",
+        "*.ts",
+        "*.go",
+        "*.rb",
+        "*.java",
+        "*.php"
+      ],
+      "suggestion": "Use bcrypt, scrypt, or argon2 for password hashing"
+    },
+    {
+      "rule_id": "PREVENT-026",
+      "name": "Security: SSRF via unvalidated URL",
+      "enabled": true,
+      "pattern": "(fetch|requests|http.Get|urllib|axios)\\s*\\(\\s*(user|input|param|query|request)",
+      "forbidden_context": "(validated|whitelist|allowlist|sanitize)",
+      "message": "Potential SSRF: User input passed to URL fetch without validation",
+      "severity": "error",
+      "file_glob": [
+        "*.py",
+        "*.js",
+        "*.ts",
+        "*.go",
+        "*.rb",
+        "*.java"
+      ],
+      "suggestion": "Validate URL against allowlist before fetching"
+    },
+    {
+      "rule_id": "PREVENT-027",
+      "name": "Docker: Missing .dockerignore",
+      "enabled": true,
+      "pattern": ".*",
+      "forbidden_context": null,
+      "message": "No .dockerignore file found — entire context sent to Docker daemon",
+      "severity": "info",
+      "file_glob": [
+        "Dockerfile",
+        "Dockerfile.*"
+      ],
+      "suggestion": "Create .dockerignore to exclude .git, node_modules, __pycache__, .env"
+    },
+    {
+      "rule_id": "PREVENT-028",
+      "name": "GDScript: Missing type hints in function return",
+      "enabled": true,
+      "pattern": "func\\s+\\w+\\s*\\([^)]*\\)\\s*:",
+      "forbidden_context": "(->|_ready|_process|_init|_input|_enter_tree|_exit_tree)",
+      "message": "Function without return type hint. Use func name() -> ReturnType:",
+      "severity": "info",
+      "file_glob": [
+        "*.gd"
+      ],
+      "suggestion": "Add return type: func get_score() -> int:"
+    }
+  ]
+}

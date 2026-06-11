@@ -1,0 +1,15 @@
+# Development configuration
+# Used when APP_ENV=development
+
+database:
+  host: "localhost"
+  port: 5432
+  name: "dev_db"
+  ssl_mode: "disable"
+  max_connections: 10
+
+services:
+  api_url: "http://localhost:3000"
+  cache_host: "localhost:6379"
+  timeout_seconds: 10
+  retry_attempts: 2

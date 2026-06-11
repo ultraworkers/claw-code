@@ -1,0 +1,68 @@
+{
+  "schema_version": "1.0.0",
+  "last_updated": "2026-02-15T00:00:00Z",
+  "description": "Team Manager Configuration Rules",
+  "team_size_limits": {
+    "min": 4,
+    "max": 6,
+    "description": "Each team must have 4-6 members assigned"
+  },
+  "phase_gates": {
+    "Phase 1: Strategy, Governance & Planning": {
+      "required_exit_criteria": ["Business case approved", "Budget allocated"],
+      "can_proceed_to": ["Phase 2: Platform & Foundation"]
+    },
+    "Phase 2: Platform & Foundation": {
+      "required_exit_criteria": ["Infrastructure provisioned", "Platform services ready"],
+      "can_proceed_to": ["Phase 3: The Build Squads"]
+    },
+    "Phase 3: The Build Squads": {
+      "required_exit_criteria": ["Features implemented", "Code reviewed and approved"],
+      "can_proceed_to": ["Phase 4: Validation & Hardening"]
+    },
+    "Phase 4: Validation & Hardening": {
+      "required_exit_criteria": ["Security review passed", "UAT sign-off obtained"],
+      "can_proceed_to": ["Phase 5: Delivery & Sustainment"]
+    },
+    "Phase 5: Delivery & Sustainment": {
+      "required_exit_criteria": ["Change approved", "Release deployed"],
+      "can_proceed_to": []
+    }
+  },
+  "allowed_agent_types": [
+    "planner",
+    "coder",
+    "reviewer",
+    "security",
+    "tester",
+    "ops"
+  ],
+  "validation_rules": {
+    "person_name": {
+      "max_length": 256,
+      "email_pattern": "^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$",
+      "username_pattern": "^[a-zA-Z0-9_.-]+$",
+      "description": "Person name must be valid email or username"
+    },
+    "role_name": {
+      "max_length": 128,
+      "description": "Role name must match predefined roles"
+    },
+    "project_name": {
+      "max_length": 64,
+      "pattern": "^[a-zA-Z0-9_-]+$",
+      "description": "Project name must be alphanumeric with hyphens/underscores"
+    }
+  },
+  "duplicate_detection": {
+    "enabled": true,
+    "scope": "project",
+    "action": "warn",
+    "description": "Detect if same person assigned to multiple roles. Scope: 'project' (check across all teams) or 'team' (check within team only). Action: 'warn' or 'block'"
+  },
+  "versioning": {
+    "current_version": "1.0.0",
+    "minimum_supported_version": "1.0.0",
+    "auto_migrate": true
+  }
+}

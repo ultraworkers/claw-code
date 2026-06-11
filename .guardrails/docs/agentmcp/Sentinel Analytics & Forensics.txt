@@ -1,0 +1,36 @@
+Project Sentinel: Analytics, Forensics & ReportingVersion: 3.0.0-EnterpriseModule: 24-Ops-AnalyticsMaps to: sprints/ (Retrospectives)Scope: Extracting business intelligence from the Sentinel Database, generating reports, and forensic auditing.1. The Data MineSentinel is not just a gatekeeper; it is a Black Box Recorder for the software development process. Every interaction is stored in .sentinel/state.db (SQLite). This allows us to answer questions that are impossible to answer with standard Git history.1.1 The Schema Mapaudit_log: The raw stream of consciousness (Tools used, Arguments, Outputs).tasks: The business logic (Time to complete, Complexity, Churn).metrics: Telemetry (Token usage, Latency, Error rates).2. Generating ReportsSentinel includes a CLI command to generate markdown reports for humans.2.1 The Sprint RetrospectiveCommand: sentinel report --sprint=latest --type=retroOutput (docs/sprints/reports/RETRO-[DATE].md):# Sprint Retrospective: Sprint-24
+
+## Executive Summary
+* **Status:** Completed
+* **Efficiency:** 85% (vs 78% last sprint)
+* **Blockers:** 3 (Auth Module Refactor)
+
+## Agent Performance
+* **Hallucination Rate:** 2.4% (Tool calls that failed validation)
+* **Test Churn:** Task T-105 required 14 test runs to pass.
+* **Cost:** $4.50 (Est. API costs)
+
+## Security Incidents
+* **Severity L1 (Warning):** 12 (Lint errors)
+* **Severity L2 (Blocked):** 1 (Attempted to edit .env)
+* **Severity L3 (Critical):** 0
+2.2 The "Blame" Report (Forensics)Command: sentinel report --file=src/auth.go --type=forensicOutput:Line 45-50 modified by Agent Session sess-88a on 2026-01-18.Context: Task T-102 (Fix Login).Tool Used: write_file.Prompt Context: "User asked to bypass 2FA for testing."Verification: run_tests passed 14s later.Value: Unlike git blame, which only shows who and when, Sentinel shows why and how. We can see the specific user prompt that led the Agent to write that code.3. SQL Analytics (Custom Queries)For Engineering Managers, the SQLite DB is directly queryable.3.1 Efficiency MetricsQuery: "Which files cause the most Agent confusion?"SELECT target_path, COUNT(*) as failures
+FROM audit_log
+WHERE action = 'write_file' AND outcome = 'BLOCKED'
+GROUP BY target_path
+ORDER BY failures DESC;
+Insight: If src/legacy/parser.go has 50 failures, maybe it needs refactoring or better documentation.3.2 Security PostureQuery: "Show me all blocked attempts to access secrets."SELECT timestamp, actor, payload
+FROM audit_log
+WHERE action IN ('read_file', 'get_config') 
+  AND outcome = 'BLOCKED'
+  AND payload LIKE '%env%';
+4. Visualizing DataSentinel can export data to standard formats for visualization.4.1 Export to CSV/JSONsentinel export --format=json --out=metrics.json
+This file can be ingested by:Grafana: Visualizing Agent Velocity and Error Rates over time.Tableau: analyzing "Cost per Feature."Excel: For management presentations.4.2 The "Pulse" Dashboard (Terminal UI)Sentinel includes a TUI (Text User Interface) for real-time monitoring.Command: sentinel dashboardDisplay:SENTINEL MONITOR v3.0 | SPRINT: Active | PROFILE: Backend
+
+[ TASKS ] [#####...................] 25% Done
+[ TESTS ] [#############.......] 65% Passing
+[ AUDIT ] [OK] No Critical Alerts
+
+Last Action: run_tests(pkg="auth") -> PASS (300ms ago)
+Active Context: docs/standards/API.md
+5. Compliance & AuditingFor regulated industries (FinTech, Healthcare), Sentinel provides a Compliance Artifact.5.1 The Chain of CustodyCommand: sentinel audit --verify-chainMechanism: Sentinel verifies the cryptographic hash chain of the audit log rows (each row includes the hash of the previous row).Output: "Chain Valid. No tampering detected."5.2 The Release CertificateWhen moving to production, Sentinel generates release_cert.pdf (via LaTeX generation or Markdown) containing:List of all Features.Proof of Test Execution (Logs).Proof of Security Scan (Logs).Proof of Human Approval (Signatures).

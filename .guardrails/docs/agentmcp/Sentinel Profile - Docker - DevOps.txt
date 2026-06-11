@@ -1,0 +1,153 @@
+Project Sentinel: Docker & DevOps Profile
+Version: 3.0.0-Enterprise
+Module: 41-Lang-Docker
+Maps to: examples/docker/
+Scope: Active enforcement of container security, image optimization, compose integrity, and CI/CD pipeline safety.
+
+---
+
+1. Dockerfile Guardrails
+
+Sentinel detects Docker projects via `Dockerfile` (or `Dockerfile.*`). It enforces container security and optimization standards.
+
+1.1 The Base Image Pin
+
+Rule: All FROM instructions must use pinned digests or specific version tags.
+
+Enforcement:
+- BAD: `FROM node:latest` (non-deterministic)
+- BAD: `FROM node:22` (minor version can change)
+- GOOD: `FROM node:22.14.0-alpine@sha256:abc123...` (pinned)
+- GOOD: `FROM node:22.14.0-alpine` (specific version)
+- Action: BLOCKED for :latest. Warning for untagged minor versions.
+
+1.2 The Root User Guard
+
+Rule: Containers must not run as root.
+
+Enforcement:
+- Sentinel scans for missing USER directive.
+- If no USER instruction appears before the final CMD/ENTRYPOINT, warning issued.
+- Recommendation: Add `RUN adduser -D appuser && USER appuser`
+- Exception: Build stages (multi-stage) can run as root.
+- Action: Warning if container runs as root.
+
+1.3 The COPY vs ADD Rule
+
+Rule: Prefer COPY over ADD unless you need tar extraction.
+
+Enforcement:
+- Sentinel scans for ADD instruction with simple file copy source.
+- BAD: `ADD package.json /app/` (unnecessary ADD)
+- GOOD: `COPY package.json /app/`
+- Action: Warning for ADD when COPY suffices.
+
+1.4 The Layer Cache Optimization
+
+Rule: Copy dependency files before source code for better cache hits.
+
+Enforcement:
+- Sentinel validates Dockerfile layer order.
+- Pattern: COPY package.json + RUN install BEFORE COPY . .
+- If source code is copied before dependencies, warning issued.
+- Action: Info notice for suboptimal layer ordering.
+
+2. Docker Compose Guardrails
+
+2.1 The Health Check Mandate
+
+Rule: Production services must define health checks.
+
+Enforcement:
+- Sentinel scans docker-compose.yml for missing healthcheck definitions.
+- Critical for: databases, message queues, API servers.
+- Optional for: one-off workers, migration containers.
+- Action: Warning for services without health checks.
+
+2.2 The Resource Limit Guard
+
+Rule: All services must define memory and CPU limits.
+
+Enforcement:
+- Sentinel checks for deploy.resources.limits in compose files.
+- Default recommendation: memory: 512MB, cpus: 0.5 for standard services.
+- Action: Warning for services without resource limits.
+
+2.3 The Volume Mount Safety
+
+Rule: Never mount the Docker socket or host root filesystem.
+
+Enforcement:
+- Sentinel scans for dangerous volume mounts.
+- BLOCKED: `/var/run/docker.sock` mounted into containers.
+- BLOCKED: `/` or `/etc` mounted as volumes.
+- Exception: CI/CD runners with explicit approval.
+- Action: CRITICAL BLOCK for Docker socket mounts.
+
+3. CI/CD Pipeline Guardrails
+
+3.1 The Secret Exposure Guard
+
+Rule: Never echo or log secrets in CI pipelines.
+
+Enforcement:
+- Sentinel scans `.github/workflows/*.yml`, `.gitlab-ci.yml`, `Jenkinsfile`.
+- Check: `echo ${{ secrets.* }}` or `printenv` of secret variables.
+- Action: BLOCKED if secrets are logged.
+
+3.2 The Pin-to-SHA Rule (GitHub Actions)
+
+Rule: Third-party GitHub Actions must be pinned to a commit SHA.
+
+Enforcement:
+- BAD: `uses: actions/checkout@v4` (tag can be moved)
+- GOOD: `uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11` (SHA)
+- Exception: First-party actions (`uses: ./`) are exempt.
+- Action: Warning for un-pinned third-party actions.
+
+3.3 The Timeout Guard
+
+Rule: All CI jobs must have timeout-minutes set.
+
+Enforcement:
+- Sentinel scans for missing `timeout-minutes` in workflow jobs.
+- Default recommendation: 15 minutes (adjust per job).
+- Action: Warning for jobs without timeout.
+
+4. Kubernetes Guardrails
+
+4.1 The Resource Requirements Guard
+
+Rule: All Pods must specify resource requests and limits.
+
+Enforcement:
+- Sentinel scans K8s manifests for missing resources block.
+- Check: Both requests (guaranteed) and limits (maximum) must be set.
+- Action: Warning for deployments without resource specs.
+
+4.2 The Privileged Pod Block
+
+Rule: Never run containers in privileged mode.
+
+Enforcement:
+- Sentinel scans for `privileged: true` in securityContext.
+- Action: CRITICAL BLOCK for privileged containers.
+
+---
+
+## Quick Reference
+
+| Rule | Severity | Pattern | Action |
+|------|----------|---------|--------|
+| Base Image Pin | error | :latest tag | BLOCK |
+| Root User | warning | Missing USER directive | WARN |
+| COPY vs ADD | warning | ADD for simple copy | WARN |
+| Layer Cache | info | Suboptimal layer order | INFO |
+| Health Check | warning | Missing healthcheck | WARN |
+| Resource Limits | warning | No memory/CPU limits | WARN |
+| Docker Socket | critical | /var/run/docker.sock mount | BLOCK |
+| Secret Exposure | critical | Echo secrets in CI | BLOCK |
+| Action SHA Pin | warning | Un-pinned third-party action | WARN |
+| CI Timeout | warning | Missing timeout-minutes | WARN |
+| K8s Resources | warning | Missing resource specs | WARN |
+| Privileged Pods | critical | privileged: true | BLOCK |

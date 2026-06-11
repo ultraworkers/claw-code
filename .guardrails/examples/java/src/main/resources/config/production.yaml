@@ -1,0 +1,16 @@
+# Production Configuration
+# WARNING: This file contains production settings.
+# Do NOT use for testing - use test.yaml instead.
+
+app_name: "config-loader-example"
+environment: "production"
+debug: false
+log_level: "WARN"
+
+database:
+  host: "prod-db.example.com"
+  port: 5432
+  name: "app_production"
+  username: "app_prod_user"
+  pool_size: 50
+  connection_timeout: 5000

@@ -1,0 +1,225 @@
+{
+  "$schema": "../../.guardrails/prevention-rules/semantic-rules.schema.json",
+  "description": "Example semantic/AST-based prevention rules for complex regression detection. These analyze code structure, not just text patterns. All examples are DISABLED.",
+  "version": "1.0.0",
+  "rules": [
+    {
+      "rule_id": "SEMANTIC-EX-001",
+      "failure_id": "FAIL-WEB-001",
+      "name": "Unhandled promise in async function",
+      "description": "Detects async functions that don't await promises or handle rejections. Based on FAIL-WEB-001 where unhandled promise rejection caused crash.",
+      "enabled": false,
+      "language": "javascript",
+      "ast_pattern": {
+        "type": "FunctionDeclaration|FunctionExpression|ArrowFunctionExpression",
+        "async": true,
+        "body": {
+          "contains": {
+            "type": "CallExpression",
+            "callee": {
+              "type": "MemberExpression|Identifier"
+            },
+            "awaited": false,
+            "returnsPromise": true
+          }
+        }
+      },
+      "message": "ASYNC BUG RISK: Promise returned but not awaited in async function. Based on FAIL-WEB-001 where unhandled promise caused unexpected behavior.",
+      "severity": "error",
+      "suggestion": "Add await keyword: const result = await fetchData(); or handle with .catch(): fetchData().catch(handleError);"
+    },
+    {
+      "rule_id": "SEMANTIC-EX-002",
+      "failure_id": "FAIL-UI-001",
+      "name": "File opened without context manager",
+      "description": "Detects file operations that don't use 'with' statement in Python. Based on resource leak patterns.",
+      "enabled": false,
+      "language": "python",
+      "ast_pattern": {
+        "type": "Assign",
+        "targets": [{
+          "type": "Name"
+        }],
+        "value": {
+          "type": "Call",
+          "func": {
+            "type": "Name",
+            "id": "open"
+          }
+        },
+        "not_within": "with"
+      },
+      "message": "RESOURCE LEAK: File opened without context manager. File may not be closed on exception. Based on FAIL-UI-001 resource leak pattern.",
+      "severity": "warning",
+      "suggestion": "Use context manager: with open('file.txt') as f: data = f.read()"
+    },
+    {
+      "rule_id": "SEMANTIC-EX-003",
+      "failure_id": "FAIL-AUTH-001",
+      "name": "Route without authentication decorator",
+      "description": "Detects Flask/FastAPI/Django route handlers that are missing authentication decorators. Based on security vulnerability where endpoint was left unprotected.",
+      "enabled": false,
+      "language": "python",
+      "ast_pattern": {
+        "type": "FunctionDef",
+        "decorators": {
+          "contains_any": ["@app.route", "@router.get", "@router.post", "@api_view"],
+          "missing_all": ["@login_required", "@require_auth", "@jwt_required", "@permission_classes"]
+        },
+        "excluded_decorators": ["@public", "@no_auth", "@allow_anonymous"]
+      },
+      "message": "SECURITY: Route handler missing authentication decorator. Based on FAIL-AUTH-001 where unprotected endpoint exposed sensitive data.",
+      "severity": "error",
+      "suggestion": "Add authentication: @login_required or @require_auth decorator, or explicitly mark as public with @public decorator if intentional"
+    },
+    {
+      "rule_id": "SEMANTIC-EX-004",
+      "failure_id": "FAIL-DB-002",
+      "name": "Database transaction without rollback handler",
+      "description": "Detects database transactions that don't have proper exception handling with rollback. Based on FAIL-DB-002 where failed transaction left database in inconsistent state.",
+      "enabled": false,
+      "language": "python",
+      "ast_pattern": {
+        "type": "With",
+        "items": {
+          "contains": {
+            "type": "Call",
+            "func": {
+              "attr": "begin|transaction|atomic"
+            }
+          }
+        },
+        "missing": "try-except-with-rollback"
+      },
+      "message": "DATA INTEGRITY: Database transaction without proper rollback handling. Based on FAIL-DB-002 where transaction failure corrupted data.",
+      "severity": "error",
+      "suggestion": "Add exception handling: with db.begin() as tx: try: ... except: tx.rollback(); raise"
+    },
+    {
+      "rule_id": "SEMANTIC-EX-005",
+      "failure_id": "FAIL-CONFIG-002",
+      "name": "Mutable default argument in function",
+      "description": "Detects Python functions with mutable default arguments (lists, dicts) which cause unexpected shared state. Common source of bugs.",
+      "enabled": false,
+      "language": "python",
+      "ast_pattern": {
+        "type": "FunctionDef",
+        "args": {
+          "defaults": {
+            "contains": {
+              "type": "List|Dict|Set"
+            }
+          }
+        }
+      },
+      "message": "BUG PATTERN: Mutable default argument detected. This causes shared state between function calls - a classic Python gotcha.",
+      "severity": "warning",
+      "suggestion": "Use None as default and initialize inside: def func(arg=None): if arg is None: arg = []"
+    },
+    {
+      "rule_id": "SEMANTIC-EX-006",
+      "failure_id": "FAIL-API-002",
+      "name": "React useEffect with missing dependency",
+      "description": "Detects useEffect hooks that reference variables not in dependency array. Based on FAIL-API-002 where stale closure caused stale data.",
+      "enabled": false,
+      "language": "javascript",
+      "ast_pattern": {
+        "type": "CallExpression",
+        "callee": {
+          "type": "Identifier",
+          "name": "useEffect"
+        },
+        "arguments": [
+          {
+            "type": "ArrowFunctionExpression|FunctionExpression"
+          },
+          {
+            "type": "ArrayExpression",
+            "references_outside_scope": true
+          }
+        ]
+      },
+      "message": "STALE CLOSURE: useEffect references variable not in dependency array. Based on FAIL-API-002 where this caused stale data bugs.",
+      "severity": "warning",
+      "suggestion": "Add missing dependencies to array or use eslint-plugin-react-hooks to catch automatically"
+    },
+    {
+      "rule_id": "SEMANTIC-EX-007",
+      "failure_id": "FAIL-ERR-001",
+      "name": "Bare except clause catching all exceptions",
+      "description": "Detects bare 'except:' clauses in Python that catch KeyboardInterrupt and SystemExit. Based on FAIL-ERR-001 where this masked critical errors.",
+      "enabled": false,
+      "language": "python",
+      "ast_pattern": {
+        "type": "Try",
+        "handlers": {
+          "contains": {
+            "type": "ExceptHandler",
+            "type": null
+          }
+        }
+      },
+      "message": "ERROR HANDLING: Bare except clause catches KeyboardInterrupt and SystemExit. Based on FAIL-ERR-001 where this prevented proper shutdown.",
+      "severity": "error",
+      "suggestion": "Be specific: except Exception: or except SpecificError:. Never use bare except: unless re-raising."
+    },
+    {
+      "rule_id": "SEMANTIC-EX-008",
+      "failure_id": "FAIL-SEC-001",
+      "name": "Insecure random for security purposes",
+      "description": "Detects use of Math.random() or random.random() for security-sensitive operations like tokens or passwords.",
+      "enabled": false,
+      "language": "any",
+      "ast_pattern": {
+        "type": "CallExpression|Call",
+        "callee": {
+          "name": "Math.random|random.random"
+        },
+        "context": "security|token|password|key|secret|auth|crypto"
+      },
+      "message": "SECURITY: Insecure random number generator used for security purpose. Use crypto-secure random instead.",
+      "severity": "critical",
+      "suggestion": "Use crypto.randomBytes() in Node.js, secrets module in Python, or SecureRandom in Java"
+    },
+    {
+      "rule_id": "SEMANTIC-EX-009",
+      "failure_id": "FAIL-TYPE-001",
+      "name": "Type assertion without validation",
+      "description": "Detects TypeScript type assertions (as Type) that bypass runtime checks. Based on FAIL-TYPE-001 where this caused runtime crashes.",
+      "enabled": false,
+      "language": "typescript",
+      "ast_pattern": {
+        "type": "TSAsExpression|TSTypeAssertion",
+        "target": "external_data|api_response|user_input|request_body",
+        "without": "validation|guard|check|parse"
+      },
+      "message": "TYPE SAFETY: Type assertion on untrusted data without validation. Based on FAIL-TYPE-001 where this caused production crash.",
+      "severity": "error",
+      "suggestion": "Use runtime validation: const data = schema.parse(apiResponse) instead of apiResponse as MyType"
+    },
+    {
+      "rule_id": "SEMANTIC-EX-010",
+      "failure_id": "FAIL-PERF-001",
+      "name": "N+1 database query pattern",
+      "description": "Detects loops that make database queries inside them. Based on FAIL-PERF-001 performance degradation.",
+      "enabled": false,
+      "language": "any",
+      "ast_pattern": {
+        "type": "For|ForIn|ForOf|While",
+        "body": {
+          "contains": {
+            "type": "CallExpression|Call|Await",
+            "callee": {
+              "attr": "get|fetch|find|query|select|filter"
+            },
+            "target": "database|db|model|orm"
+          }
+        }
+      },
+      "message": "PERFORMANCE: Database query inside loop (N+1 problem). Based on FAIL-PERF-001 where this caused severe performance degradation.",
+      "severity": "warning",
+      "suggestion": "Use eager loading: Model.objects.select_related() or fetch all data first, then process in memory"
+    }
+  ],
+  "_comment": "SEMANTIC RULES are more powerful than pattern rules because they analyze AST structure. Use when: 1) Pattern rules produce too many false positives, 2) Need to check code context, 3) Detecting complex patterns. To enable: Copy rule, update IDs, set enabled: true, add to semantic-rules.json"
+}

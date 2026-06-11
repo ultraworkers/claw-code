@@ -1,0 +1,329 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="Guardrail MCP Server - Management Interface">
+  <title>Guardrail</title>
+
+  <!-- Styles with cache-busting: v1.11.11 -->
+  <link rel="stylesheet" href="/web/css/variables.css?v=1.11.11">
+  <link rel="stylesheet" href="/web/css/components.css?v=1.11.11">
+  <link rel="stylesheet" href="/web/css/layout.css?v=1.11.11">
+
+  <!-- Favicon -->
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='15' fill='%233b82f6'/><text x='50' y='70' font-size='50' text-anchor='middle' fill='white' font-family='sans-serif' font-weight='bold'>G</text></svg>">
+
+  <style>
+    /* Critical inline styles for initial load */
+    html, body {
+      margin: 0;
+      padding: 0;
+      min-height: 100vh;
+      background-color: #0f172a;
+    }
+
+    #initial-loader {
+      position: fixed;
+      top: 0;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      background-color: #0f172a;
+      z-index: 9999;
+    }
+
+    #initial-loader.hidden {
+      display: none;
+    }
+
+    .loader-spinner {
+      width: 50px;
+      height: 50px;
+      border: 3px solid #334155;
+      border-top-color: #3b82f6;
+      border-radius: 50%;
+      animation: loader-spin 1s linear infinite;
+    }
+
+    .loader-text {
+      margin-top: 1rem;
+      color: #94a3b8;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      font-size: 0.875rem;
+    }
+
+    @keyframes loader-spin {
+      to { transform: rotate(360deg); }
+    }
+
+    /* Error display styles */
+    #error-display {
+      display: none;
+      position: fixed;
+      top: 0;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      background-color: #0f172a;
+      z-index: 10000;
+      padding: 2rem;
+      overflow: auto;
+    }
+
+    #error-display.visible {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: flex-start;
+    }
+
+    .error-container {
+      max-width: 800px;
+      width: 100%;
+      background-color: #1e293b;
+      border: 1px solid #ef4444;
+      border-radius: 8px;
+      padding: 1.5rem;
+      margin-top: 2rem;
+    }
+
+    .error-header {
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+      margin-bottom: 1rem;
+      color: #ef4444;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      font-size: 1.25rem;
+      font-weight: 600;
+    }
+
+    .error-icon {
+      width: 24px;
+      height: 24px;
+      flex-shrink: 0;
+    }
+
+    .error-message {
+      color: #f1f5f9;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      font-size: 0.9375rem;
+      line-height: 1.5;
+      margin-bottom: 1rem;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+
+    .error-stack {
+      background-color: #0f172a;
+      border: 1px solid #334155;
+      border-radius: 4px;
+      padding: 1rem;
+      color: #94a3b8;
+      font-family: 'SF Mono', Monaco, Inconsolata, 'Fira Code', monospace;
+      font-size: 0.8125rem;
+      line-height: 1.6;
+      overflow-x: auto;
+      white-space: pre-wrap;
+      word-break: break-all;
+      max-height: 400px;
+      overflow-y: auto;
+    }
+
+    .error-stack-label {
+      color: #64748b;
+      font-size: 0.75rem;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      margin-bottom: 0.5rem;
+    }
+
+    .error-reload-btn {
+      margin-top: 1.5rem;
+      padding: 0.75rem 1.5rem;
+      background-color: #3b82f6;
+      color: white;
+      border: none;
+      border-radius: 6px;
+      font-size: 0.9375rem;
+      font-weight: 500;
+      cursor: pointer;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    }
+
+    .error-reload-btn:hover {
+      background-color: #2563eb;
+    }
+
+    .error-api-key-hint {
+      margin-top: 1rem;
+      padding: 1rem;
+      background-color: #fef3c7;
+      border: 1px solid #f59e0b;
+      border-radius: 4px;
+      color: #92400e;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      font-size: 0.875rem;
+    }
+  </style>
+</head>
+<body>
+  <!-- Initial loader shown before JS loads -->
+  <div id="initial-loader">
+    <div class="loader-spinner"></div>
+    <p class="loader-text">Loading Guardrail...</p>
+  </div>
+
+  <!-- Error display area - shown when JavaScript errors occur -->
+  <div id="error-display">
+    <div class="error-container">
+      <div class="error-header">
+        <svg class="error-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <circle cx="12" cy="12" r="10"/>
+          <line x1="12" y1="8" x2="12" y2="12"/>
+          <line x1="12" y1="16" x2="12.01" y2="16"/>
+        </svg>
+        <span>Application Error</span>
+      </div>
+      <div id="error-message" class="error-message">An unexpected error occurred while loading the application.</div>
+      <div id="error-api-key-hint" class="error-api-key-hint" style="display: none;">
+        <strong>API Key Issue Detected:</strong> This error may be related to an invalid or missing API key.
+        Try clearing your browser storage and reloading the page.
+      </div>
+      <div class="error-stack-label">Error Details:</div>
+      <pre id="error-stack" class="error-stack">No error details available.</pre>
+      <button class="error-reload-btn" onclick="location.reload()">Reload Page</button>
+    </div>
+  </div>
+
+  <!-- Application will be mounted here by app.js -->
+
+  <!-- Scripts loaded in order of dependency -->
+  <!-- Cache-busting: v1.11.11 - force browser to load new files -->
+  <script src="/web/js/api.js?v=1.11.11"></script>
+  <script src="/web/js/components/Navigation.js?v=1.11.11"></script>
+  <script src="/web/js/components/Forms.js?v=1.11.11"></script>
+  <script src="/web/js/components/Modal.js?v=1.11.11"></script>
+  <script src="/web/js/components/Toast.js?v=1.11.11"></script>
+  <script src="/web/js/components/DataTable.js?v=1.11.11"></script>
+  <script src="/web/js/components/UpdateNotifier.js?v=1.11.11"></script>
+  <script src="/web/js/pages/Dashboard.js?v=1.11.11"></script>
+  <script src="/web/js/pages/Documents.js?v=1.11.11"></script>
+  <script src="/web/js/pages/Rules.js?v=1.11.11"></script>
+  <script src="/web/js/pages/Projects.js?v=1.11.11"></script>
+  <script src="/web/js/pages/Failures.js?v=1.11.11"></script>
+  <script src="/web/js/pages/IDETools.js?v=1.11.11"></script>
+  <script src="/web/js/router.js?v=1.11.11"></script>
+  <script src="/web/js/app.js?v=1.11.11"></script>
+
+  <script>
+    // Hide initial loader once app signals ready
+    window.hideLoader = function() {
+      const loader = document.getElementById('initial-loader');
+      if (loader) {
+        loader.classList.add('hidden');
+      }
+    };
+
+    // Show error display with error details
+    window.showError = function(message, stack, isApiKeyError) {
+      const loader = document.getElementById('initial-loader');
+      const errorDisplay = document.getElementById('error-display');
+      const errorMessage = document.getElementById('error-message');
+      const errorStack = document.getElementById('error-stack');
+      const apiKeyHint = document.getElementById('error-api-key-hint');
+
+      if (loader) {
+        loader.classList.add('hidden');
+      }
+
+      if (errorDisplay) {
+        errorDisplay.classList.add('visible');
+      }
+
+      if (errorMessage) {
+        errorMessage.textContent = message || 'An unexpected error occurred.';
+      }
+
+      if (errorStack) {
+        errorStack.textContent = stack || 'No stack trace available.';
+      }
+
+      if (apiKeyHint) {
+        apiKeyHint.style.display = isApiKeyError ? 'block' : 'none';
+      }
+    };
+
+    // Global error handler - catches errors before app loads
+    window.onerror = function(message, source, lineno, colno, error) {
+      console.error('Global error caught:', message, 'at', source, lineno, colno, error);
+
+      const isApiKeyError = message.toLowerCase().includes('api') ||
+                           message.toLowerCase().includes('key') ||
+                           message.toLowerCase().includes('unauthorized') ||
+                           message.toLowerCase().includes('401');
+
+      const stack = error && error.stack ? error.stack : 'Error: ' + message + '\n    at ' + source + ':' + lineno + ':' + colno;
+
+      window.showError(message, stack, isApiKeyError);
+      return true; // Prevent default browser error handling
+    };
+
+    // Handle unhandled promise rejections
+    window.onunhandledrejection = function(event) {
+      console.error('Unhandled promise rejection:', event.reason);
+
+      const reason = event.reason;
+      let message = 'Unhandled Promise Rejection';
+      let stack = '';
+      let isApiKeyError = false;
+
+      if (reason) {
+        if (typeof reason === 'string') {
+          message = reason;
+          isApiKeyError = reason.toLowerCase().includes('api') ||
+                          reason.toLowerCase().includes('unauthorized') ||
+                          reason.toLowerCase().includes('401');
+        } else if (reason.message) {
+          message = reason.message;
+          stack = reason.stack || '';
+          isApiKeyError = message.toLowerCase().includes('api') ||
+                          message.toLowerCase().includes('unauthorized') ||
+                          message.toLowerCase().includes('401') ||
+                          (reason.status === 401) ||
+                          (reason.statusCode === 401);
+        } else {
+          message = JSON.stringify(reason, null, 2);
+        }
+      }
+
+      window.showError(message, stack, isApiKeyError);
+    };
+
+    // Catch script loading errors
+    document.addEventListener('error', function(event) {
+      const target = event.target;
+      if (target.tagName === 'SCRIPT') {
+        const message = 'Failed to load script: ' + (target.src || 'unknown');
+        window.showError(message, 'Script loading error - check that all JavaScript files are accessible and not blocked by CSP or network issues.', false);
+      }
+    }, true);
+
+    // Fallback: hide loader after 10 seconds even if app fails (increased from 5s)
+    document.addEventListener('DOMContentLoaded', () => {
+      setTimeout(() => {
+        const errorDisplay = document.getElementById('error-display');
+        // Only hide loader if no error is showing
+        if (!errorDisplay || !errorDisplay.classList.contains('visible')) {
+          window.hideLoader();
+        }
+      }, 10000);
+    });
+  </script>
+</body>
+</html>

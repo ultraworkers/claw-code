@@ -1,0 +1,27 @@
+{
+  "name": "guardrails-logging-example",
+  "version": "1.0.0",
+  "description": "TypeScript sample demonstrating guardrails-compliant testing patterns with logging hooks",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "test": "jest",
+    "test:watch": "jest --watch",
+    "test:coverage": "jest --coverage"
+  },
+  "devDependencies": {
+    "@types/jest": "^29.5.12",
+    "@types/node": "^20.11.0",
+    "jest": "^29.7.0",
+    "ts-jest": "^29.1.2",
+    "typescript": "^5.3.3"
+  },
+  "keywords": [
+    "guardrails",
+    "logging",
+    "typescript",
+    "testing"
+  ],
+  "license": "MIT"
+}

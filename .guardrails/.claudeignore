@@ -1,0 +1,13 @@
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+poetry.lock
+Cargo.lock
+node_modules/
+dist/
+build/
+.git/
+.vscode/
+*.log
+*.csv
+*.svg

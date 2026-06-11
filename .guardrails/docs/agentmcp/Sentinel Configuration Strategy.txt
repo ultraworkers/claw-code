@@ -1,0 +1,77 @@
+Project Sentinel: Configuration & Policy EngineVersion: 3.0.0-EnterpriseModule: 20-Setup-ConfigMaps to: sentinel.toml (New File)Scope: Policy definition, override rules, tool customization, and profile management.1. The Configuration PhilosophySentinel follows a "Config-as-Code" philosophy. The rules of the guardrail system are defined in sentinel.toml, which is committed to the repository. This allows the security policy to evolve alongside the codebase and undergo code review.1.1 Hierarchy of ConfigInternal Defaults: Hardcoded strict values (Safe by default).sentinel.toml: Repository-specific overrides.Environment Variables: Runtime overrides (e.g., SENTINEL_DEBUG=true).CLI Flags: Immediate overrides (--force).2. The sentinel.toml SchemaA complete reference of the configuration surface area.2.1 Global Settings[global]
+  # Identification
+  project_name = "AgentGuardrails"
+  environment = "production" 
+
+  # Strictness Level (low, medium, strict, paranoid)
+  # paranoid: Requires HITL for all writes.
+  # strict: Requires tests for all commits.
+  security_level = "strict"
+
+  # Path to docs
+  docs_path = "./docs"
+2.2 Guardrail PoliciesControl what the "VFS Jail" allows.[guardrails]
+  # Files the agent can NEVER see (Regex)
+  denylist_patterns = [
+    "\\.env.*",
+    "id_rsa",
+    "\\.aws/",
+    "kubeconfig"
+  ]
+
+  # Files the agent can READ but NOT EDIT
+  readonly_patterns = [
+    "go.mod",
+    "package.json",
+    "sentinel.toml",  # Agent cannot weaken its own chains
+    ".github/workflows/"
+  ]
+
+  # Maximum file size to read (prevent context flooding)
+  max_read_size_kb = 50
+2.3 Workflow EnforcementControl the logic of the State Machine.[workflows]
+  # Sprint Management
+  require_sprint_goals = true
+  allow_concurrent_tasks = false
+
+  # Testing
+  # Require 80% coverage on new code
+  min_test_coverage = 80.0
+  # Block commit if tests take > 5 minutes
+  max_test_duration_sec = 300
+
+  # Reviews
+  require_human_approval = true
+  require_linear_history = true
+2.4 Toolchain Mapping(See Module 21 for details on Polyglot config).[toolchain]
+  language = "go"
+  test_cmd = "go test ./..."
+  lint_cmd = "golangci-lint run"
+  build_cmd = "go build ./..."
+3. Dynamic ProfilesSentinel allows defining different "Modes" of operation. The Agent can request a profile switch via switch_context().3.1 Profile DefinitionsIn sentinel.toml:[profiles.backend]
+  description = "Backend Development (Go/SQL)"
+  mount_docs = ["docs/standards/API.md", "docs/examples/go"]
+  hidden_paths = ["frontend/", "ui/"]
+
+[profiles.frontend]
+  description = "Frontend Development (React/TS)"
+  mount_docs = ["docs/standards/UI.md", "docs/examples/ts"]
+  hidden_paths = ["services/", "db/"]
+
+[profiles.hotfix]
+  description = "Emergency Production Fix"
+  security_level = "medium"  # Lower barrier for speed
+  audit_severity = "critical" # But log everything loudly
+  allow_main_push = false     # Still no pushing to main!
+4. Policy Overrides (The Escape Hatch)Sometimes, the guardrails are too strict. Sentinel provides a mechanism for Audit-Logged Overrides.4.1 The .sentinelignoreSimilar to .gitignore, but for the Guardrail engine.Format:# Allow agent to edit the legacy perl script
+!legacy/script.pl
+Risk: This file is closely monitored. Any change to .sentinelignore triggers a specific "Security Alert" in the PR comment.4.2 Admin Override KeysFor automated pipelines, you can bypass HITL prompts using a signed JWT.Env: SENTINEL_ADMIN_TOKENUsage: If present, Sentinel skips request_approval steps and auto-logs "Authorized by Admin Token".5. Secret Detection ConfigurationCustomize the entropy and regex engines.[secrets]
+  # Enable Shannon Entropy check
+  enable_entropy = true
+  entropy_threshold = 4.5
+
+  # Custom Regex for internal tokens
+  [[secrets.patterns]]
+  name = "Internal Auth Token"
+  regex = "INT-[A-Z0-9]{16}"
+6. Validation & LintingHow do we ensure the config itself is valid?Command: sentinel config checkLogic:Parses TOML.Verifies all paths in readonly_patterns actually exist.Validates regex syntax.Checks for logical contradictions (e.g., security_level="paranoid" but require_human_approval=false).

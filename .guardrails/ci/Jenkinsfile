@@ -1,0 +1,98 @@
+// Jenkins Pipeline for Team Tools
+// Place this file in your repository as Jenkinsfile
+
+pipeline {
+    agent any
+
+    environment {
+        PYTHON_VERSION = '3.11'
+        GO_VERSION = '1.21'
+        PROJECT_NAME = 'team-tools'
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+            }
+        }
+
+        stage('Validate Teams') {
+            steps {
+                script {
+                    // Validate team sizes
+                    sh """
+                        python3 scripts/team_manager.py \\
+                            --project ${env.PROJECT_NAME} \\
+                            validate-size
+                    """
+
+                    // Check team status
+                    sh """
+                        python3 scripts/team_manager.py \\
+                            --project ${env.PROJECT_NAME} \\
+                            status
+                    """
+                }
+            }
+        }
+
+        stage('Test Python') {
+            steps {
+                script {
+                    sh """
+                        pip install -r requirements.txt
+                        pip install pytest pytest-cov
+                        pytest scripts/ -v --cov=scripts --cov-report=xml
+                    """
+                }
+            }
+            post {
+                always {
+                    publishTestResults testResultsPattern: '**/test-*.xml'
+                    publishCoverage adapters: [coberturaAdapter('coverage.xml')]
+                }
+            }
+        }
+
+        stage('Test Go') {
+            steps {
+                script {
+                    sh """
+                        cd mcp-server
+                        go test ./... -v -race
+                    """
+                }
+            }
+        }
+
+        stage('Build CLI') {
+            steps {
+                script {
+                    sh """
+                        cd cmd/team-cli
+                        make build
+                    """
+                }
+            }
+        }
+
+        stage('Archive') {
+            steps {
+                archiveArtifacts artifacts: 'cmd/team-cli/team', fingerprint: true
+            }
+        }
+    }
+
+    post {
+        always {
+            cleanWs()
+        }
+        success {
+            echo 'Team validation successful!'
+        }
+        failure {
+            echo 'Team validation failed!'
+        }
+    }
+}

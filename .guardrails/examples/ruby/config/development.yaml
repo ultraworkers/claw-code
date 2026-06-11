@@ -1,0 +1,28 @@
+# Development Configuration
+# This file contains development environment settings.
+# Default environment when APP_ENV is not set.
+
+app_name: "ConfigLoader Example"
+version: "1.0.0-dev"
+
+database:
+  host: "localhost"
+  port: 5432
+  name: "app_development"
+  pool_size: 10
+  ssl: false
+
+cache:
+  enabled: true
+  host: "localhost"
+  port: 6379
+  ttl: 300
+
+logging:
+  level: "debug"
+  format: "text"
+
+features:
+  rate_limiting: false
+  analytics: false
+  debug_mode: true

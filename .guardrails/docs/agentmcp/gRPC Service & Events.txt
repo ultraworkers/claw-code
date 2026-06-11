@@ -1,0 +1,232 @@
+/*
+PACKAGE: sentinel/api
+MODULE 3: GRPC SERVICE & EVENT BUS
+VERSION: 3.0.0-Enterprise
+
+OVERVIEW:
+This module provides the high-performance, strongly-typed interface for Sentinel.
+While the REST API is good for CRUD, gRPC is required for:
+1. Log Streaming: Real-time feedback to the IDE.
+2. Remote Execution: Controlling cloud agents with mTLS security.
+3. Binary Data Transfer: Efficient file syncing.
+
+COMPONENTS:
+- EventBus: A pub/sub system for internal Sentinel events.
+- GRPCServer: The gRPC listener implementation.
+- Proto Definitions: (Embedded as comments for reference).
+
+PROTOBUF DEFINITION (Reference):
+    service SentinelRPC {
+        rpc SubscribeLogs (LogFilter) returns (stream LogEntry);
+        rpc ExecuteTool (ToolRequest) returns (ToolResponse);
+        rpc SyncFile (FileChunk) returns (SyncStatus);
+    }
+*/
+
+package api
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"net"
+	"sync"
+	"time"
+
+	"github.com/TheArchitectit/agent-guardrails-template/services/sentinel/internal/kernel"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
+)
+
+// =============================================================================
+// EVENT BUS (Internal Pub/Sub)
+// =============================================================================
+
+// EventType defines system lifecycle events.
+type EventType string
+
+const (
+	EventSecurityViolation EventType = "SECURITY_VIOLATION"
+	EventTaskUpdate        EventType = "TASK_UPDATE"
+	EventFileChange        EventType = "FILE_CHANGE"
+)
+
+// EventPayload carries data across the bus.
+type EventPayload struct {
+	Type      EventType
+	Timestamp time.Time
+	Data      map[string]interface{}
+}
+
+// EventBus manages subscriptions.
+type EventBus struct {
+	mu          sync.RWMutex
+	subscribers map[EventType][]chan EventPayload
+}
+
+var Bus = &EventBus{
+	subscribers: make(map[EventType][]chan EventPayload),
+}
+
+// Subscribe returns a channel that receives specific events.
+func (b *EventBus) Subscribe(topic EventType) <-chan EventPayload {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	ch := make(chan EventPayload, 100) // Buffered
+	b.subscribers[topic] = append(b.subscribers[topic], ch)
+	return ch
+}
+
+// Publish broadcasts an event to all listeners.
+func (b *EventBus) Publish(event EventPayload) {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	for _, ch := range b.subscribers[event.Type] {
+		select {
+		case ch <- event:
+		default:
+			// Drop if buffer full to prevent blocking kernel
+		}
+	}
+}
+
+// =============================================================================
+// GRPC SERVER IMPLEMENTATION
+// =============================================================================
+
+// SentinelGRPC implements the generated protobuf interface.
+// Note: In a real repo, this would import the generated `.pb.go` package.
+// Here we define the structs to simulate the contract.
+type SentinelGRPC struct {
+	Kernel *kernel.Kernel
+	// UnimplementedSentinelRPCServer
+}
+
+func NewGRPCServer(k *kernel.Kernel) *SentinelGRPC {
+	return &SentinelGRPC{Kernel: k}
+}
+
+func (s *SentinelGRPC) Serve(port int) error {
+	lis, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
+	if err != nil {
+		return err
+	}
+	
+	opts := []grpc.ServerOption{
+		grpc.UnaryInterceptor(s.UnaryAuthInterceptor),
+		grpc.StreamInterceptor(s.StreamAuthInterceptor),
+	}
+	
+	grpcServer := grpc.NewServer(opts...)
+	// RegisterSentinelRPCServer(grpcServer, s) // Generated code hook
+	
+	fmt.Printf("[GRPC] Listening on :%d\n", port)
+	return grpcServer.Serve(lis)
+}
+
+// =============================================================================
+// RPC METHODS
+// =============================================================================
+
+// SubscribeLogs streams audit events to the IDE in real-time.
+// This allows the IDE to show a red "Security Alert" toast instantly.
+func (s *SentinelGRPC) SubscribeLogs(req *LogFilter, stream grpc.ServerStream) error {
+	// Create a subscription to the Event Bus
+	events := Bus.Subscribe(EventSecurityViolation)
+	
+	for {
+		select {
+		case <-stream.Context().Done():
+			return nil
+		case evt := <-events:
+			// Convert internal Event to Proto LogEntry
+			// Send to stream
+			entry := &LogEntry{
+				Timestamp: evt.Timestamp.Unix(),
+				Severity:  "CRITICAL",
+				Message:   fmt.Sprintf("%v", evt.Data),
+			}
+			if err := stream.SendMsg(entry); err != nil {
+				return err
+			}
+		}
+	}
+}
+
+// ExecuteTool allows a Remote Orchestrator to run tools via mTLS.
+func (s *SentinelGRPC) ExecuteTool(ctx context.Context, req *ToolRequest) (*ToolResponse, error) {
+	// 1. Validation
+	if req.ToolName == "destroy_system" {
+		return nil, status.Errorf(codes.PermissionDenied, "Tool forbidden via RPC")
+	}
+
+	// 2. Authentication Check (Context)
+	// Extracted from mTLS certificate subjects via Interceptor.
+	// if !isAuthorized(ctx) { return PermissionDenied }
+
+	// 3. Execution
+	// Map to Kernel MCP logic...
+	// For brevity, we mock the result.
+	
+	return &ToolResponse{
+		Success: true,
+		Output:  "Tool executed successfully on remote node.",
+	}, nil
+}
+
+// =============================================================================
+// INTERCEPTORS (MIDDLEWARE)
+// =============================================================================
+
+// UnaryAuthInterceptor validates mTLS or Token metadata.
+func (s *SentinelGRPC) UnaryAuthInterceptor(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
+	md, ok := metadata.FromIncomingContext(ctx)
+	if !ok {
+		return nil, status.Errorf(codes.Unauthenticated, "metadata missing")
+	}
+
+	// Check for "authorization" header
+	if tokens := md["authorization"]; len(tokens) > 0 {
+		token := tokens[0]
+		// Validate Token...
+		_ = token
+	} else {
+		// Fallback: Check mTLS peer info
+		// p, ok := peer.FromContext(ctx)
+	}
+
+	return handler(ctx, req)
+}
+
+// StreamAuthInterceptor handles auth for streaming endpoints.
+func (s *SentinelGRPC) StreamAuthInterceptor(srv interface{}, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+	// Similar logic to Unary
+	return handler(srv, ss)
+}
+
+// =============================================================================
+// DATA STRUCTURES (Simulating Protobufs)
+// =============================================================================
+
+type LogFilter struct {
+	MinSeverity string
+}
+
+type LogEntry struct {
+	Timestamp int64
+	Severity  string
+	Message   string
+}
+
+type ToolRequest struct {
+	ToolName  string
+	Arguments map[string]string
+}
+
+type ToolResponse struct {
+	Success bool
+	Output  string
+	Error   string
+}
