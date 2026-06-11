@@ -19,6 +19,7 @@ mod input;
 mod render;
 mod setup_wizard;
 mod tui;
+mod tui_update;
 
 use std::collections::BTreeSet;
 use std::env;
@@ -7189,7 +7190,7 @@ fn run_tui_repl(mut cli: LiveCli) -> Result<(), Box<dyn std::error::Error>> {
                 // The buffer may contain ANSI codes from TerminalRenderer —
                 // strip them before pushing.
                 let captured = String::from_utf8_lossy(&buf);
-                let plain = strip_ansi(&captured);
+                let plain = tui_update::strip_ansi(&captured);
                 if !plain.is_empty() {
                     app.push_output(&plain, false);
                 }
@@ -7264,59 +7265,38 @@ fn run_tui_repl(mut cli: LiveCli) -> Result<(), Box<dyn std::error::Error>> {
 
 /// Push current CLI/runtime stats into the shared dashboard state.
 fn update_dashboard(state: &tui::SharedDashboardState, cli: &LiveCli) {
-    if let Ok(mut ds) = state.write() {
-        ds.model = cli.model.clone();
-        ds.permission_mode = format!("{:?}", cli.permission_mode);
-        if let Some(rt) = cli.runtime.runtime.as_ref() {
-            let session = rt.session();
-            ds.session_id = Some(session.session_id.clone());
-            ds.turn_count = session.messages.len() as u32;
-            // Estimate token count from message text lengths (rough: ~4 chars per token)
-            let total_chars: usize = session.messages.iter().map(|m| {
-                m.blocks.iter().map(|b| match b {
-                    runtime::ContentBlock::Text { text } => text.len(),
-                    runtime::ContentBlock::ToolUse { input, .. } => input.to_string().len(),
-                    runtime::ContentBlock::ToolResult { output, .. } => output.len(),
-                    _ => 0,
-                }).sum::<usize>()
-            }).sum();
-            ds.input_tokens = (total_chars / 4) as u32;
-        }
-        ds.provider = std::env::var("CLAWD_PROVIDER").unwrap_or_else(|_| "anthropic".to_string());
-        ds.provider_url = std::env::var("ANTHROPIC_BASE_URL")
-            .or_else(|_| std::env::var("OPENAI_BASE_URL"))
-            .unwrap_or_default();
+    let mut session_id = None;
+    let mut turn_count = 0u32;
+    let mut total_chars = 0usize;
+
+    if let Some(rt) = cli.runtime.runtime.as_ref() {
+        let session = rt.session();
+        session_id = Some(session.session_id.clone());
+        turn_count = session.messages.len() as u32;
+        total_chars = session.messages.iter().map(|m| {
+            m.blocks.iter().map(|b| match b {
+                runtime::ContentBlock::Text { text } => text.len(),
+                runtime::ContentBlock::ToolUse { input, .. } => input.to_string().len(),
+                runtime::ContentBlock::ToolResult { output, .. } => output.len(),
+                _ => 0,
+            }).sum::<usize>()
+        }).sum();
     }
+
+    let update = tui_update::DashboardUpdate {
+        model: &cli.model,
+        permission_mode: &format!("{:?}", cli.permission_mode),
+        session_id: session_id.as_deref(),
+        turn_count,
+        total_chars,
+        provider: std::env::var("CLAWD_PROVIDER").unwrap_or_else(|_| "anthropic".to_string()),
+        provider_url: std::env::var("ANTHROPIC_BASE_URL")
+            .or_else(|_| std::env::var("OPENAI_BASE_URL"))
+            .unwrap_or_default(),
+    };
+    tui_update::update_dashboard_from(state, &update);
 }
 
-/// Strip ANSI escape sequences from a string.  Used by the TUI path to
-/// clean captured output before pushing it into the conversation pane.
-fn strip_ansi(s: &str) -> String {
-    let mut result = String::with_capacity(s.len());
-    let mut chars = s.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch == '\x1b' && chars.peek() == Some(&'[') {
-            chars.next(); // consume '['
-            // Consume the sequence: parameter bytes (0x30-0x3f),
-            // intermediate bytes (0x20-0x2f), final byte (0x40-0x7e)
-            while let Some(&b) = chars.peek() {
-                match b {
-                    '\x20'..='\x2f' | '\x30'..='\x3f' => {
-                        chars.next();
-                    }
-                    '\x40'..='\x7e' => {
-                        chars.next();
-                        break;
-                    }
-                    _ => break,
-                }
-            }
-        } else {
-            result.push(ch);
-        }
-    }
-    result
-}
 
 #[derive(Debug, Clone)]
 struct SessionHandle {
