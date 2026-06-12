@@ -266,18 +266,13 @@ impl TuiApp {
 
     fn draw_screen(&mut self) -> io::Result<()> {
         // Pre-borrow component references before the draw closure.
-        // This avoids the clone-everything problem of the legacy TuiApp.
+        // Each component.render(&self) reads its own state — no cloning needed.
         let conversation = &self.conversation;
         let input_bar = &self.input_bar;
         let dashboard = &self.dashboard;
         let command_palette = &self.command_palette;
         let agent_view = &self.agent_view;
         let theme = &self.theme;
-
-        // Rebuild the conversation cache if needed
-        // (In the real implementation, this should happen outside the draw closure.
-        //  For now, we rely on the cache being built during handle_key calls.)
-        let _ = conversation; // used in closure below
 
         self.terminal.draw(|f| {
             let area = f.area();
@@ -306,6 +301,10 @@ impl TuiApp {
                 agent_view.render_overlay(area, f, theme);
             }
         })?;
+
+        // Clear dirty flags after successful render
+        self.conversation.mark_clean();
+        self.dashboard.clear_dirty();
 
         self.terminal.backend_mut().flush()?;
         Ok(())

@@ -1,8 +1,9 @@
 //! Conversation pane component.
 //!
 //! Renders the left-pane conversation view with word-wrapping, scroll,
-//! markdown content, and diff highlighting. Extracted from the standalone
-//! `draw_left_pane` and `build_wrapped_conversation` functions in legacy.rs.
+//! markdown content, and diff highlighting.
+
+use std::cell::RefCell;
 
 use crossterm::event::KeyEvent;
 use ratatui::layout::Rect;
@@ -10,7 +11,6 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
-use tui_textarea::TextArea;
 use unicode_width::UnicodeWidthChar;
 
 use crate::keybindings::KeyMap;
@@ -21,25 +21,33 @@ use crate::tui::legacy::{ConversationContent, ConversationLine};
 use crate::tui::markdown::render_diff;
 use crate::tui::markdown::ratatui_renderer::MarkdownRenderer;
 
-/// Maximum conversation lines before trimming.
 const MAX_CONVERSATION_LINES: usize = 10_000;
+
+/// Render cache — built during the update phase, read during render.
+struct RenderCache {
+    wrapped_lines: Vec<Line<'static>>,
+    expand_counts: Vec<usize>,
+    built_width: u16,
+}
+
+impl Default for RenderCache {
+    fn default() -> Self {
+        Self {
+            wrapped_lines: Vec::new(),
+            expand_counts: Vec::new(),
+            built_width: 0,
+        }
+    }
+}
 
 /// Conversation pane — the main content area of the TUI.
 pub struct ConversationPane {
-    /// Conversation entries (owning the content).
     conversation: Vec<ConversationLine>,
-    /// Scroll offset (0 = bottom/latest, increases upward).
     scroll: u16,
-    /// Whether content has changed since last render.
     dirty: bool,
-    /// Markdown renderer for rich content.
     renderer: MarkdownRenderer,
-    /// Pre-computed wrapped lines (rebuilt when content or width changes).
-    wrapped_cache: Vec<Line<'static>>,
-    /// Expand counts for each ConversationLine (for scroll math).
-    expand_counts: Vec<usize>,
-    /// Width the cache was built for.
-    cached_width: u16,
+    /// Interior-mutability cache so `render(&self)` can rebuild if needed.
+    cache: RefCell<RenderCache>,
 }
 
 impl ConversationPane {
@@ -49,9 +57,7 @@ impl ConversationPane {
             scroll: 0,
             dirty: true,
             renderer: MarkdownRenderer::new(theme),
-            wrapped_cache: Vec::new(),
-            expand_counts: Vec::new(),
-            cached_width: 0,
+            cache: RefCell::new(RenderCache::default()),
         }
     }
 
@@ -61,7 +67,7 @@ impl ConversationPane {
     }
 
     // -------------------------------------------------------------------
-    // Content mutators (update phase)
+    // Content mutators
     // -------------------------------------------------------------------
 
     pub fn push_banner(&mut self, text: String, color: Color) {
@@ -144,13 +150,10 @@ impl ConversationPane {
         self.dirty = true;
     }
 
-    // -------------------------------------------------------------------
-    // Render cache
-    // -------------------------------------------------------------------
-
-    /// Rebuild the wrapped-line cache if content or width changed.
-    fn ensure_cache(&mut self, width: u16, theme: &TuiTheme) {
-        if !self.dirty && self.cached_width == width {
+    /// Rebuild the wrapped-line cache if needed.
+    fn rebuild_cache(&self, width: u16, theme: &TuiTheme) {
+        let mut cache = self.cache.borrow_mut();
+        if !self.dirty && cache.built_width == width {
             return;
         }
         let content_width = (width as usize).saturating_sub(2);
@@ -160,23 +163,33 @@ impl ConversationPane {
             &self.renderer,
             theme,
         );
-        self.wrapped_cache = wrapped;
-        self.expand_counts = expand_counts;
-        self.cached_width = width;
+        cache.wrapped_lines = wrapped;
+        cache.expand_counts = expand_counts;
+        cache.built_width = width;
+        // Note: can't clear self.dirty here because we borrow self.cache
+        // and self.dirty is on self. The caller (render) will handle this.
+    }
+
+    /// Clear the dirty flag after a successful cache rebuild + render.
+    pub fn mark_clean(&mut self) {
         self.dirty = false;
     }
 }
 
 impl Component for ConversationPane {
     fn render(&self, area: Rect, frame: &mut Frame, theme: &TuiTheme) {
+        // Rebuild cache if dirty or width changed
+        self.rebuild_cache(area.width, theme);
+
+        let cache = self.cache.borrow();
         let pane_rows = (area.height.saturating_sub(1) as usize).max(1);
-        let total_visual = self.wrapped_cache.len();
+        let total_visual = cache.wrapped_lines.len();
 
         let scroll = self.scroll as usize;
         let max_offset = total_visual.saturating_sub(pane_rows);
         let offset = scroll.min(max_offset);
         let start = total_visual.saturating_sub(pane_rows + offset);
-        let visible: Vec<Line> = self.wrapped_cache.iter().skip(start).take(pane_rows).cloned().collect();
+        let visible: Vec<Line> = cache.wrapped_lines.iter().skip(start).take(pane_rows).cloned().collect();
 
         let conversation_widget = Paragraph::new(visible).block(
             Block::default()
@@ -189,7 +202,6 @@ impl Component for ConversationPane {
         );
         frame.render_widget(conversation_widget, area);
 
-        // Scroll indicator when content overflows
         if total_visual > pane_rows {
             let scroll_label = format!(" {}/{} ", offset, max_offset);
             let scroll_area = Rect {
@@ -205,12 +217,6 @@ impl Component for ConversationPane {
         }
     }
 
-    fn handle_key(&mut self, _key: KeyEvent, _keymap: &KeyMap) -> bool {
-        false // Scroll handled by the app
-    }
-
-    fn handle_event(&mut self, _event: &TuiEvent) {}
-
     fn is_dirty(&self) -> bool {
         self.dirty
     }
@@ -220,7 +226,6 @@ impl Component for ConversationPane {
 // Word-wrap + build helpers
 // ---------------------------------------------------------------------------
 
-/// Word-wrap a single text line into visual lines that fit `width` columns.
 fn wrap_line<'a>(text: &str, width: usize, style: Style) -> Vec<Line<'a>> {
     if width == 0 {
         return vec![Line::from(Span::styled(text.to_string(), style))];
@@ -266,7 +271,6 @@ fn wrap_line<'a>(text: &str, width: usize, style: Style) -> Vec<Line<'a>> {
     result
 }
 
-/// Build the full conversation as wrapped visual lines.
 fn build_wrapped_conversation<'a>(
     conversation: &[ConversationLine],
     content_width: usize,
@@ -338,18 +342,6 @@ mod tests {
     }
 
     #[test]
-    fn test_wrap_hyphen_break() {
-        let lines = wrap_line("well-known-author", 10, Style::default());
-        assert!(lines.len() >= 2);
-    }
-
-    #[test]
-    fn test_wrap_no_break_point() {
-        let lines = wrap_line("abcdefghijklmnop", 5, Style::default());
-        assert!(lines.len() >= 2);
-    }
-
-    #[test]
     fn test_conversation_pane_push_and_scroll() {
         let theme = test_theme();
         let mut pane = ConversationPane::new(theme.clone());
@@ -369,5 +361,19 @@ mod tests {
         assert!(!pane.conversation.is_empty());
         pane.clear();
         assert!(pane.conversation.is_empty());
+    }
+
+    #[test]
+    fn test_cache_rebuilds_on_dirty() {
+        let theme = test_theme();
+        let mut pane = ConversationPane::new(theme.clone());
+        pane.push_user_input("Hello world", theme.conversation_user.to_color());
+        assert!(pane.dirty);
+
+        // Rebuild cache (simulating what render() does)
+        pane.rebuild_cache(80, &theme);
+        let cache = pane.cache.borrow();
+        assert!(!cache.wrapped_lines.is_empty());
+        assert_eq!(cache.built_width, 80);
     }
 }

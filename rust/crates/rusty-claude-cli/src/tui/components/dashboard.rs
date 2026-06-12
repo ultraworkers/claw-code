@@ -40,6 +40,10 @@ impl Dashboard {
         }
         self.dirty = true;
     }
+
+    pub fn clear_dirty(&mut self) {
+        self.dirty = false;
+    }
 }
 
 impl Component for Dashboard {
