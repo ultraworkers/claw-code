@@ -183,6 +183,7 @@ pub struct TuiApp {
     pub keymap: crate::keybindings::KeyMap,
     pub command_palette: crate::command_palette::CommandPalette,
     pub chat_mode: crate::chat_mode::ChatMode,
+    pub agent_view: crate::agent_view::AgentView,
 }
 
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -240,6 +241,7 @@ impl TuiApp {
             keymap: crate::keybindings::KeyMap::new(crate::keybindings::KeyPreset::Emacs),
             command_palette: crate::command_palette::CommandPalette::new(),
             chat_mode: crate::chat_mode::ChatMode::Code,
+            agent_view: crate::agent_view::AgentView::new(),
             needs_redraw: true,
         };
         me.draw_screen()?;
@@ -447,8 +449,20 @@ impl TuiApp {
         let input_lines: Vec<String> = self.input.lines().iter().cloned().collect();
         let renderer = self.markdown_renderer.clone();
         let theme = self.theme.clone();
+        let agent_view_active = self.agent_view.active;
+        let agent_sessions: Vec<_> = self.agent_view.filtered_sessions().into_iter().cloned().collect();
+        let agent_selected = self.agent_view.selected;
+        let agent_filter = self.agent_view.filter;
+        let agent_sort = self.agent_view.sort_by;
+        let palette_active = self.command_palette.active;
+        let palette_query = self.command_palette.query.clone();
+        let palette_entries = self.command_palette.entries.clone();
+        let palette_filtered = self.command_palette.filtered.clone();
+        let palette_selected = self.command_palette.selected;
+        let chat_mode = self.chat_mode;
 
         self.terminal.draw(|f| {
+            let area = f.area();
             draw_frame(
                 f,
                 &dashboard,
@@ -462,7 +476,18 @@ impl TuiApp {
                 spinner_frame,
                 &renderer,
                 &theme,
+                chat_mode,
             );
+
+            // Command palette overlay
+            if palette_active {
+                draw_command_palette(f, area, &palette_query, &palette_entries, &palette_filtered, palette_selected, &theme);
+            }
+
+            // Agent View overlay
+            if agent_view_active {
+                draw_agent_view(f, area, &agent_sessions, agent_selected, agent_filter, agent_sort, &theme);
+            }
         })?;
         self.terminal.backend_mut().flush()?;
         Ok(())
@@ -486,6 +511,20 @@ impl TuiApp {
                 KeyCode::Down => self.command_palette.select_next(),
                 KeyCode::Backspace => self.command_palette.backspace(),
                 KeyCode::Char(c) => self.command_palette.input(c),
+                _ => {}
+            }
+            self.needs_redraw = true;
+            return Ok(TuiReadOutcome::Pending);
+        }
+
+        // Agent View intercepts keys when active
+        if self.agent_view.active {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => self.agent_view.close(),
+                KeyCode::Tab => self.agent_view.cycle_filter(),
+                KeyCode::Char('s') => self.agent_view.cycle_sort(),
+                KeyCode::Down | KeyCode::Char('j') => self.agent_view.select_next(),
+                KeyCode::Up | KeyCode::Char('k') => self.agent_view.select_prev(),
                 _ => {}
             }
             self.needs_redraw = true;
@@ -738,6 +777,7 @@ fn draw_frame(
     spinner_frame: usize,
     markdown_renderer: &crate::markdown::MarkdownRenderer,
     theme: &crate::theme::TuiTheme,
+    chat_mode: crate::chat_mode::ChatMode,
 ) {
     let size = f.area();
     let main = Layout::default()
@@ -1171,6 +1211,176 @@ fn kv<'a>(key: &str, val: &str, val_color: Color) -> Line<'a> {
         ),
         Span::styled(val.to_string(), Style::default().fg(val_color)),
     ])
+}
+
+// ---------------------------------------------------------------------------
+// Command Palette overlay
+// ---------------------------------------------------------------------------
+
+fn draw_command_palette(
+    f: &mut Frame,
+    area: Rect,
+    query: &str,
+    entries: &[crate::command_palette::PaletteEntry],
+    filtered: &[usize],
+    selected: usize,
+    theme: &crate::theme::TuiTheme,
+) {
+    let popup_w = (area.width * 60 / 100).min(60);
+    let popup_h = (area.height * 50 / 100).min(20);
+    let popup = Rect::new(
+        (area.width.saturating_sub(popup_w)) / 2,
+        (area.height.saturating_sub(popup_h)) / 2,
+        popup_w,
+        popup_h,
+    );
+
+    f.render_widget(ratatui::widgets::Clear, popup);
+
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(vec![
+        Span::styled("🔍 ", Style::default().fg(theme.key_hint.to_color())),
+        Span::styled(query.to_string(), Style::default().fg(theme.input_fg.to_color())),
+        Span::styled("█", Style::default().fg(theme.input_cursor_bg.to_color())),
+    ]));
+    lines.push(Line::from(""));
+
+    for (i, &idx) in filtered.iter().enumerate() {
+        let entry = &entries[idx];
+        let is_sel = i == selected;
+        let (fg, bg) = if is_sel {
+            (theme.completion_selected_fg.to_color(), theme.completion_selected_bg.to_color())
+        } else {
+            (theme.completion_fg.to_color(), Color::Reset)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!(" {} ", entry.label), Style::default().fg(fg).bg(bg)),
+            Span::styled(format!("  {}  ", entry.description), Style::default().fg(theme.key_hint.to_color())),
+            Span::styled(&entry.key_hint, Style::default().fg(theme.key_hint.to_color())),
+        ]));
+    }
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.border_active.to_color()))
+        .title(" Command Palette ");
+
+    f.render_widget(Paragraph::new(lines).block(block), popup);
+}
+
+// ---------------------------------------------------------------------------
+// Agent View overlay
+// ---------------------------------------------------------------------------
+
+fn draw_agent_view(
+    f: &mut Frame,
+    area: Rect,
+    sessions: &[crate::agent_view::AgentSession],
+    selected: usize,
+    filter: crate::agent_view::FilterState,
+    sort: crate::agent_view::SortField,
+    theme: &crate::theme::TuiTheme,
+) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),  // Header
+            Constraint::Min(10),   // Session list
+            Constraint::Length(6), // Detail
+        ])
+        .split(area);
+
+    // Header
+    let filter_label = format!("Filter: {filter:?}");
+    let sort_label = format!("Sort: {sort:?}");
+    let header = Paragraph::new(Line::from(vec![
+        Span::styled(
+            "  Agent View  ",
+            Style::default().fg(theme.dashboard_header.to_color()).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("  [{filter_label}]  [{sort_label}]  Tab:filter  S:sort  Esc:close"),
+            Style::default().fg(theme.key_hint.to_color()),
+        ),
+    ]))
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(theme.border_active.to_color())),
+    );
+    f.render_widget(header, chunks[0]);
+
+    // Session list
+    let items: Vec<ListItem> = sessions
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            let is_sel = i == selected;
+            let status_color = match s.status {
+                crate::agent_view::AgentStatus::Running => theme.agent_running.to_color(),
+                crate::agent_view::AgentStatus::WaitingForInput => theme.agent_waiting.to_color(),
+                crate::agent_view::AgentStatus::Done => theme.agent_done.to_color(),
+                crate::agent_view::AgentStatus::Failed => theme.agent_failed.to_color(),
+                crate::agent_view::AgentStatus::Cancelled => theme.agent_cancelled.to_color(),
+            };
+            let elapsed = s.started_at.elapsed().as_secs();
+            let elapsed_str = if elapsed < 60 {
+                format!("{elapsed}s")
+            } else {
+                format!("{}m{}s", elapsed / 60, elapsed % 60)
+            };
+            let line = Line::from(vec![
+                Span::styled(format!(" {} ", s.status.icon()), Style::default().fg(status_color)),
+                Span::styled(format!("{:<20}", s.name), Style::default().fg(theme.conversation_text.to_color())),
+                Span::styled(format!("{:<16}", s.model), Style::default().fg(theme.dashboard_key.to_color())),
+                Span::styled(format!("{} turns  ", s.turn_count), Style::default().fg(theme.dashboard_value.to_color())),
+                Span::styled(elapsed_str, Style::default().fg(theme.key_hint.to_color())),
+            ]);
+            let style = if is_sel {
+                Style::default().bg(theme.completion_selected_bg.to_color())
+            } else {
+                Style::default()
+            };
+            ListItem::new(line).style(style)
+        })
+        .collect();
+
+    let list = List::new(items).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(theme.border.to_color()))
+            .title(" Sessions "),
+    );
+    f.render_widget(list, chunks[1]);
+
+    // Detail panel
+    if let Some(session) = sessions.get(selected) {
+        let detail = Paragraph::new(vec![
+            Line::from(vec![
+                Span::styled("  ID: ", Style::default().fg(theme.dashboard_key.to_color())),
+                Span::styled(&session.id, Style::default().fg(theme.dashboard_value.to_color())),
+            ]),
+            Line::from(vec![
+                Span::styled("  Task: ", Style::default().fg(theme.dashboard_key.to_color())),
+                Span::styled(
+                    session.task_subject.as_deref().unwrap_or("(none)"),
+                    Style::default().fg(theme.dashboard_value.to_color()),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("  Dir: ", Style::default().fg(theme.dashboard_key.to_color())),
+                Span::styled(&session.working_dir, Style::default().fg(theme.dashboard_value.to_color())),
+            ]),
+        ])
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(theme.border.to_color()))
+                .title(" Details "),
+        )
+        .wrap(Wrap { trim: false });
+        f.render_widget(detail, chunks[2]);
+    }
 }
 
 // ANSI stripping is now in tui_update::strip_ansi() — single canonical implementation.

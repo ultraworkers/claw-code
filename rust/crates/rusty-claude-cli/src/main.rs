@@ -18,6 +18,7 @@ mod init;
 mod input;
 mod render;
 mod setup_wizard;
+mod agent_view;
 mod chat_mode;
 mod command_palette;
 mod keybindings;
@@ -7368,8 +7369,11 @@ fn run_tui_repl(mut cli: LiveCli) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             tui::TuiReadOutcome::ToggleAgentView => {
-                // Agent View integration in Sprint 6
-                app.push_system_message("Agent View coming in Sprint 6");
+                if app.agent_view.active {
+                    app.agent_view.close();
+                } else {
+                    app.agent_view.open();
+                }
             }
         }
     }
