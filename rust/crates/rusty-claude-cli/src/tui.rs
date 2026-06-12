@@ -179,6 +179,7 @@ pub struct TuiApp {
     spinner_frame: usize,
     needs_redraw: bool,
     pub markdown_renderer: crate::markdown::MarkdownRenderer,
+    pub theme: crate::theme::TuiTheme,
 }
 
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -204,18 +205,19 @@ impl TuiApp {
         let mut terminal = ratatui::Terminal::new(backend)?;
         terminal.hide_cursor()?;
 
+        let theme = crate::theme::TuiTheme::builtin("default").unwrap();
         let mut input = TextArea::new(vec![String::new()]);
         input.set_block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Cyan))
+                .border_style(Style::default().fg(theme.input_border.to_color()))
                 .title(" > "),
         );
-        input.set_style(Style::default().fg(Color::White));
+        input.set_style(Style::default().fg(theme.input_fg.to_color()));
         input.set_cursor_style(
             Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
+                .fg(theme.input_cursor_fg.to_color())
+                .bg(theme.input_cursor_bg.to_color())
                 .add_modifier(Modifier::BOLD),
         );
 
@@ -231,6 +233,7 @@ impl TuiApp {
             showing_completions: false,
             spinner_frame: 0,
             markdown_renderer: crate::markdown::MarkdownRenderer::new(),
+            theme: crate::theme::TuiTheme::builtin("default").unwrap(),
             needs_redraw: true,
         };
         me.draw_screen()?;
@@ -293,6 +296,18 @@ impl TuiApp {
     pub fn mark_resize(&mut self) {
         // ratatui Terminal picks up new size on next draw via f.area().
         // We just need to force a redraw so word-wrapping recalculates.
+        self.needs_redraw = true;
+    }
+
+    /// Short helper to convert theme ColorDef to ratatui Color.
+    pub fn tc(&self, c: &crate::theme::ColorDef) -> Color {
+        c.to_color()
+    }
+
+    /// Set a new theme and trigger redraw.
+    pub fn set_theme(&mut self, theme: crate::theme::TuiTheme) {
+        self.markdown_renderer.set_code_theme(&theme.syntax_theme);
+        self.theme = theme;
         self.needs_redraw = true;
     }
 
@@ -425,6 +440,7 @@ impl TuiApp {
         let spinner_frame = self.spinner_frame;
         let input_lines: Vec<String> = self.input.lines().iter().cloned().collect();
         let renderer = self.markdown_renderer.clone();
+        let theme = self.theme.clone();
 
         self.terminal.draw(|f| {
             draw_frame(
@@ -439,6 +455,7 @@ impl TuiApp {
                 showing_completions,
                 spinner_frame,
                 &renderer,
+                &theme,
             );
         })?;
         self.terminal.backend_mut().flush()?;
@@ -569,6 +586,7 @@ fn draw_frame(
     showing_completions: bool,
     spinner_frame: usize,
     markdown_renderer: &crate::markdown::MarkdownRenderer,
+    theme: &crate::theme::TuiTheme,
 ) {
     let size = f.area();
     let main = Layout::default()
@@ -588,7 +606,7 @@ fn draw_frame(
         showing_completions,
         markdown_renderer,
     );
-    draw_right_pane(f, main[1], dashboard, spinner_frame);
+    draw_right_pane(f, main[1], dashboard, spinner_frame, theme);
 }
 
 /// Word-wrap a single text line into visual lines that fit `width` columns.
@@ -817,6 +835,7 @@ fn draw_right_pane(
     area: Rect,
     dashboard: &SharedDashboardState,
     spinner_frame: usize,
+    theme: &crate::theme::TuiTheme,
 ) {
     let state = dashboard.read().unwrap_or_else(|e| e.into_inner());
     let mut lines: Vec<Line> = Vec::new();
@@ -824,55 +843,56 @@ fn draw_right_pane(
     let mut gauge_row: Option<usize> = None;
 
     lines.push(section("Connection"));
-    lines.push(kv("Model", &state.model, Color::White));
-    lines.push(kv("Provider", &state.provider, Color::Gray));
-    lines.push(kv("URL", &state.provider_url, Color::DarkGray));
-    lines.push(kv("Mode", &state.permission_mode, Color::Yellow));
+    lines.push(kv("Model", &state.model, theme.dashboard_value.to_color()));
+    lines.push(kv("Provider", &state.provider, theme.dashboard_key.to_color()));
+    lines.push(kv("URL", &state.provider_url, theme.conversation_dim.to_color()));
+    lines.push(kv("Mode", &state.permission_mode, theme.conversation_system.to_color()));
     if let Some(ref branch) = state.git_branch {
-        lines.push(kv("Branch", branch, Color::Green));
+        lines.push(kv("Branch", branch, theme.agent_done.to_color()));
     }
     lines.push(Line::from(""));
 
     lines.push(section("Tokens"));
-    lines.push(kv("Turns", &state.turn_count.to_string(), Color::White));
-    lines.push(kv("Input", &state.input_tokens.to_string(), Color::White));
-    lines.push(kv("Output", &state.output_tokens.to_string(), Color::White));
+    lines.push(kv("Turns", &state.turn_count.to_string(), theme.dashboard_value.to_color()));
+    lines.push(kv("Input", &state.input_tokens.to_string(), theme.dashboard_value.to_color()));
+    lines.push(kv("Output", &state.output_tokens.to_string(), theme.dashboard_value.to_color()));
     lines.push(kv(
         "Cache R",
         &state.cache_read_tokens.to_string(),
-        Color::Gray,
+        theme.dashboard_key.to_color(),
     ));
     lines.push(kv(
         "Cache W",
         &state.cache_creation_tokens.to_string(),
-        Color::Gray,
+        theme.dashboard_key.to_color(),
     ));
     lines.push(kv(
         "Cost",
         &format!("${:.4}", state.cost_usd),
-        Color::Yellow,
+        theme.conversation_system.to_color(),
     ));
     lines.push(Line::from(""));
 
     let pct = state.context_percent;
-    let gauge_color = match () {
-        _ if pct > 80.0 => Color::Red,
-        _ if pct > 50.0 => Color::Yellow,
-        _ => Color::Green,
+    let gauge_color = if pct > 80.0 {
+        theme.gauge_fill_red.to_color()
+    } else if pct > 50.0 {
+        theme.gauge_fill_yellow.to_color()
+    } else {
+        theme.gauge_fill_green.to_color()
     };
     lines.push(section("Context"));
     lines.push(kv(
         "Used",
         &format!("{:.1}% of {}", pct, state.context_window),
-        Color::White,
+        theme.dashboard_value.to_color(),
     ));
-    // Reserve a row for the gauge bar — we'll overlay it after
     gauge_row = Some(lines.len());
-    lines.push(Line::from("")); // gauge placeholder row
+    lines.push(Line::from(""));
     lines.push(kv(
         "Compactions",
         &state.compaction_count.to_string(),
-        Color::Gray,
+        theme.dashboard_key.to_color(),
     ));
     lines.push(Line::from(""));
 
@@ -880,9 +900,9 @@ fn draw_right_pane(
         lines.push(section("LSP"));
         for lsp in &state.lsp_servers {
             let c = match lsp.status.as_str() {
-                "connected" => Color::Green,
-                "starting" => Color::Yellow,
-                _ => Color::Red,
+                "connected" => theme.agent_done.to_color(),
+                "starting" => theme.agent_waiting.to_color(),
+                _ => theme.agent_failed.to_color(),
             };
             lines.push(kv(&lsp.language, &lsp.status, c));
         }
@@ -891,17 +911,17 @@ fn draw_right_pane(
 
     if let Some(ref team) = state.team {
         lines.push(section("Team"));
-        lines.push(kv("Name", &team.team_name, Color::White));
+        lines.push(kv("Name", &team.team_name, theme.dashboard_value.to_color()));
         let progress = format!(
             "{}/{} done, {} fail, {} run",
             team.completed_agents, team.total_agents, team.failed_agents, team.running_agents
         );
-        lines.push(kv("Status", &progress, Color::Green));
+        lines.push(kv("Status", &progress, theme.agent_done.to_color()));
         for agent in &team.agents {
             let c = match agent.status.as_str() {
-                "completed" => Color::Green,
-                "failed" => Color::Red,
-                _ => Color::Cyan,
+                "completed" => theme.agent_done.to_color(),
+                "failed" => theme.agent_failed.to_color(),
+                _ => theme.agent_running.to_color(),
             };
             let label = format!("● {}", agent.name);
             let detail = format!("({})", agent.subagent_type.as_deref().unwrap_or("?"));
@@ -910,7 +930,7 @@ fn draw_right_pane(
                     format!("  {:<KV_KEY_WIDTH$}", label),
                     Style::default().fg(c),
                 ),
-                Span::styled(detail, Style::default().fg(Color::Gray)),
+                Span::styled(detail, Style::default().fg(theme.dashboard_key.to_color())),
             ]));
         }
         lines.push(Line::from(""));
@@ -920,7 +940,7 @@ fn draw_right_pane(
     lines.push(kv(
         "ID",
         state.session_id.as_deref().unwrap_or("-"),
-        Color::Gray,
+        theme.dashboard_key.to_color(),
     ));
 
     if !state.status_message.is_empty() {
@@ -928,22 +948,22 @@ fn draw_right_pane(
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
             format!("{frame} {}", state.status_message),
-            Style::default().fg(Color::Blue),
+            Style::default().fg(theme.spinner.to_color()),
         )));
     }
 
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         "─ Keys ─",
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(theme.key_hint.to_color()),
     )));
     lines.push(Line::from(Span::styled(
         "  Enter Submit  Shift+Enter ↵",
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(theme.key_hint.to_color()),
     )));
     lines.push(Line::from(Span::styled(
         "  ^P Swap  ^T Team  ^C ⊘  ^D Exit",
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(theme.key_hint.to_color()),
     )));
 
     let widget = Paragraph::new(lines)
