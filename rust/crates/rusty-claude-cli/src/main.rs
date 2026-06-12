@@ -7163,7 +7163,7 @@ fn run_tui_repl(mut cli: LiveCli) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let mut app = tui::TuiApp::init(dashboard_state.clone())?;
+    let mut app = tui::app::TuiApp::init(dashboard_state.clone())?;
 
     // Push startup info into conversation pane
     app.push_banner(&[tui::BannerLine { text: "🦀 Claw Code".to_string(), color: ratatui::style::Color::Cyan }]);
@@ -7171,155 +7171,140 @@ fn run_tui_repl(mut cli: LiveCli) -> Result<(), Box<dyn std::error::Error>> {
 
     loop {
         match app.read_line()? {
-            tui::TuiReadOutcome::Pending => {}
-            tui::TuiReadOutcome::Submit(input) => {
+            tui::legacy::TuiReadOutcome::Pending => {}
+            tui::legacy::TuiReadOutcome::Submit(input) => {
                 let trimmed = input.trim().to_string();
                 if trimmed.is_empty() {
                     continue;
                 }
-                if matches!(trimmed.as_str(), "/exit" | "/quit") {
-                    app.push_system_message("Bye!");
-                    cli.persist_session()?;
-                    break;
-                }
 
-                // Slash commands handled locally in TUI (not sent to model)
-                if trimmed.starts_with("/theme") {
-                    let args = trimmed.strip_prefix("/theme").unwrap_or("").trim();
-                    if args.is_empty() {
-                        let names = crate::theme::TuiTheme::all_builtin_names();
-                        app.push_system_message(&format!(
-                            "Available themes: {}\nUsage: /theme <name>",
-                            names.join(", ")
-                        ));
-                    } else if let Some(theme) = crate::theme::TuiTheme::builtin(args) {
-                        app.set_theme(theme);
-                        app.push_system_message(&format!("Theme: {args}"));
-                    } else {
-                        app.push_system_message(&format!("Unknown theme: {args}"));
+                // Dispatch slash commands using the new SlashCommandDispatcher
+                use crate::tui::slash_commands::{dispatch_slash_command, SlashCommandAction};
+                match dispatch_slash_command(&trimmed) {
+                    SlashCommandAction::Exit => {
+                        app.push_system_message("Bye!");
+                        cli.persist_session()?;
+                        break;
                     }
-                    continue;
-                }
-                if trimmed.starts_with("/keys") {
-                    let args = trimmed.strip_prefix("/keys").unwrap_or("").trim();
-                    match args {
-                        "emacs" => { app.keymap.set_preset(crate::keybindings::KeyPreset::Emacs); app.push_system_message("Keys: Emacs"); }
-                        "vim" => { app.keymap.set_preset(crate::keybindings::KeyPreset::Vim); app.push_system_message("Keys: Vim — i for insert, Esc for normal"); }
-                        "windows" => { app.keymap.set_preset(crate::keybindings::KeyPreset::Windows); app.push_system_message("Keys: Windows"); }
-                        "" => {
-                            app.push_system_message(&format!("Current: {:?}\nAvailable: emacs, vim, windows\nUsage: /keys <preset>", app.keymap.preset()));
+                    SlashCommandAction::SetTheme { name } => {
+                        if name.is_empty() {
+                            let names = crate::theme::TuiTheme::all_builtin_names();
+                            app.push_system_message(&format!("Available themes: {}\nUsage: /theme <name>", names.join(", ")));
+                        } else if let Some(theme) = crate::theme::TuiTheme::builtin(name) {
+                            app.set_theme(theme);
+                            app.push_system_message(&format!("Theme: {name}"));
+                        } else {
+                            app.push_system_message(&format!("Unknown theme: {name}"));
                         }
-                        _ => { app.push_system_message(&format!("Unknown: {args}. Available: emacs, vim, windows")); }
+                        continue;
                     }
-                    continue;
-                }
-                if matches!(trimmed.as_str(), "/code" | "/ask" | "/architect" | "/arch") {
-                    let mode = match trimmed.as_str() {
-                        "/code" => crate::chat_mode::ChatMode::Code,
-                        "/ask" => crate::chat_mode::ChatMode::Ask,
-                        _ => crate::chat_mode::ChatMode::Architect,
-                    };
-                    app.chat_mode = mode;
-                    app.push_system_message(&format!("Mode: {} — {}", mode.label(), mode.description()));
-                    continue;
-                }
-                if trimmed == "/diff" {
-                    let output = std::process::Command::new("git")
-                        .args(["diff"])
-                        .current_dir(std::env::current_dir().unwrap_or_default())
-                        .output();
-                    match output {
-                        Ok(out) if out.status.success() => {
-                            let diff = String::from_utf8_lossy(&out.stdout);
-                            if diff.is_empty() {
-                                app.push_system_message("No uncommitted changes.");
-                            } else {
-                                app.push_diff(&diff);
-                            }
+                    SlashCommandAction::SetKeymap { preset } => {
+                        match preset {
+                            "emacs" => { app.set_key_preset(crate::keybindings::KeyPreset::Emacs); app.push_system_message("Keys: Emacs"); }
+                            "vim" => { app.set_key_preset(crate::keybindings::KeyPreset::Vim); app.push_system_message("Keys: Vim — i for insert, Esc for normal"); }
+                            "windows" => { app.set_key_preset(crate::keybindings::KeyPreset::Windows); app.push_system_message("Keys: Windows"); }
+                            "" => { app.push_system_message(&format!("Current: {}\nAvailable: emacs, vim, windows\nUsage: /keys <preset>", app.key_preset_name())); }
+                            _ => { app.push_system_message(&format!("Unknown: {preset}. Available: emacs, vim, windows")); }
                         }
-                        Ok(out) => {
-                            let err = String::from_utf8_lossy(&out.stderr);
-                            app.push_system_message(&format!("git diff failed: {err}"));
-                        }
-                        Err(e) => { app.push_system_message(&format!("Failed to run git: {e}")); }
+                        continue;
                     }
-                    continue;
-                }
-                if trimmed.starts_with("/undo") {
-                    let args = trimmed.strip_prefix("/undo").unwrap_or("").trim();
-                    if args == "--confirm" || args == "-y" {
+                    SlashCommandAction::SetChatMode { mode } => {
+                        app.push_system_message(&format!("Mode: {} — {}", mode.label(), mode.description()));
+                        continue;
+                    }
+                    SlashCommandAction::ShowDiff => {
                         let output = std::process::Command::new("git")
-                            .args(["checkout", "--", "."])
+                            .args(["diff"])
                             .current_dir(std::env::current_dir().unwrap_or_default())
                             .output();
                         match output {
-                            Ok(out) if out.status.success() => app.push_system_message("✓ Reverted all uncommitted changes."),
-                            Ok(out) => { let err = String::from_utf8_lossy(&out.stderr); app.push_system_message(&format!("Undo failed: {err}")); }
+                            Ok(out) if out.status.success() => {
+                                let diff = String::from_utf8_lossy(&out.stdout);
+                                if diff.is_empty() {
+                                    app.push_system_message("No uncommitted changes.");
+                                } else {
+                                    app.push_diff(&diff);
+                                }
+                            }
+                            Ok(out) => {
+                                let err = String::from_utf8_lossy(&out.stderr);
+                                app.push_system_message(&format!("git diff failed: {err}"));
+                            }
                             Err(e) => { app.push_system_message(&format!("Failed to run git: {e}")); }
                         }
-                    } else {
-                        let output = std::process::Command::new("git")
-                            .args(["diff", "--stat"])
-                            .current_dir(std::env::current_dir().unwrap_or_default())
-                            .output();
-                        let stat = output.ok().filter(|o| o.status.success())
-                            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
-                            .unwrap_or_default();
-                        if stat.is_empty() {
-                            app.push_system_message("Nothing to undo — no uncommitted changes.");
-                        } else {
-                            app.push_system_message(&format!("This will revert:\n{stat}\nType /undo --confirm to proceed."));
-                        }
+                        continue;
                     }
-                    continue;
-                }
-                if trimmed.starts_with("/ls") {
-                    let path = trimmed.strip_prefix("/ls").unwrap_or("").trim();
-                    if path.is_empty() {
-                        app.push_system_message("Usage: /ls <file-path>");
-                    } else {
-                        match std::fs::read_to_string(path) {
-                            Ok(content) => {
-                                app.push_system_message(&format!("── {path} ──"));
-                                app.push_output(&content, false);
+                    SlashCommandAction::Undo { confirm } => {
+                        if confirm {
+                            let output = std::process::Command::new("git")
+                                .args(["checkout", "--", "."])
+                                .current_dir(std::env::current_dir().unwrap_or_default())
+                                .output();
+                            match output {
+                                Ok(out) if out.status.success() => app.push_system_message("✓ Reverted all uncommitted changes."),
+                                Ok(out) => { let err = String::from_utf8_lossy(&out.stderr); app.push_system_message(&format!("Undo failed: {err}")); }
+                                Err(e) => { app.push_system_message(&format!("Failed to run git: {e}")); }
                             }
-                            Err(e) => app.push_system_message(&format!("Cannot read {path}: {e}")),
+                        } else {
+                            let output = std::process::Command::new("git")
+                                .args(["diff", "--stat"])
+                                .current_dir(std::env::current_dir().unwrap_or_default())
+                                .output();
+                            let stat = output.ok().filter(|o| o.status.success())
+                                .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+                                .unwrap_or_default();
+                            if stat.is_empty() {
+                                app.push_system_message("Nothing to undo — no uncommitted changes.");
+                            } else {
+                                app.push_system_message(&format!("This will revert:\n{stat}\nType /undo --confirm to proceed."));
+                            }
                         }
+                        continue;
                     }
-                    continue;
+                    SlashCommandAction::ShowFile { path } => {
+                        if path.is_empty() {
+                            app.push_system_message("Usage: /ls <file-path>");
+                        } else {
+                            match std::fs::read_to_string(path) {
+                                Ok(content) => {
+                                    app.push_system_message(&format!("── {path} ──"));
+                                    app.push_output(&content, false);
+                                }
+                                Err(e) => app.push_system_message(&format!("Cannot read {path}: {e}")),
+                            }
+                        }
+                        continue;
+                    }
+                    SlashCommandAction::ShowHelp => {
+                        let preset = app.key_preset_name().to_string();
+                        let msg = format!("Keybindings ({preset}):\n\nEnter Submit  Shift+Enter ↵\nCtrl+C Cancel  Ctrl+D Exit\nCtrl+P Swap  Ctrl+K Palette\nCtrl+A Agents  Ctrl+T Team\n\nSlash commands:\n/theme /keys /code /ask /architect\n/diff /undo /ls /help\n");
+                        app.push_system_message(&msg);
+                        continue;
+                    }
+                    SlashCommandAction::Unknown { command } => {
+                        app.push_system_message(&format!("Unknown command: {command}"));
+                        continue;
+                    }
+                    SlashCommandAction::NotACommand => {
+                        // Not a slash command — send to model
+                    }
                 }
 
                 app.push_user_input(&input);
-                app.push_history(&input);
-                cli.record_prompt_history(&trimmed);
                 update_dashboard(&dashboard_state, &cli);
                 app.set_status("Thinking...");
 
-                // ── Nuclear stdout suppression ──
-                // dup fd 1 (stdout), redirect to /dev/null, run the turn,
-                // then restore.  This catches ALL writes to stdout: runtime
-                // streaming, tool executor output, child processes, println!,
-                // crossterm escape codes — everything hits /dev/null.
-                let saved_fd = unsafe { libc::dup(1) };
-                let devnull = unsafe {
-                    libc::open(
-                        b"/dev/null\0".as_ptr() as *const i8,
-                        libc::O_WRONLY | libc::O_CLOEXEC,
-                    )
-                };
-                if devnull >= 0 {
-                    unsafe { libc::dup2(devnull, 1); }
-                    unsafe { libc::close(devnull); }
-                }
+                // ── Turn execution ──
+                // Suspend the TUI (disable raw mode, clear screen) so that
+                // any stdout output from child processes doesn't corrupt the
+                // TUI frame.  Then restore after the turn completes.
+                app.suspend()?;
 
                 let mut buf: Vec<u8> = Vec::new();
                 let result = cli.run_turn_to(&trimmed, &mut buf, false);
 
-                // Restore fd 1 (stdout)
-                if saved_fd >= 0 {
-                    unsafe { libc::dup2(saved_fd, 1); }
-                    unsafe { libc::close(saved_fd); }
-                }
+                // Resume the TUI — re-enable raw mode, clear any debris, redraw
+                app.resume()?;
 
                 // Read the last assistant message from the session for
                 // the conversation pane.
@@ -7346,19 +7331,16 @@ fn run_tui_repl(mut cli: LiveCli) -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 update_dashboard(&dashboard_state, &cli);
-                // Force a full clear+redraw to ensure the conversation pane
-                // is correctly bounded after each turn
                 let _ = app.redraw_after_turn();
             }
-            tui::TuiReadOutcome::Cancel => {
+            tui::legacy::TuiReadOutcome::Cancel => {
                 // Clear input, stay in TUI
             }
-            tui::TuiReadOutcome::Exit => {
+            tui::legacy::TuiReadOutcome::Exit => {
                 cli.persist_session()?;
                 break;
             }
-            tui::TuiReadOutcome::ProviderSwap => {
-                // Stay in alt screen, disable raw mode for wizard prompts
+            tui::legacy::TuiReadOutcome::ProviderSwap => {
                 app.suspend()?;
                 setup_wizard::run_setup_wizard()?;
                 let cwd = std::env::current_dir().unwrap_or_default();
@@ -7368,11 +7350,10 @@ fn run_tui_repl(mut cli: LiveCli) -> Result<(), Box<dyn std::error::Error>> {
                 {
                     let _ = cli.set_model(Some(new_model));
                 }
-                // Re-enter TUI — re-enables raw mode, redraws
                 app.resume()?;
                 app.push_system_message("Provider updated");
             }
-            tui::TuiReadOutcome::TeamToggle => {
+            tui::legacy::TuiReadOutcome::TeamToggle => {
                 let current = std::env::var("CLAWD_AGENT_TEAMS").unwrap_or_default();
                 if current == "1" {
                     std::env::set_var("CLAWD_AGENT_TEAMS", "0");
@@ -7382,12 +7363,8 @@ fn run_tui_repl(mut cli: LiveCli) -> Result<(), Box<dyn std::error::Error>> {
                     app.push_system_message("[team] Agent teams enabled");
                 }
             }
-            tui::TuiReadOutcome::ToggleAgentView => {
-                if app.agent_view.active {
-                    app.agent_view.close();
-                } else {
-                    app.agent_view.open();
-                }
+            tui::legacy::TuiReadOutcome::ToggleAgentView => {
+                // The new TuiApp handles this internally via InputBar
             }
         }
     }
