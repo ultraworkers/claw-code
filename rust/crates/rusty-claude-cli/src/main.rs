@@ -7295,16 +7295,26 @@ fn run_tui_repl(mut cli: LiveCli) -> Result<(), Box<dyn std::error::Error>> {
                 app.set_status("Thinking...");
 
                 // ── Turn execution ──
-                // Suspend the TUI (disable raw mode, clear screen) so that
-                // any stdout output from child processes doesn't corrupt the
-                // TUI frame.  Then restore after the turn completes.
-                app.suspend()?;
+                // Capture stdout/stderr safely with `gag` so child processes
+                // can't bleed output onto the TUI. Then render any captured
+                // tool output inside the conversation pane.
+                let (result, captured_stdout, captured_stderr) =
+                    crate::tui::capture::capture_output(|| {
+                        let mut buf: Vec<u8> = Vec::new();
+                        cli.run_turn_to(&trimmed, &mut buf, false)
+                    });
 
-                let mut buf: Vec<u8> = Vec::new();
-                let result = cli.run_turn_to(&trimmed, &mut buf, false);
-
-                // Resume the TUI — re-enable raw mode, clear any debris, redraw
-                app.resume()?;
+                // Render captured stdout/stderr from tools (only if meaningful)
+                if !captured_stdout.is_empty() {
+                    app.push_output("```tool-output\n", false);
+                    app.push_output(&captured_stdout, false);
+                    app.push_output("\n```\n", false);
+                }
+                if !captured_stderr.is_empty() {
+                    app.push_output("```tool-error\n", false);
+                    app.push_output(&captured_stderr, true);
+                    app.push_output("\n```\n", false);
+                }
 
                 // Read the last assistant message from the session for
                 // the conversation pane.

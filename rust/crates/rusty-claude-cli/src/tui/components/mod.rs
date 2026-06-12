@@ -5,3 +5,4 @@ pub mod input_bar;
 pub mod dashboard;
 pub mod command_palette;
 pub mod agent_view;
+pub mod status_bar;

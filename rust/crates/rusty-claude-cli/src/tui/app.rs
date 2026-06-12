@@ -21,6 +21,7 @@ use crate::tui::components::agent_view::AgentViewOverlay;
 use crate::tui::components::conversation::ConversationPane;
 use crate::tui::components::dashboard::Dashboard;
 use crate::tui::components::input_bar::{InputBar, InputOutcome};
+use crate::tui::components::status_bar::StatusBar;
 use crate::tui::event::{EventBus, TuiEvent};
 use crate::tui::legacy::{BannerLine, SharedDashboardState, TuiReadOutcome};
 
@@ -34,6 +35,7 @@ pub struct TuiApp {
     conversation: ConversationPane,
     input_bar: InputBar,
     dashboard: Dashboard,
+    status_bar: StatusBar,
     command_palette: CommandPaletteOverlay,
     agent_view: AgentViewOverlay,
 
@@ -71,7 +73,8 @@ impl TuiApp {
         let app = Self {
             conversation: ConversationPane::new(theme.clone()),
             input_bar,
-            dashboard: Dashboard::new(dashboard_state),
+            dashboard: Dashboard::new(dashboard_state.clone()),
+            status_bar: StatusBar::new(dashboard_state),
             command_palette: CommandPaletteOverlay::new(),
             agent_view: AgentViewOverlay::new(),
             theme,
@@ -187,6 +190,7 @@ impl TuiApp {
 
         self.spinner_frame = (self.spinner_frame + 1) % SPINNER_FRAMES.len();
         self.dashboard.tick_spinner();
+        self.status_bar.tick_spinner();
         self.draw_screen()?;
         Ok(TuiReadOutcome::Pending)
     }
@@ -270,6 +274,7 @@ impl TuiApp {
         let conversation = &self.conversation;
         let input_bar = &self.input_bar;
         let dashboard = &self.dashboard;
+        let status_bar = &self.status_bar;
         let command_palette = &self.command_palette;
         let agent_view = &self.agent_view;
         let theme = &self.theme;
@@ -277,21 +282,38 @@ impl TuiApp {
         self.terminal.draw(|f| {
             let area = f.area();
 
-            // Main layout: left (conversation + input) | right (dashboard)
+            // OpenCode-style focused layout:
+            // - full-width status bar on top
+            // - large conversation pane below it
+            // - compact input bar at the bottom
+            // - optional right-side dashboard (hidden if terminal is narrow)
+            let has_room_for_dashboard = area.width >= 100;
+            let dashboard_width = if has_room_for_dashboard { 32u16 } else { 0u16 };
+
             let main = Layout::default()
                 .direction(Direction::Horizontal)
-                .constraints([Constraint::Min(40), Constraint::Length(36)])
+                .constraints([
+                    Constraint::Min(40),
+                    Constraint::Length(dashboard_width),
+                ])
                 .split(area);
 
-            // Left pane: conversation (top) + input (bottom)
             let left = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([Constraint::Min(5), Constraint::Length(7)])
+                .constraints([
+                    Constraint::Length(1), // status bar
+                    Constraint::Min(5),    // conversation
+                    Constraint::Length(6), // input
+                ])
                 .split(main[0]);
 
-            conversation.render(left[0], f, theme);
-            input_bar.render(left[1], f, theme);
-            dashboard.render(main[1], f, theme);
+            status_bar.render(left[0], f, theme);
+            conversation.render(left[1], f, theme);
+            input_bar.render(left[2], f, theme);
+
+            if dashboard_width > 0 {
+                dashboard.render(main[1], f, theme);
+            }
 
             // Overlays
             if command_palette.is_active() {
@@ -305,6 +327,7 @@ impl TuiApp {
         // Clear dirty flags after successful render
         self.conversation.mark_clean();
         self.dashboard.clear_dirty();
+        self.status_bar.clear_dirty();
 
         self.terminal.backend_mut().flush()?;
         Ok(())

@@ -14,6 +14,7 @@ api = { path = "../api" }
 commands = { path = "../commands" }
 crossterm = "0.28"
 crossbeam-channel = "0.5"
+gag = "1"
 pulldown-cmark = "0.13"
 once_cell = "1"
 ratatui = "0.29"

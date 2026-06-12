@@ -16,3 +16,4 @@ pub mod slash_commands;
 pub mod app;
 pub mod components;
 pub mod markdown;
+pub mod capture;
