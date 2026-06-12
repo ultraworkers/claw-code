@@ -121,11 +121,45 @@ pub struct BannerLine {
     pub color: Color,
 }
 
+/// Content variant — determines how a conversation entry is rendered.
+#[derive(Debug, Clone)]
+pub enum ConversationContent {
+    Plain {
+        text: String,
+        color: Color,
+        bold: bool,
+    },
+    Markdown {
+        source: String,
+    },
+    CodeDiff {
+        diff: String,
+    },
+}
+
 #[derive(Debug, Clone)]
 pub struct ConversationLine {
-    pub text: String,
-    pub color: Color,
-    pub bold: bool,
+    pub content: ConversationContent,
+}
+
+impl ConversationLine {
+    pub fn plain(text: String, color: Color, bold: bool) -> Self {
+        Self {
+            content: ConversationContent::Plain { text, color, bold },
+        }
+    }
+
+    pub fn markdown(source: String) -> Self {
+        Self {
+            content: ConversationContent::Markdown { source },
+        }
+    }
+
+    pub fn diff(diff: String) -> Self {
+        Self {
+            content: ConversationContent::CodeDiff { diff },
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -134,7 +168,7 @@ pub struct ConversationLine {
 
 pub struct TuiApp {
     dashboard: SharedDashboardState,
-    conversation: Vec<ConversationLine>,
+    pub conversation: Vec<ConversationLine>,
     conversation_scroll: u16,
     input: TextArea<'static>,
     should_exit: bool,
@@ -144,6 +178,7 @@ pub struct TuiApp {
     showing_completions: bool,
     spinner_frame: usize,
     needs_redraw: bool,
+    pub markdown_renderer: crate::markdown::MarkdownRenderer,
 }
 
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -195,6 +230,7 @@ impl TuiApp {
             completion_index: 0,
             showing_completions: false,
             spinner_frame: 0,
+            markdown_renderer: crate::markdown::MarkdownRenderer::new(),
             needs_redraw: true,
         };
         me.draw_screen()?;
@@ -266,33 +302,24 @@ impl TuiApp {
 
     pub fn push_banner(&mut self, lines: &[BannerLine]) {
         for bl in lines {
-            self.conversation.push(ConversationLine {
-                text: bl.text.clone(),
-                color: bl.color,
-                bold: true,
-            });
+            self.conversation
+                .push(ConversationLine::plain(bl.text.clone(), bl.color, true));
         }
         self.auto_scroll();
     }
 
     pub fn push_user_input(&mut self, text: &str) {
         for raw_line in text.lines() {
-            self.conversation.push(ConversationLine {
-                text: raw_line.to_string(),
-                color: Color::Cyan,
-                bold: true,
-            });
+            self.conversation
+                .push(ConversationLine::plain(raw_line.to_string(), Color::Cyan, true));
         }
         self.auto_scroll();
     }
 
     pub fn push_system_message(&mut self, text: &str) {
         for raw_line in text.lines() {
-            self.conversation.push(ConversationLine {
-                text: raw_line.to_string(),
-                color: Color::Yellow,
-                bold: false,
-            });
+            self.conversation
+                .push(ConversationLine::plain(raw_line.to_string(), Color::Yellow, false));
         }
         self.auto_scroll();
     }
@@ -301,19 +328,28 @@ impl TuiApp {
         if text.is_empty() {
             return;
         }
-        // Strip any ANSI escape codes that may have leaked through from the
-        // runtime's stdout rendering.  The conversation pane renders plain text
-        // with ratatui styles, so ANSI bytes would corrupt the layout and
-        // confuse wrap_line()'s character counting.
         let clean = crate::tui_update::strip_ansi(text);
-        for raw_line in clean.lines() {
-            self.conversation.push(ConversationLine {
-                text: raw_line.to_string(),
-                color: if is_error { Color::Red } else { Color::White },
-                bold: false,
-            });
+        if is_error {
+            for raw_line in clean.lines() {
+                self.conversation
+                    .push(ConversationLine::plain(raw_line.to_string(), Color::Red, false));
+            }
+        } else if crate::markdown::looks_like_markdown(&clean) {
+            self.conversation.push(ConversationLine::markdown(clean));
+        } else {
+            for raw_line in clean.lines() {
+                self.conversation
+                    .push(ConversationLine::plain(raw_line.to_string(), Color::White, false));
+            }
         }
         self.auto_scroll();
+    }
+
+    pub fn push_diff(&mut self, diff: &str) {
+        self.conversation
+            .push(ConversationLine::diff(diff.to_string()));
+        self.auto_scroll();
+        self.needs_redraw = true;
     }
 
     /// Force a full TUI clear + redraw.  With Architecture C (buffered
@@ -343,11 +379,11 @@ impl TuiApp {
             let drain_count = self.conversation.len() - MAX_CONVERSATION_LINES;
             self.conversation.drain(..drain_count);
             // Insert trim notice
-            self.conversation.insert(0, ConversationLine {
-                text: "... (earlier messages trimmed)".to_string(),
-                color: Color::DarkGray,
-                bold: false,
-            });
+            self.conversation.insert(0, ConversationLine::plain(
+                "... (earlier messages trimmed)".to_string(),
+                Color::DarkGray,
+                false,
+            ));
         }
         self.conversation_scroll = 0;
         self.needs_redraw = true;
@@ -388,6 +424,7 @@ impl TuiApp {
         let showing_completions = self.showing_completions;
         let spinner_frame = self.spinner_frame;
         let input_lines: Vec<String> = self.input.lines().iter().cloned().collect();
+        let renderer = self.markdown_renderer.clone();
 
         self.terminal.draw(|f| {
             draw_frame(
@@ -401,6 +438,7 @@ impl TuiApp {
                 completion_index,
                 showing_completions,
                 spinner_frame,
+                &renderer,
             );
         })?;
         self.terminal.backend_mut().flush()?;
@@ -530,6 +568,7 @@ fn draw_frame(
     completion_index: usize,
     showing_completions: bool,
     spinner_frame: usize,
+    markdown_renderer: &crate::markdown::MarkdownRenderer,
 ) {
     let size = f.area();
     let main = Layout::default()
@@ -547,6 +586,7 @@ fn draw_frame(
         slash_completions,
         completion_index,
         showing_completions,
+        markdown_renderer,
     );
     draw_right_pane(f, main[1], dashboard, spinner_frame);
 }
@@ -606,26 +646,51 @@ fn wrap_line<'a>(text: &str, width: usize, style: Style) -> Vec<Line<'a>> {
 fn build_wrapped_conversation<'a>(
     conversation: &[ConversationLine],
     content_width: usize,
+    markdown_renderer: &crate::markdown::MarkdownRenderer,
 ) -> (Vec<Line<'a>>, Vec<usize>) {
     let mut all_lines: Vec<Line<'a>> = Vec::new();
-    let mut expand_counts: Vec<usize> = Vec::new(); // visual lines per logical line
+    let mut expand_counts: Vec<usize> = Vec::new();
 
     for cl in conversation {
-        let mut style = Style::default().fg(cl.color);
-        if cl.bold {
-            style = style.add_modifier(Modifier::BOLD);
+        match &cl.content {
+            ConversationContent::Plain { text, color, bold } => {
+                let mut style = Style::default().fg(*color);
+                if *bold {
+                    style = style.add_modifier(Modifier::BOLD);
+                }
+                let wrapped = wrap_line(text, content_width, style);
+                let count = wrapped.len().max(1);
+                expand_counts.push(count);
+                all_lines.extend(wrapped);
+            }
+            ConversationContent::Markdown { source } => {
+                let rendered = markdown_renderer.render(source, content_width as u16);
+                let count = rendered.len().max(1);
+                expand_counts.push(count);
+                // rendered is Vec<Line<'static>> — safe to extend
+                all_lines.extend(rendered.into_iter().map(|l: Line<'static>| {
+                    // Convert Line<'static> to Line<'a> via into_owned pattern
+                    Line::from(l.spans.into_iter().map(|s| {
+                        Span::styled(s.content.into_owned(), s.style)
+                    }).collect::<Vec<_>>())
+                }));
+            }
+            ConversationContent::CodeDiff { diff } => {
+                let rendered = crate::markdown::render_diff(diff);
+                let count = rendered.len().max(1);
+                expand_counts.push(count);
+                all_lines.extend(rendered.into_iter().map(|l: Line<'static>| {
+                    Line::from(l.spans.into_iter().map(|s| {
+                        Span::styled(s.content.into_owned(), s.style)
+                    }).collect::<Vec<_>>())
+                }));
+            }
         }
-
-        let wrapped = wrap_line(&cl.text, content_width, style);
-        let count = wrapped.len().max(1);
-        expand_counts.push(count);
-        all_lines.extend(wrapped);
     }
 
     (all_lines, expand_counts)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn draw_left_pane(
     f: &mut Frame,
     area: Rect,
@@ -636,6 +701,7 @@ fn draw_left_pane(
     slash_completions: &[String],
     completion_index: usize,
     showing_completions: bool,
+    markdown_renderer: &crate::markdown::MarkdownRenderer,
 ) {
     let left = Layout::default()
         .direction(Direction::Vertical)
@@ -645,7 +711,7 @@ fn draw_left_pane(
     // --- conversation with word-wrapping ---
     // Subtract 1 for the top border, 2 for left/right block padding
     let content_width = (left[0].width as usize).saturating_sub(2);
-    let (wrapped, expand_counts) = build_wrapped_conversation(conversation, content_width);
+    let (wrapped, expand_counts) = build_wrapped_conversation(conversation, content_width, markdown_renderer);
 
     let pane_rows = (left[0].height.saturating_sub(1) as usize).max(1);
     let total_visual = wrapped.len();

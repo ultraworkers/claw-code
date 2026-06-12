@@ -18,6 +18,7 @@ mod init;
 mod input;
 mod render;
 mod setup_wizard;
+mod markdown;
 mod tui;
 mod tui_error;
 mod tui_update;
