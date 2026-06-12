@@ -7295,26 +7295,19 @@ fn run_tui_repl(mut cli: LiveCli) -> Result<(), Box<dyn std::error::Error>> {
                 app.set_status("Thinking...");
 
                 // ── Turn execution ──
-                // Capture stdout/stderr safely with `gag` so child processes
-                // can't bleed output onto the TUI. Then render any captured
-                // tool output inside the conversation pane.
-                let (result, captured_stdout, captured_stderr) =
-                    crate::tui::capture::capture_output(|| {
-                        let mut buf: Vec<u8> = Vec::new();
-                        cli.run_turn_to(&trimmed, &mut buf, false)
-                    });
+                // Exit the alternate screen before running the turn so that
+                // any stdout/stderr from tools goes to the normal terminal
+                // instead of corrupting the TUI frame.  After the turn the
+                // user presses a key to return to the TUI, which is then
+                // fully redrawn.
+                app.leave_for_turn()?;
 
-                // Render captured stdout/stderr from tools (only if meaningful)
-                if !captured_stdout.is_empty() {
-                    app.push_output("```tool-output\n", false);
-                    app.push_output(&captured_stdout, false);
-                    app.push_output("\n```\n", false);
-                }
-                if !captured_stderr.is_empty() {
-                    app.push_output("```tool-error\n", false);
-                    app.push_output(&captured_stderr, true);
-                    app.push_output("\n```\n", false);
-                }
+                let mut buf: Vec<u8> = Vec::new();
+                let result = cli.run_turn_to(&trimmed, &mut buf, false);
+
+                // Wait for user acknowledgment before redrawing the TUI.
+                app.wait_to_return()?;
+                app.reenter_after_turn()?;
 
                 // Read the last assistant message from the session for
                 // the conversation pane.

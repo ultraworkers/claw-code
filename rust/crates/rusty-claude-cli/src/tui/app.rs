@@ -108,6 +108,60 @@ impl TuiApp {
         Ok(())
     }
 
+    /// Leave the TUI before a turn: exit alt screen, disable raw mode,
+    /// leave cursor visible, and clear.  Stdout during the turn now goes
+    /// to the normal terminal instead of corrupting the TUI frame.
+    pub fn leave_for_turn(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let _ = self.terminal.show_cursor();
+        disable_raw_mode()?;
+        crossterm::execute!(
+            io::stdout(),
+            crossterm::terminal::LeaveAlternateScreen,
+            crossterm::terminal::Clear(ClearType::All),
+            crossterm::cursor::MoveTo(0, 0),
+            crossterm::cursor::Show
+        )?;
+        io::stdout().flush()?;
+        Ok(())
+    }
+
+    /// Wait for one keypress before re-entering the TUI.
+    /// Gives the user a chance to read any tool output that printed
+    /// to the terminal during the turn.
+    pub fn wait_to_return(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        enable_raw_mode()?;
+        crossterm::execute!(
+            io::stdout(),
+            crossterm::style::Print("\nPress any key to return to TUI..."),
+            crossterm::cursor::MoveTo(0, 0)
+        )?;
+        io::stdout().flush()?;
+
+        // Block until a key is pressed
+        loop {
+            if event::poll(std::time::Duration::from_millis(100))? {
+                if let Event::Key(_) = event::read()? {
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Re-enter the TUI after a turn: alt screen, raw mode, clear, redraw.
+    pub fn reenter_after_turn(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        crossterm::execute!(
+            io::stdout(),
+            crossterm::terminal::EnterAlternateScreen,
+            crossterm::terminal::Clear(ClearType::All),
+            crossterm::cursor::Hide
+        )?;
+        io::stdout().flush()?;
+        enable_raw_mode()?;
+        self.terminal.clear()?;
+        Ok(())
+    }
+
     /// Restore terminal on exit.
     pub fn restore_terminal(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         let _ = self.terminal.show_cursor();
