@@ -7295,22 +7295,30 @@ fn run_tui_repl(mut cli: LiveCli) -> Result<(), Box<dyn std::error::Error>> {
                 update_dashboard(&dashboard_state, &cli);
                 app.set_status("Thinking...");
 
-                // Run the turn into a buffer instead of stdout.
-                // This is the KEY fix: no bytes hit the alternate screen during
-                // the turn, so nothing bleeds past the conversation pane boundary.
+                // ── Nuclear stdout suppression ──
+                // dup fd 1 (stdout), redirect to /dev/null, run the turn,
+                // then restore.  This catches ALL writes to stdout: runtime
+                // streaming, tool executor output, child processes, println!,
+                // crossterm escape codes — everything hits /dev/null.
+                let saved_fd = unsafe { libc::dup(1) };
+                let devnull = unsafe {
+                    libc::open(
+                        b"/dev/null\0".as_ptr() as *const i8,
+                        libc::O_WRONLY | libc::O_CLOEXEC,
+                    )
+                };
+                if devnull >= 0 {
+                    unsafe { libc::dup2(devnull, 1); }
+                    unsafe { libc::close(devnull); }
+                }
+
                 let mut buf: Vec<u8> = Vec::new();
                 let result = cli.run_turn_to(&trimmed, &mut buf, false);
 
-                // Wipe the alternate screen in case any runtime internals
-                // wrote to the real stdout fd despite emit_output=false
-                // (e.g. child process stderr, tokio tracing, etc.)
-                {
-                    use crossterm::terminal::ClearType;
-                    let _ = crossterm::execute!(
-                        std::io::stdout(),
-                        crossterm::terminal::Clear(ClearType::All),
-                        crossterm::cursor::MoveTo(0, 0),
-                    );
+                // Restore fd 1 (stdout)
+                if saved_fd >= 0 {
+                    unsafe { libc::dup2(saved_fd, 1); }
+                    unsafe { libc::close(saved_fd); }
                 }
 
                 // Read the last assistant message from the session for

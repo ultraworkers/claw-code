@@ -26,11 +26,19 @@ syntect = "5"
 tokio = { version = "1", features = ["rt-multi-thread", "signal", "time"] }
 tools = { path = "../tools" }
 log = "0.4"
+libc = "0.2"
 unicode-width = "0.2"
 
 
-[lints]
-workspace = true
+[lints.rust]
+unsafe_code = "allow"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "allow", priority = -1 }
+module_name_repetitions = "allow"
+missing_panics_doc = "allow"
+missing_errors_doc = "allow"
 
 [dev-dependencies]
 mock-anthropic-service = { path = "../mock-anthropic-service" }

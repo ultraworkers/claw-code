@@ -2398,6 +2398,7 @@ dependencies = [
  "api",
  "commands",
  "crossterm",
+ "libc",
  "log",
  "mock-anthropic-service",
  "once_cell",
