@@ -7301,18 +7301,20 @@ fn run_tui_repl(mut cli: LiveCli) -> Result<(), Box<dyn std::error::Error>> {
                 let mut buf: Vec<u8> = Vec::new();
                 let result = cli.run_turn_to(&trimmed, &mut buf, false);
 
-                // Feed the captured output into the conversation pane.
-                // The buffer may contain ANSI codes from TerminalRenderer —
-                // strip them before pushing.
-                let captured = String::from_utf8_lossy(&buf);
-                let plain = tui_update::strip_ansi(&captured);
-                if !plain.is_empty() {
-                    app.push_output(&plain, false);
+                // Wipe the alternate screen in case any runtime internals
+                // wrote to the real stdout fd despite emit_output=false
+                // (e.g. child process stderr, tokio tracing, etc.)
+                {
+                    use crossterm::terminal::ClearType;
+                    let _ = crossterm::execute!(
+                        std::io::stdout(),
+                        crossterm::terminal::Clear(ClearType::All),
+                        crossterm::cursor::MoveTo(0, 0),
+                    );
                 }
 
-                // Also read the last assistant message from the session for
-                // the conversation pane (richer content than the spinner/status
-                // lines in the buffer).
+                // Read the last assistant message from the session for
+                // the conversation pane.
                 {
                     let messages = &cli.runtime.session().messages;
                     if let Some(msg) = messages.last() {
@@ -7336,6 +7338,9 @@ fn run_tui_repl(mut cli: LiveCli) -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 update_dashboard(&dashboard_state, &cli);
+                // Force a full clear+redraw to ensure the conversation pane
+                // is correctly bounded after each turn
+                let _ = app.redraw_after_turn();
             }
             tui::TuiReadOutcome::Cancel => {
                 // Clear input, stay in TUI
