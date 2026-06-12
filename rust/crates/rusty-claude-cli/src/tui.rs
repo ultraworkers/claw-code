@@ -180,6 +180,8 @@ pub struct TuiApp {
     needs_redraw: bool,
     pub markdown_renderer: crate::markdown::MarkdownRenderer,
     pub theme: crate::theme::TuiTheme,
+    pub keymap: crate::keybindings::KeyMap,
+    pub command_palette: crate::command_palette::CommandPalette,
 }
 
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -234,6 +236,8 @@ impl TuiApp {
             spinner_frame: 0,
             markdown_renderer: crate::markdown::MarkdownRenderer::new(),
             theme: crate::theme::TuiTheme::builtin("default").unwrap(),
+            keymap: crate::keybindings::KeyMap::new(crate::keybindings::KeyPreset::Emacs),
+            command_palette: crate::command_palette::CommandPalette::new(),
             needs_redraw: true,
         };
         me.draw_screen()?;
@@ -463,37 +467,51 @@ impl TuiApp {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> io::Result<TuiReadOutcome> {
-        if key.modifiers.contains(KeyModifiers::CONTROL) {
+        use crate::keybindings::{Action, VimMode};
+
+        // Command palette intercepts all keys when active
+        if self.command_palette.active {
             match key.code {
-                KeyCode::Char('d') => {
-                    self.should_exit = true;
-                    return Ok(TuiReadOutcome::Exit);
+                KeyCode::Esc => self.command_palette.close(),
+                KeyCode::Enter => {
+                    if let Some(action) = self.command_palette.selected_action() {
+                        self.command_palette.close();
+                        return self.dispatch_action(action);
+                    }
+                    self.command_palette.close();
                 }
-                KeyCode::Char('c') => {
-                    self.input.select_all();
-                    self.input.cut();
-                    return Ok(TuiReadOutcome::Cancel);
-                }
-                KeyCode::Char('p') => {
-                    self.input.select_all();
-                    self.input.cut();
-                    return Ok(TuiReadOutcome::ProviderSwap);
-                }
-                KeyCode::Char('t') => {
-                    self.input.select_all();
-                    self.input.cut();
-                    return Ok(TuiReadOutcome::TeamToggle);
-                }
+                KeyCode::Up => self.command_palette.select_prev(),
+                KeyCode::Down => self.command_palette.select_next(),
+                KeyCode::Backspace => self.command_palette.backspace(),
+                KeyCode::Char(c) => self.command_palette.input(c),
                 _ => {}
             }
+            self.needs_redraw = true;
+            return Ok(TuiReadOutcome::Pending);
         }
 
-        match key.code {
-            KeyCode::Enter => {
-                if key.modifiers.contains(KeyModifiers::SHIFT) {
-                    self.input.insert_newline();
-                    return Ok(TuiReadOutcome::Pending);
-                }
+        // Vim mode transition: Esc → Normal mode
+        if self.keymap.preset() == crate::keybindings::KeyPreset::Vim
+            && key.code == KeyCode::Esc
+            && key.modifiers.is_empty()
+            && self.keymap.vim_mode() == VimMode::Insert
+        {
+            self.keymap.set_vim_mode(VimMode::Normal);
+            self.needs_redraw = true;
+            return Ok(TuiReadOutcome::Pending);
+        }
+
+        // Tab completion has priority when active
+        if self.showing_completions && key.code == KeyCode::Tab {
+            self.handle_tab();
+            return Ok(TuiReadOutcome::Pending);
+        }
+
+        // Resolve key → action through KeyMap
+        let action = self.keymap.resolve(key);
+
+        match action {
+            Some(Action::Submit) => {
                 let lines = self.input.lines();
                 let text = lines.join("\n");
                 self.input.select_all();
@@ -503,27 +521,157 @@ impl TuiApp {
                 }
                 Ok(TuiReadOutcome::Submit(text))
             }
-            KeyCode::Tab => {
+            Some(Action::Cancel) => {
+                self.showing_completions = false;
+                self.input.select_all();
+                self.input.cut();
+                Ok(TuiReadOutcome::Cancel)
+            }
+            Some(Action::Newline) => {
+                self.input.insert_newline();
+                Ok(TuiReadOutcome::Pending)
+            }
+            Some(Action::Exit) => {
+                self.should_exit = true;
+                Ok(TuiReadOutcome::Exit)
+            }
+            Some(Action::ProviderSwap) => {
+                self.input.select_all();
+                self.input.cut();
+                Ok(TuiReadOutcome::ProviderSwap)
+            }
+            Some(Action::TeamToggle) => {
+                self.input.select_all();
+                self.input.cut();
+                Ok(TuiReadOutcome::TeamToggle)
+            }
+            Some(Action::CommandPalette) => {
+                self.command_palette.open();
+                self.needs_redraw = true;
+                Ok(TuiReadOutcome::Pending)
+            }
+            Some(Action::ToggleAgentView) => {
+                Ok(TuiReadOutcome::ToggleAgentView)
+            }
+            Some(Action::ToggleSidebar) => {
+                // Future: toggle sidebar
+                Ok(TuiReadOutcome::Pending)
+            }
+            Some(Action::ClearConversation) => {
+                self.conversation.clear();
+                self.conversation_scroll = 0;
+                self.needs_redraw = true;
+                Ok(TuiReadOutcome::Pending)
+            }
+            Some(Action::Help) => {
+                self.show_help();
+                Ok(TuiReadOutcome::Pending)
+            }
+            Some(Action::CycleChatMode) => {
                 self.handle_tab();
                 Ok(TuiReadOutcome::Pending)
             }
-            KeyCode::Esc => {
-                self.showing_completions = false;
-                Ok(TuiReadOutcome::Cancel)
+            Some(Action::ScrollUp) => {
+                self.conversation_scroll = self.conversation_scroll.saturating_add(1);
+                Ok(TuiReadOutcome::Pending)
             }
-            KeyCode::PageUp => {
+            Some(Action::ScrollDown) => {
+                self.conversation_scroll = self.conversation_scroll.saturating_sub(1);
+                Ok(TuiReadOutcome::Pending)
+            }
+            Some(Action::ScrollHalfUp) => {
                 self.conversation_scroll = self.conversation_scroll.saturating_add(5);
                 Ok(TuiReadOutcome::Pending)
             }
-            KeyCode::PageDown => {
+            Some(Action::ScrollHalfDown) => {
                 self.conversation_scroll = self.conversation_scroll.saturating_sub(5);
                 Ok(TuiReadOutcome::Pending)
             }
+            Some(Action::ScrollTop) => {
+                self.conversation_scroll = u16::MAX;
+                Ok(TuiReadOutcome::Pending)
+            }
+            Some(Action::ScrollBottom) => {
+                self.conversation_scroll = 0;
+                Ok(TuiReadOutcome::Pending)
+            }
+            Some(Action::FocusInput) => {
+                if self.keymap.preset() == crate::keybindings::KeyPreset::Vim {
+                    self.keymap.set_vim_mode(VimMode::Insert);
+                }
+                Ok(TuiReadOutcome::Pending)
+            }
+            Some(Action::FocusConversation) => {
+                Ok(TuiReadOutcome::Pending)
+            }
             _ => {
+                // Unbound key — pass to text area for editing
                 self.showing_completions = false;
                 self.input.input(key);
                 Ok(TuiReadOutcome::Pending)
             }
+        }
+    }
+
+    fn show_help(&mut self) {
+        let preset = self.keymap.preset();
+        let mut msg = format!("Keybindings ({preset:?}):\n\n");
+        msg += "Enter       Submit\n";
+        msg += "Shift+Enter Newline\n";
+        msg += "Ctrl+C      Cancel\n";
+        msg += "Ctrl+D      Exit TUI\n";
+        msg += "Ctrl+P      Swap provider\n";
+        msg += "Ctrl+K      Command palette\n";
+        msg += "Ctrl+A      Agent view\n";
+        msg += "Ctrl+T      Team toggle\n";
+        msg += "Ctrl+L      Clear conversation\n";
+        msg += "F1          This help\n";
+        msg += "PageUp/Down Scroll\n";
+        if preset == crate::keybindings::KeyPreset::Vim {
+            msg += "\nVim mode:\n";
+            msg += "  i     Insert\n";
+            msg += "  Esc   Normal\n";
+            msg += "  j/k   Scroll\n";
+            msg += "  g/G   Top/Bottom\n";
+            msg += "  :     Command palette\n";
+        }
+        msg += "\nSlash commands:\n";
+        msg += "/tui /theme /keys /code /ask /architect\n";
+        msg += "/diff /undo /ls /help\n";
+        self.push_system_message(&msg);
+    }
+
+    /// Dispatch an Action — used by command palette and handle_key.
+    fn dispatch_action(&mut self, action: crate::keybindings::Action) -> io::Result<TuiReadOutcome> {
+        use crate::keybindings::Action;
+        match action {
+            Action::Submit => {
+                let lines = self.input.lines();
+                let text = lines.join("\n");
+                self.input.select_all();
+                self.input.cut();
+                if text.trim().is_empty() { return Ok(TuiReadOutcome::Pending); }
+                Ok(TuiReadOutcome::Submit(text))
+            }
+            Action::Cancel => { self.showing_completions = false; self.input.select_all(); self.input.cut(); Ok(TuiReadOutcome::Cancel) }
+            Action::Newline => { self.input.insert_newline(); Ok(TuiReadOutcome::Pending) }
+            Action::Exit => { self.should_exit = true; Ok(TuiReadOutcome::Exit) }
+            Action::ProviderSwap => { self.input.select_all(); self.input.cut(); Ok(TuiReadOutcome::ProviderSwap) }
+            Action::TeamToggle => { self.input.select_all(); self.input.cut(); Ok(TuiReadOutcome::TeamToggle) }
+            Action::CommandPalette => { self.command_palette.open(); self.needs_redraw = true; Ok(TuiReadOutcome::Pending) }
+            Action::ToggleAgentView => Ok(TuiReadOutcome::ToggleAgentView),
+            Action::ToggleSidebar => Ok(TuiReadOutcome::Pending),
+            Action::ClearConversation => { self.conversation.clear(); self.conversation_scroll = 0; self.needs_redraw = true; Ok(TuiReadOutcome::Pending) }
+            Action::Help => { self.show_help(); Ok(TuiReadOutcome::Pending) }
+            Action::CycleChatMode => { self.handle_tab(); Ok(TuiReadOutcome::Pending) }
+            Action::ScrollUp => { self.conversation_scroll = self.conversation_scroll.saturating_add(1); Ok(TuiReadOutcome::Pending) }
+            Action::ScrollDown => { self.conversation_scroll = self.conversation_scroll.saturating_sub(1); Ok(TuiReadOutcome::Pending) }
+            Action::ScrollHalfUp => { self.conversation_scroll = self.conversation_scroll.saturating_add(5); Ok(TuiReadOutcome::Pending) }
+            Action::ScrollHalfDown => { self.conversation_scroll = self.conversation_scroll.saturating_sub(5); Ok(TuiReadOutcome::Pending) }
+            Action::ScrollTop => { self.conversation_scroll = u16::MAX; Ok(TuiReadOutcome::Pending) }
+            Action::ScrollBottom => { self.conversation_scroll = 0; Ok(TuiReadOutcome::Pending) }
+            Action::FocusInput => { Ok(TuiReadOutcome::Pending) }
+            Action::FocusConversation => { Ok(TuiReadOutcome::Pending) }
         }
     }
 
@@ -567,6 +715,7 @@ pub enum TuiReadOutcome {
     Exit,
     ProviderSwap,
     TeamToggle,
+    ToggleAgentView,
 }
 
 // ---------------------------------------------------------------------------

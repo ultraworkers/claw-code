@@ -18,6 +18,8 @@ mod init;
 mod input;
 mod render;
 mod setup_wizard;
+mod command_palette;
+mod keybindings;
 mod markdown;
 mod theme;
 mod tui;
@@ -7257,6 +7259,10 @@ fn run_tui_repl(mut cli: LiveCli) -> Result<(), Box<dyn std::error::Error>> {
                     std::env::set_var("CLAWD_AGENT_TEAMS", "1");
                     app.push_system_message("[team] Agent teams enabled");
                 }
+            }
+            tui::TuiReadOutcome::ToggleAgentView => {
+                // Agent View integration in Sprint 6
+                app.push_system_message("Agent View coming in Sprint 6");
             }
         }
     }
