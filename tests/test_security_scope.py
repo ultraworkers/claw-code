@@ -94,6 +94,15 @@ class WorkspacePathScopeTests(unittest.TestCase):
             self.assertFalse(decision.allowed)
             self.assertIn(str(outside.resolve()), decision.resolved or '')
 
+    def test_null_device_redirection_is_allowed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp) / 'workspace'
+            workspace.mkdir()
+
+            decision = WorkspacePathScope.from_root(workspace).validate_payload('echo ok >/dev/null')
+
+            self.assertTrue(decision.allowed, decision.reason)
+
     def test_explicit_worktree_roots_are_allowed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

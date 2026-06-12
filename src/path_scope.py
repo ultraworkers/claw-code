@@ -59,6 +59,8 @@ class WorkspacePathScope:
 
     def validate_path(self, candidate: str | Path, cwd: str | Path | None = None) -> PathScopeDecision:
         raw = os.path.expandvars(os.path.expanduser(str(candidate)))
+        if raw == os.devnull:
+            return PathScopeDecision(True, 'null device is outside filesystem scope', str(candidate), raw)
         if _is_windows_absolute(raw):
             return self._validate_windows_path(raw)
         base = Path(cwd).expanduser().resolve(strict=False) if cwd else self.roots[0]
