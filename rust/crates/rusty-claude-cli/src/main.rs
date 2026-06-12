@@ -7290,6 +7290,7 @@ fn run_tui_repl(mut cli: LiveCli) -> Result<(), Box<dyn std::error::Error>> {
                 }
 
                 app.push_user_input(&input);
+                app.push_history(&input);
                 cli.record_prompt_history(&trimmed);
                 update_dashboard(&dashboard_state, &cli);
                 app.set_status("Thinking...");

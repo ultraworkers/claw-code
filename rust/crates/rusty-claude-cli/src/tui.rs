@@ -184,6 +184,8 @@ pub struct TuiApp {
     pub command_palette: crate::command_palette::CommandPalette,
     pub chat_mode: crate::chat_mode::ChatMode,
     pub agent_view: crate::agent_view::AgentView,
+    pub input_history: Vec<String>,
+    pub history_index: Option<usize>,
 }
 
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -242,6 +244,8 @@ impl TuiApp {
             command_palette: crate::command_palette::CommandPalette::new(),
             chat_mode: crate::chat_mode::ChatMode::Code,
             agent_view: crate::agent_view::AgentView::new(),
+            input_history: Vec::new(),
+            history_index: None,
             needs_redraw: true,
         };
         me.draw_screen()?;
@@ -317,6 +321,63 @@ impl TuiApp {
         self.markdown_renderer.set_code_theme(&theme.syntax_theme);
         self.theme = theme;
         self.needs_redraw = true;
+    }
+
+    /// Set keybinding preset.
+    pub fn set_key_preset(&mut self, preset: crate::keybindings::KeyPreset) {
+        self.keymap.set_preset(preset);
+        self.needs_redraw = true;
+    }
+
+    /// Get current keybinding preset name.
+    pub fn key_preset_name(&self) -> &'static str {
+        match self.keymap.preset() {
+            crate::keybindings::KeyPreset::Emacs => "Emacs",
+            crate::keybindings::KeyPreset::Vim => "Vim",
+            crate::keybindings::KeyPreset::Windows => "Windows",
+        }
+    }
+
+    /// Add text to input history.
+    pub fn push_history(&mut self, text: &str) {
+        if !text.trim().is_empty() {
+            self.input_history.push(text.to_string());
+            if self.input_history.len() > 500 {
+                self.input_history.remove(0);
+            }
+        }
+        self.history_index = None;
+    }
+
+    /// Navigate up in input history.
+    pub fn history_up(&mut self) {
+        if self.input_history.is_empty() {
+            return;
+        }
+        let new_idx = match self.history_index {
+            Some(i) => i.saturating_add(1).min(self.input_history.len() - 1),
+            None => self.input_history.len() - 1,
+        };
+        self.history_index = Some(new_idx);
+        let entry = &self.input_history[self.input_history.len() - 1 - new_idx];
+        self.input = TextArea::new(vec![entry.clone()]);
+    }
+
+    /// Navigate down in input history.
+    pub fn history_down(&mut self) {
+        match self.history_index {
+            Some(0) => {
+                self.history_index = None;
+                self.input = TextArea::new(vec![String::new()]);
+            }
+            Some(i) => {
+                let new_idx = i - 1;
+                self.history_index = Some(new_idx);
+                let entry = &self.input_history[self.input_history.len() - 1 - new_idx];
+                self.input = TextArea::new(vec![entry.clone()]);
+            }
+            None => {}
+        }
     }
 
     // -------------------------------------------------------------------
@@ -646,7 +707,17 @@ impl TuiApp {
                 Ok(TuiReadOutcome::Pending)
             }
             _ => {
-                // Unbound key — pass to text area for editing
+                // Unbound keys — check for history navigation, then pass to text area
+                if key.code == KeyCode::Up && !self.showing_completions {
+                    self.history_up();
+                    self.needs_redraw = true;
+                    return Ok(TuiReadOutcome::Pending);
+                }
+                if key.code == KeyCode::Down && !self.showing_completions {
+                    self.history_down();
+                    self.needs_redraw = true;
+                    return Ok(TuiReadOutcome::Pending);
+                }
                 self.showing_completions = false;
                 self.input.input(key);
                 Ok(TuiReadOutcome::Pending)
@@ -804,47 +875,57 @@ fn draw_frame(
 /// Returns a list of styled `Line` values.  Long words that exceed `width`
 /// are hard-broken to prevent overflow.
 fn wrap_line<'a>(text: &str, width: usize, style: Style) -> Vec<Line<'a>> {
+    use unicode_width::UnicodeWidthChar;
+
     if width == 0 {
         return vec![Line::from(Span::styled(text.to_string(), style))];
     }
 
     let mut result: Vec<Line<'a>> = Vec::new();
-    let mut remaining = text;
 
-    if remaining.is_empty() {
+    if text.is_empty() {
         result.push(Line::from(Span::styled(String::new(), style)));
         return result;
     }
 
-    while !remaining.is_empty() {
-        if remaining.chars().count() <= width {
-            result.push(Line::from(Span::styled(remaining.to_string(), style)));
-            break;
-        }
+    let mut current_line = String::new();
+    let mut current_width: usize = 0;
+    let mut last_break_byte: usize = 0;
 
-        // Find the last space within `width` chars
-        let char_indices: Vec<(usize, char)> = remaining.char_indices().take(width).collect();
-        let mut break_pos = None;
+    for ch in text.chars() {
+        let cw = ch.width().unwrap_or(0);
 
-        for &(idx, ch) in char_indices.iter().rev() {
-            if ch == ' ' || ch == '-' {
-                break_pos = Some(idx + ch.len_utf8());
-                break;
+        if current_width + cw > width && !current_line.is_empty() {
+            // Need to break
+            if last_break_byte > 0 {
+                let keep = current_line[..last_break_byte].trim_end().to_string();
+                let rest = current_line[last_break_byte..].to_string();
+                result.push(Line::from(Span::styled(keep, style.clone())));
+                current_width = rest.chars().map(|c| c.width().unwrap_or(0)).sum();
+                current_line = rest;
+                last_break_byte = 0;
+            } else {
+                result.push(Line::from(Span::styled(current_line.clone(), style.clone())));
+                current_line.clear();
+                current_width = 0;
+                last_break_byte = 0;
             }
         }
 
-        let (head, tail) = match break_pos {
-            Some(pos) => (&remaining[..pos], remaining[pos..].trim_start()),
-            None => {
-                // No space found — hard-break at column boundary
-                let (idx, _) = char_indices.last().unwrap();
-                let end = *idx + remaining[*idx..].chars().next().map_or(0, |c| c.len_utf8());
-                (&remaining[..end], &remaining[end..])
-            }
-        };
+        current_line.push(ch);
+        current_width += cw;
 
-        result.push(Line::from(Span::styled(head.to_string(), style)));
-        remaining = tail;
+        if ch == ' ' || ch == '-' || ch == '_' || ch == '/' {
+            last_break_byte = current_line.len();
+        }
+    }
+
+    if !current_line.is_empty() {
+        result.push(Line::from(Span::styled(current_line, style)));
+    }
+
+    if result.is_empty() {
+        result.push(Line::from(Span::styled(String::new(), style)));
     }
 
     result
@@ -1384,3 +1465,69 @@ fn draw_agent_view(
 }
 
 // ANSI stripping is now in tui_update::strip_ansi() — single canonical implementation.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_wrap_empty() {
+        let lines = wrap_line("", 80, Style::default());
+        assert_eq!(lines.len(), 1);
+    }
+
+    #[test]
+    fn test_wrap_exact_width() {
+        let lines = wrap_line("hello", 5, Style::default());
+        assert_eq!(lines.len(), 1);
+    }
+
+    #[test]
+    fn test_wrap_overflow_with_break() {
+        let lines = wrap_line("hello world foo bar", 10, Style::default());
+        assert!(lines.len() >= 2);
+    }
+
+    #[test]
+    fn test_wrap_hyphen_break() {
+        let lines = wrap_line("well-known-author", 10, Style::default());
+        assert!(lines.len() >= 2);
+    }
+
+    #[test]
+    fn test_wrap_no_break_point() {
+        let lines = wrap_line("abcdefghijklmnop", 5, Style::default());
+        assert!(lines.len() >= 2);
+    }
+
+    #[test]
+    fn test_wrap_cjk_double_width() {
+        use unicode_width::UnicodeWidthChar;
+        let lines = wrap_line("你好世界你好世界你好世界", 10, Style::default());
+        for line in &lines {
+            let width: usize = line.spans.iter()
+                .flat_map(|s| s.content.chars())
+                .map(|c| c.width().unwrap_or(0))
+                .sum();
+            assert!(width <= 10 + 2, "line width {width} exceeds 10+2 tolerance");
+        }
+    }
+
+    #[test]
+    fn test_wrap_zero_width() {
+        let lines = wrap_line("hello", 0, Style::default());
+        assert_eq!(lines.len(), 1);
+    }
+
+    #[test]
+    fn test_conversation_line_constructors() {
+        let plain = ConversationLine::plain("test".into(), Color::Red, true);
+        assert!(matches!(plain.content, ConversationContent::Plain { .. }));
+
+        let md = ConversationLine::markdown("# Hello".into());
+        assert!(matches!(md.content, ConversationContent::Markdown { .. }));
+
+        let diff = ConversationLine::diff("+line".into());
+        assert!(matches!(diff.content, ConversationContent::CodeDiff { .. }));
+    }
+}
