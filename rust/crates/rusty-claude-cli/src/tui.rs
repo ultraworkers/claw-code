@@ -182,6 +182,7 @@ pub struct TuiApp {
     pub theme: crate::theme::TuiTheme,
     pub keymap: crate::keybindings::KeyMap,
     pub command_palette: crate::command_palette::CommandPalette,
+    pub chat_mode: crate::chat_mode::ChatMode,
 }
 
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -238,6 +239,7 @@ impl TuiApp {
             theme: crate::theme::TuiTheme::builtin("default").unwrap(),
             keymap: crate::keybindings::KeyMap::new(crate::keybindings::KeyPreset::Emacs),
             command_palette: crate::command_palette::CommandPalette::new(),
+            chat_mode: crate::chat_mode::ChatMode::Code,
             needs_redraw: true,
         };
         me.draw_screen()?;

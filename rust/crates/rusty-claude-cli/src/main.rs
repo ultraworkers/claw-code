@@ -18,6 +18,7 @@ mod init;
 mod input;
 mod render;
 mod setup_wizard;
+mod chat_mode;
 mod command_palette;
 mod keybindings;
 mod markdown;
@@ -7179,6 +7180,112 @@ fn run_tui_repl(mut cli: LiveCli) -> Result<(), Box<dyn std::error::Error>> {
                     app.push_system_message("Bye!");
                     cli.persist_session()?;
                     break;
+                }
+
+                // Slash commands handled locally in TUI (not sent to model)
+                if trimmed.starts_with("/theme") {
+                    let args = trimmed.strip_prefix("/theme").unwrap_or("").trim();
+                    if args.is_empty() {
+                        let names = crate::theme::TuiTheme::all_builtin_names();
+                        app.push_system_message(&format!(
+                            "Available themes: {}\nUsage: /theme <name>",
+                            names.join(", ")
+                        ));
+                    } else if let Some(theme) = crate::theme::TuiTheme::builtin(args) {
+                        app.set_theme(theme);
+                        app.push_system_message(&format!("Theme: {args}"));
+                    } else {
+                        app.push_system_message(&format!("Unknown theme: {args}"));
+                    }
+                    continue;
+                }
+                if trimmed.starts_with("/keys") {
+                    let args = trimmed.strip_prefix("/keys").unwrap_or("").trim();
+                    match args {
+                        "emacs" => { app.keymap.set_preset(crate::keybindings::KeyPreset::Emacs); app.push_system_message("Keys: Emacs"); }
+                        "vim" => { app.keymap.set_preset(crate::keybindings::KeyPreset::Vim); app.push_system_message("Keys: Vim — i for insert, Esc for normal"); }
+                        "windows" => { app.keymap.set_preset(crate::keybindings::KeyPreset::Windows); app.push_system_message("Keys: Windows"); }
+                        "" => {
+                            app.push_system_message(&format!("Current: {:?}\nAvailable: emacs, vim, windows\nUsage: /keys <preset>", app.keymap.preset()));
+                        }
+                        _ => { app.push_system_message(&format!("Unknown: {args}. Available: emacs, vim, windows")); }
+                    }
+                    continue;
+                }
+                if matches!(trimmed.as_str(), "/code" | "/ask" | "/architect" | "/arch") {
+                    let mode = match trimmed.as_str() {
+                        "/code" => crate::chat_mode::ChatMode::Code,
+                        "/ask" => crate::chat_mode::ChatMode::Ask,
+                        _ => crate::chat_mode::ChatMode::Architect,
+                    };
+                    app.chat_mode = mode;
+                    app.push_system_message(&format!("Mode: {} — {}", mode.label(), mode.description()));
+                    continue;
+                }
+                if trimmed == "/diff" {
+                    let output = std::process::Command::new("git")
+                        .args(["diff"])
+                        .current_dir(std::env::current_dir().unwrap_or_default())
+                        .output();
+                    match output {
+                        Ok(out) if out.status.success() => {
+                            let diff = String::from_utf8_lossy(&out.stdout);
+                            if diff.is_empty() {
+                                app.push_system_message("No uncommitted changes.");
+                            } else {
+                                app.push_diff(&diff);
+                            }
+                        }
+                        Ok(out) => {
+                            let err = String::from_utf8_lossy(&out.stderr);
+                            app.push_system_message(&format!("git diff failed: {err}"));
+                        }
+                        Err(e) => { app.push_system_message(&format!("Failed to run git: {e}")); }
+                    }
+                    continue;
+                }
+                if trimmed.starts_with("/undo") {
+                    let args = trimmed.strip_prefix("/undo").unwrap_or("").trim();
+                    if args == "--confirm" || args == "-y" {
+                        let output = std::process::Command::new("git")
+                            .args(["checkout", "--", "."])
+                            .current_dir(std::env::current_dir().unwrap_or_default())
+                            .output();
+                        match output {
+                            Ok(out) if out.status.success() => app.push_system_message("✓ Reverted all uncommitted changes."),
+                            Ok(out) => { let err = String::from_utf8_lossy(&out.stderr); app.push_system_message(&format!("Undo failed: {err}")); }
+                            Err(e) => { app.push_system_message(&format!("Failed to run git: {e}")); }
+                        }
+                    } else {
+                        let output = std::process::Command::new("git")
+                            .args(["diff", "--stat"])
+                            .current_dir(std::env::current_dir().unwrap_or_default())
+                            .output();
+                        let stat = output.ok().filter(|o| o.status.success())
+                            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+                            .unwrap_or_default();
+                        if stat.is_empty() {
+                            app.push_system_message("Nothing to undo — no uncommitted changes.");
+                        } else {
+                            app.push_system_message(&format!("This will revert:\n{stat}\nType /undo --confirm to proceed."));
+                        }
+                    }
+                    continue;
+                }
+                if trimmed.starts_with("/ls") {
+                    let path = trimmed.strip_prefix("/ls").unwrap_or("").trim();
+                    if path.is_empty() {
+                        app.push_system_message("Usage: /ls <file-path>");
+                    } else {
+                        match std::fs::read_to_string(path) {
+                            Ok(content) => {
+                                app.push_system_message(&format!("── {path} ──"));
+                                app.push_output(&content, false);
+                            }
+                            Err(e) => app.push_system_message(&format!("Cannot read {path}: {e}")),
+                        }
+                    }
+                    continue;
                 }
 
                 app.push_user_input(&input);
