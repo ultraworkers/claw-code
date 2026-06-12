@@ -238,8 +238,8 @@ impl TuiApp {
             completion_index: 0,
             showing_completions: false,
             spinner_frame: 0,
-            markdown_renderer: crate::markdown::MarkdownRenderer::new(),
-            theme: crate::theme::TuiTheme::builtin("default").unwrap(),
+            markdown_renderer: crate::markdown::MarkdownRenderer::new(theme.clone()),
+            theme,
             keymap: crate::keybindings::KeyMap::new(crate::keybindings::KeyPreset::Emacs),
             command_palette: crate::command_palette::CommandPalette::new(),
             chat_mode: crate::chat_mode::ChatMode::Code,
@@ -318,7 +318,7 @@ impl TuiApp {
 
     /// Set a new theme and trigger redraw.
     pub fn set_theme(&mut self, theme: crate::theme::TuiTheme) {
-        self.markdown_renderer.set_code_theme(&theme.syntax_theme);
+        self.markdown_renderer.set_theme(theme.clone());
         self.theme = theme;
         self.needs_redraw = true;
     }
@@ -393,17 +393,19 @@ impl TuiApp {
     }
 
     pub fn push_user_input(&mut self, text: &str) {
+        let color = self.theme.conversation_user.to_color();
         for raw_line in text.lines() {
             self.conversation
-                .push(ConversationLine::plain(raw_line.to_string(), Color::Cyan, true));
+                .push(ConversationLine::plain(raw_line.to_string(), color, true));
         }
         self.auto_scroll();
     }
 
     pub fn push_system_message(&mut self, text: &str) {
+        let color = self.theme.conversation_system.to_color();
         for raw_line in text.lines() {
             self.conversation
-                .push(ConversationLine::plain(raw_line.to_string(), Color::Yellow, false));
+                .push(ConversationLine::plain(raw_line.to_string(), color, false));
         }
         self.auto_scroll();
     }
@@ -414,16 +416,18 @@ impl TuiApp {
         }
         let clean = crate::tui_update::strip_ansi(text);
         if is_error {
+            let color = self.theme.conversation_error.to_color();
             for raw_line in clean.lines() {
                 self.conversation
-                    .push(ConversationLine::plain(raw_line.to_string(), Color::Red, false));
+                    .push(ConversationLine::plain(raw_line.to_string(), color, false));
             }
         } else if crate::markdown::looks_like_markdown(&clean) {
             self.conversation.push(ConversationLine::markdown(clean));
         } else {
+            let color = self.theme.conversation_text.to_color();
             for raw_line in clean.lines() {
                 self.conversation
-                    .push(ConversationLine::plain(raw_line.to_string(), Color::White, false));
+                    .push(ConversationLine::plain(raw_line.to_string(), color, false));
             }
         }
         self.auto_scroll();
@@ -465,7 +469,7 @@ impl TuiApp {
             // Insert trim notice
             self.conversation.insert(0, ConversationLine::plain(
                 "... (earlier messages trimmed)".to_string(),
-                Color::DarkGray,
+                self.theme.conversation_dim.to_color(),
                 false,
             ));
         }
@@ -867,6 +871,7 @@ fn draw_frame(
         completion_index,
         showing_completions,
         markdown_renderer,
+        theme,
     );
     draw_right_pane(f, main[1], dashboard, spinner_frame, theme);
 }
@@ -937,6 +942,7 @@ fn build_wrapped_conversation<'a>(
     conversation: &[ConversationLine],
     content_width: usize,
     markdown_renderer: &crate::markdown::MarkdownRenderer,
+    theme: &crate::theme::TuiTheme,
 ) -> (Vec<Line<'a>>, Vec<usize>) {
     let mut all_lines: Vec<Line<'a>> = Vec::new();
     let mut expand_counts: Vec<usize> = Vec::new();
@@ -966,7 +972,7 @@ fn build_wrapped_conversation<'a>(
                 }));
             }
             ConversationContent::CodeDiff { diff } => {
-                let rendered = crate::markdown::render_diff(diff);
+                let rendered = crate::markdown::render_diff(diff, theme);
                 let count = rendered.len().max(1);
                 expand_counts.push(count);
                 all_lines.extend(rendered.into_iter().map(|l: Line<'static>| {
@@ -992,6 +998,7 @@ fn draw_left_pane(
     completion_index: usize,
     showing_completions: bool,
     markdown_renderer: &crate::markdown::MarkdownRenderer,
+    theme: &crate::theme::TuiTheme,
 ) {
     let left = Layout::default()
         .direction(Direction::Vertical)
@@ -1001,7 +1008,7 @@ fn draw_left_pane(
     // --- conversation with word-wrapping ---
     // Subtract 1 for the top border, 2 for left/right block padding
     let content_width = (left[0].width as usize).saturating_sub(2);
-    let (wrapped, expand_counts) = build_wrapped_conversation(conversation, content_width, markdown_renderer);
+    let (wrapped, expand_counts) = build_wrapped_conversation(conversation, content_width, markdown_renderer, theme);
 
     let pane_rows = (left[0].height.saturating_sub(1) as usize).max(1);
     let total_visual = wrapped.len();
@@ -1017,10 +1024,10 @@ fn draw_left_pane(
     let conversation_widget = Paragraph::new(visible).block(
         Block::default()
             .borders(Borders::TOP)
-            .border_style(Style::default().fg(Color::DarkGray))
+            .border_style(Style::default().fg(theme.border.to_color()))
             .title(Span::styled(
                 " Conversation ",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(theme.border.to_color()),
             )),
     );
     f.render_widget(conversation_widget, left[0]);
@@ -1056,7 +1063,7 @@ fn draw_left_pane(
         f.render_widget(
             Paragraph::new(Span::styled(
                 scroll_label,
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(theme.conversation_dim.to_color()),
             )),
             scroll_area,
         );
@@ -1079,9 +1086,9 @@ fn draw_left_pane(
                 .enumerate()
                 .map(|(i, m)| {
                     let style = if i == completion_index % matches.len() {
-                        Style::default().bg(Color::DarkGray).fg(Color::White)
+                        Style::default().bg(theme.completion_selected_bg.to_color()).fg(theme.completion_selected_fg.to_color())
                     } else {
-                        Style::default().fg(Color::Gray)
+                        Style::default().fg(theme.completion_fg.to_color())
                     };
                     ListItem::new(Line::from(Span::styled(m.as_str(), style)))
                 })
@@ -1089,7 +1096,7 @@ fn draw_left_pane(
             let list = List::new(items).block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::DarkGray)),
+                    .border_style(Style::default().fg(theme.border.to_color())),
             );
             let popup = Rect {
                 x: left[1].x,
@@ -1114,34 +1121,37 @@ fn draw_right_pane(
     #[allow(unused_assignments)]
     let mut gauge_row: Option<usize> = None;
 
-    lines.push(section("Connection"));
-    lines.push(kv("Model", &state.model, theme.dashboard_value.to_color()));
-    lines.push(kv("Provider", &state.provider, theme.dashboard_key.to_color()));
-    lines.push(kv("URL", &state.provider_url, theme.conversation_dim.to_color()));
-    lines.push(kv("Mode", &state.permission_mode, theme.conversation_system.to_color()));
+    lines.push(section("Connection", theme));
+    lines.push(kv("Model", &state.model, theme.dashboard_value.to_color(), theme));
+    lines.push(kv("Provider", &state.provider, theme.dashboard_key.to_color(), theme));
+    lines.push(kv("URL", &state.provider_url, theme.conversation_dim.to_color(), theme));
+    lines.push(kv("Mode", &state.permission_mode, theme.conversation_system.to_color(), theme));
     if let Some(ref branch) = state.git_branch {
-        lines.push(kv("Branch", branch, theme.agent_done.to_color()));
+        lines.push(kv("Branch", branch, theme.agent_done.to_color(), theme));
     }
     lines.push(Line::from(""));
 
-    lines.push(section("Tokens"));
-    lines.push(kv("Turns", &state.turn_count.to_string(), theme.dashboard_value.to_color()));
-    lines.push(kv("Input", &state.input_tokens.to_string(), theme.dashboard_value.to_color()));
-    lines.push(kv("Output", &state.output_tokens.to_string(), theme.dashboard_value.to_color()));
+    lines.push(section("Tokens", theme));
+    lines.push(kv("Turns", &state.turn_count.to_string(), theme.dashboard_value.to_color(), theme));
+    lines.push(kv("Input", &state.input_tokens.to_string(), theme.dashboard_value.to_color(), theme));
+    lines.push(kv("Output", &state.output_tokens.to_string(), theme.dashboard_value.to_color(), theme));
     lines.push(kv(
         "Cache R",
         &state.cache_read_tokens.to_string(),
         theme.dashboard_key.to_color(),
+        theme,
     ));
     lines.push(kv(
         "Cache W",
         &state.cache_creation_tokens.to_string(),
         theme.dashboard_key.to_color(),
+        theme,
     ));
     lines.push(kv(
         "Cost",
         &format!("${:.4}", state.cost_usd),
         theme.conversation_system.to_color(),
+        theme,
     ));
     lines.push(Line::from(""));
 
@@ -1153,11 +1163,12 @@ fn draw_right_pane(
     } else {
         theme.gauge_fill_green.to_color()
     };
-    lines.push(section("Context"));
+    lines.push(section("Context", theme));
     lines.push(kv(
         "Used",
         &format!("{:.1}% of {}", pct, state.context_window),
         theme.dashboard_value.to_color(),
+        theme,
     ));
     gauge_row = Some(lines.len());
     lines.push(Line::from(""));
@@ -1165,30 +1176,31 @@ fn draw_right_pane(
         "Compactions",
         &state.compaction_count.to_string(),
         theme.dashboard_key.to_color(),
+        theme,
     ));
     lines.push(Line::from(""));
 
     if !state.lsp_servers.is_empty() {
-        lines.push(section("LSP"));
+        lines.push(section("LSP", theme));
         for lsp in &state.lsp_servers {
             let c = match lsp.status.as_str() {
                 "connected" => theme.agent_done.to_color(),
                 "starting" => theme.agent_waiting.to_color(),
                 _ => theme.agent_failed.to_color(),
             };
-            lines.push(kv(&lsp.language, &lsp.status, c));
+            lines.push(kv(&lsp.language, &lsp.status, c, theme));
         }
         lines.push(Line::from(""));
     }
 
     if let Some(ref team) = state.team {
-        lines.push(section("Team"));
-        lines.push(kv("Name", &team.team_name, theme.dashboard_value.to_color()));
+        lines.push(section("Team", theme));
+        lines.push(kv("Name", &team.team_name, theme.dashboard_value.to_color(), theme));
         let progress = format!(
             "{}/{} done, {} fail, {} run",
             team.completed_agents, team.total_agents, team.failed_agents, team.running_agents
         );
-        lines.push(kv("Status", &progress, theme.agent_done.to_color()));
+        lines.push(kv("Status", &progress, theme.agent_done.to_color(), theme));
         for agent in &team.agents {
             let c = match agent.status.as_str() {
                 "completed" => theme.agent_done.to_color(),
@@ -1208,11 +1220,12 @@ fn draw_right_pane(
         lines.push(Line::from(""));
     }
 
-    lines.push(section("Session"));
+    lines.push(section("Session", theme));
     lines.push(kv(
         "ID",
         state.session_id.as_deref().unwrap_or("-"),
         theme.dashboard_key.to_color(),
+        theme,
     ));
 
     if !state.status_message.is_empty() {
@@ -1242,11 +1255,11 @@ fn draw_right_pane(
         .block(
             Block::default()
                 .borders(Borders::LEFT)
-                .border_style(Style::default().fg(Color::DarkGray))
+                .border_style(Style::default().fg(theme.border.to_color()))
                 .title(Span::styled(
                     " Dashboard ",
                     Style::default()
-                        .fg(Color::Cyan)
+                        .fg(theme.dashboard_header.to_color())
                         .add_modifier(Modifier::BOLD),
                 )),
         )
@@ -1263,7 +1276,7 @@ fn draw_right_pane(
             height: 1,
         };
         let gauge = Gauge::default()
-            .gauge_style(Style::default().fg(gauge_color).bg(Color::DarkGray))
+            .gauge_style(Style::default().fg(gauge_color).bg(theme.gauge_bg.to_color()))
             .ratio(if pct > 0.0 {
                 (pct / 100.0).min(1.0)
             } else {
@@ -1273,22 +1286,22 @@ fn draw_right_pane(
     }
 }
 
-fn section<'a>(label: &str) -> Line<'a> {
+fn section<'a>(label: &str, theme: &crate::theme::TuiTheme) -> Line<'a> {
     Line::from(Span::styled(
         format!("─ {label} ─"),
         Style::default()
-            .fg(Color::Cyan)
+            .fg(theme.dashboard_header.to_color())
             .add_modifier(Modifier::BOLD),
     ))
 }
 
 /// Key-value row with fixed-width key column so values align vertically.
 /// Key is right-padded to `KV_KEY_WIDTH` columns: `"  Model       value"`.
-fn kv<'a>(key: &str, val: &str, val_color: Color) -> Line<'a> {
+fn kv<'a>(key: &str, val: &str, val_color: Color, theme: &crate::theme::TuiTheme) -> Line<'a> {
     Line::from(vec![
         Span::styled(
             format!("  {:<KV_KEY_WIDTH$}", key),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme.dashboard_key.to_color()),
         ),
         Span::styled(val.to_string(), Style::default().fg(val_color)),
     ])

@@ -183,9 +183,18 @@ mod tests {
     fn test_filter_by_label() {
         let mut cp = CommandPalette::new();
         cp.open();
+        // 'Z' doesn't appear in any default entry label/description/category,
+        // so it should filter down to zero results.
+        cp.input('Z');
+        assert!(cp.filtered.is_empty());
+        // A more specific query that matches only some entries
+        cp.backspace();
+        cp.input('H');
         cp.input('e');
-        // Should filter to entries containing 'e'
+        cp.input('l');
+        cp.input('p');
         assert!(cp.filtered.len() < cp.entries.len());
+        assert!(cp.filtered.len() >= 1);
     }
 
     #[test]

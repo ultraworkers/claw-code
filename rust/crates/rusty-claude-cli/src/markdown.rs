@@ -16,17 +16,25 @@ pub static THEME_SET: Lazy<ThemeSet> = Lazy::new(ThemeSet::load_defaults);
 #[derive(Clone)]
 pub struct MarkdownRenderer {
     code_theme_name: String,
+    theme: crate::theme::TuiTheme,
 }
 
 impl MarkdownRenderer {
-    pub fn new() -> Self {
+    pub fn new(theme: crate::theme::TuiTheme) -> Self {
+        let code_theme_name = theme.syntax_theme.clone();
         Self {
-            code_theme_name: "base16-ocean.dark".to_string(),
+            code_theme_name,
+            theme,
         }
     }
 
     pub fn set_code_theme(&mut self, name: &str) {
         self.code_theme_name = name.to_string();
+    }
+
+    pub fn set_theme(&mut self, theme: crate::theme::TuiTheme) {
+        self.code_theme_name = theme.syntax_theme.clone();
+        self.theme = theme;
     }
 
     /// Render a markdown string into ratatui Lines at the given terminal width.
@@ -52,7 +60,7 @@ impl MarkdownRenderer {
                         flush_line(&mut lines, &mut current_spans);
                         style_stack.push(
                             Style::default()
-                                .fg(Color::Cyan)
+                                .fg(self.theme.conversation_user.to_color())
                                 .add_modifier(Modifier::BOLD),
                         );
                     }
@@ -84,8 +92,8 @@ impl MarkdownRenderer {
                     }
                     Tag::BlockQuote(_) => {
                         current_spans
-                            .push(Span::styled("│ ", Style::default().fg(Color::DarkGray)));
-                        style_stack.push(Style::default().fg(Color::DarkGray));
+                            .push(Span::styled("│ ", Style::default().fg(self.theme.conversation_dim.to_color())));
+                        style_stack.push(Style::default().fg(self.theme.conversation_dim.to_color()));
                     }
                     Tag::Emphasis => {
                         style_stack.push(Style::default().add_modifier(Modifier::ITALIC));
@@ -96,7 +104,7 @@ impl MarkdownRenderer {
                     Tag::Link { .. } => {
                         style_stack.push(
                             Style::default()
-                                .fg(Color::Blue)
+                                .fg(self.theme.conversation_user.to_color())
                                 .add_modifier(Modifier::UNDERLINED),
                         );
                     }
@@ -144,7 +152,7 @@ impl MarkdownRenderer {
                     }
                 }
                 Event::Code(code) => {
-                    let style = Style::default().fg(Color::Yellow).bg(Color::DarkGray);
+                    let style = Style::default().fg(self.theme.conversation_system.to_color()).bg(self.theme.code_bg.to_color());
                     current_spans.push(Span::styled(format!(" {code} "), style));
                 }
                 Event::SoftBreak | Event::HardBreak => {
@@ -158,7 +166,7 @@ impl MarkdownRenderer {
                     flush_line(&mut lines, &mut current_spans);
                     lines.push(Line::from(Span::styled(
                         "─".repeat(width as usize),
-                        Style::default().fg(Color::DarkGray),
+                        Style::default().fg(self.theme.conversation_dim.to_color()),
                     )));
                 }
                 _ => {}
@@ -186,7 +194,7 @@ impl MarkdownRenderer {
         let lang_label = language.unwrap_or("text");
         lines.push(Line::from(Span::styled(
             format!("╭─ {lang_label} ─"),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(self.theme.code_language_label.to_color()),
         )));
 
         // syntect 5.x: HighlightLines::new() returns directly (not Result)
@@ -197,7 +205,7 @@ impl MarkdownRenderer {
                 Ok(ranges) => {
                     let mut line_spans: Vec<Span<'static>> = vec![Span::styled(
                         "│ ",
-                        Style::default().fg(Color::DarkGray),
+                        Style::default().fg(self.theme.code_border.to_color()),
                     )];
                     for (style, text) in ranges {
                         let fg = style.foreground;
@@ -210,7 +218,7 @@ impl MarkdownRenderer {
                 }
                 Err(_) => {
                     lines.push(Line::from(vec![
-                        Span::styled("│ ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("│ ", Style::default().fg(self.theme.code_border.to_color())),
                         Span::raw(line.to_string()),
                     ]));
                 }
@@ -219,7 +227,7 @@ impl MarkdownRenderer {
 
         lines.push(Line::from(Span::styled(
             "╰─",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(self.theme.code_border.to_color()),
         )));
         lines
     }
@@ -249,19 +257,19 @@ pub fn looks_like_markdown(text: &str) -> bool {
 }
 
 /// Render a unified diff with color-coded lines.
-pub fn render_diff(diff: &str) -> Vec<Line<'static>> {
+pub fn render_diff(diff: &str, theme: &crate::theme::TuiTheme) -> Vec<Line<'static>> {
     diff.lines()
         .map(|raw_line| {
             let (text, color) = if raw_line.starts_with("+++") || raw_line.starts_with("---") {
-                (raw_line.to_string(), Color::White)
+                (raw_line.to_string(), theme.conversation_text.to_color())
             } else if raw_line.starts_with("@@") {
-                (raw_line.to_string(), Color::Cyan)
+                (raw_line.to_string(), theme.conversation_user.to_color())
             } else if raw_line.starts_with('+') {
-                (raw_line.to_string(), Color::Green)
+                (raw_line.to_string(), theme.agent_done.to_color())
             } else if raw_line.starts_with('-') {
-                (raw_line.to_string(), Color::Red)
+                (raw_line.to_string(), theme.conversation_error.to_color())
             } else {
-                (raw_line.to_string(), Color::DarkGray)
+                (raw_line.to_string(), theme.conversation_dim.to_color())
             };
             Line::from(Span::styled(text, Style::default().fg(color)))
         })
@@ -272,18 +280,22 @@ pub fn render_diff(diff: &str) -> Vec<Line<'static>> {
 mod tests {
     use super::*;
 
+    fn test_theme() -> crate::theme::TuiTheme {
+        crate::theme::TuiTheme::builtin("default").unwrap()
+    }
+
     // --- Markdown rendering ---
 
     #[test]
     fn test_plain_paragraph() {
-        let r = MarkdownRenderer::new();
+        let r = MarkdownRenderer::new(test_theme());
         let lines = r.render("Just a paragraph.", 80);
         assert_eq!(lines.len(), 2); // text + blank
     }
 
     #[test]
     fn test_h1_rendering() {
-        let r = MarkdownRenderer::new();
+        let r = MarkdownRenderer::new(test_theme());
         let lines = r.render("# Hello", 80);
         assert!(lines[0]
             .spans
@@ -293,7 +305,7 @@ mod tests {
 
     #[test]
     fn test_rust_code_block() {
-        let r = MarkdownRenderer::new();
+        let r = MarkdownRenderer::new(test_theme());
         let lines = r.render("```rust\nfn main() {\n    println!(\"hi\");\n}\n```", 80);
         // At minimum: top border + at least 1 code line + bottom border
         assert!(lines.len() >= 3);
@@ -306,7 +318,7 @@ mod tests {
 
     #[test]
     fn test_python_code_block() {
-        let r = MarkdownRenderer::new();
+        let r = MarkdownRenderer::new(test_theme());
         let lines = r.render("```python\ndef hello():\n    pass\n```", 80);
         assert!(lines.len() >= 3);
         let text: String = lines.iter().map(|l| {
@@ -317,21 +329,21 @@ mod tests {
 
     #[test]
     fn test_inline_code() {
-        let r = MarkdownRenderer::new();
+        let r = MarkdownRenderer::new(test_theme());
         let lines = r.render("Use `git status` to check", 80);
         assert_eq!(lines.len(), 2);
     }
 
     #[test]
     fn test_bold_and_italic() {
-        let r = MarkdownRenderer::new();
+        let r = MarkdownRenderer::new(test_theme());
         let lines = r.render("**bold** and *italic*", 80);
         assert_eq!(lines.len(), 2);
     }
 
     #[test]
     fn test_nested_list() {
-        let r = MarkdownRenderer::new();
+        let r = MarkdownRenderer::new(test_theme());
         let lines = r.render("- item 1\n- item 2\n  - nested", 80);
         // At least 2 list items rendered (nested may be part of item 2)
         assert!(lines.len() >= 2);
@@ -339,7 +351,7 @@ mod tests {
 
     #[test]
     fn test_blockquote() {
-        let r = MarkdownRenderer::new();
+        let r = MarkdownRenderer::new(test_theme());
         let lines = r.render("> quoted\n> text", 80);
         // 2 blockquote lines + possible blank lines
         assert!(lines.len() >= 2);
@@ -347,21 +359,21 @@ mod tests {
 
     #[test]
     fn test_horizontal_rule() {
-        let r = MarkdownRenderer::new();
+        let r = MarkdownRenderer::new(test_theme());
         let lines = r.render("---", 80);
         assert_eq!(lines.len(), 1);
     }
 
     #[test]
     fn test_empty_input() {
-        let r = MarkdownRenderer::new();
+        let r = MarkdownRenderer::new(test_theme());
         let lines = r.render("", 80);
         assert!(lines.is_empty());
     }
 
     #[test]
     fn test_mixed_content() {
-        let r = MarkdownRenderer::new();
+        let r = MarkdownRenderer::new(test_theme());
         let md = "# Title\n\nSome text with `code`.\n\n```rust\nfn main() {}\n```\n\n- list item";
         let lines = r.render(md, 80);
         // Header + blank + text + blank + code block (3+) + blank + list item + blanks
@@ -370,7 +382,7 @@ mod tests {
 
     #[test]
     fn test_theme_fallback() {
-        let mut r = MarkdownRenderer::new();
+        let mut r = MarkdownRenderer::new(test_theme());
         r.set_code_theme("nonexistent_theme");
         // Should not panic — falls back gracefully
         let lines = r.render("```rust\nfn main() {}\n```", 80);
@@ -416,26 +428,30 @@ mod tests {
 
     #[test]
     fn test_diff_additions_green() {
-        let lines = render_diff("+new line");
-        assert_eq!(lines[0].spans[0].style.fg, Some(Color::Green));
+        let theme = test_theme();
+        let lines = render_diff("+new line", &theme);
+        assert_eq!(lines[0].spans[0].style.fg, Some(theme.agent_done.to_color()));
     }
 
     #[test]
     fn test_diff_deletions_red() {
-        let lines = render_diff("-old line");
-        assert_eq!(lines[0].spans[0].style.fg, Some(Color::Red));
+        let theme = test_theme();
+        let lines = render_diff("-old line", &theme);
+        assert_eq!(lines[0].spans[0].style.fg, Some(theme.conversation_error.to_color()));
     }
 
     #[test]
     fn test_diff_hunk_header() {
-        let lines = render_diff("@@ -1,3 +1,4 @@");
-        assert_eq!(lines[0].spans[0].style.fg, Some(Color::Cyan));
+        let theme = test_theme();
+        let lines = render_diff("@@ -1,3 +1,4 @@", &theme);
+        assert_eq!(lines[0].spans[0].style.fg, Some(theme.conversation_user.to_color()));
     }
 
     #[test]
     fn test_diff_file_headers() {
-        let lines = render_diff("--- a/file.rs\n+++ b/file.rs");
-        assert_eq!(lines[0].spans[0].style.fg, Some(Color::White));
-        assert_eq!(lines[1].spans[0].style.fg, Some(Color::White));
+        let theme = test_theme();
+        let lines = render_diff("--- a/file.rs\n+++ b/file.rs", &theme);
+        assert_eq!(lines[0].spans[0].style.fg, Some(theme.conversation_text.to_color()));
+        assert_eq!(lines[1].spans[0].style.fg, Some(theme.conversation_text.to_color()));
     }
 }
