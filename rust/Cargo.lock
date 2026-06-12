@@ -2400,6 +2400,7 @@ dependencies = [
  "crossterm",
  "log",
  "mock-anthropic-service",
+ "once_cell",
  "plugins",
  "pulldown-cmark",
  "ratatui",
@@ -2411,6 +2412,7 @@ dependencies = [
  "tokio",
  "tools",
  "tui-textarea",
+ "unicode-width 0.2.0",
 ]
 
 [[package]]
