@@ -7293,24 +7293,15 @@ fn run_tui_repl(mut cli: LiveCli) -> Result<(), Box<dyn std::error::Error>> {
                 app.push_user_input(&input);
                 update_dashboard(&dashboard_state, &cli);
                 app.set_status("Thinking...");
+                app.draw_screen()?;
 
-                // ── Turn execution ──
-                // Exit the alternate screen before running the turn so that
-                // any stdout/stderr from tools goes to the normal terminal
-                // instead of corrupting the TUI frame.  After the turn the
-                // user presses a key to return to the TUI, which is then
-                // fully redrawn.
-                app.leave_for_turn()?;
-
+                app.suspend()?;
+                let mut stdout = std::io::stdout().lock();
                 let mut buf: Vec<u8> = Vec::new();
                 let result = cli.run_turn_to(&trimmed, &mut buf, false);
+                drop(stdout);
+                app.resume()?;
 
-                // Wait for user acknowledgment before redrawing the TUI.
-                app.wait_to_return()?;
-                app.reenter_after_turn()?;
-
-                // Read the last assistant message from the session for
-                // the conversation pane.
                 {
                     let messages = &cli.runtime.session().messages;
                     if let Some(msg) = messages.last() {
@@ -7325,9 +7316,7 @@ fn run_tui_repl(mut cli: LiveCli) -> Result<(), Box<dyn std::error::Error>> {
                 }
 
                 match result {
-                    Ok(()) => {
-                        app.set_status("Done");
-                    }
+                    Ok(()) => app.set_status("Done"),
                     Err(e) => {
                         app.push_system_message(&format!("Error: {e}"));
                         app.set_status("");

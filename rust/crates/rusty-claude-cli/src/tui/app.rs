@@ -89,12 +89,19 @@ impl TuiApp {
         Ok(app)
     }
 
-    /// Suspend TUI for a blocking stdout operation.
+    /// Suspend TUI so a blocking turn can use the terminal directly.
+    /// Leaves the alternate screen and disables raw mode.
     pub fn suspend(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         let _ = self.terminal.show_cursor();
         disable_raw_mode()?;
-        let _ = crossterm::execute!(io::stdout(), Clear(ClearType::All), crossterm::cursor::MoveTo(0, 0));
-        let _ = io::stdout().flush();
+        crossterm::execute!(
+            io::stdout(),
+            crossterm::terminal::LeaveAlternateScreen,
+            crossterm::terminal::Clear(ClearType::All),
+            crossterm::cursor::MoveTo(0, 0),
+            crossterm::cursor::Show
+        )?;
+        io::stdout().flush()?;
         Ok(())
     }
 
@@ -322,7 +329,7 @@ impl TuiApp {
     // Rendering — pre-borrow pattern
     // -------------------------------------------------------------------
 
-    fn draw_screen(&mut self) -> io::Result<()> {
+    pub fn draw_screen(&mut self) -> io::Result<()> {
         // Pre-borrow component references before the draw closure.
         // Each component.render(&self) reads its own state — no cloning needed.
         let conversation = &self.conversation;

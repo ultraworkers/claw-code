@@ -1,19 +1,17 @@
 //! Safe stdout/stderr capture for TUI turns.
 //!
 //! Replaces the unsafe `libc::dup/dup2` hack. The `gag` crate redirects
-//! file descriptors to an in-process pipe, which we read after the turn
-//! completes. Captured output can then be rendered inside the TUI instead
-//! of bleeding onto the terminal.
+//! file descriptors to an in-process pipe for the duration of the closure.
+//! Captured output can then be rendered inside the TUI instead of reaching
+//! the terminal directly.
 
-use std::io::{Read, Write};
-
+use std::io::Read;
 use gag::BufferRedirect;
 
-/// Captures both stdout and stderr during a closure.
+/// Runs `f` with stdout and stderr redirected into memory.
 ///
-/// Returns the captured stdout and stderr bytes, plus the closure result.
-/// Any errors during capture setup are logged to the original stderr and
-/// ignored — the closure still runs without capture in that case.
+/// Returns `(f_result, captured_stdout, captured_stderr)`.  If capture
+/// setup fails we fall back to running `f` uncaptured.
 pub fn capture_output<F, T>(f: F) -> (T, String, String)
 where
     F: FnOnce() -> T,
@@ -30,14 +28,8 @@ where
 
     let result = f();
 
-    let stdout_str = match read_redirect(stdout_gag) {
-        Ok(s) => s,
-        Err(_) => String::new(),
-    };
-    let stderr_str = match read_redirect(stderr_gag) {
-        Ok(s) => s,
-        Err(_) => String::new(),
-    };
+    let stdout_str = read_redirect(stdout_gag).unwrap_or_default();
+    let stderr_str = read_redirect(stderr_gag).unwrap_or_default();
 
     (result, stdout_str, stderr_str)
 }
@@ -52,23 +44,31 @@ fn read_redirect(mut redirect: BufferRedirect) -> Result<String, std::io::Error>
 mod tests {
     use super::*;
 
-    // Note: Rust's test harness itself captures stdout/stderr, so println!()
-    // inside a unit test does not write to fd 1/2. These tests verify the
-    // capture utility runs and returns sensible values. Real fd capture is
-    // exercised when the TUI runs outside the test harness.
-
     #[test]
-    fn test_capture_runs_closure() {
-        let (result, _stdout, _stderr) = capture_output(|| 42);
-        assert_eq!(result, 42);
+    fn test_capture_basic() {
+        #[allow(clippy::let_and_return)]
+        let captured = capture_output(|| {
+            println!("out");
+            eprintln!("err");
+            42
+        });
+        assert_eq!(captured.0, 42);
     }
 
     #[test]
-    fn test_capture_no_output_is_safe() {
-        let (result, stdout, stderr) = capture_output(|| 7);
-        assert_eq!(result, 7);
-        // Strings are returned and are valid UTF-8
-        assert!(stdout.is_empty() || stdout.chars().count() >= 0);
-        assert!(stderr.is_empty() || stderr.chars().count() >= 0);
+    fn test_capture_empty_output() {
+        #[allow(clippy::let_and_return)]
+        let (result, stdout, stderr) = capture_output(|| 1);
+        assert_eq!(result, 1);
+        assert_eq!(stdout, String::new());
+        assert_eq!(stderr, String::new());
+    }
+
+    #[test]
+    fn test_capture_panic_safety() {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            capture_output(|| panic!("boom"))
+        }));
+        assert!(result.is_err());
     }
 }
