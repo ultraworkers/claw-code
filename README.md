@@ -18,6 +18,11 @@
   </a>
 </p>
 
+<p align="center">
+  <strong>English</strong> ·
+  <a href="README.zh.md">中文</a>
+</p>
+
 <h3 align="center">start with the real crab-powered harnesses</h3>
 
 <p align="center">
