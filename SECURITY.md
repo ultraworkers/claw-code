@@ -42,6 +42,13 @@ Out of scope:
 - reports against third-party providers or upstream tools without a Claw Code
   integration issue.
 
+## Workspace path scope
+
+Claw Code validates shell and file-tool path operands against the active
+workspace roots. Redirection to `/dev/null` is treated as a null-device sink,
+not as a filesystem read or write target, so it is allowed even though it is
+outside the workspace tree.
+
 ## Handling expectations
 
 Maintainers will acknowledge valid private reports as soon as practical, keep
