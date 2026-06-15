@@ -14,15 +14,15 @@
     clippy::unnecessary_wraps,
     clippy::unused_self
 )]
-mod init;
-mod input;
-mod render;
-mod setup_wizard;
 mod agent_view;
 mod chat_mode;
 mod command_palette;
+mod init;
+mod input;
 mod keybindings;
 mod markdown;
+mod render;
+mod setup_wizard;
 mod theme;
 mod tui;
 mod tui_error;
@@ -7127,8 +7127,9 @@ fn run_repl(
                 let _ = setup_wizard::run_setup_wizard();
                 let cwd = std::env::current_dir().unwrap_or_default();
                 let config = runtime::ConfigLoader::default_for(&cwd).load().ok();
-                if let Some(new_model) =
-                    config.as_ref().and_then(|c| c.provider().model().map(str::to_string))
+                if let Some(new_model) = config
+                    .as_ref()
+                    .and_then(|c| c.provider().model().map(str::to_string))
                 {
                     let _ = cli.set_model(Some(new_model));
                 }
@@ -7167,8 +7168,14 @@ fn run_tui_repl(mut cli: LiveCli) -> Result<(), Box<dyn std::error::Error>> {
     let mut app = tui::app::TuiApp::init(dashboard_state.clone())?;
 
     // Push startup info into conversation pane
-    app.push_banner(&[tui::BannerLine { text: "🦀 Claw Code".to_string(), color: ratatui::style::Color::Cyan }]);
-    app.push_banner(&[tui::BannerLine { text: format_connected_line(&cli.model), color: ratatui::style::Color::DarkGray }]);
+    app.push_banner(&[tui::BannerLine {
+        text: "🦀 Claw Code".to_string(),
+        color: ratatui::style::Color::Cyan,
+    }]);
+    app.push_banner(&[tui::BannerLine {
+        text: format_connected_line(&cli.model),
+        color: ratatui::style::Color::DarkGray,
+    }]);
 
     loop {
         match app.read_line()? {
@@ -7179,18 +7186,32 @@ fn run_tui_repl(mut cli: LiveCli) -> Result<(), Box<dyn std::error::Error>> {
                     continue;
                 }
 
-                // Dispatch slash commands using the new SlashCommandDispatcher
-                use crate::tui::slash_commands::{dispatch_slash_command, SlashCommandAction};
-                match dispatch_slash_command(&trimmed) {
-                    SlashCommandAction::Exit => {
+                // ── Slash command dispatch ──────────────────────────────
+                // Try to parse as a slash command. If it is one, route it
+                // through the same SlashCommand::parse() + handle_repl_command()
+                // that the plain REPL uses. This gives the TUI access to ALL
+                // slash commands (60+) instead of just a handful.
+                //
+                // TUI-specific commands (/theme, /keys) are handled locally
+                // because they modify TuiApp state directly. Everything else
+                // goes through the REPL handler with output captured.
+                if trimmed.starts_with('/') {
+                    // TUI-specific: /exit and /quit
+                    if trimmed == "/exit" || trimmed == "/quit" {
                         app.push_system_message("Bye!");
                         cli.persist_session()?;
                         break;
                     }
-                    SlashCommandAction::SetTheme { name } => {
+
+                    // TUI-specific: /theme — modifies TuiApp theme state
+                    if let Some(rest) = trimmed.strip_prefix("/theme") {
+                        let name = rest.trim();
                         if name.is_empty() {
                             let names = crate::theme::TuiTheme::all_builtin_names();
-                            app.push_system_message(&format!("Available themes: {}\nUsage: /theme <name>", names.join(", ")));
+                            app.push_system_message(&format!(
+                                "Available themes: {}\nUsage: /theme <name>",
+                                names.join(", ")
+                            ));
                         } else if let Some(theme) = crate::theme::TuiTheme::builtin(name) {
                             app.set_theme(theme);
                             app.push_system_message(&format!("Theme: {name}"));
@@ -7199,104 +7220,76 @@ fn run_tui_repl(mut cli: LiveCli) -> Result<(), Box<dyn std::error::Error>> {
                         }
                         continue;
                     }
-                    SlashCommandAction::SetKeymap { preset } => {
+
+                    // TUI-specific: /keys — modifies TuiApp keymap state
+                    if let Some(rest) = trimmed.strip_prefix("/keys") {
+                        let preset = rest.trim();
                         match preset {
-                            "emacs" => { app.set_key_preset(crate::keybindings::KeyPreset::Emacs); app.push_system_message("Keys: Emacs"); }
-                            "vim" => { app.set_key_preset(crate::keybindings::KeyPreset::Vim); app.push_system_message("Keys: Vim — i for insert, Esc for normal"); }
-                            "windows" => { app.set_key_preset(crate::keybindings::KeyPreset::Windows); app.push_system_message("Keys: Windows"); }
-                            "" => { app.push_system_message(&format!("Current: {}\nAvailable: emacs, vim, windows\nUsage: /keys <preset>", app.key_preset_name())); }
-                            _ => { app.push_system_message(&format!("Unknown: {preset}. Available: emacs, vim, windows")); }
-                        }
-                        continue;
-                    }
-                    SlashCommandAction::SetChatMode { mode } => {
-                        app.push_system_message(&format!("Mode: {} — {}", mode.label(), mode.description()));
-                        continue;
-                    }
-                    SlashCommandAction::ShowDiff => {
-                        let output = std::process::Command::new("git")
-                            .args(["diff"])
-                            .current_dir(std::env::current_dir().unwrap_or_default())
-                            .output();
-                        match output {
-                            Ok(out) if out.status.success() => {
-                                let diff = String::from_utf8_lossy(&out.stdout);
-                                if diff.is_empty() {
-                                    app.push_system_message("No uncommitted changes.");
-                                } else {
-                                    app.push_diff(&diff);
-                                }
+                            "emacs" => {
+                                app.set_key_preset(crate::keybindings::KeyPreset::Emacs);
+                                app.push_system_message("Keys: Emacs");
                             }
-                            Ok(out) => {
-                                let err = String::from_utf8_lossy(&out.stderr);
-                                app.push_system_message(&format!("git diff failed: {err}"));
+                            "vim" => {
+                                app.set_key_preset(crate::keybindings::KeyPreset::Vim);
+                                app.push_system_message("Keys: Vim — i for insert, Esc for normal");
                             }
-                            Err(e) => { app.push_system_message(&format!("Failed to run git: {e}")); }
-                        }
-                        continue;
-                    }
-                    SlashCommandAction::Undo { confirm } => {
-                        if confirm {
-                            let output = std::process::Command::new("git")
-                                .args(["checkout", "--", "."])
-                                .current_dir(std::env::current_dir().unwrap_or_default())
-                                .output();
-                            match output {
-                                Ok(out) if out.status.success() => app.push_system_message("✓ Reverted all uncommitted changes."),
-                                Ok(out) => { let err = String::from_utf8_lossy(&out.stderr); app.push_system_message(&format!("Undo failed: {err}")); }
-                                Err(e) => { app.push_system_message(&format!("Failed to run git: {e}")); }
+                            "windows" => {
+                                app.set_key_preset(crate::keybindings::KeyPreset::Windows);
+                                app.push_system_message("Keys: Windows");
                             }
-                        } else {
-                            let output = std::process::Command::new("git")
-                                .args(["diff", "--stat"])
-                                .current_dir(std::env::current_dir().unwrap_or_default())
-                                .output();
-                            let stat = output.ok().filter(|o| o.status.success())
-                                .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
-                                .unwrap_or_default();
-                            if stat.is_empty() {
-                                app.push_system_message("Nothing to undo — no uncommitted changes.");
-                            } else {
-                                app.push_system_message(&format!("This will revert:\n{stat}\nType /undo --confirm to proceed."));
+                            "" => {
+                                app.push_system_message(&format!(
+                                    "Current: {}\nAvailable: emacs, vim, windows\nUsage: /keys <preset>",
+                                    app.key_preset_name()
+                                ));
+                            }
+                            _ => {
+                                app.push_system_message(&format!(
+                                    "Unknown: {preset}. Available: emacs, vim, windows"
+                                ));
                             }
                         }
                         continue;
                     }
-                    SlashCommandAction::ShowFile { path } => {
-                        if path.is_empty() {
-                            app.push_system_message("Usage: /ls <file-path>");
-                        } else {
-                            match std::fs::read_to_string(path) {
-                                Ok(content) => {
-                                    app.push_system_message(&format!("── {path} ──"));
-                                    app.push_output(&content, false);
-                                }
-                                Err(e) => app.push_system_message(&format!("Cannot read {path}: {e}")),
-                            }
+
+                    // /tui again — no-op, already in TUI
+                    if trimmed == "/tui" {
+                        continue;
+                    }
+
+                    // All other slash commands: route through the REPL handler.
+                    // Leave alternate screen, run the command (which prints to stdout),
+                    // capture the output, re-enter the TUI, and push into the
+                    // conversation pane.
+                    if let Ok(Some(command)) = SlashCommand::parse(&trimmed) {
+                        // Commands that need interactive terminal access
+                        // (permissions prompts, setup wizard) leave alternate
+                        // screen and let the user interact directly.
+                        app.leave_for_turn()?;
+                        let should_exit = cli.handle_repl_command(command)?;
+                        app.reenter_after_turn()?;
+
+                        if should_exit {
+                            break;
                         }
+                        update_dashboard(&dashboard_state, &cli);
+                        let _ = app.redraw_after_turn();
                         continue;
                     }
-                    SlashCommandAction::ShowHelp => {
-                        let preset = app.key_preset_name().to_string();
-                        let msg = format!("Keybindings ({preset}):\n\nEnter Submit  Shift+Enter ↵\nCtrl+C Cancel  Ctrl+D Exit\nCtrl+P Swap  Ctrl+K Palette\nCtrl+A Agents  Ctrl+T Team\n\nSlash commands:\n/theme /keys /code /ask /architect\n/diff /undo /ls /help\n");
-                        app.push_system_message(&msg);
-                        continue;
-                    }
-                    SlashCommandAction::Unknown { command } => {
-                        app.push_system_message(&format!("Unknown command: {command}"));
-                        continue;
-                    }
-                    SlashCommandAction::NotACommand => {
-                        // Not a slash command — send to model
-                    }
+
+                    // Unrecognized slash command
+                    app.push_system_message(&format!("Unknown command: {trimmed}"));
+                    continue;
                 }
 
+                // ── Regular user message — send to model ────────────────
                 app.push_user_input(&input);
                 update_dashboard(&dashboard_state, &cli);
                 app.set_status("Thinking...");
                 app.draw_screen()?;
 
-                // Leave alternate screen so runtime output goes to the real terminal.
+                // Leave alternate screen so runtime output (permission prompts,
+                // tool output) can use the real terminal.
                 // TerminalGuard tracks state — reenter_after_turn restores the TUI.
                 app.leave_for_turn()?;
                 let mut buf: Vec<u8> = Vec::new();
@@ -7304,6 +7297,9 @@ fn run_tui_repl(mut cli: LiveCli) -> Result<(), Box<dyn std::error::Error>> {
                 app.reenter_after_turn()?;
                 app.set_turn_in_progress(false);
 
+                // Extract assistant text from the session and push into the conversation pane.
+                // When the turn runs on a background thread (Phase 3), this will be
+                // replaced by a TuiEvent::TurnComplete posted through the event bus.
                 {
                     let messages = &cli.runtime.session().messages;
                     if let Some(msg) = messages.last() {
@@ -7339,8 +7335,9 @@ fn run_tui_repl(mut cli: LiveCli) -> Result<(), Box<dyn std::error::Error>> {
                 setup_wizard::run_setup_wizard()?;
                 let cwd = std::env::current_dir().unwrap_or_default();
                 let config = runtime::ConfigLoader::default_for(&cwd).load().ok();
-                if let Some(new_model) =
-                    config.as_ref().and_then(|c| c.provider().model().map(str::to_string))
+                if let Some(new_model) = config
+                    .as_ref()
+                    .and_then(|c| c.provider().model().map(str::to_string))
                 {
                     let _ = cli.set_model(Some(new_model));
                 }
@@ -7417,7 +7414,6 @@ fn update_dashboard(state: &tui::SharedDashboardState, cli: &LiveCli) {
     };
     tui_update::update_dashboard_from(state, &update);
 }
-
 
 #[derive(Debug, Clone)]
 struct SessionHandle {
@@ -8070,22 +8066,14 @@ impl LiveCli {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(emit_output)?;
         let mut spinner = Spinner::new();
-        spinner.tick(
-            "🦀 Thinking...",
-            TerminalRenderer::new().color_theme(),
-            out,
-        )?;
+        spinner.tick("🦀 Thinking...", TerminalRenderer::new().color_theme(), out)?;
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
         let result = runtime.run_turn(input, Some(&mut permission_prompter));
         hook_abort_monitor.stop();
         match result {
             Ok(summary) => {
                 self.replace_runtime(runtime)?;
-                spinner.finish(
-                    "✨ Done",
-                    TerminalRenderer::new().color_theme(),
-                    out,
-                )?;
+                spinner.finish("✨ Done", TerminalRenderer::new().color_theme(), out)?;
                 let final_text = final_assistant_text(&summary);
                 if !final_text.is_empty() {
                     writeln!(out, "{final_text}")?;
