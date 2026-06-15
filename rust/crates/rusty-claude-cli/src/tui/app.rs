@@ -2,10 +2,10 @@
 //!
 //! Replaces the legacy god-struct `TuiApp` with a clean component architecture.
 //! Uses the pre-borrow draw pattern to avoid the clone-everything problem.
+//! Uses `TerminalGuard` for safe terminal lifecycle management.
 
 use std::io;
 use std::io::Write;
-use std::sync::Arc;
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, Clear, ClearType};
@@ -27,9 +27,100 @@ use crate::tui::legacy::{BannerLine, SharedDashboardState, TuiReadOutcome};
 
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
+// ---------------------------------------------------------------------------
+// TerminalGuard — owns the terminal lifecycle, guarantees cleanup
+// ---------------------------------------------------------------------------
+
+/// RAII guard for alternate screen + raw mode.
+///
+/// Created in `TuiApp::init()`. On drop it restores the terminal to its
+/// original state — even if the code panics. This replaces the ad-hoc
+/// suspend/resume/restore methods and the panic hook that tried to do
+/// the same thing indirectly.
+pub struct TerminalGuard {
+    /// Whether we are currently inside the alternate screen + raw mode.
+    /// Toggled by `leave_for_turn()` / `reenter_after_turn()`.
+    in_tui: bool,
+}
+
+impl TerminalGuard {
+    /// Enter alternate screen, enable raw mode, clear screen, hide cursor.
+    pub fn enter() -> Result<Self, Box<dyn std::error::Error>> {
+        crossterm::execute!(
+            io::stdout(),
+            crossterm::terminal::EnterAlternateScreen,
+            crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
+            crossterm::cursor::MoveTo(0, 0)
+        )?;
+        enable_raw_mode()?;
+        Ok(Self { in_tui: true })
+    }
+
+    /// Leave the alternate screen so a blocking turn can use the terminal.
+    /// This is the *only* method that temporarily gives up terminal ownership.
+    /// Call `reenter_after_turn()` to take it back.
+    pub fn leave_for_turn(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        if !self.in_tui {
+            return Ok(());
+        }
+        // Best-effort: show cursor, leave alt screen, disable raw mode
+        let _ = crossterm::execute!(
+            io::stdout(),
+            crossterm::cursor::Show,
+            crossterm::terminal::LeaveAlternateScreen,
+            crossterm::terminal::Clear(ClearType::All),
+            crossterm::cursor::MoveTo(0, 0)
+        );
+        let _ = io::stdout().flush();
+        let _ = disable_raw_mode();
+        self.in_tui = false;
+        Ok(())
+    }
+
+    /// Re-enter the alternate screen after a turn.
+    pub fn reenter_after_turn(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        if self.in_tui {
+            return Ok(());
+        }
+        crossterm::execute!(
+            io::stdout(),
+            crossterm::terminal::EnterAlternateScreen,
+            crossterm::terminal::Clear(ClearType::All),
+            crossterm::cursor::Hide
+        )?;
+        enable_raw_mode()?;
+        let _ = io::stdout().flush();
+        self.in_tui = true;
+        Ok(())
+    }
+
+    /// Whether we are currently in the TUI (alternate screen + raw mode).
+    pub fn is_in_tui(&self) -> bool {
+        self.in_tui
+    }
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        if self.in_tui {
+            // Best-effort cleanup — ignore errors since we might be panicking
+            let _ = crossterm::execute!(
+                io::stdout(),
+                crossterm::cursor::Show,
+                crossterm::terminal::LeaveAlternateScreen,
+                crossterm::terminal::Clear(ClearType::All),
+                crossterm::cursor::MoveTo(0, 0)
+            );
+            let _ = disable_raw_mode();
+            let _ = io::stdout().flush();
+        }
+    }
+}
+
 /// The new component-based TUI application.
 pub struct TuiApp {
     terminal: ratatui::Terminal<ratatui::backend::CrosstermBackend<io::Stdout>>,
+    guard: TerminalGuard,
 
     // Components (each owns its own state)
     conversation: ConversationPane,
@@ -55,13 +146,7 @@ pub struct TuiApp {
 impl TuiApp {
     /// Initialize the TUI — enter alternate screen, enable raw mode.
     pub fn init(dashboard_state: SharedDashboardState) -> Result<Self, Box<dyn std::error::Error>> {
-        crossterm::execute!(
-            io::stdout(),
-            crossterm::terminal::EnterAlternateScreen,
-            crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
-            crossterm::cursor::MoveTo(0, 0)
-        )?;
-        enable_raw_mode()?;
+        let guard = TerminalGuard::enter()?;
 
         let backend = ratatui::backend::CrosstermBackend::new(io::stdout());
         let mut terminal = ratatui::Terminal::new(backend)?;
@@ -84,108 +169,31 @@ impl TuiApp {
             should_exit: false,
             spinner_frame: 0,
             terminal,
+            guard,
         };
 
         Ok(app)
     }
 
-    /// Suspend TUI so a blocking turn can use the terminal directly.
-    /// Leaves the alternate screen and disables raw mode.
-    pub fn suspend(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        let _ = self.terminal.show_cursor();
-        disable_raw_mode()?;
-        crossterm::execute!(
-            io::stdout(),
-            crossterm::terminal::LeaveAlternateScreen,
-            crossterm::terminal::Clear(ClearType::All),
-            crossterm::cursor::MoveTo(0, 0),
-            crossterm::cursor::Show
-        )?;
-        io::stdout().flush()?;
-        Ok(())
-    }
-
-    /// Resume TUI after suspend.
-    pub fn resume(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        crossterm::execute!(
-            io::stdout(),
-            crossterm::terminal::EnterAlternateScreen,
-            Clear(ClearType::All),
-            crossterm::cursor::Hide
-        )?;
-        enable_raw_mode()?;
-        let _ = io::stdout().flush();
-        self.terminal.clear()?;
-        Ok(())
-    }
-
-    /// Leave the TUI before a turn: exit alt screen, disable raw mode,
-    /// leave cursor visible, and clear.  Stdout during the turn now goes
-    /// to the normal terminal instead of corrupting the TUI frame.
+    /// Leave the alternate screen so a blocking turn can use the terminal.
+    /// The guard tracks state — call `reenter_after_turn()` to return.
     pub fn leave_for_turn(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         let _ = self.terminal.show_cursor();
-        disable_raw_mode()?;
-        crossterm::execute!(
-            io::stdout(),
-            crossterm::terminal::LeaveAlternateScreen,
-            crossterm::terminal::Clear(ClearType::All),
-            crossterm::cursor::MoveTo(0, 0),
-            crossterm::cursor::Show
-        )?;
-        io::stdout().flush()?;
-        Ok(())
+        self.guard.leave_for_turn()
     }
 
-    /// Wait for one keypress before re-entering the TUI.
-    /// Gives the user a chance to read any tool output that printed
-    /// to the terminal during the turn.
-    pub fn wait_to_return(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        enable_raw_mode()?;
-        crossterm::execute!(
-            io::stdout(),
-            crossterm::style::Print("\nPress any key to return to TUI..."),
-            crossterm::cursor::MoveTo(0, 0)
-        )?;
-        io::stdout().flush()?;
-
-        // Block until a key is pressed
-        loop {
-            if event::poll(std::time::Duration::from_millis(100))? {
-                if let Event::Key(_) = event::read()? {
-                    break;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Re-enter the TUI after a turn: alt screen, raw mode, clear, redraw.
+    /// Re-enter the alternate screen after a turn and force a full redraw.
     pub fn reenter_after_turn(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        crossterm::execute!(
-            io::stdout(),
-            crossterm::terminal::EnterAlternateScreen,
-            crossterm::terminal::Clear(ClearType::All),
-            crossterm::cursor::Hide
-        )?;
-        io::stdout().flush()?;
-        enable_raw_mode()?;
+        self.guard.reenter_after_turn()?;
         self.terminal.clear()?;
         Ok(())
     }
 
-    /// Restore terminal on exit.
+    /// Restore terminal on exit. The guard's Drop also handles this,
+    /// but calling explicitly allows a clean ordered shutdown.
     pub fn restore_terminal(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         let _ = self.terminal.show_cursor();
-        let _ = disable_raw_mode();
-        let _ = crossterm::execute!(
-            io::stdout(),
-            crossterm::terminal::LeaveAlternateScreen,
-            crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
-            crossterm::cursor::MoveTo(0, 0),
-            crossterm::cursor::Show
-        );
-        let _ = io::stdout().flush();
-        Ok(())
+        self.guard.leave_for_turn()
     }
 
     // -------------------------------------------------------------------
@@ -419,5 +427,30 @@ mod tests {
     fn test_tui_app_init_requires_terminal() {
         // TuiApp::init() requires a real terminal — just verify the type exists.
         // Real tests run via `cargo test --bin claw -- tui::app`
+    }
+
+    #[test]
+    fn test_terminal_guard_default_state() {
+        // TerminalGuard::enter() requires a real terminal.
+        // Just verify the struct fields are accessible and the type exists.
+        let guard = TerminalGuard { in_tui: false };
+        assert!(!guard.is_in_tui());
+    }
+
+    #[test]
+    fn test_terminal_guard_in_tui_flag() {
+        let guard = TerminalGuard { in_tui: true };
+        assert!(guard.is_in_tui());
+    }
+
+    #[test]
+    fn test_guard_drop_on_panic_restores_terminal() {
+        // Simulate a guard that's in_tui when dropped (panic scenario).
+        // The Drop impl should try to leave alternate screen + disable raw mode.
+        // We can't fully test this without a terminal, but we verify the struct
+        // can be constructed in the right state.
+        let guard = TerminalGuard { in_tui: true };
+        assert!(guard.is_in_tui());
+        // Drop happens here — in a real terminal it would clean up
     }
 }

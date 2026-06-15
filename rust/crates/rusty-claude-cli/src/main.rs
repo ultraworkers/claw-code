@@ -7152,7 +7152,8 @@ fn run_repl(
 /// Run the REPL inside the split-pane TUI.  Unlike the plain REPL,
 /// all output goes into the TUI conversation pane instead of stdout.
 fn run_tui_repl(mut cli: LiveCli) -> Result<(), Box<dyn std::error::Error>> {
-    let prev_hook = tui_update::install_panic_hook();
+    // TerminalGuard in TuiApp handles cleanup via Drop — even on panic.
+    // No need for a manual panic hook anymore.
     let dashboard_state = tui::SharedDashboardState::default();
     {
         let mut ds = dashboard_state.write().unwrap();
@@ -7295,12 +7296,12 @@ fn run_tui_repl(mut cli: LiveCli) -> Result<(), Box<dyn std::error::Error>> {
                 app.set_status("Thinking...");
                 app.draw_screen()?;
 
-                app.suspend()?;
-                let mut stdout = std::io::stdout().lock();
+                // Leave alternate screen so runtime output goes to the real terminal.
+                // TerminalGuard tracks state — reenter_after_turn restores the TUI.
+                app.leave_for_turn()?;
                 let mut buf: Vec<u8> = Vec::new();
                 let result = cli.run_turn_to(&trimmed, &mut buf, false);
-                drop(stdout);
-                app.resume()?;
+                app.reenter_after_turn()?;
                 app.set_turn_in_progress(false);
 
                 {
@@ -7334,7 +7335,7 @@ fn run_tui_repl(mut cli: LiveCli) -> Result<(), Box<dyn std::error::Error>> {
                 break;
             }
             tui::legacy::TuiReadOutcome::ProviderSwap => {
-                app.suspend()?;
+                app.leave_for_turn()?;
                 setup_wizard::run_setup_wizard()?;
                 let cwd = std::env::current_dir().unwrap_or_default();
                 let config = runtime::ConfigLoader::default_for(&cwd).load().ok();
@@ -7343,7 +7344,7 @@ fn run_tui_repl(mut cli: LiveCli) -> Result<(), Box<dyn std::error::Error>> {
                 {
                     let _ = cli.set_model(Some(new_model));
                 }
-                app.resume()?;
+                app.reenter_after_turn()?;
                 app.push_system_message("Provider updated");
             }
             tui::legacy::TuiReadOutcome::TeamToggle => {
@@ -7362,8 +7363,10 @@ fn run_tui_repl(mut cli: LiveCli) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    tui_update::restore_panic_hook(prev_hook);
-    app.restore_terminal()?;
+    // TerminalGuard in app restores terminal via Drop.
+    // Explicit restore_terminal() for clean ordered shutdown;
+    // if we skip it, the guard's Drop still handles it.
+    let _ = app.restore_terminal();
     Ok(())
 }
 
