@@ -135,8 +135,8 @@ pub struct TuiApp {
     keymap: KeyMap,
     chat_mode: crate::chat_mode::ChatMode,
 
-    // Event bus (Phase 3: will be crossbeam-channel)
-    _event_bus: EventBus,
+    // Event bus — receives turn lifecycle events and streaming deltas
+    event_bus: EventBus,
 
     // Lifecycle
     should_exit: bool,
@@ -165,7 +165,7 @@ impl TuiApp {
             theme,
             keymap: KeyMap::new(KeyPreset::Emacs),
             chat_mode: crate::chat_mode::ChatMode::Code,
-            _event_bus: EventBus::new(),
+            event_bus: EventBus::new(),
             should_exit: false,
             spinner_frame: 0,
             terminal,
@@ -250,11 +250,74 @@ impl TuiApp {
         }
     }
 
+    /// Get a sender for posting events to the TUI event bus.
+    /// Use this from background threads to post streaming updates.
+    pub fn event_sender(&self) -> crossbeam_channel::Sender<TuiEvent> {
+        self.event_bus.sender()
+    }
+
+    /// Drain pending events and update components.
+    /// Returns true if any events were processed (meaning a redraw is needed).
+    pub fn drain_events(&mut self) -> bool {
+        let events = self.event_bus.drain();
+        if events.is_empty() {
+            return false;
+        }
+
+        for event in events {
+            match event {
+                TuiEvent::StreamTextDelta { text } => {
+                    self.conversation.push_output(&text, false, &self.theme);
+                }
+                TuiEvent::TurnComplete { assistant_text } => {
+                    if !assistant_text.is_empty() {
+                        self.conversation.push_output(&assistant_text, false, &self.theme);
+                    }
+                    self.input_bar.set_turn_in_progress(false);
+                    self.dashboard.set_status("Done");
+                }
+                TuiEvent::TurnError { error } => {
+                    let color = self.theme.conversation_error.to_color();
+                    self.conversation.push_system_message(&format!("Error: {error}"), color);
+                    self.input_bar.set_turn_in_progress(false);
+                    self.dashboard.set_status("");
+                }
+                TuiEvent::TurnStarted => {
+                    self.input_bar.set_turn_in_progress(true);
+                    self.dashboard.set_status("Thinking...");
+                }
+                TuiEvent::DashboardUpdate(_state) => {
+                    // Dashboard state is shared via SharedDashboardState (Arc<RwLock<>>).
+                    // The main loop calls update_dashboard() directly.  When we move
+                    // to the full event-driven architecture, this will post the update
+                    // through the shared state instead.
+                }
+                TuiEvent::ThemeChanged(theme) => {
+                    self.set_theme(theme);
+                }
+                TuiEvent::KeymapChanged(preset) => {
+                    self.keymap.set_preset(preset);
+                }
+                TuiEvent::ChatModeChanged(mode) => {
+                    self.chat_mode = mode;
+                }
+                // Other events are handled by their respective components
+                // when we move to the full event-driven architecture
+                _ => {}
+            }
+        }
+
+        true
+    }
+
     // -------------------------------------------------------------------
     // Main event loop
     // -------------------------------------------------------------------
 
     pub fn read_line(&mut self) -> io::Result<TuiReadOutcome> {
+        // Drain pending TUI events (streaming deltas, turn lifecycle, etc.)
+        let _events_processed = self.drain_events();
+
         if event::poll(std::time::Duration::from_millis(16))? {
             match event::read()? {
                 Event::Key(key) => return self.handle_key(key),
