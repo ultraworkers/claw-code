@@ -107,10 +107,14 @@ impl TuiApp {
 
     /// Resume TUI after suspend.
     pub fn resume(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        crossterm::execute!(
+            io::stdout(),
+            crossterm::terminal::EnterAlternateScreen,
+            Clear(ClearType::All),
+            crossterm::cursor::Hide
+        )?;
         enable_raw_mode()?;
-        let _ = crossterm::execute!(io::stdout(), Clear(ClearType::All), crossterm::cursor::MoveTo(0, 0));
         let _ = io::stdout().flush();
-        self.terminal.hide_cursor()?;
         self.terminal.clear()?;
         Ok(())
     }
@@ -226,6 +230,10 @@ impl TuiApp {
         self.keymap.set_preset(preset);
     }
 
+    pub fn set_turn_in_progress(&mut self, in_progress: bool) {
+        self.input_bar.set_turn_in_progress(in_progress);
+    }
+
     pub fn key_preset_name(&self) -> &'static str {
         match self.keymap.preset() {
             KeyPreset::Emacs => "Emacs",
@@ -284,6 +292,7 @@ impl TuiApp {
         match outcome {
             InputOutcome::Submit(text) => {
                 self.input_bar.push_history(&text);
+                self.set_turn_in_progress(true);
                 Ok(TuiReadOutcome::Submit(text))
             }
             InputOutcome::Cancel => Ok(TuiReadOutcome::Cancel),

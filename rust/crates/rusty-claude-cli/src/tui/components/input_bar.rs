@@ -105,6 +105,7 @@ impl InputBar {
 
     pub fn set_turn_in_progress(&mut self, in_progress: bool) {
         self.turn_in_progress = in_progress;
+        self.dirty = true;
     }
 
     /// Push text to history.
@@ -293,23 +294,17 @@ impl InputBar {
             width: area.width.min(40),
             height: (matches.len() as u16 + 2).min(10),
         };
+        frame.render_widget(ratatui::widgets::Clear, popup);
         frame.render_widget(list, popup);
     }
 }
 
 impl Component for InputBar {
     fn render(&self, area: Rect, frame: &mut Frame, theme: &TuiTheme) {
+        frame.render_widget(ratatui::widgets::Clear, area);
         let widget = self.textarea.clone();
         frame.render_widget(&widget, area);
-
-        // Render completions popup above the input area
-        if self.showing_completions {
-            // Note: can't call self.render_completions() from &self here
-            // because we need mutable access to check state but render is &self.
-            // Workaround: render completions in the draw_frame function directly.
-            // This is acceptable for Phase 1 — will be refined later.
-            let _ = (area, frame, theme);
-        }
+        self.render_completions(area, frame, theme);
     }
 
     fn is_dirty(&self) -> bool {

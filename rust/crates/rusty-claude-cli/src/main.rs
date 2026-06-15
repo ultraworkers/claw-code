@@ -7301,6 +7301,7 @@ fn run_tui_repl(mut cli: LiveCli) -> Result<(), Box<dyn std::error::Error>> {
                 let result = cli.run_turn_to(&trimmed, &mut buf, false);
                 drop(stdout);
                 app.resume()?;
+                app.set_turn_in_progress(false);
 
                 {
                     let messages = &cli.runtime.session().messages;
