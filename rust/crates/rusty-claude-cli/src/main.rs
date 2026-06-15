@@ -12955,6 +12955,12 @@ impl AnthropicRuntimeClient {
         tool_registry: GlobalToolRegistry,
         progress_reporter: Option<InternalPromptProgressReporter>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        // Inject saved provider settings (from /setup wizard) as env var
+        // fallbacks. The API client constructors read env vars only,
+        // so we set them here when the user hasn't already set them.
+        // 3-tier resolution: env var > .env file > stored config.
+        inject_config_as_env_fallbacks();
+
         // Dispatch to the correct provider at construction time.
         // `ApiProviderClient` (exposed by the api crate as
         // `ProviderClient`) is an enum over Anthropic / xAI / OpenAI
@@ -13023,6 +13029,44 @@ fn resolve_cli_auth_source() -> Result<AuthSource, Box<dyn std::error::Error>> {
 #[allow(clippy::result_large_err)]
 fn resolve_cli_auth_source_for_cwd() -> Result<AuthSource, api::ApiError> {
     resolve_startup_auth_source(|| Ok(None))
+}
+
+/// Inject provider settings from `~/.claw/settings.json` as environment
+/// variable fallbacks so the API client constructors (which only read env
+/// vars) can find them.
+///
+/// This bridges the gap between `/setup` (which saves apiKey/baseUrl to
+/// the config file) and the API crate (which reads env vars only).
+/// Already-set env vars are never overwritten — the 3-tier resolution
+/// order is preserved: env var > .env file > stored config.
+fn inject_config_as_env_fallbacks() {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let Ok(config) = runtime::ConfigLoader::default_for(&cwd).load() else {
+        return;
+    };
+    let provider = config.provider();
+
+    // Map provider kind to the expected env var names
+    let (api_key_env, base_url_env) = match provider.kind().unwrap_or("anthropic") {
+        "anthropic" => ("ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL"),
+        "xai" => ("XAI_API_KEY", "XAI_BASE_URL"),
+        "openai" => ("OPENAI_API_KEY", "OPENAI_BASE_URL"),
+        "dashscope" => ("DASHSCOPE_API_KEY", "DASHSCOPE_BASE_URL"),
+        _ => return, // unknown provider kind — don't inject
+    };
+
+    // Only set env vars that aren't already set (preserve user's explicit env)
+    if let Some(api_key) = provider.api_key() {
+        if !api_key.is_empty() && std::env::var(api_key_env).is_err() {
+            std::env::set_var(api_key_env, api_key);
+        }
+    }
+
+    if let Some(base_url) = provider.base_url() {
+        if !base_url.is_empty() && std::env::var(base_url_env).is_err() {
+            std::env::set_var(base_url_env, base_url);
+        }
+    }
 }
 
 impl ApiClient for AnthropicRuntimeClient {
