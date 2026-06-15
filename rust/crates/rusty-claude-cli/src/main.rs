@@ -7150,6 +7150,89 @@ fn run_repl(
     Ok(())
 }
 
+/// Run the plain REPL starting from an existing LiveCli (e.g. after /menu
+/// exits the TUI). This is the same loop as `run_repl` but takes ownership
+/// of a pre-existing `LiveCli` instead of creating one from CLI args.
+fn run_repl_from_cli(mut cli: LiveCli) -> Result<(), Box<dyn std::error::Error>> {
+    let mut editor =
+        input::LineEditor::new("> ", cli.repl_completion_candidates().unwrap_or_default());
+    println!();
+    println!("{}", format_connected_line(&cli.model));
+    println!("\x1b[2mTip: type /tui for the split-pane dashboard view\x1b[0m");
+
+    loop {
+        editor.set_completions(cli.repl_completion_candidates().unwrap_or_default());
+        match editor.read_line()? {
+            input::ReadOutcome::Submit(input) => {
+                let trimmed = input.trim().to_string();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if matches!(trimmed.as_str(), "/exit" | "/quit") {
+                    cli.persist_session()?;
+                    break;
+                }
+                if trimmed == "/tui" {
+                    cli.persist_session()?;
+                    drop(editor);
+                    return run_tui_repl(cli);
+                }
+                match SlashCommand::parse(&trimmed) {
+                    Ok(Some(command)) => {
+                        if cli.handle_repl_command(command)? {
+                            cli.persist_session()?;
+                        }
+                        continue;
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        eprintln!("{error}");
+                        continue;
+                    }
+                }
+                let cwd = std::env::current_dir().unwrap_or_default();
+                if let Some(prompt) = try_resolve_bare_skill_prompt(&cwd, &trimmed) {
+                    editor.push_history(input);
+                    cli.record_prompt_history(&trimmed);
+                    cli.run_turn(&prompt)?;
+                    continue;
+                }
+                editor.push_history(input);
+                cli.record_prompt_history(&trimmed);
+                cli.run_turn(&trimmed)?;
+            }
+            input::ReadOutcome::Cancel => {}
+            input::ReadOutcome::Exit => {
+                cli.persist_session()?;
+                break;
+            }
+            input::ReadOutcome::ProviderSwap => {
+                let _ = setup_wizard::run_setup_wizard();
+                let cwd = std::env::current_dir().unwrap_or_default();
+                let config = runtime::ConfigLoader::default_for(&cwd).load().ok();
+                if let Some(new_model) = config
+                    .as_ref()
+                    .and_then(|c| c.provider().model().map(str::to_string))
+                {
+                    let _ = cli.set_model(Some(new_model));
+                }
+            }
+            input::ReadOutcome::TeamToggle => {
+                let current = std::env::var("CLAWD_AGENT_TEAMS").unwrap_or_default();
+                if current == "1" {
+                    std::env::set_var("CLAWD_AGENT_TEAMS", "0");
+                    eprintln!("[team] Agent teams disabled");
+                } else {
+                    std::env::set_var("CLAWD_AGENT_TEAMS", "1");
+                    eprintln!("[team] Agent teams enabled");
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Run the REPL inside the split-pane TUI.  Unlike the plain REPL,
 /// all output goes into the TUI conversation pane instead of stdout.
 fn run_tui_repl(mut cli: LiveCli) -> Result<(), Box<dyn std::error::Error>> {
@@ -7177,6 +7260,39 @@ fn run_tui_repl(mut cli: LiveCli) -> Result<(), Box<dyn std::error::Error>> {
         color: ratatui::style::Color::DarkGray,
     }]);
 
+    // Populate conversation from existing session history so the
+    // TUI shows messages from the REPL session that preceded /tui.
+    {
+        let session = cli.runtime.session();
+        for msg in &session.messages {
+            match msg.role {
+                runtime::MessageRole::User => {
+                    for block in &msg.blocks {
+                        if let runtime::ContentBlock::Text { text } = block {
+                            app.push_user_input(text);
+                        }
+                    }
+                }
+                runtime::MessageRole::Assistant => {
+                    for block in &msg.blocks {
+                        if let runtime::ContentBlock::Text { text } = block {
+                            app.push_output(text, false);
+                        }
+                    }
+                }
+                runtime::MessageRole::System => {
+                    for block in &msg.blocks {
+                        if let runtime::ContentBlock::Text { text } = block {
+                            app.push_system_message(text);
+                        }
+                    }
+                }
+                // Skip tool messages — they're part of the assistant turn
+                runtime::MessageRole::Tool => {}
+            }
+        }
+    }
+
     loop {
         match app.read_line()? {
             tui::legacy::TuiReadOutcome::Pending => {}
@@ -7196,11 +7312,17 @@ fn run_tui_repl(mut cli: LiveCli) -> Result<(), Box<dyn std::error::Error>> {
                 // because they modify TuiApp state directly. Everything else
                 // goes through the REPL handler with output captured.
                 if trimmed.starts_with('/') {
-                    // TUI-specific: /exit and /quit
+                    // TUI-specific: /exit and /quit — leave the TUI and exit
                     if trimmed == "/exit" || trimmed == "/quit" {
-                        app.push_system_message("Bye!");
                         cli.persist_session()?;
                         break;
+                    }
+
+                    // TUI-specific: /menu — go back to the plain REPL
+                    if trimmed == "/menu" {
+                        cli.persist_session()?;
+                        let _ = app.restore_terminal();
+                        return run_repl_from_cli(cli);
                     }
 
                     // TUI-specific: /theme — modifies TuiApp theme state
@@ -7324,9 +7446,10 @@ fn run_tui_repl(mut cli: LiveCli) -> Result<(), Box<dyn std::error::Error>> {
                 let _ = app.redraw_after_turn();
             }
             tui::legacy::TuiReadOutcome::Cancel => {
-                // Clear input, stay in TUI
+                // Ctrl+C clears input — stay in TUI
             }
             tui::legacy::TuiReadOutcome::Exit => {
+                // Ctrl+D or /exit — exit the application
                 cli.persist_session()?;
                 break;
             }
