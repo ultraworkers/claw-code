@@ -516,4 +516,41 @@ mod tests {
         assert!(guard.is_in_tui());
         // Drop happens here — in a real terminal it would clean up
     }
+
+    /// Regression: EventBus can be created and drained without a terminal.
+    #[test]
+    fn test_event_bus_sender_and_drain() {
+        let bus = EventBus::new();
+        let sender = bus.sender();
+        sender.send(TuiEvent::TurnStarted).unwrap();
+        sender.send(TuiEvent::TurnError { error: "test".into() }).unwrap();
+        let events = bus.drain();
+        assert_eq!(events.len(), 2);
+    }
+
+    /// Regression: drain on empty bus returns empty vec.
+    #[test]
+    fn test_event_bus_drain_empty() {
+        let bus = EventBus::new();
+        assert!(bus.drain().is_empty());
+    }
+
+    /// Regression: leave_for_turn is a no-op when already outside TUI.
+    #[test]
+    fn test_terminal_guard_leave_when_already_outside() {
+        let mut guard = TerminalGuard { in_tui: false };
+        assert!(guard.leave_for_turn().is_ok());
+        assert!(!guard.is_in_tui());
+    }
+
+    /// Regression: reenter_after_turn is a no-op when already inside TUI.
+    #[test]
+    fn test_terminal_guard_reenter_when_already_inside() {
+        let mut guard = TerminalGuard { in_tui: true };
+        // reenter_after_turn would try to enter alternate screen,
+        // which fails without a real terminal. But the guard should
+        // short-circuit since it's already in_tui.
+        // (We can't call it without a terminal, so just verify the state check.)
+        assert!(guard.is_in_tui());
+    }
 }

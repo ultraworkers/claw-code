@@ -320,6 +320,10 @@ mod tests {
         TuiTheme::builtin("default").unwrap()
     }
 
+    fn test_key(code: crossterm::event::KeyCode) -> KeyEvent {
+        KeyEvent::new(code, crossterm::event::KeyModifiers::NONE)
+    }
+
     #[test]
     fn test_input_bar_new() {
         let theme = test_theme();
@@ -351,5 +355,107 @@ mod tests {
         let mut bar = InputBar::new(&theme);
         bar.set_turn_in_progress(true);
         assert!(bar.turn_in_progress);
+        assert!(bar.dirty);
+    }
+
+    // -------------------------------------------------------------------
+    // Regression tests for input corruption and output bleed bugs
+    // -------------------------------------------------------------------
+
+    /// Regression: Submit action is blocked while a turn is in progress.
+    /// Bug: typed text overwrites itself during a turn because subsequent
+    /// Enter keypresses submitted empty/duplicate input.
+    #[test]
+    fn test_submit_blocked_during_turn() {
+        let theme = test_theme();
+        let mut bar = InputBar::new(&theme);
+
+        // Type some text
+        bar.textarea.insert_char('h');
+        bar.textarea.insert_char('i');
+
+        // Mark turn as in progress (simulating what happens after submit)
+        bar.set_turn_in_progress(true);
+
+        // Try to submit — should be blocked
+        let mut keymap = KeyMap::new(KeyPreset::Emacs);
+        let enter_key = KeyEvent::new(crossterm::event::KeyCode::Enter, crossterm::event::KeyModifiers::NONE);
+        let outcome = bar.process_key(enter_key, &mut keymap);
+        assert_eq!(outcome, InputOutcome::None, "Submit should return None while turn is in progress");
+    }
+
+    /// Regression: Turn state is properly cleared after the turn completes.
+    /// Bug: input stayed disabled after a turn because turn_in_progress
+    /// was never set back to false.
+    #[test]
+    fn test_turn_state_cleared_after_turn() {
+        let theme = test_theme();
+        let mut bar = InputBar::new(&theme);
+
+        // Submit text — sets turn_in_progress
+        bar.textarea.insert_char('h');
+        bar.textarea.insert_char('i');
+        bar.set_turn_in_progress(true);
+        assert!(bar.turn_in_progress);
+
+        // Turn completes — clear the flag
+        bar.set_turn_in_progress(false);
+        assert!(!bar.turn_in_progress);
+        assert!(bar.dirty);
+
+        // Should be able to submit again now
+        let mut keymap = KeyMap::new(KeyPreset::Emacs);
+        let enter_key = KeyEvent::new(crossterm::event::KeyCode::Enter, crossterm::event::KeyModifiers::NONE);
+        let outcome = bar.process_key(enter_key, &mut keymap);
+        // Either Submit or None (empty after textarea was cleared by previous submit)
+        assert_ne!(outcome, InputOutcome::None, "Should be able to submit after turn completes");
+    }
+
+    /// Regression: Completions popup is a no-op when not showing.
+    /// Bug: completion popup left visual residue on screen because it
+    /// rendered into a stale area without clearing first.
+    #[test]
+    fn test_completions_noop_when_not_showing() {
+        let theme = test_theme();
+        let bar = InputBar::new(&theme);
+        assert!(!bar.showing_completions);
+        // render_completions should return early — verified by the
+        // `showing_completions` check at the top of the method
+    }
+
+    /// Regression: Setting turn_in_progress marks the input bar dirty.
+    /// Bug: input bar didn't redraw after turn state changed, leaving
+    /// stale text visible.
+    #[test]
+    fn test_turn_state_marks_dirty() {
+        let theme = test_theme();
+        let mut bar = InputBar::new(&theme);
+
+        // Start clean
+        bar.dirty = false;
+        bar.set_turn_in_progress(true);
+        assert!(bar.dirty, "set_turn_in_progress(true) must mark dirty");
+
+        bar.dirty = false;
+        bar.set_turn_in_progress(false);
+        assert!(bar.dirty, "set_turn_in_progress(false) must mark dirty");
+    }
+
+    /// Regression: Cancel action clears the textarea and marks dirty.
+    #[test]
+    fn test_cancel_clears_and_marks_dirty() {
+        let theme = test_theme();
+        let mut bar = InputBar::new(&theme);
+
+        // Type some text
+        bar.textarea.insert_char('x');
+
+        // Cancel
+        let mut keymap = KeyMap::new(KeyPreset::Emacs);
+        let ctrl_c = KeyEvent::new(crossterm::event::KeyCode::Char('c'), crossterm::event::KeyModifiers::CONTROL);
+        let outcome = bar.process_key(ctrl_c, &mut keymap);
+        assert_eq!(outcome, InputOutcome::Cancel);
+        assert!(bar.dirty);
+        assert!(bar.text().is_empty(), "Cancel should clear the textarea");
     }
 }

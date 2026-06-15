@@ -376,4 +376,78 @@ mod tests {
         assert!(!cache.wrapped_lines.is_empty());
         assert_eq!(cache.built_width, 80);
     }
+
+    // -------------------------------------------------------------------
+    // Regression tests for word-wrap bounds and output bleed bugs
+    // -------------------------------------------------------------------
+
+    /// Regression: wrap_line output should never exceed the given width
+    /// in unicode-width terms. Bug: text wrapped outside the conversation
+    /// pane, causing output to bleed across the terminal.
+    #[test]
+    fn test_wrap_line_respects_width() {
+        // Long string with no natural break points
+        let long_str = "abcdefghij".repeat(20); // 200 chars, no spaces
+        let width = 40;
+        let lines = wrap_line(&long_str, width, Style::default());
+
+        for line in &lines {
+            let line_width: usize = line.spans.iter()
+                .map(|span| {
+                    span.content.chars().map(|c| c.width().unwrap_or(0)).sum::<usize>()
+                })
+                .sum();
+            assert!(
+                line_width <= width,
+                "Wrapped line width {line_width} exceeds target {width}: {:?}",
+                line.spans.iter().map(|s| s.content.clone()).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    /// Regression: narrow width doesn't cause infinite loop or zero-width output.
+    #[test]
+    fn test_wrap_line_narrow_width() {
+        let lines = wrap_line("hello world foo bar", 1, Style::default());
+        assert!(!lines.is_empty(), "Even with width=1, must produce lines");
+
+        // With width=1, each char gets its own line
+        let lines = wrap_line("ab", 1, Style::default());
+        assert!(lines.len() >= 2, "2 chars at width=1 should produce >= 2 lines");
+    }
+
+    /// Regression: cache is invalidated when width changes.
+    /// Bug: conversation didn't re-wrap after terminal resize.
+    #[test]
+    fn test_cache_invalidated_on_width_change() {
+        let theme = test_theme();
+        let mut pane = ConversationPane::new(theme.clone());
+        pane.push_user_input("Hello world this is a test", theme.conversation_user.to_color());
+
+        // Build at width 80
+        pane.rebuild_cache(80, &theme);
+        let cache_lines_80 = pane.cache.borrow().wrapped_lines.len();
+
+        // Resize to 40 — should invalidate and re-wrap
+        pane.dirty = true; // width change would set dirty in render()
+        pane.rebuild_cache(40, &theme);
+        let cache_lines_40 = pane.cache.borrow().wrapped_lines.len();
+
+        // Narrower width should produce more wrapped lines
+        assert!(
+            cache_lines_40 >= cache_lines_80,
+            "Narrower width ({cache_lines_40} lines) should produce >= as many lines as wider ({cache_lines_80} lines)"
+        );
+    }
+
+    /// Regression: mark_clean clears the dirty flag.
+    #[test]
+    fn test_mark_clean_clears_dirty() {
+        let theme = test_theme();
+        let mut pane = ConversationPane::new(theme);
+        pane.push_system_message("test", Color::Yellow);
+        assert!(pane.dirty);
+        pane.mark_clean();
+        assert!(!pane.dirty);
+    }
 }
