@@ -3,12 +3,27 @@
 use crate::keybindings::Action;
 use commands::slash_command_specs;
 
+/// Curated "top / high-stakes" slash commands shown by the Ctrl+Shift+D palette.
+const TOP_COMMANDS: &[&str] = &[
+    "/permissions",
+    "/setup",
+    "/model",
+    "/env",
+    "/plugins",
+    "/mcp",
+    "/team",
+];
+
 pub struct CommandPalette {
     pub active: bool,
     pub query: String,
     pub entries: Vec<PaletteEntry>,
     pub filtered: Vec<usize>,
     pub selected: usize,
+    /// Indices of the curated "top / dangerous" commands used by Ctrl+Shift+D.
+    top_indices: Vec<usize>,
+    /// When set, filtering is restricted to this subset.
+    restricted: Option<Vec<usize>>,
 }
 
 #[derive(Debug, Clone)]
@@ -108,6 +123,12 @@ impl CommandPalette {
             });
         }
 
+        let top_indices: Vec<usize> = entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| TOP_COMMANDS.contains(&e.label.as_str()))
+            .map(|(i, _)| i)
+            .collect();
         let filtered = (0..entries.len()).collect();
         Self {
             active: false,
@@ -115,13 +136,25 @@ impl CommandPalette {
             entries,
             filtered,
             selected: 0,
+            top_indices,
+            restricted: None,
         }
     }
 
     pub fn open(&mut self) {
         self.active = true;
         self.query.clear();
+        self.restricted = None;
         self.filtered = (0..self.entries.len()).collect();
+        self.selected = 0;
+    }
+
+    /// Open the palette restricted to the curated top/dangerous commands.
+    pub fn open_top_commands(&mut self) {
+        self.active = true;
+        self.query.clear();
+        self.restricted = Some(self.top_indices.clone());
+        self.filtered = self.top_indices.clone();
         self.selected = 0;
     }
 
@@ -163,20 +196,24 @@ impl CommandPalette {
     }
 
     fn update_filter(&mut self) {
+        let pool: Vec<usize> = self
+            .restricted
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| (0..self.entries.len()).collect());
+
         if self.query.is_empty() {
-            self.filtered = (0..self.entries.len()).collect();
+            self.filtered = pool;
         } else {
             let q = self.query.to_lowercase();
-            self.filtered = self
-                .entries
-                .iter()
-                .enumerate()
-                .filter(|(_, e)| {
+            self.filtered = pool
+                .into_iter()
+                .filter(|&i| {
+                    let e = &self.entries[i];
                     e.label.to_lowercase().contains(&q)
                         || e.description.to_lowercase().contains(&q)
                         || e.category.to_lowercase().contains(&q)
                 })
-                .map(|(i, _)| i)
                 .collect();
         }
         self.selected = self.selected.min(self.filtered.len().saturating_sub(1));

@@ -7414,8 +7414,17 @@ fn run_tui_repl(mut cli: LiveCli) -> Result<(), Box<dyn std::error::Error>> {
                         // Commands that need interactive terminal access
                         // (permissions prompts, setup wizard) leave alternate
                         // screen and let the user interact directly.
+                        let is_setup = matches!(command, SlashCommand::Setup);
                         app.leave_for_turn()?;
-                        let should_persist = cli.handle_repl_command(command)?;
+
+                        // Capture stdout/stderr so command output survives the
+                        // re-enter into the TUI instead of being wiped by the
+                        // alternate-screen swap.
+                        let (result, stdout, stderr) = crate::tui::capture::capture_output(|| {
+                            cli.handle_repl_command(command)
+                        });
+                        let should_persist = result?;
+
                         app.reenter_after_turn()?;
 
                         // `true` means the runtime/session was mutated
@@ -7424,6 +7433,40 @@ fn run_tui_repl(mut cli: LiveCli) -> Result<(), Box<dyn std::error::Error>> {
                         if should_persist {
                             cli.persist_session()?;
                         }
+
+                        // Push captured command output into the conversation pane.
+                        if !stdout.is_empty() {
+                            app.push_system_message(&crate::tui_update::strip_ansi(&stdout));
+                        }
+                        if !stderr.is_empty() {
+                            app.push_system_message(&format!(
+                                "Error output:\n{}",
+                                crate::tui_update::strip_ansi(&stderr)
+                            ));
+                        }
+
+                        // /setup doesn't print a tidy summary; give the user one.
+                        if is_setup {
+                            let cwd = std::env::current_dir().unwrap_or_default();
+                            let config = runtime::ConfigLoader::default_for(&cwd).load().ok();
+                            let model = config
+                                .as_ref()
+                                .and_then(|c| c.provider().model())
+                                .unwrap_or(&cli.model);
+                            let provider = config
+                                .as_ref()
+                                .and_then(|c| c.provider().kind())
+                                .map(|s| s.to_string())
+                                .unwrap_or_else(|| {
+                                    std::env::var("CLAWD_PROVIDER")
+                                        .unwrap_or_else(|_| "custom".to_string())
+                                });
+                            app.push_system_message(&format!(
+                                "Setup complete. Provider: {}  Model: {}",
+                                provider, model
+                            ));
+                        }
+
                         update_dashboard(&dashboard_state, &cli);
                         let _ = app.redraw_after_turn();
                         continue;

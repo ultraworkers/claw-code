@@ -27,6 +27,8 @@ pub enum Action {
     CycleChatMode,
     /// Run a slash command by index into `commands::slash_command_specs()`.
     RunSlashCommand(usize),
+    /// Open a filtered palette with high-stakes / top slash commands.
+    TopCommandsPalette,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,6 +105,11 @@ impl KeyMap {
             KeyCode::Char('l'),
             Action::ClearConversation,
         );
+        self.bind(
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            KeyCode::Char('D'),
+            Action::TopCommandsPalette,
+        );
         self.bind(KeyModifiers::CONTROL, KeyCode::Char('h'), Action::Help);
         self.bind(KeyModifiers::NONE, KeyCode::PageUp, Action::ScrollHalfUp);
         self.bind(
@@ -139,6 +146,11 @@ impl KeyMap {
             KeyModifiers::CONTROL,
             KeyCode::Char('l'),
             Action::ClearConversation,
+        );
+        self.bind(
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            KeyCode::Char('D'),
+            Action::TopCommandsPalette,
         );
         self.bind(KeyModifiers::NONE, KeyCode::F(1), Action::Help);
         self.bind(KeyModifiers::NONE, KeyCode::PageUp, Action::ScrollHalfUp);

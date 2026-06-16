@@ -344,9 +344,11 @@ impl TuiApp {
         if self.command_palette.is_active() {
             let consumed = self.command_palette.handle_key(key, &self.keymap);
             if consumed {
-                if let Some(action) = self.command_palette.selected_action() {
-                    self.command_palette.close();
-                    return self.dispatch_action(action);
+                if key.code == crossterm::event::KeyCode::Enter {
+                    if let Some(action) = self.command_palette.selected_action() {
+                        self.command_palette.close();
+                        return self.dispatch_action(action);
+                    }
                 }
                 self.draw_screen()?;
                 return Ok(TuiReadOutcome::Pending);
@@ -370,7 +372,17 @@ impl TuiApp {
                 self.set_turn_in_progress(true);
                 Ok(TuiReadOutcome::Submit(text))
             }
-            InputOutcome::Cancel => Ok(TuiReadOutcome::Cancel),
+            InputOutcome::Cancel => {
+                // Empty input + Ctrl/Cancel opens the command palette so the
+                // user has a quick keyboard path to every slash command.
+                if self.input_bar.is_empty() {
+                    self.command_palette.open();
+                    self.draw_screen()?;
+                    Ok(TuiReadOutcome::Pending)
+                } else {
+                    Ok(TuiReadOutcome::Cancel)
+                }
+            }
             InputOutcome::Exit => {
                 self.should_exit = true;
                 Ok(TuiReadOutcome::Exit)
@@ -391,10 +403,14 @@ impl TuiApp {
                 self.command_palette.open();
                 Ok(TuiReadOutcome::Pending)
             }
+            Action::TopCommandsPalette => {
+                self.command_palette.open_top();
+                Ok(TuiReadOutcome::Pending)
+            }
             Action::ToggleAgentView => Ok(TuiReadOutcome::ToggleAgentView),
             Action::Help => {
                 let preset = self.key_preset_name().to_string();
-                let msg = format!("Keybindings ({preset}):\n\nEnter Submit  Shift+Enter ↵\nCtrl+C Cancel  Ctrl+D Exit\nCtrl+P Swap  Ctrl+K Palette (includes /slash commands)\nCtrl+A Agents  Ctrl+T Team\n");
+                let msg = format!("Keybindings ({preset}):\n\nEnter Submit  Shift+Enter ↵\nCtrl+C clear input (opens commands when empty)  Ctrl+D Exit\nCtrl+P Swap  Ctrl+K Palette (includes /slash commands)\nCtrl+Shift+D Top/dangerous commands  Ctrl+A Agents  Ctrl+T Team\n");
                 self.push_system_message(&msg);
                 Ok(TuiReadOutcome::Pending)
             }

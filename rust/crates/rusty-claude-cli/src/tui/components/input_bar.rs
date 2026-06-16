@@ -6,8 +6,8 @@
 use crossterm::event::KeyEvent;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
-use ratatui::widgets::{Block, Borders, List, ListItem};
 use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, List, ListItem};
 use ratatui::Frame;
 use tui_textarea::TextArea;
 
@@ -89,7 +89,8 @@ impl InputBar {
                 .border_style(Style::default().fg(theme.input_border.to_color()))
                 .title(" > "),
         );
-        self.textarea.set_style(Style::default().fg(theme.input_fg.to_color()));
+        self.textarea
+            .set_style(Style::default().fg(theme.input_fg.to_color()));
         self.textarea.set_cursor_style(
             Style::default()
                 .fg(theme.input_cursor_fg.to_color())
@@ -213,12 +214,19 @@ impl InputBar {
         self.textarea.lines().join("\n")
     }
 
+    /// Whether the input box is empty.
+    pub fn is_empty(&self) -> bool {
+        self.textarea.lines().join("").trim().is_empty()
+    }
+
     fn handle_tab(&mut self) {
         if !self.showing_completions {
             let current_text: String = self.textarea.lines().join("");
             if current_text.starts_with('/') {
                 let prefix = &current_text;
-                let matches: Vec<&String> = self.slash_completions.iter()
+                let matches: Vec<&String> = self
+                    .slash_completions
+                    .iter()
                     .filter(|c| c.starts_with(prefix))
                     .collect();
                 if matches.len() == 1 {
@@ -239,7 +247,9 @@ impl InputBar {
     }
 
     fn history_up(&mut self) {
-        if self.history.is_empty() { return; }
+        if self.history.is_empty() {
+            return;
+        }
         let new_idx = match self.history_index {
             Some(i) => i.saturating_add(1).min(self.history.len() - 1),
             None => self.history.len() - 1,
@@ -267,21 +277,33 @@ impl InputBar {
 
     /// Render the completions popup (called after the main input render).
     fn render_completions(&self, area: Rect, frame: &mut Frame, theme: &TuiTheme) {
-        if !self.showing_completions { return; }
+        if !self.showing_completions {
+            return;
+        }
         let current_text: String = self.textarea.lines().join("");
-        let matches: Vec<&String> = self.slash_completions.iter()
+        let matches: Vec<&String> = self
+            .slash_completions
+            .iter()
             .filter(|c| c.starts_with(current_text.as_str()))
             .collect();
-        if matches.is_empty() { return; }
+        if matches.is_empty() {
+            return;
+        }
 
-        let items: Vec<ListItem> = matches.iter().enumerate().map(|(i, m)| {
-            let style = if i == self.completion_index % matches.len() {
-                Style::default().bg(theme.completion_selected_bg.to_color()).fg(theme.completion_selected_fg.to_color())
-            } else {
-                Style::default().fg(theme.completion_fg.to_color())
-            };
-            ListItem::new(Line::from(Span::styled(m.as_str(), style)))
-        }).collect();
+        let items: Vec<ListItem> = matches
+            .iter()
+            .enumerate()
+            .map(|(i, m)| {
+                let style = if i == self.completion_index % matches.len() {
+                    Style::default()
+                        .bg(theme.completion_selected_bg.to_color())
+                        .fg(theme.completion_selected_fg.to_color())
+                } else {
+                    Style::default().fg(theme.completion_fg.to_color())
+                };
+                ListItem::new(Line::from(Span::styled(m.as_str(), style)))
+            })
+            .collect();
 
         let list = List::new(items).block(
             Block::default()
@@ -379,9 +401,16 @@ mod tests {
 
         // Try to submit — should be blocked
         let mut keymap = KeyMap::new(KeyPreset::Emacs);
-        let enter_key = KeyEvent::new(crossterm::event::KeyCode::Enter, crossterm::event::KeyModifiers::NONE);
+        let enter_key = KeyEvent::new(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        );
         let outcome = bar.process_key(enter_key, &mut keymap);
-        assert_eq!(outcome, InputOutcome::None, "Submit should return None while turn is in progress");
+        assert_eq!(
+            outcome,
+            InputOutcome::None,
+            "Submit should return None while turn is in progress"
+        );
     }
 
     /// Regression: Turn state is properly cleared after the turn completes.
@@ -405,10 +434,17 @@ mod tests {
 
         // Should be able to submit again now
         let mut keymap = KeyMap::new(KeyPreset::Emacs);
-        let enter_key = KeyEvent::new(crossterm::event::KeyCode::Enter, crossterm::event::KeyModifiers::NONE);
+        let enter_key = KeyEvent::new(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        );
         let outcome = bar.process_key(enter_key, &mut keymap);
         // Either Submit or None (empty after textarea was cleared by previous submit)
-        assert_ne!(outcome, InputOutcome::None, "Should be able to submit after turn completes");
+        assert_ne!(
+            outcome,
+            InputOutcome::None,
+            "Should be able to submit after turn completes"
+        );
     }
 
     /// Regression: Completions popup is a no-op when not showing.
@@ -452,7 +488,10 @@ mod tests {
 
         // Cancel
         let mut keymap = KeyMap::new(KeyPreset::Emacs);
-        let ctrl_c = KeyEvent::new(crossterm::event::KeyCode::Char('c'), crossterm::event::KeyModifiers::CONTROL);
+        let ctrl_c = KeyEvent::new(
+            crossterm::event::KeyCode::Char('c'),
+            crossterm::event::KeyModifiers::CONTROL,
+        );
         let outcome = bar.process_key(ctrl_c, &mut keymap);
         assert_eq!(outcome, InputOutcome::Cancel);
         assert!(bar.dirty);

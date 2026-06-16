@@ -652,6 +652,13 @@ impl TuiApp {
                 Ok(TuiReadOutcome::Submit(text))
             }
             Some(Action::Cancel) => {
+                // Empty input + Cancel opens the command palette as a quick
+                // way to run slash commands like /setup or /permissions.
+                if self.input.lines().join("").trim().is_empty() {
+                    self.command_palette.open();
+                    self.needs_redraw = true;
+                    return Ok(TuiReadOutcome::Pending);
+                }
                 self.showing_completions = false;
                 self.input.select_all();
                 self.input.cut();
@@ -754,10 +761,11 @@ impl TuiApp {
         let mut msg = format!("Keybindings ({preset:?}):\n\n");
         msg += "Enter       Submit\n";
         msg += "Shift+Enter Newline\n";
-        msg += "Ctrl+C      Cancel\n";
+        msg += "Ctrl+C      Cancel (open commands when empty)\n";
         msg += "Ctrl+D      Exit TUI\n";
         msg += "Ctrl+P      Swap provider\n";
         msg += "Ctrl+K      Command palette\n";
+        msg += "Ctrl+Shift+D Top/dangerous commands\n";
         msg += "Ctrl+A      Agent view\n";
         msg += "Ctrl+T      Team toggle\n";
         msg += "Ctrl+L      Clear conversation\n";
@@ -820,6 +828,11 @@ impl TuiApp {
             }
             Action::CommandPalette => {
                 self.command_palette.open();
+                self.needs_redraw = true;
+                Ok(TuiReadOutcome::Pending)
+            }
+            Action::TopCommandsPalette => {
+                self.command_palette.open_top_commands();
                 self.needs_redraw = true;
                 Ok(TuiReadOutcome::Pending)
             }

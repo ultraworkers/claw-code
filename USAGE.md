@@ -673,3 +673,23 @@ Current Rust crates:
 - `rusty-claude-cli`
 - `telemetry`
 - `tools`
+
+## TUI mode (`claw /tui`)
+
+The terminal UI is an alternate-screen dashboard for interactive sessions.
+
+| Key | Action |
+|-----|--------|
+| `Enter` | Submit the current input |
+| `Shift+Enter` | Insert a newline |
+| `Ctrl+C` | Clear input; opens the command palette when input is empty |
+| `Ctrl+D` | Exit the TUI |
+| `Ctrl+K` | Open the full command palette ( searchable, includes every `/` command) |
+| `Ctrl+Shift+D` | Open the **top / dangerous commands** palette (`/permissions`, `/setup`, `/model`, `/env`, `/plugins`, `/mcp`, `/team`) |
+| `Ctrl+P` | Swap provider (runs `/setup`) |
+| `Ctrl+A` | Toggle agent view |
+| `Ctrl+T` | Toggle team pane |
+| `Ctrl+L` | Clear conversation |
+| `↑` / `↓` | Navigate palette or input history |
+
+In the palette, type to fuzzy-filter, use `↑`/`↓` to move, and `Enter` to run the selected slash command. Slash command output (for example `/status`, `/cost`, `/memory`) is captured and shown inside the TUI conversation pane instead of disappearing when the alternate screen returns.
