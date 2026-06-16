@@ -13,6 +13,8 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::Frame;
 
+use commands::slash_command_specs;
+
 use crate::keybindings::{Action, KeyMap, KeyPreset, VimMode};
 use crate::theme::TuiTheme;
 use crate::tui::component::{Component, Overlay};
@@ -392,7 +394,7 @@ impl TuiApp {
             Action::ToggleAgentView => Ok(TuiReadOutcome::ToggleAgentView),
             Action::Help => {
                 let preset = self.key_preset_name().to_string();
-                let msg = format!("Keybindings ({preset}):\n\nEnter Submit  Shift+Enter ↵\nCtrl+C Cancel  Ctrl+D Exit\nCtrl+P Swap  Ctrl+K Palette\nCtrl+A Agents  Ctrl+T Team\n");
+                let msg = format!("Keybindings ({preset}):\n\nEnter Submit  Shift+Enter ↵\nCtrl+C Cancel  Ctrl+D Exit\nCtrl+P Swap  Ctrl+K Palette (includes /slash commands)\nCtrl+A Agents  Ctrl+T Team\n");
                 self.push_system_message(&msg);
                 Ok(TuiReadOutcome::Pending)
             }
@@ -422,6 +424,14 @@ impl TuiApp {
             }
             Action::ScrollBottom => {
                 self.conversation.scroll_bottom();
+                Ok(TuiReadOutcome::Pending)
+            }
+            Action::RunSlashCommand(idx) => {
+                let specs = slash_command_specs();
+                if let Some(spec) = specs.get(idx) {
+                    let cmd = format!("/{}", spec.name);
+                    return Ok(TuiReadOutcome::Submit(cmd));
+                }
                 Ok(TuiReadOutcome::Pending)
             }
             _ => Ok(TuiReadOutcome::Pending),

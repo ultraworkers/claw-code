@@ -467,11 +467,14 @@ impl TuiApp {
             let drain_count = self.conversation.len() - MAX_CONVERSATION_LINES;
             self.conversation.drain(..drain_count);
             // Insert trim notice
-            self.conversation.insert(0, ConversationLine::plain(
-                "... (earlier messages trimmed)".to_string(),
-                self.theme.conversation_dim.to_color(),
-                false,
-            ));
+            self.conversation.insert(
+                0,
+                ConversationLine::plain(
+                    "... (earlier messages trimmed)".to_string(),
+                    self.theme.conversation_dim.to_color(),
+                    false,
+                ),
+            );
         }
         self.conversation_scroll = 0;
         self.needs_redraw = true;
@@ -515,7 +518,12 @@ impl TuiApp {
         let renderer = self.markdown_renderer.clone();
         let theme = self.theme.clone();
         let agent_view_active = self.agent_view.active;
-        let agent_sessions: Vec<_> = self.agent_view.filtered_sessions().into_iter().cloned().collect();
+        let agent_sessions: Vec<_> = self
+            .agent_view
+            .filtered_sessions()
+            .into_iter()
+            .cloned()
+            .collect();
         let agent_selected = self.agent_view.selected;
         let agent_filter = self.agent_view.filter;
         let agent_sort = self.agent_view.sort_by;
@@ -546,12 +554,28 @@ impl TuiApp {
 
             // Command palette overlay
             if palette_active {
-                draw_command_palette(f, area, &palette_query, &palette_entries, &palette_filtered, palette_selected, &theme);
+                draw_command_palette(
+                    f,
+                    area,
+                    &palette_query,
+                    &palette_entries,
+                    &palette_filtered,
+                    palette_selected,
+                    &theme,
+                );
             }
 
             // Agent View overlay
             if agent_view_active {
-                draw_agent_view(f, area, &agent_sessions, agent_selected, agent_filter, agent_sort, &theme);
+                draw_agent_view(
+                    f,
+                    area,
+                    &agent_sessions,
+                    agent_selected,
+                    agent_filter,
+                    agent_sort,
+                    &theme,
+                );
             }
         })?;
         self.terminal.backend_mut().flush()?;
@@ -656,9 +680,7 @@ impl TuiApp {
                 self.needs_redraw = true;
                 Ok(TuiReadOutcome::Pending)
             }
-            Some(Action::ToggleAgentView) => {
-                Ok(TuiReadOutcome::ToggleAgentView)
-            }
+            Some(Action::ToggleAgentView) => Ok(TuiReadOutcome::ToggleAgentView),
             Some(Action::ToggleSidebar) => {
                 // Future: toggle sidebar
                 Ok(TuiReadOutcome::Pending)
@@ -707,9 +729,7 @@ impl TuiApp {
                 }
                 Ok(TuiReadOutcome::Pending)
             }
-            Some(Action::FocusConversation) => {
-                Ok(TuiReadOutcome::Pending)
-            }
+            Some(Action::FocusConversation) => Ok(TuiReadOutcome::Pending),
             _ => {
                 // Unbound keys — check for history navigation, then pass to text area
                 if key.code == KeyCode::Up && !self.showing_completions {
@@ -758,7 +778,10 @@ impl TuiApp {
     }
 
     /// Dispatch an Action — used by command palette and handle_key.
-    fn dispatch_action(&mut self, action: crate::keybindings::Action) -> io::Result<TuiReadOutcome> {
+    fn dispatch_action(
+        &mut self,
+        action: crate::keybindings::Action,
+    ) -> io::Result<TuiReadOutcome> {
         use crate::keybindings::Action;
         match action {
             Action::Submit => {
@@ -766,28 +789,89 @@ impl TuiApp {
                 let text = lines.join("\n");
                 self.input.select_all();
                 self.input.cut();
-                if text.trim().is_empty() { return Ok(TuiReadOutcome::Pending); }
+                if text.trim().is_empty() {
+                    return Ok(TuiReadOutcome::Pending);
+                }
                 Ok(TuiReadOutcome::Submit(text))
             }
-            Action::Cancel => { self.showing_completions = false; self.input.select_all(); self.input.cut(); Ok(TuiReadOutcome::Cancel) }
-            Action::Newline => { self.input.insert_newline(); Ok(TuiReadOutcome::Pending) }
-            Action::Exit => { self.should_exit = true; Ok(TuiReadOutcome::Exit) }
-            Action::ProviderSwap => { self.input.select_all(); self.input.cut(); Ok(TuiReadOutcome::ProviderSwap) }
-            Action::TeamToggle => { self.input.select_all(); self.input.cut(); Ok(TuiReadOutcome::TeamToggle) }
-            Action::CommandPalette => { self.command_palette.open(); self.needs_redraw = true; Ok(TuiReadOutcome::Pending) }
+            Action::Cancel => {
+                self.showing_completions = false;
+                self.input.select_all();
+                self.input.cut();
+                Ok(TuiReadOutcome::Cancel)
+            }
+            Action::Newline => {
+                self.input.insert_newline();
+                Ok(TuiReadOutcome::Pending)
+            }
+            Action::Exit => {
+                self.should_exit = true;
+                Ok(TuiReadOutcome::Exit)
+            }
+            Action::ProviderSwap => {
+                self.input.select_all();
+                self.input.cut();
+                Ok(TuiReadOutcome::ProviderSwap)
+            }
+            Action::TeamToggle => {
+                self.input.select_all();
+                self.input.cut();
+                Ok(TuiReadOutcome::TeamToggle)
+            }
+            Action::CommandPalette => {
+                self.command_palette.open();
+                self.needs_redraw = true;
+                Ok(TuiReadOutcome::Pending)
+            }
             Action::ToggleAgentView => Ok(TuiReadOutcome::ToggleAgentView),
             Action::ToggleSidebar => Ok(TuiReadOutcome::Pending),
-            Action::ClearConversation => { self.conversation.clear(); self.conversation_scroll = 0; self.needs_redraw = true; Ok(TuiReadOutcome::Pending) }
-            Action::Help => { self.show_help(); Ok(TuiReadOutcome::Pending) }
-            Action::CycleChatMode => { self.handle_tab(); Ok(TuiReadOutcome::Pending) }
-            Action::ScrollUp => { self.conversation_scroll = self.conversation_scroll.saturating_add(1); Ok(TuiReadOutcome::Pending) }
-            Action::ScrollDown => { self.conversation_scroll = self.conversation_scroll.saturating_sub(1); Ok(TuiReadOutcome::Pending) }
-            Action::ScrollHalfUp => { self.conversation_scroll = self.conversation_scroll.saturating_add(5); Ok(TuiReadOutcome::Pending) }
-            Action::ScrollHalfDown => { self.conversation_scroll = self.conversation_scroll.saturating_sub(5); Ok(TuiReadOutcome::Pending) }
-            Action::ScrollTop => { self.conversation_scroll = u16::MAX; Ok(TuiReadOutcome::Pending) }
-            Action::ScrollBottom => { self.conversation_scroll = 0; Ok(TuiReadOutcome::Pending) }
-            Action::FocusInput => { Ok(TuiReadOutcome::Pending) }
-            Action::FocusConversation => { Ok(TuiReadOutcome::Pending) }
+            Action::ClearConversation => {
+                self.conversation.clear();
+                self.conversation_scroll = 0;
+                self.needs_redraw = true;
+                Ok(TuiReadOutcome::Pending)
+            }
+            Action::Help => {
+                self.show_help();
+                Ok(TuiReadOutcome::Pending)
+            }
+            Action::CycleChatMode => {
+                self.handle_tab();
+                Ok(TuiReadOutcome::Pending)
+            }
+            Action::ScrollUp => {
+                self.conversation_scroll = self.conversation_scroll.saturating_add(1);
+                Ok(TuiReadOutcome::Pending)
+            }
+            Action::ScrollDown => {
+                self.conversation_scroll = self.conversation_scroll.saturating_sub(1);
+                Ok(TuiReadOutcome::Pending)
+            }
+            Action::ScrollHalfUp => {
+                self.conversation_scroll = self.conversation_scroll.saturating_add(5);
+                Ok(TuiReadOutcome::Pending)
+            }
+            Action::ScrollHalfDown => {
+                self.conversation_scroll = self.conversation_scroll.saturating_sub(5);
+                Ok(TuiReadOutcome::Pending)
+            }
+            Action::ScrollTop => {
+                self.conversation_scroll = u16::MAX;
+                Ok(TuiReadOutcome::Pending)
+            }
+            Action::ScrollBottom => {
+                self.conversation_scroll = 0;
+                Ok(TuiReadOutcome::Pending)
+            }
+            Action::FocusInput => Ok(TuiReadOutcome::Pending),
+            Action::FocusConversation => Ok(TuiReadOutcome::Pending),
+            Action::RunSlashCommand(idx) => {
+                let specs = commands::slash_command_specs();
+                if let Some(spec) = specs.get(idx) {
+                    return Ok(TuiReadOutcome::Submit(format!("/{}", spec.name)));
+                }
+                Ok(TuiReadOutcome::Pending)
+            }
         }
     }
 
@@ -910,7 +994,10 @@ fn wrap_line<'a>(text: &str, width: usize, style: Style) -> Vec<Line<'a>> {
                 current_line = rest;
                 last_break_byte = 0;
             } else {
-                result.push(Line::from(Span::styled(current_line.clone(), style.clone())));
+                result.push(Line::from(Span::styled(
+                    current_line.clone(),
+                    style.clone(),
+                )));
                 current_line.clear();
                 current_width = 0;
                 last_break_byte = 0;
@@ -966,9 +1053,12 @@ fn build_wrapped_conversation<'a>(
                 // rendered is Vec<Line<'static>> — safe to extend
                 all_lines.extend(rendered.into_iter().map(|l: Line<'static>| {
                     // Convert Line<'static> to Line<'a> via into_owned pattern
-                    Line::from(l.spans.into_iter().map(|s| {
-                        Span::styled(s.content.into_owned(), s.style)
-                    }).collect::<Vec<_>>())
+                    Line::from(
+                        l.spans
+                            .into_iter()
+                            .map(|s| Span::styled(s.content.into_owned(), s.style))
+                            .collect::<Vec<_>>(),
+                    )
                 }));
             }
             ConversationContent::CodeDiff { diff } => {
@@ -976,9 +1066,12 @@ fn build_wrapped_conversation<'a>(
                 let count = rendered.len().max(1);
                 expand_counts.push(count);
                 all_lines.extend(rendered.into_iter().map(|l: Line<'static>| {
-                    Line::from(l.spans.into_iter().map(|s| {
-                        Span::styled(s.content.into_owned(), s.style)
-                    }).collect::<Vec<_>>())
+                    Line::from(
+                        l.spans
+                            .into_iter()
+                            .map(|s| Span::styled(s.content.into_owned(), s.style))
+                            .collect::<Vec<_>>(),
+                    )
                 }));
             }
         }
@@ -1008,7 +1101,8 @@ fn draw_left_pane(
     // --- conversation with word-wrapping ---
     // Subtract 1 for the top border, 2 for left/right block padding
     let content_width = (left[0].width as usize).saturating_sub(2);
-    let (wrapped, expand_counts) = build_wrapped_conversation(conversation, content_width, markdown_renderer, theme);
+    let (wrapped, expand_counts) =
+        build_wrapped_conversation(conversation, content_width, markdown_renderer, theme);
 
     let pane_rows = (left[0].height.saturating_sub(1) as usize).max(1);
     let total_visual = wrapped.len();
@@ -1086,7 +1180,9 @@ fn draw_left_pane(
                 .enumerate()
                 .map(|(i, m)| {
                     let style = if i == completion_index % matches.len() {
-                        Style::default().bg(theme.completion_selected_bg.to_color()).fg(theme.completion_selected_fg.to_color())
+                        Style::default()
+                            .bg(theme.completion_selected_bg.to_color())
+                            .fg(theme.completion_selected_fg.to_color())
                     } else {
                         Style::default().fg(theme.completion_fg.to_color())
                     };
@@ -1122,19 +1218,54 @@ fn draw_right_pane(
     let mut gauge_row: Option<usize> = None;
 
     lines.push(section("Connection", theme));
-    lines.push(kv("Model", &state.model, theme.dashboard_value.to_color(), theme));
-    lines.push(kv("Provider", &state.provider, theme.dashboard_key.to_color(), theme));
-    lines.push(kv("URL", &state.provider_url, theme.conversation_dim.to_color(), theme));
-    lines.push(kv("Mode", &state.permission_mode, theme.conversation_system.to_color(), theme));
+    lines.push(kv(
+        "Model",
+        &state.model,
+        theme.dashboard_value.to_color(),
+        theme,
+    ));
+    lines.push(kv(
+        "Provider",
+        &state.provider,
+        theme.dashboard_key.to_color(),
+        theme,
+    ));
+    lines.push(kv(
+        "URL",
+        &state.provider_url,
+        theme.conversation_dim.to_color(),
+        theme,
+    ));
+    lines.push(kv(
+        "Mode",
+        &state.permission_mode,
+        theme.conversation_system.to_color(),
+        theme,
+    ));
     if let Some(ref branch) = state.git_branch {
         lines.push(kv("Branch", branch, theme.agent_done.to_color(), theme));
     }
     lines.push(Line::from(""));
 
     lines.push(section("Tokens", theme));
-    lines.push(kv("Turns", &state.turn_count.to_string(), theme.dashboard_value.to_color(), theme));
-    lines.push(kv("Input", &state.input_tokens.to_string(), theme.dashboard_value.to_color(), theme));
-    lines.push(kv("Output", &state.output_tokens.to_string(), theme.dashboard_value.to_color(), theme));
+    lines.push(kv(
+        "Turns",
+        &state.turn_count.to_string(),
+        theme.dashboard_value.to_color(),
+        theme,
+    ));
+    lines.push(kv(
+        "Input",
+        &state.input_tokens.to_string(),
+        theme.dashboard_value.to_color(),
+        theme,
+    ));
+    lines.push(kv(
+        "Output",
+        &state.output_tokens.to_string(),
+        theme.dashboard_value.to_color(),
+        theme,
+    ));
     lines.push(kv(
         "Cache R",
         &state.cache_read_tokens.to_string(),
@@ -1195,7 +1326,12 @@ fn draw_right_pane(
 
     if let Some(ref team) = state.team {
         lines.push(section("Team", theme));
-        lines.push(kv("Name", &team.team_name, theme.dashboard_value.to_color(), theme));
+        lines.push(kv(
+            "Name",
+            &team.team_name,
+            theme.dashboard_value.to_color(),
+            theme,
+        ));
         let progress = format!(
             "{}/{} done, {} fail, {} run",
             team.completed_agents, team.total_agents, team.failed_agents, team.running_agents
@@ -1276,7 +1412,11 @@ fn draw_right_pane(
             height: 1,
         };
         let gauge = Gauge::default()
-            .gauge_style(Style::default().fg(gauge_color).bg(theme.gauge_bg.to_color()))
+            .gauge_style(
+                Style::default()
+                    .fg(gauge_color)
+                    .bg(theme.gauge_bg.to_color()),
+            )
             .ratio(if pct > 0.0 {
                 (pct / 100.0).min(1.0)
             } else {
@@ -1334,7 +1474,10 @@ fn draw_command_palette(
     let mut lines: Vec<Line> = Vec::new();
     lines.push(Line::from(vec![
         Span::styled("🔍 ", Style::default().fg(theme.key_hint.to_color())),
-        Span::styled(query.to_string(), Style::default().fg(theme.input_fg.to_color())),
+        Span::styled(
+            query.to_string(),
+            Style::default().fg(theme.input_fg.to_color()),
+        ),
         Span::styled("█", Style::default().fg(theme.input_cursor_bg.to_color())),
     ]));
     lines.push(Line::from(""));
@@ -1343,14 +1486,23 @@ fn draw_command_palette(
         let entry = &entries[idx];
         let is_sel = i == selected;
         let (fg, bg) = if is_sel {
-            (theme.completion_selected_fg.to_color(), theme.completion_selected_bg.to_color())
+            (
+                theme.completion_selected_fg.to_color(),
+                theme.completion_selected_bg.to_color(),
+            )
         } else {
             (theme.completion_fg.to_color(), Color::Reset)
         };
         lines.push(Line::from(vec![
             Span::styled(format!(" {} ", entry.label), Style::default().fg(fg).bg(bg)),
-            Span::styled(format!("  {}  ", entry.description), Style::default().fg(theme.key_hint.to_color())),
-            Span::styled(&entry.key_hint, Style::default().fg(theme.key_hint.to_color())),
+            Span::styled(
+                format!("  {}  ", entry.description),
+                Style::default().fg(theme.key_hint.to_color()),
+            ),
+            Span::styled(
+                &entry.key_hint,
+                Style::default().fg(theme.key_hint.to_color()),
+            ),
         ]));
     }
 
@@ -1378,7 +1530,7 @@ fn draw_agent_view(
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),  // Header
+            Constraint::Length(3), // Header
             Constraint::Min(10),   // Session list
             Constraint::Length(6), // Detail
         ])
@@ -1390,7 +1542,9 @@ fn draw_agent_view(
     let header = Paragraph::new(Line::from(vec![
         Span::styled(
             "  Agent View  ",
-            Style::default().fg(theme.dashboard_header.to_color()).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme.dashboard_header.to_color())
+                .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
             format!("  [{filter_label}]  [{sort_label}]  Tab:filter  S:sort  Esc:close"),
@@ -1424,10 +1578,22 @@ fn draw_agent_view(
                 format!("{}m{}s", elapsed / 60, elapsed % 60)
             };
             let line = Line::from(vec![
-                Span::styled(format!(" {} ", s.status.icon()), Style::default().fg(status_color)),
-                Span::styled(format!("{:<20}", s.name), Style::default().fg(theme.conversation_text.to_color())),
-                Span::styled(format!("{:<16}", s.model), Style::default().fg(theme.dashboard_key.to_color())),
-                Span::styled(format!("{} turns  ", s.turn_count), Style::default().fg(theme.dashboard_value.to_color())),
+                Span::styled(
+                    format!(" {} ", s.status.icon()),
+                    Style::default().fg(status_color),
+                ),
+                Span::styled(
+                    format!("{:<20}", s.name),
+                    Style::default().fg(theme.conversation_text.to_color()),
+                ),
+                Span::styled(
+                    format!("{:<16}", s.model),
+                    Style::default().fg(theme.dashboard_key.to_color()),
+                ),
+                Span::styled(
+                    format!("{} turns  ", s.turn_count),
+                    Style::default().fg(theme.dashboard_value.to_color()),
+                ),
                 Span::styled(elapsed_str, Style::default().fg(theme.key_hint.to_color())),
             ]);
             let style = if is_sel {
@@ -1451,19 +1617,34 @@ fn draw_agent_view(
     if let Some(session) = sessions.get(selected) {
         let detail = Paragraph::new(vec![
             Line::from(vec![
-                Span::styled("  ID: ", Style::default().fg(theme.dashboard_key.to_color())),
-                Span::styled(&session.id, Style::default().fg(theme.dashboard_value.to_color())),
+                Span::styled(
+                    "  ID: ",
+                    Style::default().fg(theme.dashboard_key.to_color()),
+                ),
+                Span::styled(
+                    &session.id,
+                    Style::default().fg(theme.dashboard_value.to_color()),
+                ),
             ]),
             Line::from(vec![
-                Span::styled("  Task: ", Style::default().fg(theme.dashboard_key.to_color())),
+                Span::styled(
+                    "  Task: ",
+                    Style::default().fg(theme.dashboard_key.to_color()),
+                ),
                 Span::styled(
                     session.task_subject.as_deref().unwrap_or("(none)"),
                     Style::default().fg(theme.dashboard_value.to_color()),
                 ),
             ]),
             Line::from(vec![
-                Span::styled("  Dir: ", Style::default().fg(theme.dashboard_key.to_color())),
-                Span::styled(&session.working_dir, Style::default().fg(theme.dashboard_value.to_color())),
+                Span::styled(
+                    "  Dir: ",
+                    Style::default().fg(theme.dashboard_key.to_color()),
+                ),
+                Span::styled(
+                    &session.working_dir,
+                    Style::default().fg(theme.dashboard_value.to_color()),
+                ),
             ]),
         ])
         .block(
@@ -1518,7 +1699,9 @@ mod tests {
         use unicode_width::UnicodeWidthChar;
         let lines = wrap_line("你好世界你好世界你好世界", 10, Style::default());
         for line in &lines {
-            let width: usize = line.spans.iter()
+            let width: usize = line
+                .spans
+                .iter()
                 .flat_map(|s| s.content.chars())
                 .map(|c| c.width().unwrap_or(0))
                 .sum();

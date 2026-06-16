@@ -1,6 +1,7 @@
 //! Command palette — fuzzy-filterable modal for all available commands.
 
 use crate::keybindings::Action;
+use commands::slash_command_specs;
 
 pub struct CommandPalette {
     pub active: bool,
@@ -21,7 +22,7 @@ pub struct PaletteEntry {
 
 impl CommandPalette {
     pub fn new() -> Self {
-        let entries = vec![
+        let mut entries = vec![
             PaletteEntry {
                 label: "Submit".into(),
                 description: "Send message".into(),
@@ -86,6 +87,26 @@ impl CommandPalette {
                 category: "Modes".into(),
             },
         ];
+
+        // Add every registered slash command so Ctrl+K can search /theme,
+        // /permissions, /model, etc. The index is stable because the spec
+        // slice is built once at first access.
+        for (i, spec) in slash_command_specs().iter().enumerate() {
+            let label = format!("/{}", spec.name);
+            let aliases = spec.aliases.join(", ");
+            let description = if aliases.is_empty() {
+                spec.summary.to_string()
+            } else {
+                format!("{} (aliases: {})", spec.summary, aliases)
+            };
+            entries.push(PaletteEntry {
+                label,
+                description,
+                action: Action::RunSlashCommand(i),
+                key_hint: "slash".into(),
+                category: "Slash".into(),
+            });
+        }
 
         let filtered = (0..entries.len()).collect();
         Self {
@@ -158,9 +179,7 @@ impl CommandPalette {
                 .map(|(i, _)| i)
                 .collect();
         }
-        self.selected = self
-            .selected
-            .min(self.filtered.len().saturating_sub(1));
+        self.selected = self.selected.min(self.filtered.len().saturating_sub(1));
     }
 }
 
@@ -183,12 +202,16 @@ mod tests {
     fn test_filter_by_label() {
         let mut cp = CommandPalette::new();
         cp.open();
-        // 'Z' doesn't appear in any default entry label/description/category,
+        // 'ZZZZ' doesn't appear in any default entry label/description/category,
         // so it should filter down to zero results.
-        cp.input('Z');
+        for _ in 0..4 {
+            cp.input('Z');
+        }
         assert!(cp.filtered.is_empty());
         // A more specific query that matches only some entries
-        cp.backspace();
+        for _ in 0..4 {
+            cp.backspace();
+        }
         cp.input('H');
         cp.input('e');
         cp.input('l');

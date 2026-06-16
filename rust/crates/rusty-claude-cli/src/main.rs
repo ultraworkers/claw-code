@@ -7415,11 +7415,14 @@ fn run_tui_repl(mut cli: LiveCli) -> Result<(), Box<dyn std::error::Error>> {
                         // (permissions prompts, setup wizard) leave alternate
                         // screen and let the user interact directly.
                         app.leave_for_turn()?;
-                        let should_exit = cli.handle_repl_command(command)?;
+                        let should_persist = cli.handle_repl_command(command)?;
                         app.reenter_after_turn()?;
 
-                        if should_exit {
-                            break;
+                        // `true` means the runtime/session was mutated
+                        // (e.g. /permissions, /model), not that we should
+                        // leave the TUI. Persist and stay in dashboard mode.
+                        if should_persist {
+                            cli.persist_session()?;
                         }
                         update_dashboard(&dashboard_state, &cli);
                         let _ = app.redraw_after_turn();

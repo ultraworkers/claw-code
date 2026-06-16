@@ -25,6 +25,8 @@ pub enum Action {
     FocusInput,
     FocusConversation,
     CycleChatMode,
+    /// Run a slash command by index into `commands::slash_command_specs()`.
+    RunSlashCommand(usize),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,15 +73,43 @@ impl KeyMap {
         self.bind(KeyModifiers::SHIFT, KeyCode::Enter, Action::Newline);
         self.bind(KeyModifiers::CONTROL, KeyCode::Char('c'), Action::Cancel);
         self.bind(KeyModifiers::CONTROL, KeyCode::Char('d'), Action::Exit);
-        self.bind(KeyModifiers::CONTROL, KeyCode::Char('p'), Action::ProviderSwap);
-        self.bind(KeyModifiers::CONTROL, KeyCode::Char('t'), Action::TeamToggle);
-        self.bind(KeyModifiers::CONTROL, KeyCode::Char('k'), Action::CommandPalette);
-        self.bind(KeyModifiers::CONTROL, KeyCode::Char('b'), Action::ToggleSidebar);
-        self.bind(KeyModifiers::CONTROL, KeyCode::Char('a'), Action::ToggleAgentView);
-        self.bind(KeyModifiers::CONTROL, KeyCode::Char('l'), Action::ClearConversation);
+        self.bind(
+            KeyModifiers::CONTROL,
+            KeyCode::Char('p'),
+            Action::ProviderSwap,
+        );
+        self.bind(
+            KeyModifiers::CONTROL,
+            KeyCode::Char('t'),
+            Action::TeamToggle,
+        );
+        self.bind(
+            KeyModifiers::CONTROL,
+            KeyCode::Char('k'),
+            Action::CommandPalette,
+        );
+        self.bind(
+            KeyModifiers::CONTROL,
+            KeyCode::Char('b'),
+            Action::ToggleSidebar,
+        );
+        self.bind(
+            KeyModifiers::CONTROL,
+            KeyCode::Char('a'),
+            Action::ToggleAgentView,
+        );
+        self.bind(
+            KeyModifiers::CONTROL,
+            KeyCode::Char('l'),
+            Action::ClearConversation,
+        );
         self.bind(KeyModifiers::CONTROL, KeyCode::Char('h'), Action::Help);
         self.bind(KeyModifiers::NONE, KeyCode::PageUp, Action::ScrollHalfUp);
-        self.bind(KeyModifiers::NONE, KeyCode::PageDown, Action::ScrollHalfDown);
+        self.bind(
+            KeyModifiers::NONE,
+            KeyCode::PageDown,
+            Action::ScrollHalfDown,
+        );
         self.bind(KeyModifiers::CONTROL, KeyCode::Home, Action::ScrollTop);
         self.bind(KeyModifiers::CONTROL, KeyCode::End, Action::ScrollBottom);
         self.bind(KeyModifiers::NONE, KeyCode::F(1), Action::Help);
@@ -90,13 +120,33 @@ impl KeyMap {
         self.bind(KeyModifiers::NONE, KeyCode::Enter, Action::Newline);
         self.bind(KeyModifiers::NONE, KeyCode::Esc, Action::Cancel);
         self.bind(KeyModifiers::CONTROL, KeyCode::Char('d'), Action::Exit);
-        self.bind(KeyModifiers::CONTROL, KeyCode::Char('p'), Action::ProviderSwap);
-        self.bind(KeyModifiers::CONTROL, KeyCode::Char('k'), Action::CommandPalette);
-        self.bind(KeyModifiers::CONTROL, KeyCode::Char('a'), Action::ToggleAgentView);
-        self.bind(KeyModifiers::CONTROL, KeyCode::Char('l'), Action::ClearConversation);
+        self.bind(
+            KeyModifiers::CONTROL,
+            KeyCode::Char('p'),
+            Action::ProviderSwap,
+        );
+        self.bind(
+            KeyModifiers::CONTROL,
+            KeyCode::Char('k'),
+            Action::CommandPalette,
+        );
+        self.bind(
+            KeyModifiers::CONTROL,
+            KeyCode::Char('a'),
+            Action::ToggleAgentView,
+        );
+        self.bind(
+            KeyModifiers::CONTROL,
+            KeyCode::Char('l'),
+            Action::ClearConversation,
+        );
         self.bind(KeyModifiers::NONE, KeyCode::F(1), Action::Help);
         self.bind(KeyModifiers::NONE, KeyCode::PageUp, Action::ScrollHalfUp);
-        self.bind(KeyModifiers::NONE, KeyCode::PageDown, Action::ScrollHalfDown);
+        self.bind(
+            KeyModifiers::NONE,
+            KeyCode::PageDown,
+            Action::ScrollHalfDown,
+        );
     }
 
     fn bind(&mut self, modifiers: KeyModifiers, code: KeyCode, action: Action) {
