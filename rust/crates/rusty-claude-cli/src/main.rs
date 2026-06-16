@@ -1012,6 +1012,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     let (args, cwd) = split_global_cwd_args(&args)?;
     apply_global_cwd(cwd)?;
+    // Inject saved provider settings (from /setup wizard) as env var fallbacks.
+    // The API client constructors read env vars only, so we set them once at
+    // process startup before any runtime threads are spawned. Already-set env
+    // vars are preserved — resolution order remains: env var > .env file >
+    // stored config. This only runs in the real binary (run() is not called by
+    // unit tests) to avoid leaking user config into the test suite.
+    inject_config_as_env_fallbacks();
     match parse_args(&args)? {
         CliAction::DumpManifests {
             output_format,
@@ -2995,6 +3002,8 @@ fn is_local_openai_model_syntax(model: &str) -> bool {
     if let Some(rest) = model.strip_prefix("local/") {
         return !rest.is_empty() && rest.split('/').all(|segment| !segment.is_empty());
     }
+    // Ollama-style tags (contain ':' or '.') are accepted when a custom
+    // OpenAI-compatible base URL is configured via OPENAI_BASE_URL.
     std::env::var_os("OPENAI_BASE_URL").is_some() && (model.contains(':') || model.contains('.'))
 }
 
@@ -3120,7 +3129,30 @@ fn config_permission_mode_for_current_dir() -> Option<PermissionMode> {
 fn config_model_for_current_dir() -> Option<String> {
     let cwd = env::current_dir().ok()?;
     let loader = ConfigLoader::default_for(&cwd);
-    loader.load().ok()?.model().map(ToOwned::to_owned)
+    let config = loader.load().ok()?;
+    let model = config.model()?;
+
+    // If the user configured a custom OpenAI-compatible endpoint with a bare
+    // model name (e.g. "openclaw"), normalize it to "openai/openclaw" so it
+    // passes provider/model syntax validation. Real OpenAI bare names like
+    // "gpt-4" are already accepted as aliases.
+    if config_has_custom_openai_base_url(&config) && !model.contains('/') {
+        return Some(format!("openai/{model}"));
+    }
+
+    Some(model.to_owned())
+}
+
+/// Check whether the loaded config has a custom OpenAI-compatible base URL.
+fn config_has_custom_openai_base_url(config: &runtime::RuntimeConfig) -> bool {
+    let provider = config.provider();
+    if provider.kind() != Some("openai") && provider.kind() != Some("openai-compat") {
+        return false;
+    }
+    let Some(base_url) = provider.base_url() else {
+        return false;
+    };
+    !base_url.is_empty() && base_url != "https://api.openai.com/v1"
 }
 
 fn resolve_repl_model(cli_model: String) -> Result<String, String> {
@@ -12955,12 +12987,6 @@ impl AnthropicRuntimeClient {
         tool_registry: GlobalToolRegistry,
         progress_reporter: Option<InternalPromptProgressReporter>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        // Inject saved provider settings (from /setup wizard) as env var
-        // fallbacks. The API client constructors read env vars only,
-        // so we set them here when the user hasn't already set them.
-        // 3-tier resolution: env var > .env file > stored config.
-        inject_config_as_env_fallbacks();
-
         // Dispatch to the correct provider at construction time.
         // `ApiProviderClient` (exposed by the api crate as
         // `ProviderClient`) is an enum over Anthropic / xAI / OpenAI
