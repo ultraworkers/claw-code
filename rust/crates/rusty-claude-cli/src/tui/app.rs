@@ -16,8 +16,8 @@ use ratatui::Frame;
 use crate::keybindings::{Action, KeyMap, KeyPreset, VimMode};
 use crate::theme::TuiTheme;
 use crate::tui::component::{Component, Overlay};
-use crate::tui::components::command_palette::CommandPaletteOverlay;
 use crate::tui::components::agent_view::AgentViewOverlay;
+use crate::tui::components::command_palette::CommandPaletteOverlay;
 use crate::tui::components::conversation::ConversationPane;
 use crate::tui::components::dashboard::Dashboard;
 use crate::tui::components::input_bar::{InputBar, InputOutcome};
@@ -271,14 +271,16 @@ impl TuiApp {
                 }
                 TuiEvent::TurnComplete { assistant_text } => {
                     if !assistant_text.is_empty() {
-                        self.conversation.push_output(&assistant_text, false, &self.theme);
+                        self.conversation
+                            .push_output(&assistant_text, false, &self.theme);
                     }
                     self.input_bar.set_turn_in_progress(false);
                     self.dashboard.set_status("Done");
                 }
                 TuiEvent::TurnError { error } => {
                     let color = self.theme.conversation_error.to_color();
-                    self.conversation.push_system_message(&format!("Error: {error}"), color);
+                    self.conversation
+                        .push_system_message(&format!("Error: {error}"), color);
                     self.input_bar.set_turn_in_progress(false);
                     self.dashboard.set_status("");
                 }
@@ -383,7 +385,10 @@ impl TuiApp {
 
     fn dispatch_action(&mut self, action: Action) -> io::Result<TuiReadOutcome> {
         match action {
-            Action::CommandPalette => { self.command_palette.open(); Ok(TuiReadOutcome::Pending) }
+            Action::CommandPalette => {
+                self.command_palette.open();
+                Ok(TuiReadOutcome::Pending)
+            }
             Action::ToggleAgentView => Ok(TuiReadOutcome::ToggleAgentView),
             Action::Help => {
                 let preset = self.key_preset_name().to_string();
@@ -395,12 +400,30 @@ impl TuiApp {
                 self.conversation.clear();
                 Ok(TuiReadOutcome::Pending)
             }
-            Action::ScrollUp => { self.conversation.scroll_up(1); Ok(TuiReadOutcome::Pending) }
-            Action::ScrollDown => { self.conversation.scroll_down(1); Ok(TuiReadOutcome::Pending) }
-            Action::ScrollHalfUp => { self.conversation.scroll_up(5); Ok(TuiReadOutcome::Pending) }
-            Action::ScrollHalfDown => { self.conversation.scroll_down(5); Ok(TuiReadOutcome::Pending) }
-            Action::ScrollTop => { self.conversation.scroll_top(); Ok(TuiReadOutcome::Pending) }
-            Action::ScrollBottom => { self.conversation.scroll_bottom(); Ok(TuiReadOutcome::Pending) }
+            Action::ScrollUp => {
+                self.conversation.scroll_up(1);
+                Ok(TuiReadOutcome::Pending)
+            }
+            Action::ScrollDown => {
+                self.conversation.scroll_down(1);
+                Ok(TuiReadOutcome::Pending)
+            }
+            Action::ScrollHalfUp => {
+                self.conversation.scroll_up(5);
+                Ok(TuiReadOutcome::Pending)
+            }
+            Action::ScrollHalfDown => {
+                self.conversation.scroll_down(5);
+                Ok(TuiReadOutcome::Pending)
+            }
+            Action::ScrollTop => {
+                self.conversation.scroll_top();
+                Ok(TuiReadOutcome::Pending)
+            }
+            Action::ScrollBottom => {
+                self.conversation.scroll_bottom();
+                Ok(TuiReadOutcome::Pending)
+            }
             _ => Ok(TuiReadOutcome::Pending),
         }
     }
@@ -433,10 +456,7 @@ impl TuiApp {
 
             let main = Layout::default()
                 .direction(Direction::Horizontal)
-                .constraints([
-                    Constraint::Min(40),
-                    Constraint::Length(dashboard_width),
-                ])
+                .constraints([Constraint::Min(40), Constraint::Length(dashboard_width)])
                 .split(area);
 
             let left = Layout::default()
@@ -523,7 +543,11 @@ mod tests {
         let bus = EventBus::new();
         let sender = bus.sender();
         sender.send(TuiEvent::TurnStarted).unwrap();
-        sender.send(TuiEvent::TurnError { error: "test".into() }).unwrap();
+        sender
+            .send(TuiEvent::TurnError {
+                error: "test".into(),
+            })
+            .unwrap();
         let events = bus.drain();
         assert_eq!(events.len(), 2);
     }
@@ -546,7 +570,7 @@ mod tests {
     /// Regression: reenter_after_turn is a no-op when already inside TUI.
     #[test]
     fn test_terminal_guard_reenter_when_already_inside() {
-        let mut guard = TerminalGuard { in_tui: true };
+        let guard = TerminalGuard { in_tui: true };
         // reenter_after_turn would try to enter alternate screen,
         // which fails without a real terminal. But the guard should
         // short-circuit since it's already in_tui.
