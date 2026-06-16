@@ -3133,26 +3133,21 @@ fn config_model_for_current_dir() -> Option<String> {
     let model = config.model()?;
 
     // If the user configured a custom OpenAI-compatible endpoint with a bare
-    // model name (e.g. "openclaw"), route it through the local/ prefix so it
-    // passes validation, maps to the OpenAI-compat client, and gets stripped
-    // down to the bare model id on the wire (avoiding a proxy 404).
-    if config_has_custom_openai_base_url(&config) && !model.contains('/') {
-        return Some(format!("local/{model}"));
+    // model name (e.g. "openclaw"), route it through the custom/ prefix so it
+    // passes validation, maps to the custom OpenAI-compat client, and gets
+    // stripped down to the bare model id on the wire (avoiding a proxy 404).
+    if is_custom_openai_provider(&config) && !model.contains('/') {
+        return Some(format!("custom/{model}"));
     }
 
     Some(model.to_owned())
 }
 
-/// Check whether the loaded config has a custom OpenAI-compatible base URL.
-fn config_has_custom_openai_base_url(config: &runtime::RuntimeConfig) -> bool {
-    let provider = config.provider();
-    if provider.kind() != Some("openai") && provider.kind() != Some("openai-compat") {
-        return false;
-    }
-    let Some(base_url) = provider.base_url() else {
-        return false;
-    };
-    !base_url.is_empty() && base_url != "https://api.openai.com/v1"
+/// Check whether the loaded config uses the Claw custom OpenAI-compatible
+/// provider, which has its own env var namespace so it can coexist with real
+/// OpenAI/NeuralWatt credentials.
+fn is_custom_openai_provider(config: &runtime::RuntimeConfig) -> bool {
+    config.provider().kind() == Some("custom-openai")
 }
 
 fn resolve_repl_model(cli_model: String) -> Result<String, String> {
@@ -13078,6 +13073,7 @@ fn inject_config_as_env_fallbacks() {
         "xai" => ("XAI_API_KEY", "XAI_BASE_URL"),
         "openai" => ("OPENAI_API_KEY", "OPENAI_BASE_URL"),
         "dashscope" => ("DASHSCOPE_API_KEY", "DASHSCOPE_BASE_URL"),
+        "custom-openai" => ("CLAWCUSTOMOPENAI_API_KEY", "CLAWCUSTOMOPENAI_BASE_URL"),
         _ => return, // unknown provider kind — don't inject
     };
 
@@ -15117,7 +15113,42 @@ mod tests {
     }
 
     #[test]
-    fn config_model_normalizes_bare_name_to_local_prefix_for_custom_openai_endpoint() {
+    fn config_model_normalizes_bare_name_to_custom_prefix_for_custom_openai_provider() {
+        let _guard = env_lock();
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let config_home = root.join("config-home");
+        std::fs::create_dir_all(&cwd).expect("project dir should exist");
+        std::fs::create_dir_all(&config_home).expect("config home should exist");
+        std::fs::write(
+            config_home.join("settings.json"),
+            r#"{
+                "provider": {
+                    "kind": "custom-openai",
+                    "apiKey": "sk-test",
+                    "baseUrl": "http://localhost:9999/v1"
+                },
+                "model": "openclaw"
+            }"#,
+        )
+        .expect("user settings should write");
+
+        let original_config_home = std::env::var("CLAW_CONFIG_HOME").ok();
+        std::env::set_var("CLAW_CONFIG_HOME", &config_home);
+
+        let resolved = with_current_dir(&cwd, super::config_model_for_current_dir);
+
+        match original_config_home {
+            Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
+            None => std::env::remove_var("CLAW_CONFIG_HOME"),
+        }
+        std::fs::remove_dir_all(root).expect("temp config root should clean up");
+
+        assert_eq!(resolved, Some("custom/openclaw".to_string()));
+    }
+
+    #[test]
+    fn config_model_leaves_openai_kind_bare_model_unnormalized() {
         let _guard = env_lock();
         let root = temp_dir();
         let cwd = root.join("project");
@@ -15138,9 +15169,7 @@ mod tests {
         .expect("user settings should write");
 
         let original_config_home = std::env::var("CLAW_CONFIG_HOME").ok();
-        let original_base_url = std::env::var("OPENAI_BASE_URL").ok();
         std::env::set_var("CLAW_CONFIG_HOME", &config_home);
-        std::env::remove_var("OPENAI_BASE_URL");
 
         let resolved = with_current_dir(&cwd, super::config_model_for_current_dir);
 
@@ -15148,13 +15177,9 @@ mod tests {
             Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
             None => std::env::remove_var("CLAW_CONFIG_HOME"),
         }
-        match original_base_url {
-            Some(value) => std::env::set_var("OPENAI_BASE_URL", value),
-            None => std::env::remove_var("OPENAI_BASE_URL"),
-        }
         std::fs::remove_dir_all(root).expect("temp config root should clean up");
 
-        assert_eq!(resolved, Some("local/openclaw".to_string()));
+        assert_eq!(resolved, Some("openclaw".to_string()));
     }
 
     #[test]
@@ -15201,6 +15226,57 @@ mod tests {
         match original_base_url {
             Some(value) => std::env::set_var("OPENAI_BASE_URL", value),
             None => std::env::remove_var("OPENAI_BASE_URL"),
+        }
+        std::fs::remove_dir_all(root).expect("temp config root should clean up");
+
+        assert_eq!(api_key, Some("sk-from-config".to_string()));
+        assert_eq!(base_url, Some("http://localhost:9999/v1".to_string()));
+    }
+
+    #[test]
+    fn inject_config_as_env_fallbacks_sets_custom_openai_provider_env_vars() {
+        let _guard = env_lock();
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let config_home = root.join("config-home");
+        std::fs::create_dir_all(&cwd).expect("project dir should exist");
+        std::fs::create_dir_all(&config_home).expect("config home should exist");
+        std::fs::write(
+            config_home.join("settings.json"),
+            r#"{
+                "provider": {
+                    "kind": "custom-openai",
+                    "apiKey": "sk-from-config",
+                    "baseUrl": "http://localhost:9999/v1"
+                }
+            }"#,
+        )
+        .expect("user settings should write");
+
+        let original_config_home = std::env::var("CLAW_CONFIG_HOME").ok();
+        let original_api_key = std::env::var("CLAWCUSTOMOPENAI_API_KEY").ok();
+        let original_base_url = std::env::var("CLAWCUSTOMOPENAI_BASE_URL").ok();
+
+        std::env::set_var("CLAW_CONFIG_HOME", &config_home);
+        std::env::remove_var("CLAWCUSTOMOPENAI_API_KEY");
+        std::env::remove_var("CLAWCUSTOMOPENAI_BASE_URL");
+
+        with_current_dir(&cwd, super::inject_config_as_env_fallbacks);
+
+        let api_key = std::env::var("CLAWCUSTOMOPENAI_API_KEY").ok();
+        let base_url = std::env::var("CLAWCUSTOMOPENAI_BASE_URL").ok();
+
+        match original_config_home {
+            Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
+            None => std::env::remove_var("CLAW_CONFIG_HOME"),
+        }
+        match original_api_key {
+            Some(value) => std::env::set_var("CLAWCUSTOMOPENAI_API_KEY", value),
+            None => std::env::remove_var("CLAWCUSTOMOPENAI_API_KEY"),
+        }
+        match original_base_url {
+            Some(value) => std::env::set_var("CLAWCUSTOMOPENAI_BASE_URL", value),
+            None => std::env::remove_var("CLAWCUSTOMOPENAI_BASE_URL"),
         }
         std::fs::remove_dir_all(root).expect("temp config root should clean up");
 
