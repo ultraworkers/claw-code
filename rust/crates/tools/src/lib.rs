@@ -5630,10 +5630,24 @@ fn resolve_agent_model(model: Option<&str>) -> String {
     if let Some(m) = model.map(str::trim).filter(|m| !m.is_empty()) {
         return m.to_string();
     }
+    // subagentModel (if set) pins the sub-agent model.
     if let Some(fast) = load_subagent_model_from_config() {
         return fast;
     }
+    // Otherwise default to the session's configured `model` so sub-agents use
+    // the same provider the user is actually connected with, rather than the
+    // hard-coded DEFAULT_AGENT_MODEL (which may not exist on a custom endpoint).
+    if let Some(session_model) = load_main_model_from_config() {
+        return session_model;
+    }
     DEFAULT_AGENT_MODEL.to_string()
+}
+
+/// Read the top-level `model` from merged config as a sub-agent default.
+fn load_main_model_from_config() -> Option<String> {
+    let cwd = std::env::current_dir().ok()?;
+    let config = ConfigLoader::default_for(&cwd).load().ok()?;
+    config.model().map(str::to_string)
 }
 
 /// Read the `subagentModel` setting from merged config so the Agent tool
@@ -6601,18 +6615,33 @@ impl ProviderRuntimeClient {
         allowed_tools: BTreeSet<String>,
         fallback_config: &ProviderFallbackConfig,
     ) -> Result<Self, String> {
-        let primary_model = fallback_config.primary().map_or(model, str::to_string);
-        let primary = build_provider_entry(&primary_model)?;
+        // The caller's resolved `model` is the primary. `providerFallbacks`
+        // (primary + fallbacks) are recovery entries tried in order after the
+        // primary fails with a retryable error. Previously the config's
+        // `providerFallbacks.primary` silently overrode the resolved model,
+        // which made sub-agents ignore `subagentModel` / the Agent tool's
+        // explicit model — e.g. spawning agents that always used a dead
+        // configured primary instead of the model the caller picked.
+        let primary = build_provider_entry(&model)?;
         let mut chain = vec![primary];
-        for fallback_model in fallback_config.fallbacks() {
-            match build_provider_entry(fallback_model) {
+        let mut seen: BTreeSet<String> = std::iter::once(model.clone()).collect();
+        let mut push_fallback = |chain: &mut Vec<ProviderEntry>, m: &str| {
+            if seen.contains(m) {
+                return;
+            }
+            seen.insert(m.to_string());
+            match build_provider_entry(m) {
                 Ok(entry) => chain.push(entry),
                 Err(error) => {
-                    eprintln!(
-                        "warning: skipping unavailable fallback provider {fallback_model}: {error}"
-                    );
+                    eprintln!("warning: skipping unavailable fallback provider {m}: {error}")
                 }
             }
+        };
+        if let Some(config_primary) = fallback_config.primary() {
+            push_fallback(&mut chain, config_primary);
+        }
+        for fallback_model in fallback_config.fallbacks() {
+            push_fallback(&mut chain, fallback_model);
         }
         Ok(Self {
             runtime: tokio::runtime::Runtime::new().map_err(|error| error.to_string())?,
@@ -6638,6 +6667,111 @@ fn load_provider_fallback_config() -> ProviderFallbackConfig {
         .map_or_else(ProviderFallbackConfig::default, |config| {
             config.provider_fallbacks().clone()
         })
+}
+
+/// Whether an API error should advance the provider chain to the next model.
+/// In addition to the standard retryable statuses (429/500/502/503/504), a
+/// 404 whose body indicates the model itself is unknown ("model not found")
+/// is chain-eligible: a dead primary model shouldn't abort the whole team —
+/// fall through to the next configured fallback.
+fn fallback_chain_eligible(error: &ApiError) -> bool {
+    if error.is_retryable() {
+        return true;
+    }
+    is_model_not_found(error)
+}
+
+/// True when the error body indicates the requested model doesn't exist on
+/// the provider (HTTP 404 + a "not found" / "model" message).
+fn is_model_not_found(error: &ApiError) -> bool {
+    let Some(status) = error.status_code() else {
+        return false;
+    };
+    if status != reqwest::StatusCode::NOT_FOUND && status != reqwest::StatusCode::BAD_REQUEST {
+        return false;
+    }
+    let body = error
+        .response_body()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let message = error.to_string().to_ascii_lowercase();
+    body.contains("not found")
+        || body.contains("does not exist")
+        || message.contains("not found")
+        || (body.contains("model") && body.contains("unavailable"))
+}
+
+/// Short human-readable reason for a chain fallthrough, for the log line.
+fn fallback_reason(error: &ApiError) -> &'static str {
+    if error.is_retryable() {
+        "retryable error"
+    } else if is_model_not_found(error) {
+        "model not found"
+    } else {
+        "error"
+    }
+}
+
+#[cfg(test)]
+mod fallback_chain_tests {
+    use super::{fallback_chain_eligible, is_model_not_found};
+    use api::ApiError;
+
+    fn model_not_found_404() -> ApiError {
+        ApiError::Api {
+            status: reqwest::StatusCode::NOT_FOUND,
+            error_type: Some("invalid_request_error".to_string()),
+            message: Some("Model 'openai/glm-5.1-fast' not found.".to_string()),
+            request_id: None,
+            body: "{\"detail\":\"Model 'openai/glm-5.1-fast' not found. Use GET /v1/models to see available models.\"}".to_string(),
+            retryable: false,
+            suggested_action: None,
+            retry_after: None,
+        }
+    }
+
+    fn auth_error() -> ApiError {
+        ApiError::Api {
+            status: reqwest::StatusCode::UNAUTHORIZED,
+            error_type: None,
+            message: None,
+            request_id: None,
+            body: "unauthorized".to_string(),
+            retryable: false,
+            suggested_action: None,
+            retry_after: None,
+        }
+    }
+
+    fn rate_limited() -> ApiError {
+        ApiError::Api {
+            status: reqwest::StatusCode::TOO_MANY_REQUESTS,
+            error_type: None,
+            message: None,
+            request_id: None,
+            body: "slow down".to_string(),
+            retryable: true,
+            suggested_action: None,
+            retry_after: None,
+        }
+    }
+
+    #[test]
+    fn model_not_found_404_is_chain_eligible() {
+        assert!(is_model_not_found(&model_not_found_404()));
+        assert!(fallback_chain_eligible(&model_not_found_404()));
+    }
+
+    #[test]
+    fn auth_error_is_not_chain_eligible() {
+        assert!(!is_model_not_found(&auth_error()));
+        assert!(!fallback_chain_eligible(&auth_error()));
+    }
+
+    #[test]
+    fn retryable_error_remains_chain_eligible() {
+        assert!(fallback_chain_eligible(&rate_limited()));
+    }
 }
 
 impl ApiClient for ProviderRuntimeClient {
@@ -6673,10 +6807,11 @@ impl ApiClient for ProviderRuntimeClient {
             let attempt = runtime.block_on(stream_with_provider(&entry.client, &message_request));
             match attempt {
                 Ok(events) => return Ok(events),
-                Err(error) if error.is_retryable() && index + 1 < chain.len() => {
+                Err(error) if fallback_chain_eligible(&error) && index + 1 < chain.len() => {
                     eprintln!(
-                        "provider {} failed with retryable error, falling back: {error}",
-                        entry.model
+                        "provider {} failed ({}, falling back to next in chain): {error}",
+                        entry.model,
+                        fallback_reason(&error)
                     );
                     last_error = Some(error);
                 }
