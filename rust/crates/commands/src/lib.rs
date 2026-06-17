@@ -66,6 +66,13 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         resume_supported: true,
     },
     SlashCommandSpec {
+        name: "tui",
+        aliases: &[],
+        summary: "Switch to the split-pane TUI dashboard",
+        argument_hint: None,
+        resume_supported: true,
+    },
+    SlashCommandSpec {
         name: "status",
         aliases: &[],
         summary: "Show current session status",
@@ -1508,6 +1515,9 @@ pub fn validate_slash_command_input(
         "add-dir" => SlashCommand::AddDir { path: remainder },
         "history" => SlashCommand::History {
             count: optional_single_arg(command, &args, "[count]")?,
+        },
+        "team" => SlashCommand::Team {
+            action: optional_single_arg(command, &args, "[list|create|delete]")?,
         },
         other => SlashCommand::Unknown(other.to_string()),
     }))
@@ -5526,6 +5536,16 @@ mod tests {
     fn parses_supported_slash_commands() {
         assert_eq!(SlashCommand::parse("/help"), Ok(Some(SlashCommand::Help)));
         assert_eq!(
+            SlashCommand::parse("/team"),
+            Ok(Some(SlashCommand::Team { action: None }))
+        );
+        assert_eq!(
+            SlashCommand::parse("/team list"),
+            Ok(Some(SlashCommand::Team {
+                action: Some("list".to_string())
+            }))
+        );
+        assert_eq!(
             SlashCommand::parse(" /status "),
             Ok(Some(SlashCommand::Status))
         );
@@ -6012,7 +6032,7 @@ mod tests {
         assert!(!help.contains("/login"));
         assert!(!help.contains("/logout"));
         assert!(help.contains("/setup"));
-        assert_eq!(slash_command_specs().len(), 140);
+        assert_eq!(slash_command_specs().len(), 141);
         assert!(resume_supported_slash_commands().len() >= 39);
     }
 

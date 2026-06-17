@@ -8714,10 +8714,13 @@ impl LiveCli {
             | SlashCommand::Ide { .. }
             | SlashCommand::Tag { .. }
             | SlashCommand::OutputStyle { .. }
-            | SlashCommand::AddDir { .. }
-            | SlashCommand::Team { .. } => {
+            | SlashCommand::AddDir { .. } => {
                 let cmd_name = command.slash_name();
                 eprintln!("{cmd_name} is not yet implemented in this build.");
+                false
+            }
+            SlashCommand::Team { action } => {
+                self.print_team_command(action.as_deref());
                 false
             }
             SlashCommand::Unknown(name) => {
@@ -8730,6 +8733,48 @@ impl LiveCli {
     fn persist_session(&self) -> Result<(), Box<dyn std::error::Error>> {
         self.runtime.session().save_to_path(&self.session.path)?;
         Ok(())
+    }
+
+    /// `/team` — user-facing manager for agent teams.
+    ///
+    /// The team registry and the `TeamCreate` / `TeamDelete` / `Cron*` tools live
+    /// inside the tool executor, so the model invokes them directly during a
+    /// turn. This slash command surfaces a readable view of the same teams and
+    /// is the user's way to take action without driving the model.
+    fn print_team_command(&self, action: Option<&str>) {
+        match action.map(str::to_ascii_lowercase).as_deref() {
+            None | Some("help") => {
+                println!("Agent teams — the model creates and manages teams via its tools.");
+                println!();
+                println!("Available team tools the model can call:");
+                println!("  TeamCreate   create a team from a set of tasks");
+                println!("  TeamDelete   mark a team deleted by team_id");
+                println!("  CronCreate   schedule a recurring prompt (cron)");
+                println!("  CronDelete   remove a scheduled cron by cron_id");
+                println!("  CronList     list scheduled crons");
+                println!();
+                println!("Slash commands:");
+                println!("  /team list   show teams in this session registry");
+                println!("  /team help   this message");
+                println!();
+                println!("Teams are held in-process for the lifetime of this claw session.");
+            }
+            Some("list") => {
+                // The team registry is owned by the in-process tool executor
+                // (tools::global_team_registry) and is not currently exposed to
+                // the CLI layer, so we can't enumerate live teams from here.
+                // Listing will arrive with tool-registry introspection.
+                println!("Live team listing isn't wired into the CLI yet.");
+                println!(
+                    "Teams are created/managed by the model via the TeamCreate and TeamDelete"
+                );
+                println!("tools during a turn. Ask the model to report on its teams.");
+            }
+            Some(other) => {
+                println!("Unknown /team action: {other}");
+                println!("Available: list, help");
+            }
+        }
     }
 
     fn print_status(&self) {
