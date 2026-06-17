@@ -2608,6 +2608,49 @@ fn deep_merge_objects(
     }
 }
 
+/// Read the provider config saved by `/setup` and inject its credentials
+/// into the environment so `ProviderClient::from_model()` can find them via
+/// the env-var-based provider dispatch. Only sets vars that aren't already
+/// present (preserves explicit env). Idempotent.
+///
+/// Called by the main CLI at startup and by sub-agent threads in the tools
+/// crate so that custom/ exotic providers work for spawned agents too.
+pub fn inject_config_as_env_fallbacks() {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let Ok(config) = ConfigLoader::default_for(&cwd).load() else {
+        return;
+    };
+    let provider = config.provider();
+
+    // Map provider kind to the expected env var names
+    let (api_key_env, base_url_env) = match provider.kind().unwrap_or("anthropic") {
+        "anthropic" => ("ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL"),
+        "xai" => ("XAI_API_KEY", "XAI_BASE_URL"),
+        "openai" => ("OPENAI_API_KEY", "OPENAI_BASE_URL"),
+        "dashscope" => ("DASHSCOPE_API_KEY", "DASHSCOPE_BASE_URL"),
+        "custom-openai" => ("CLAWCUSTOMOPENAI_API_KEY", "CLAWCUSTOMOPENAI_BASE_URL"),
+        _ => return, // unknown provider kind — don't inject
+    };
+
+    // Only set env vars that aren't already set (preserve user's explicit env)
+    if let Some(api_key) = provider.api_key() {
+        if std::env::var(api_key_env).is_err() {
+            std::env::set_var(api_key_env, api_key);
+        }
+    }
+    if let Some(base_url) = provider.base_url() {
+        if std::env::var(base_url_env).is_err() {
+            std::env::set_var(base_url_env, base_url);
+        }
+    }
+    // Also inject the saved model so resolve_model_alias sees it
+    if let Some(model) = provider.model() {
+        if std::env::var("CLAWD_PROVIDER_MODEL").is_err() {
+            std::env::set_var("CLAWD_PROVIDER_MODEL", model);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{

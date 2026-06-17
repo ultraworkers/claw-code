@@ -1018,7 +1018,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // vars are preserved — resolution order remains: env var > .env file >
     // stored config. This only runs in the real binary (run() is not called by
     // unit tests) to avoid leaking user config into the test suite.
-    inject_config_as_env_fallbacks();
+    runtime::inject_config_as_env_fallbacks();
     match parse_args(&args)? {
         CliAction::DumpManifests {
             output_format,

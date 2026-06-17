@@ -5523,6 +5523,13 @@ fn teardown_agent_worktree(agent_id: &str, worktree_path: &std::path::Path) -> R
 }
 
 fn run_agent_job(job: &AgentJob) -> Result<(), String> {
+    // Inject provider credentials from /setup-saved config into env vars so
+    // sub-agents can reach the same endpoint the user connected the main session
+    // with (e.g. custom-openai's CLAWCUSTOMOPENAI_API_KEY / BASE_URL). Without
+    // this, sub-agents can't find custom/ or exotic providers that were set up
+    // via /setup rather than via explicit env vars.
+    runtime::inject_config_as_env_fallbacks();
+
     // Claim task if task_id is set (prevents duplicate work)
     if let Some(ref task_id) = job.task_id {
         if let Some(ref team_id) = job.team_id {
