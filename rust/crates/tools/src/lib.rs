@@ -5645,7 +5645,7 @@ fn resolve_agent_model(model: Option<&str>) -> String {
     // the same provider the user is actually connected with, rather than the
     // hard-coded DEFAULT_AGENT_MODEL (which may not exist on a custom endpoint).
     if let Some(session_model) = load_main_model_from_config() {
-        return session_model;
+        return qualify_for_provider(&session_model);
     }
     DEFAULT_AGENT_MODEL.to_string()
 }
