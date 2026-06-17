@@ -5635,11 +5635,11 @@ The following patterns, pitfalls, and style guidelines were documented by previo
 
 fn resolve_agent_model(model: Option<&str>) -> String {
     if let Some(m) = model.map(str::trim).filter(|m| !m.is_empty()) {
-        return m.to_string();
+        return qualify_for_provider(m);
     }
     // subagentModel (if set) pins the sub-agent model.
     if let Some(fast) = load_subagent_model_from_config() {
-        return fast;
+        return qualify_for_provider(&fast);
     }
     // Otherwise default to the session's configured `model` so sub-agents use
     // the same provider the user is actually connected with, rather than the
@@ -5663,6 +5663,24 @@ fn load_subagent_model_from_config() -> Option<String> {
     let cwd = std::env::current_dir().ok()?;
     let config = ConfigLoader::default_for(&cwd).load().ok()?;
     config.subagent_model().map(str::to_string)
+}
+
+/// When the user's active provider is `custom-openai`, bare model names
+/// (e.g. "claude-haiku-4-5-20251001") need a `custom/` prefix so
+/// `ProviderClient::from_model` routes them through the custom endpoint
+/// instead of dispatching to the Anthropic provider (which has no creds).
+fn qualify_for_provider(model: &str) -> String {
+    if model.starts_with("custom/") || model.contains('/') {
+        return model.to_string();
+    }
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let Ok(config) = ConfigLoader::default_for(&cwd).load() else {
+        return model.to_string();
+    };
+    if config.provider().kind() == Some("custom-openai") {
+        return format!("custom/{model}");
+    }
+    model.to_string()
 }
 
 fn allowed_tools_for_subagent(subagent_type: &str) -> BTreeSet<String> {
