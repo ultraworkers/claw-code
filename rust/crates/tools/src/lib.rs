@@ -7,10 +7,10 @@ use aspect_macros::aspect;
 use aspect_std::LoggingAspect;
 
 use api::{
-    max_tokens_for_model, model_family_identity_for, model_token_limit, ModelTokenLimit,
-    resolve_model_alias, ApiError, ContentBlockDelta, InputContentBlock, InputMessage,
-    MessageRequest, MessageResponse, OutputContentBlock, ProviderClient,
-    StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
+    max_tokens_for_model, model_family_identity_for, model_token_limit, resolve_model_alias,
+    ApiError, ContentBlockDelta, InputContentBlock, InputMessage, MessageRequest, MessageResponse,
+    OutputContentBlock, ProviderClient, StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition,
+    ToolResultContentBlock,
 };
 use plugins::PluginTool;
 use reqwest::blocking::Client;
@@ -1593,7 +1593,9 @@ fn execute_tool_with_enforcer(
         "AgentMessage" => from_value::<AgentMessageInput>(input).and_then(run_agent_message),
         "TeamStatus" => from_value::<TeamStatusInput>(input).and_then(run_team_status),
         "TaskClaim" => from_value::<TaskClaimInput>(input).and_then(run_task_claim),
-        "AgentSuggestion" => from_value::<AgentSuggestionInput>(input).and_then(run_agent_suggestion),
+        "AgentSuggestion" => {
+            from_value::<AgentSuggestionInput>(input).and_then(run_agent_suggestion)
+        }
         "ContextRequest" => from_value::<ContextRequestInput>(input).and_then(run_context_request),
         "CronCreate" => from_value::<CronCreateInput>(input).and_then(run_cron_create),
         "CronDelete" => from_value::<CronDeleteInput>(input).and_then(run_cron_delete),
@@ -1888,10 +1890,13 @@ fn run_team_create(input: TeamCreateInput) -> Result<String, String> {
         return Err("Agent teams is disabled. Use /team on or Ctrl+T to enable.".to_string());
     }
 
-    let team_id = format!("team-{}", std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos());
+    let team_id = format!(
+        "team-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    );
     let output_dir = agent_store_dir()?;
     let team_dir = output_dir.join("teams");
     std::fs::create_dir_all(&team_dir).map_err(|e| e.to_string())?;
@@ -1899,9 +1904,23 @@ fn run_team_create(input: TeamCreateInput) -> Result<String, String> {
     // Expand mode preset into tasks, or use manual tasks.
     // Default to "2x" when neither mode nor tasks are provided.
     let tasks = if let Some(mode) = &input.mode {
-        expand_team_mode(mode, input.prompt.as_deref().unwrap_or("Explore the codebase and report findings"), &team_id)?
+        expand_team_mode(
+            mode,
+            input
+                .prompt
+                .as_deref()
+                .unwrap_or("Explore the codebase and report findings"),
+            &team_id,
+        )?
     } else if input.tasks.is_empty() {
-        expand_team_mode("2x", input.prompt.as_deref().unwrap_or("Explore the codebase and report findings"), &team_id)?
+        expand_team_mode(
+            "2x",
+            input
+                .prompt
+                .as_deref()
+                .unwrap_or("Explore the codebase and report findings"),
+            &team_id,
+        )?
     } else {
         input.tasks.clone()
     };
@@ -1911,7 +1930,10 @@ fn run_team_create(input: TeamCreateInput) -> Result<String, String> {
 
     for (i, task) in tasks.iter().enumerate() {
         let prompt = task.get("prompt").and_then(|v| v.as_str()).unwrap_or("");
-        let description = task.get("description").and_then(|v| v.as_str()).unwrap_or(&input.name);
+        let description = task
+            .get("description")
+            .and_then(|v| v.as_str())
+            .unwrap_or(&input.name);
         let subagent_type = task.get("subagent_type").and_then(|v| v.as_str());
         let model_override = task.get("model").and_then(|v| v.as_str());
 
@@ -1919,12 +1941,19 @@ fn run_team_create(input: TeamCreateInput) -> Result<String, String> {
             continue;
         }
 
-        let task_id = task.get("task_id").and_then(|v| v.as_str()).map(|s| s.to_string());
+        let task_id = task
+            .get("task_id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
         let agent_input = AgentInput {
             description: description.to_string(),
             prompt: prompt.to_string(),
             subagent_type: subagent_type.map(|s| s.to_string()),
-            name: Some(format!("{}-agent-{}", slugify_agent_name(&input.name), i + 1)),
+            name: Some(format!(
+                "{}-agent-{}",
+                slugify_agent_name(&input.name),
+                i + 1
+            )),
             model: model_override.map(|s| s.to_string()),
             team_id: Some(team_id.clone()),
             task_id,
@@ -1961,8 +1990,11 @@ fn run_team_create(input: TeamCreateInput) -> Result<String, String> {
         "created_at": iso8601_now(),
     });
     let manifest_path = team_dir.join(format!("{team_id}.json"));
-    std::fs::write(&manifest_path, serde_json::to_string_pretty(&team_manifest).map_err(|e| e.to_string())?)
-        .map_err(|e| e.to_string())?;
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_string_pretty(&team_manifest).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
 
     // Register in global registry
     let team = global_team_registry().create(&input.name, agent_ids.clone());
@@ -1989,10 +2021,11 @@ fn run_team_status(input: TeamStatusInput) -> Result<String, String> {
     if !manifest_path.exists() {
         return Err(format!("team {} not found", input.team_id));
     }
-    let team_data: Value = serde_json::from_str(
-        &std::fs::read_to_string(&manifest_path).map_err(|e| e.to_string())?
-    ).map_err(|e| e.to_string())?;
-    let agent_ids = team_data.get("agent_ids")
+    let team_data: Value =
+        serde_json::from_str(&std::fs::read_to_string(&manifest_path).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+    let agent_ids = team_data
+        .get("agent_ids")
         .and_then(|v| v.as_array())
         .cloned()
         .unwrap_or_default();
@@ -2012,9 +2045,11 @@ fn run_team_status(input: TeamStatusInput) -> Result<String, String> {
             if agent_json.exists() {
                 if let Ok(data) = std::fs::read_to_string(&agent_json) {
                     if let Ok(parsed) = serde_json::from_str::<Value>(&data) {
-                        detail["status"] = parsed.get("status").cloned().unwrap_or(json!("unknown"));
+                        detail["status"] =
+                            parsed.get("status").cloned().unwrap_or(json!("unknown"));
                         detail["name"] = parsed.get("name").cloned().unwrap_or(json!(null));
-                        detail["subagent_type"] = parsed.get("subagent_type").cloned().unwrap_or(json!(null));
+                        detail["subagent_type"] =
+                            parsed.get("subagent_type").cloned().unwrap_or(json!(null));
                         if let Some(completed) = parsed.get("completed_at") {
                             detail["completed_at"] = completed.clone();
                         }
@@ -2026,7 +2061,8 @@ fn run_team_status(input: TeamStatusInput) -> Result<String, String> {
 
             if agent_md.exists() {
                 if let Ok(md_content) = std::fs::read_to_string(&agent_md) {
-                    let summary = md_content.lines()
+                    let summary = md_content
+                        .lines()
                         .skip_while(|line| !line.starts_with("## Result"))
                         .skip(1)
                         .take(10)
@@ -2038,7 +2074,11 @@ fn run_team_status(input: TeamStatusInput) -> Result<String, String> {
                 }
             }
 
-            match detail.get("status").and_then(|v| v.as_str()).unwrap_or("unknown") {
+            match detail
+                .get("status")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown")
+            {
                 "completed" => completed_count += 1,
                 "failed" => failed_count += 1,
                 _ => running_count += 1,
@@ -2287,14 +2327,33 @@ fn get_agent_result_preview(store_dir: &std::path::Path, agent_id: &str) -> Stri
     let md_path = store_dir.join(format!("{agent_id}.md"));
     if let Ok(content) = std::fs::read_to_string(&md_path) {
         let lines: Vec<&str> = content.lines().collect();
-        let start = lines.iter().position(|l| l.starts_with("## Result")).map(|i| i + 1).unwrap_or(0);
-        lines[start..].iter().take(5).cloned().collect::<Vec<&str>>().join(" ").chars().take(200).collect()
+        let start = lines
+            .iter()
+            .position(|l| l.starts_with("## Result"))
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        lines[start..]
+            .iter()
+            .take(5)
+            .cloned()
+            .collect::<Vec<&str>>()
+            .join(" ")
+            .chars()
+            .take(200)
+            .collect()
     } else {
         String::new()
     }
 }
 
-fn append_team_event(events_path: &std::path::Path, team_id: &str, agent_id: &str, event_type: &str, name: &str, detail: Option<&str>) {
+fn append_team_event(
+    events_path: &std::path::Path,
+    team_id: &str,
+    agent_id: &str,
+    event_type: &str,
+    name: &str,
+    detail: Option<&str>,
+) {
     let entry = json!({
         "timestamp": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis(),
         "team_id": team_id,
@@ -2305,12 +2364,15 @@ fn append_team_event(events_path: &std::path::Path, team_id: &str, agent_id: &st
     });
     if let Ok(line) = serde_json::to_string(&entry) {
         use std::io::Write;
-        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(events_path) {
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(events_path)
+        {
             let _ = writeln!(file, "{line}");
         }
     }
 }
-
 
 fn run_team_delete(input: TeamDeleteInput) -> Result<String, String> {
     // Delete from disk-based team storage
@@ -2381,8 +2443,11 @@ fn run_agent_message(input: AgentMessageInput) -> Result<String, String> {
                 "message": msg,
                 "timestamp": ts,
             });
-            std::fs::write(&msg_file, serde_json::to_string_pretty(&entry).map_err(|e| e.to_string())?)
-                .map_err(|e| e.to_string())?;
+            std::fs::write(
+                &msg_file,
+                serde_json::to_string_pretty(&entry).map_err(|e| e.to_string())?,
+            )
+            .map_err(|e| e.to_string())?;
             to_pretty_json(json!({
                 "action": "sent",
                 "to": target,
@@ -2404,9 +2469,7 @@ fn run_agent_message(input: AgentMessageInput) -> Result<String, String> {
             let entries: Vec<_> = std::fs::read_dir(&inbox_dir)
                 .map_err(|e| e.to_string())?
                 .filter_map(|e| e.ok())
-                .filter(|e| {
-                    e.path().extension().is_some_and(|ext| ext == "json")
-                })
+                .filter(|e| e.path().extension().is_some_and(|ext| ext == "json"))
                 .collect();
             for entry in &entries {
                 if let Ok(content) = std::fs::read_to_string(entry.path()) {
@@ -2443,9 +2506,11 @@ fn run_agent_message(input: AgentMessageInput) -> Result<String, String> {
                 return Err(format!("team {team_id} not found"));
             }
             let team_data: Value = serde_json::from_str(
-                &std::fs::read_to_string(&manifest_path).map_err(|e| e.to_string())?
-            ).map_err(|e| e.to_string())?;
-            let agent_ids = team_data.get("agent_ids")
+                &std::fs::read_to_string(&manifest_path).map_err(|e| e.to_string())?,
+            )
+            .map_err(|e| e.to_string())?;
+            let agent_ids = team_data
+                .get("agent_ids")
                 .and_then(|v| v.as_array())
                 .cloned()
                 .unwrap_or_default();
@@ -2457,7 +2522,9 @@ fn run_agent_message(input: AgentMessageInput) -> Result<String, String> {
             let mut sent_to: Vec<String> = Vec::new();
             for id_val in agent_ids {
                 if let Some(id) = id_val.as_str() {
-                    if id == sender { continue; }
+                    if id == sender {
+                        continue;
+                    }
                     let inbox_dir = mailbox_dir.join(id);
                     std::fs::create_dir_all(&inbox_dir).map_err(|e| e.to_string())?;
                     let msg_file = inbox_dir.join(format!("msg-{ts}-{sender}.json"));
@@ -2467,8 +2534,11 @@ fn run_agent_message(input: AgentMessageInput) -> Result<String, String> {
                         "timestamp": ts,
                         "team_id": team_id,
                     });
-                    std::fs::write(&msg_file, serde_json::to_string_pretty(&entry).map_err(|e| e.to_string())?)
-                        .map_err(|e| e.to_string())?;
+                    std::fs::write(
+                        &msg_file,
+                        serde_json::to_string_pretty(&entry).map_err(|e| e.to_string())?,
+                    )
+                    .map_err(|e| e.to_string())?;
                     sent_to.push(id.to_string());
                 }
             }
@@ -2535,7 +2605,9 @@ fn run_task_claim(input: TaskClaimInput) -> Result<String, String> {
                 "count": claims.len(),
             }))
         }
-        other => Err(format!("unknown TaskClaim action: {other}. Use claim, release, or list")),
+        other => Err(format!(
+            "unknown TaskClaim action: {other}. Use claim, release, or list"
+        )),
     }
 }
 
@@ -2557,8 +2629,11 @@ fn run_agent_suggestion(input: AgentSuggestionInput) -> Result<String, String> {
     });
     let filename = format!("suggestion-{agent_id}-{ts}.json");
     let path = suggestions_dir.join(&filename);
-    std::fs::write(&path, serde_json::to_string_pretty(&entry).map_err(|e| e.to_string())?)
-        .map_err(|e| e.to_string())?;
+    std::fs::write(
+        &path,
+        serde_json::to_string_pretty(&entry).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
     to_pretty_json(json!({
         "action": "suggestion",
         "file": filename,
@@ -2579,7 +2654,11 @@ fn run_context_request(input: ContextRequestInput) -> Result<String, String> {
             match std::fs::read_to_string(&path) {
                 Ok(content) => {
                     let truncated = if content.len() > 10000 {
-                        format!("{}... (truncated, {} bytes total)", &content[..10000], content.len())
+                        format!(
+                            "{}... (truncated, {} bytes total)",
+                            &content[..10000],
+                            content.len()
+                        )
                     } else {
                         content
                     };
@@ -2610,7 +2689,15 @@ fn run_context_request(input: ContextRequestInput) -> Result<String, String> {
     for symbol in &input.symbols {
         let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
         let output = std::process::Command::new("grep")
-            .args(["-rn", "--include=*.rs", "--include=*.ts", "--include=*.js", "--include=*.py", symbol, "."])
+            .args([
+                "-rn",
+                "--include=*.rs",
+                "--include=*.ts",
+                "--include=*.js",
+                "--include=*.py",
+                symbol,
+                ".",
+            ])
             .current_dir(&cwd)
             .output()
             .map_err(|e| e.to_string())?;
@@ -2646,7 +2733,11 @@ fn expand_team_mode(mode: &str, base_prompt: &str, team_id: &str) -> Result<Vec<
         "4x" | "large" => 4,
         "5x" | "xlarge" => 5,
         "6x" | "mega" => 6,
-        other => return Err(format!("unknown team mode '{other}'. Use 1x-6x or tiny/small/medium/large/xlarge/mega")),
+        other => {
+            return Err(format!(
+                "unknown team mode '{other}'. Use 1x-6x or tiny/small/medium/large/xlarge/mega"
+            ))
+        }
     };
     let short_team_id = &team_id[team_id.len().saturating_sub(8)..];
     let roles: &[&str] = &["Explore", "Plan", "Verification"];
@@ -2721,8 +2812,11 @@ fn claim_task(task_id: &str, agent_id: &str, team_id: &str) -> Result<bool, Stri
     });
     // Atomic claim: write to temp file then rename
     let tmp_path = dir.join(format!("{task_id}.lock.tmp.{agent_id}"));
-    std::fs::write(&tmp_path, serde_json::to_string_pretty(&entry).map_err(|e| e.to_string())?)
-        .map_err(|e| e.to_string())?;
+    std::fs::write(
+        &tmp_path,
+        serde_json::to_string_pretty(&entry).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
     match std::fs::rename(&tmp_path, &lock_path) {
         Ok(()) => Ok(true),
         Err(_) => {
@@ -2755,7 +2849,8 @@ fn list_claims(team_id: Option<&str>) -> Vec<serde_json::Value> {
             if path.extension().map_or(false, |e| e == "lock") {
                 if let Ok(content) = std::fs::read_to_string(&path) {
                     if let Ok(v) = serde_json::from_str::<serde_json::Value>(&content) {
-                        if team_id.map_or(true, |tid| v.get("team_id").map_or(false, |t| t == tid)) {
+                        if team_id.map_or(true, |tid| v.get("team_id").map_or(false, |t| t == tid))
+                        {
                             claims.push(v);
                         }
                     }
@@ -2778,7 +2873,12 @@ impl TeamInboxReporter {
     fn new(team_id: String, agent_id: String, agent_name: String) -> Self {
         let inbox_dir = agent_mailbox_dir().join("team").join(&team_id);
         let _ = std::fs::create_dir_all(&inbox_dir);
-        Self { team_id, agent_id, agent_name, inbox_dir }
+        Self {
+            team_id,
+            agent_id,
+            agent_name,
+            inbox_dir,
+        }
     }
 }
 
@@ -2812,10 +2912,9 @@ impl TurnProgressReporter for TeamInboxReporter {
             "max_iterations": max_iterations,
             "timestamp": ts,
         });
-        let msg_file = self.inbox_dir.join(format!(
-            "tp-{}-{}-{ts}.json",
-            self.agent_id, iteration
-        ));
+        let msg_file = self
+            .inbox_dir
+            .join(format!("tp-{}-{}-{ts}.json", self.agent_id, iteration));
         if let Ok(line) = serde_json::to_string(&entry) {
             let _ = std::fs::write(&msg_file, line);
         }
@@ -2830,13 +2929,19 @@ impl TurnProgressReporter for TeamInboxReporter {
                 .output();
             if diff_check.map_or(true, |o| !o.status.success()) {
                 let _ = std::process::Command::new("git")
-                    .args(["commit", "-m", &format!("agent {} progress: iteration {iteration}", self.agent_id)])
+                    .args([
+                        "commit",
+                        "-m",
+                        &format!("agent {} progress: iteration {iteration}", self.agent_id),
+                    ])
                     .output();
             }
         }
 
         // Check for kill signal from team lead
-        for entry in std::fs::read_dir(&self.inbox_dir).unwrap_or_else(|_| std::fs::read_dir(".").unwrap()) {
+        for entry in
+            std::fs::read_dir(&self.inbox_dir).unwrap_or_else(|_| std::fs::read_dir(".").unwrap())
+        {
             if let Ok(e) = entry {
                 let name = e.file_name();
                 let name_str = name.to_string_lossy();
@@ -5352,14 +5457,25 @@ fn setup_agent_worktree(agent_id: &str) -> Result<std::path::PathBuf, String> {
     // Create worktree on a new branch
     let branch_name = format!("agent/{agent_id}");
     let output = std::process::Command::new("git")
-        .args(["worktree", "add", worktree_dir.to_str().unwrap_or(""), "-b", &branch_name])
+        .args([
+            "worktree",
+            "add",
+            worktree_dir.to_str().unwrap_or(""),
+            "-b",
+            &branch_name,
+        ])
         .current_dir(&cwd)
         .output()
         .map_err(|e| e.to_string())?;
     if !output.status.success() {
         // Branch might already exist, try with existing branch
         let output2 = std::process::Command::new("git")
-            .args(["worktree", "add", worktree_dir.to_str().unwrap_or(""), &branch_name])
+            .args([
+                "worktree",
+                "add",
+                worktree_dir.to_str().unwrap_or(""),
+                &branch_name,
+            ])
             .current_dir(&cwd)
             .output()
             .map_err(|e| e.to_string())?;
@@ -5390,7 +5506,12 @@ fn teardown_agent_worktree(agent_id: &str, worktree_path: &std::path::Path) -> R
     }
     // Remove the worktree
     let _ = std::process::Command::new("git")
-        .args(["worktree", "remove", worktree_path.to_str().unwrap_or(""), "--force"])
+        .args([
+            "worktree",
+            "remove",
+            worktree_path.to_str().unwrap_or(""),
+            "--force",
+        ])
         .current_dir(&cwd)
         .output();
     // Delete the branch
@@ -5405,8 +5526,7 @@ fn run_agent_job(job: &AgentJob) -> Result<(), String> {
     // Claim task if task_id is set (prevents duplicate work)
     if let Some(ref task_id) = job.task_id {
         if let Some(ref team_id) = job.team_id {
-            let claimed = claim_task(task_id, &job.manifest.agent_id, team_id)
-                .unwrap_or(false);
+            let claimed = claim_task(task_id, &job.manifest.agent_id, team_id).unwrap_or(false);
             if !claimed {
                 return Err(format!("task {task_id} already claimed by another agent"));
             }
@@ -5732,8 +5852,11 @@ fn post_agent_completion_to_team_inbox(
         "timestamp": ts,
     });
     let msg_file = mailbox_dir.join(format!("{}-{ts}.json", manifest.agent_id));
-    std::fs::write(&msg_file, serde_json::to_string_pretty(&entry).map_err(|e| e.to_string())?)
-        .map_err(|e| e.to_string())
+    std::fs::write(
+        &msg_file,
+        serde_json::to_string_pretty(&entry).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())
 }
 
 const MIN_LANE_SUMMARY_WORDS: usize = 7;
@@ -10038,8 +10161,8 @@ mod tests {
                 subagent_type: Some("Explore".to_string()),
                 name: Some("ship-audit".to_string()),
                 model: None,
-            team_id: None,
-            task_id: None,
+                team_id: None,
+                task_id: None,
             },
             move |job| {
                 *captured_for_spawn
@@ -10121,8 +10244,8 @@ mod tests {
                 subagent_type: Some("Explore".to_string()),
                 name: Some("complete-task".to_string()),
                 model: Some("claude-sonnet-4-6".to_string()),
-            team_id: None,
-            task_id: None,
+                team_id: None,
+                task_id: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -10180,8 +10303,8 @@ mod tests {
                 subagent_type: Some("Verification".to_string()),
                 name: Some("fail-task".to_string()),
                 model: None,
-            team_id: None,
-            task_id: None,
+                team_id: None,
+                task_id: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -10229,8 +10352,8 @@ mod tests {
                 subagent_type: Some("Explore".to_string()),
                 name: Some("summary-floor".to_string()),
                 model: None,
-            team_id: None,
-            task_id: None,
+                team_id: None,
+                task_id: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -10326,8 +10449,8 @@ mod tests {
                 subagent_type: Some("Verification".to_string()),
                 name: Some("review-lane".to_string()),
                 model: None,
-            team_id: None,
-            task_id: None,
+                team_id: None,
+                task_id: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -10488,8 +10611,8 @@ mod tests {
                 subagent_type: Some("Explore".to_string()),
                 name: Some("cron-closeout".to_string()),
                 model: None,
-            team_id: None,
-            task_id: None,
+                team_id: None,
+                task_id: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -10531,8 +10654,8 @@ mod tests {
                 subagent_type: None,
                 name: Some("spawn-error".to_string()),
                 model: None,
-            team_id: None,
-            task_id: None,
+                team_id: None,
+                task_id: None,
             },
             |_| Err(String::from("thread creation failed")),
         )

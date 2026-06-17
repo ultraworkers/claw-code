@@ -815,7 +815,7 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         name: "team",
         aliases: &[],
         summary: "Manage agent teams",
-        argument_hint: Some("[list|create|delete]"),
+        argument_hint: Some("[on|off|status]"),
         resume_supported: true,
     },
     SlashCommandSpec {
@@ -5545,9 +5545,9 @@ mod tests {
             Ok(Some(SlashCommand::Team { action: None }))
         );
         assert_eq!(
-            SlashCommand::parse("/team list"),
+            SlashCommand::parse("/team on"),
             Ok(Some(SlashCommand::Team {
-                action: Some("list".to_string())
+                action: Some("on".to_string())
             }))
         );
         assert_eq!(

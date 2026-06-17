@@ -680,7 +680,8 @@ pub fn model_token_limit(model: &str) -> Option<ModelTokenLimit> {
             context_window_tokens: 256_000,
         }),
         // Qwen models via DashScope / OpenAI-compat
-        "qwen3.6-35b-fast" | "qwen3-235b-a22b" | "qwen-max" | "qwen-plus" | "qwen-turbo" | "qwen-qwq" => Some(ModelTokenLimit {
+        "qwen3.6-35b-fast" | "qwen3-235b-a22b" | "qwen-max" | "qwen-plus" | "qwen-turbo"
+        | "qwen-qwq" => Some(ModelTokenLimit {
             max_output_tokens: 16_384,
             context_window_tokens: 131_072,
         }),

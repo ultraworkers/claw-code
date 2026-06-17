@@ -284,10 +284,7 @@ where
         self
     }
 
-    pub fn with_turn_progress_reporter(
-        mut self,
-        reporter: Box<dyn TurnProgressReporter>,
-    ) -> Self {
+    pub fn with_turn_progress_reporter(mut self, reporter: Box<dyn TurnProgressReporter>) -> Self {
         self.turn_progress_reporter = Some(reporter);
         self
     }
@@ -578,7 +575,13 @@ where
             // Phase 3: Post-hooks and session updates (sequential, original order).
             for p in &pending {
                 // Capture progress data for the reporter.
-                let (progress_tool_name, progress_input, progress_output, progress_is_error, result_message) = if p.allowed {
+                let (
+                    progress_tool_name,
+                    progress_input,
+                    progress_output,
+                    progress_is_error,
+                    result_message,
+                ) = if p.allowed {
                     let batch_result = &batch_results[batch_index];
                     batch_index += 1;
                     let (mut output, mut is_error) = match &batch_result.result {
@@ -621,16 +624,32 @@ where
                         output,
                         is_error,
                     );
-                    (p.tool_name.clone(), p.effective_input.clone(), progress_output, is_error, result_message)
+                    (
+                        p.tool_name.clone(),
+                        p.effective_input.clone(),
+                        progress_output,
+                        is_error,
+                        result_message,
+                    )
                 } else {
-                    let denied_output = merge_hook_feedback(&p.pre_hook_messages, p.deny_reason.clone().unwrap_or_default(), true);
+                    let denied_output = merge_hook_feedback(
+                        &p.pre_hook_messages,
+                        p.deny_reason.clone().unwrap_or_default(),
+                        true,
+                    );
                     let result_message = ConversationMessage::tool_result(
                         p.tool_use_id.clone(),
                         p.tool_name.clone(),
                         denied_output,
                         true,
                     );
-                    (p.tool_name.clone(), String::new(), String::new(), true, result_message)
+                    (
+                        p.tool_name.clone(),
+                        String::new(),
+                        String::new(),
+                        true,
+                        result_message,
+                    )
                 };
                 self.session
                     .push_message(result_message.clone())
@@ -642,7 +661,13 @@ where
                     } else {
                         Ok(progress_output.as_str())
                     };
-                    reporter.on_tool_result(iterations, self.max_iterations, &progress_tool_name, &progress_input, report_result);
+                    reporter.on_tool_result(
+                        iterations,
+                        self.max_iterations,
+                        &progress_tool_name,
+                        &progress_input,
+                        report_result,
+                    );
                 }
                 tool_results.push(result_message);
             }

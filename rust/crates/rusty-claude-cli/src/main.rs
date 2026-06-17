@@ -7173,16 +7173,6 @@ fn run_repl(
                     let _ = cli.set_model(Some(new_model));
                 }
             }
-            input::ReadOutcome::TeamToggle => {
-                let current = std::env::var("CLAWD_AGENT_TEAMS").unwrap_or_default();
-                if current == "1" {
-                    std::env::set_var("CLAWD_AGENT_TEAMS", "0");
-                    eprintln!("[team] Agent teams disabled");
-                } else {
-                    std::env::set_var("CLAWD_AGENT_TEAMS", "1");
-                    eprintln!("[team] Agent teams enabled");
-                }
-            }
         }
     }
 
@@ -8641,7 +8631,9 @@ impl LiveCli {
                         if current == "1" {
                             eprintln!("[team] Agent teams: ENABLED");
                         } else {
-                            eprintln!("[team] Agent teams: DISABLED (use /team on or Ctrl+T to enable)");
+                            eprintln!(
+                                "[team] Agent teams: DISABLED (use /team on or Ctrl+T to enable)"
+                            );
                         }
                     }
                     "" => {
@@ -8655,7 +8647,9 @@ impl LiveCli {
                             eprintln!("[team] Agent teams enabled (TeamCreate now available)");
                         }
                     }
-                    other => eprintln!("[team] unknown action: {other}. Use: /team [on|off|status]"),
+                    other => {
+                        eprintln!("[team] unknown action: {other}. Use: /team [on|off|status]")
+                    }
                 }
                 false
             }
@@ -8664,7 +8658,10 @@ impl LiveCli {
                 // Reload the model from config after wizard saves
                 let cwd = std::env::current_dir().unwrap_or_default();
                 let config = runtime::ConfigLoader::default_for(&cwd).load().ok();
-                if let Some(new_model) = config.as_ref().and_then(|c| c.provider().model().map(str::to_string)) {
+                if let Some(new_model) = config
+                    .as_ref()
+                    .and_then(|c| c.provider().model().map(str::to_string))
+                {
                     self.set_model(Some(new_model))?;
                 }
                 false
@@ -14573,10 +14570,11 @@ impl ToolExecutor for CliToolExecutor {
             "LSP",
             "Agent",
             "AgentMessage",
-                        "TeamStatus",
+            "TeamStatus",
             "TaskClaim",
             "AgentSuggestion",
-            "ContextRequest", "TaskGet",
+            "ContextRequest",
+            "TaskGet",
             "TaskList",
             "TaskOutput",
             "GitStatus",
@@ -14593,11 +14591,9 @@ impl ToolExecutor for CliToolExecutor {
 
         // Classify calls as parallel-safe or sequential
         for (i, call) in calls.iter().enumerate() {
-            if self
-                .allowed_tools
-                .as_ref()
-                .is_some_and(|allowed| !allowed.contains(&canonical_allowed_tool_name(&call.tool_name)))
-            {
+            if self.allowed_tools.as_ref().is_some_and(|allowed| {
+                !allowed.contains(&canonical_allowed_tool_name(&call.tool_name))
+            }) {
                 results[i] = Some(runtime::ToolResult {
                     tool_use_id: call.tool_use_id.clone(),
                     tool_name: call.tool_name.clone(),
@@ -14633,12 +14629,11 @@ impl ToolExecutor for CliToolExecutor {
                         let input = input.clone();
                         let idx = *idx;
                         handles.push(s.spawn(move || {
-                            let value = serde_json::from_str(&input)
-                                .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")));
+                            let value = serde_json::from_str(&input).map_err(|error| {
+                                ToolError::new(format!("invalid tool input JSON: {error}"))
+                            });
                             let result = match value {
-                                Ok(v) => registry
-                                    .execute(&tool_name, &v)
-                                    .map_err(ToolError::new),
+                                Ok(v) => registry.execute(&tool_name, &v).map_err(ToolError::new),
                                 Err(e) => Err(e),
                             };
                             (idx, tool_use_id, tool_name, result)
@@ -14646,14 +14641,16 @@ impl ToolExecutor for CliToolExecutor {
                     }
                     handles
                         .into_iter()
-                        .map(|h| h.join().unwrap_or_else(|_| {
-                            (
-                                0,
-                                String::new(),
-                                String::new(),
-                                Err(ToolError::new("parallel thread panicked")),
-                            )
-                        }))
+                        .map(|h| {
+                            h.join().unwrap_or_else(|_| {
+                                (
+                                    0,
+                                    String::new(),
+                                    String::new(),
+                                    Err(ToolError::new("parallel thread panicked")),
+                                )
+                            })
+                        })
                         .collect()
                 });
 

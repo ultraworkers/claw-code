@@ -1734,7 +1734,11 @@ fn parse_optional_model(root: &JsonValue) -> Option<String> {
 /// falls back to the default model.
 fn parse_optional_subagent_model(root: &JsonValue) -> Option<String> {
     root.as_object()
-        .and_then(|object| object.get("subagentModel").or_else(|| object.get("subagent_model")))
+        .and_then(|object| {
+            object
+                .get("subagentModel")
+                .or_else(|| object.get("subagent_model"))
+        })
         .and_then(JsonValue::as_str)
         .filter(|s| !s.trim().is_empty())
         .map(|s| s.trim().to_string())
