@@ -12,8 +12,8 @@
 //! - `render_diff` — unified diff renderer
 //! - `strip_ansi` — ANSI escape stripping
 
-pub mod ratatui_renderer;
 pub mod ansi_renderer;
+pub mod ratatui_renderer;
 pub mod stream;
 
 // ---------------------------------------------------------------------------
@@ -143,7 +143,11 @@ pub fn parse_markdown(markdown: &str) -> MarkdownAst {
                     code_block_lang = match kind {
                         CodeBlockKind::Fenced(lang) => {
                             let s = lang.to_string();
-                            if s.is_empty() { None } else { Some(s) }
+                            if s.is_empty() {
+                                None
+                            } else {
+                                Some(s)
+                            }
                         }
                         _ => None,
                     };
@@ -164,7 +168,9 @@ pub fn parse_markdown(markdown: &str) -> MarkdownAst {
                     style_stack.push(SemanticStyle::Strong);
                 }
                 Tag::Link { dest_url, .. } => {
-                    style_stack.push(SemanticStyle::Link { destination: dest_url.to_string() });
+                    style_stack.push(SemanticStyle::Link {
+                        destination: dest_url.to_string(),
+                    });
                 }
                 _ => {}
             },
@@ -178,7 +184,8 @@ pub fn parse_markdown(markdown: &str) -> MarkdownAst {
                     nodes.push(MarkdownNode::BlankLine);
                 }
                 TagEnd::CodeBlock => {
-                    let code_lines = highlight_code(&code_block_content, code_block_lang.as_deref());
+                    let code_lines =
+                        highlight_code(&code_block_content, code_block_lang.as_deref());
                     nodes.push(MarkdownNode::CodeBlock {
                         language: code_block_lang.take(),
                         lines: code_lines,
@@ -249,14 +256,21 @@ fn highlight_code(code: &str, language: Option<&str>) -> Vec<CodeLine> {
                     .into_iter()
                     .map(|(style, text)| CodeSegment {
                         text: text.to_string(),
-                        fg: Some(Rgb { r: style.foreground.r, g: style.foreground.g, b: style.foreground.b }),
+                        fg: Some(Rgb {
+                            r: style.foreground.r,
+                            g: style.foreground.g,
+                            b: style.foreground.b,
+                        }),
                     })
                     .collect();
                 lines.push(CodeLine { segments });
             }
             Err(_) => {
                 lines.push(CodeLine {
-                    segments: vec![CodeSegment { text: line.to_string(), fg: None }],
+                    segments: vec![CodeSegment {
+                        text: line.to_string(),
+                        fg: None,
+                    }],
                 });
             }
         }
@@ -265,9 +279,9 @@ fn highlight_code(code: &str, language: Option<&str>) -> Vec<CodeLine> {
     lines
 }
 
+use crate::theme::TuiTheme;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use crate::theme::TuiTheme;
 
 // ---------------------------------------------------------------------------
 // Markdown detection heuristic (shared)
@@ -278,11 +292,16 @@ pub fn looks_like_markdown(text: &str) -> bool {
     let lines: Vec<&str> = text.lines().collect();
     let has_header = lines.iter().any(|l| l.starts_with('#'));
     let has_code_block = text.contains("```");
-    let has_list = lines.iter().any(|l| l.starts_with("- ") || l.starts_with("* "));
+    let has_list = lines
+        .iter()
+        .any(|l| l.starts_with("- ") || l.starts_with("* "));
     let has_bold = text.contains("**");
     let has_inline_code = text.matches('`').count() >= 2;
     let multi_line = lines.len() > 3;
-    has_code_block || (has_header && multi_line) || (has_list && multi_line) || (has_bold && has_inline_code)
+    has_code_block
+        || (has_header && multi_line)
+        || (has_list && multi_line)
+        || (has_bold && has_inline_code)
 }
 
 // ---------------------------------------------------------------------------
@@ -332,56 +351,103 @@ pub fn normalize_nested_fences(markdown: &str) -> String {
     fn parse_fence_line(line: &str) -> Option<FenceLine> {
         let trimmed = line.trim_end_matches('\n').trim_end_matches('\r');
         let indent = trimmed.chars().take_while(|c| *c == ' ').count();
-        if indent > 3 { return None; }
+        if indent > 3 {
+            return None;
+        }
         let rest = &trimmed[indent..];
         let ch = rest.chars().next()?;
-        if ch != '`' && ch != '~' { return None; }
+        if ch != '`' && ch != '~' {
+            return None;
+        }
         let len = rest.chars().take_while(|c| *c == ch).count();
-        if len < 3 { return None; }
+        if len < 3 {
+            return None;
+        }
         let after = &rest[len..];
-        if ch == '`' && after.contains('`') { return None; }
+        if ch == '`' && after.contains('`') {
+            return None;
+        }
         let has_info = !after.trim().is_empty();
-        Some(FenceLine { char: ch, len, has_info, indent })
+        Some(FenceLine {
+            char: ch,
+            len,
+            has_info,
+            indent,
+        })
     }
 
     let lines: Vec<&str> = markdown.split_inclusive('\n').collect();
     let fence_info: Vec<Option<FenceLine>> = lines.iter().map(|l| parse_fence_line(l)).collect();
 
-    struct StackEntry { line_idx: usize, fence: FenceLine }
+    struct StackEntry {
+        line_idx: usize,
+        fence: FenceLine,
+    }
     let mut stack: Vec<StackEntry> = Vec::new();
     let mut pairs: Vec<(usize, usize, usize)> = Vec::new();
 
     for (i, fi) in fence_info.iter().enumerate() {
         let Some(fl) = fi else { continue };
         if fl.has_info {
-            stack.push(StackEntry { line_idx: i, fence: fl.clone() });
+            stack.push(StackEntry {
+                line_idx: i,
+                fence: fl.clone(),
+            });
         } else {
-            let closes_top = stack.last().is_some_and(|top| top.fence.char == fl.char && fl.len >= top.fence.len);
+            let closes_top = stack
+                .last()
+                .is_some_and(|top| top.fence.char == fl.char && fl.len >= top.fence.len);
             if closes_top {
                 let opener = stack.pop().unwrap();
                 let inner_max = fence_info[opener.line_idx + 1..i]
-                    .iter().filter_map(|fi| fi.as_ref().map(|f| f.len)).max().unwrap_or(0);
+                    .iter()
+                    .filter_map(|fi| fi.as_ref().map(|f| f.len))
+                    .max()
+                    .unwrap_or(0);
                 pairs.push((opener.line_idx, i, inner_max));
             } else {
-                stack.push(StackEntry { line_idx: i, fence: fl.clone() });
+                stack.push(StackEntry {
+                    line_idx: i,
+                    fence: fl.clone(),
+                });
             }
         }
     }
 
-    struct Rewrite { char: char, new_len: usize, indent: usize }
+    struct Rewrite {
+        char: char,
+        new_len: usize,
+        indent: usize,
+    }
     let mut rewrites: std::collections::HashMap<usize, Rewrite> = std::collections::HashMap::new();
 
     for (opener_idx, closer_idx, inner_max) in &pairs {
         let opener_fl = fence_info[*opener_idx].as_ref().unwrap();
         if opener_fl.len <= *inner_max {
             let new_len = inner_max + 1;
-            rewrites.insert(*opener_idx, Rewrite { char: opener_fl.char, new_len, indent: opener_fl.indent });
+            rewrites.insert(
+                *opener_idx,
+                Rewrite {
+                    char: opener_fl.char,
+                    new_len,
+                    indent: opener_fl.indent,
+                },
+            );
             let closer_fl = fence_info[*closer_idx].as_ref().unwrap();
-            rewrites.insert(*closer_idx, Rewrite { char: closer_fl.char, new_len, indent: closer_fl.indent });
+            rewrites.insert(
+                *closer_idx,
+                Rewrite {
+                    char: closer_fl.char,
+                    new_len,
+                    indent: closer_fl.indent,
+                },
+            );
         }
     }
 
-    if rewrites.is_empty() { return markdown.to_string(); }
+    if rewrites.is_empty() {
+        return markdown.to_string();
+    }
 
     let mut out = String::with_capacity(markdown.len() + rewrites.len() * 4);
     for (i, line) in lines.iter().enumerate() {
@@ -437,27 +503,42 @@ pub fn find_stream_safe_boundary(markdown: &str) -> Option<usize> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct FenceMarker { character: char, length: usize }
+struct FenceMarker {
+    character: char,
+    length: usize,
+}
 
 fn parse_fence_opener(line: &str) -> Option<FenceMarker> {
     let indent = line.chars().take_while(|c| *c == ' ').count();
-    if indent > 3 { return None; }
+    if indent > 3 {
+        return None;
+    }
     let rest = &line[indent..];
     let character = rest.chars().next()?;
-    if character != '`' && character != '~' { return None; }
+    if character != '`' && character != '~' {
+        return None;
+    }
     let length = rest.chars().take_while(|c| *c == character).count();
-    if length < 3 { return None; }
+    if length < 3 {
+        return None;
+    }
     let info_string = &rest[length..];
-    if character == '`' && info_string.contains('`') { return None; }
+    if character == '`' && info_string.contains('`') {
+        return None;
+    }
     Some(FenceMarker { character, length })
 }
 
 fn line_closes_fence(line: &str, opener: FenceMarker) -> bool {
     let indent = line.chars().take_while(|c| *c == ' ').count();
-    if indent > 3 { return false; }
+    if indent > 3 {
+        return false;
+    }
     let rest = &line[indent..];
     let length = rest.chars().take_while(|c| *c == opener.character).count();
-    if length < opener.length { return false; }
+    if length < opener.length {
+        return false;
+    }
     rest[length..].chars().all(|c| c == ' ' || c == '\t')
 }
 
@@ -474,24 +555,39 @@ pub fn strip_ansi(text: &str) -> String {
             match chars.peek() {
                 Some('[') => {
                     chars.next();
-                    while let Some(&c) = chars.peek() { chars.next(); if ('\x40'..='\x7e').contains(&c) { break; } }
+                    while let Some(&c) = chars.peek() {
+                        chars.next();
+                        if ('\x40'..='\x7e').contains(&c) {
+                            break;
+                        }
+                    }
                 }
                 Some(']') => {
                     chars.next();
                     while let Some(&c) = chars.peek() {
                         chars.next();
-                        if c == '\x07' { break; }
-                        if c == '\x1b' && chars.peek() == Some(&'\\') { chars.next(); break; }
+                        if c == '\x07' {
+                            break;
+                        }
+                        if c == '\x1b' && chars.peek() == Some(&'\\') {
+                            chars.next();
+                            break;
+                        }
                     }
                 }
                 Some('P') | Some('_') | Some('^') => {
                     chars.next();
                     while let Some(&c) = chars.peek() {
                         chars.next();
-                        if c == '\x1b' && chars.peek() == Some(&'\\') { chars.next(); break; }
+                        if c == '\x1b' && chars.peek() == Some(&'\\') {
+                            chars.next();
+                            break;
+                        }
                     }
                 }
-                _ => { chars.next(); }
+                _ => {
+                    chars.next();
+                }
             }
         } else {
             result.push(ch);
@@ -506,11 +602,15 @@ mod tests {
 
     #[test]
     fn test_looks_like_markdown_code_block() {
-        assert!(looks_like_markdown("some text\n```rust\ncode\n```\nmore text"));
+        assert!(looks_like_markdown(
+            "some text\n```rust\ncode\n```\nmore text"
+        ));
     }
     #[test]
     fn test_looks_like_markdown_plain() {
-        assert!(!looks_like_markdown("Just a simple response without any formatting."));
+        assert!(!looks_like_markdown(
+            "Just a simple response without any formatting."
+        ));
     }
     #[test]
     fn test_strip_ansi_basic() {
@@ -529,7 +629,10 @@ mod tests {
     #[test]
     fn test_render_diff() {
         let theme = crate::theme::TuiTheme::builtin("default").unwrap();
-        let lines = render_diff("+added\n-removed\n@@ hunk @@\n--- a/file.rs\n+++ b/file.rs", &theme);
+        let lines = render_diff(
+            "+added\n-removed\n@@ hunk @@\n--- a/file.rs\n+++ b/file.rs",
+            &theme,
+        );
         assert_eq!(lines.len(), 5);
     }
 }

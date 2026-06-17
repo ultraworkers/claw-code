@@ -41,9 +41,7 @@ pub fn parse_slash_command(input: &str) -> Option<(&str, &str)> {
 /// This is a pure function that doesn't depend on TuiApp or LiveCli —
 /// side effects (pushing messages, changing theme) are delegated to the
 /// caller through the return value and optional context.
-pub fn dispatch_slash_command<'a>(
-    input: &'a str,
-) -> SlashCommandAction<'a> {
+pub fn dispatch_slash_command<'a>(input: &'a str) -> SlashCommandAction<'a> {
     let Some((command, args)) = parse_slash_command(input) else {
         return SlashCommandAction::NotACommand;
     };
@@ -52,11 +50,19 @@ pub fn dispatch_slash_command<'a>(
         "/exit" | "/quit" => SlashCommandAction::Exit,
         "/theme" => SlashCommandAction::SetTheme { name: args },
         "/keys" => SlashCommandAction::SetKeymap { preset: args },
-        "/code" => SlashCommandAction::SetChatMode { mode: ChatMode::Code },
-        "/ask" => SlashCommandAction::SetChatMode { mode: ChatMode::Ask },
-        "/architect" | "/arch" => SlashCommandAction::SetChatMode { mode: ChatMode::Architect },
+        "/code" => SlashCommandAction::SetChatMode {
+            mode: ChatMode::Code,
+        },
+        "/ask" => SlashCommandAction::SetChatMode {
+            mode: ChatMode::Ask,
+        },
+        "/architect" | "/arch" => SlashCommandAction::SetChatMode {
+            mode: ChatMode::Architect,
+        },
         "/diff" => SlashCommandAction::ShowDiff,
-        "/undo" => SlashCommandAction::Undo { confirm: args == "--confirm" || args == "-y" },
+        "/undo" => SlashCommandAction::Undo {
+            confirm: args == "--confirm" || args == "-y",
+        },
         "/ls" => SlashCommandAction::ShowFile { path: args },
         "/help" => SlashCommandAction::ShowHelp,
         _ => SlashCommandAction::Unknown { command },
@@ -94,7 +100,10 @@ mod tests {
 
     #[test]
     fn test_parse_slash_command() {
-        assert_eq!(parse_slash_command("/theme tokyonight"), Some(("/theme", "tokyonight")));
+        assert_eq!(
+            parse_slash_command("/theme tokyonight"),
+            Some(("/theme", "tokyonight"))
+        );
         assert_eq!(parse_slash_command("/keys"), Some(("/keys", "")));
         assert_eq!(parse_slash_command("/help me"), Some(("/help", "me")));
         assert_eq!(parse_slash_command("not a command"), None);
@@ -121,32 +130,70 @@ mod tests {
 
     #[test]
     fn test_dispatch_chat_mode() {
-        assert_eq!(dispatch_slash_command("/code"), SlashCommandAction::SetChatMode { mode: ChatMode::Code });
-        assert_eq!(dispatch_slash_command("/ask"), SlashCommandAction::SetChatMode { mode: ChatMode::Ask });
-        assert_eq!(dispatch_slash_command("/architect"), SlashCommandAction::SetChatMode { mode: ChatMode::Architect });
-        assert_eq!(dispatch_slash_command("/arch"), SlashCommandAction::SetChatMode { mode: ChatMode::Architect });
+        assert_eq!(
+            dispatch_slash_command("/code"),
+            SlashCommandAction::SetChatMode {
+                mode: ChatMode::Code
+            }
+        );
+        assert_eq!(
+            dispatch_slash_command("/ask"),
+            SlashCommandAction::SetChatMode {
+                mode: ChatMode::Ask
+            }
+        );
+        assert_eq!(
+            dispatch_slash_command("/architect"),
+            SlashCommandAction::SetChatMode {
+                mode: ChatMode::Architect
+            }
+        );
+        assert_eq!(
+            dispatch_slash_command("/arch"),
+            SlashCommandAction::SetChatMode {
+                mode: ChatMode::Architect
+            }
+        );
     }
 
     #[test]
     fn test_dispatch_diff() {
-        assert_eq!(dispatch_slash_command("/diff"), SlashCommandAction::ShowDiff);
+        assert_eq!(
+            dispatch_slash_command("/diff"),
+            SlashCommandAction::ShowDiff
+        );
     }
 
     #[test]
     fn test_dispatch_undo() {
-        assert_eq!(dispatch_slash_command("/undo"), SlashCommandAction::Undo { confirm: false });
-        assert_eq!(dispatch_slash_command("/undo --confirm"), SlashCommandAction::Undo { confirm: true });
-        assert_eq!(dispatch_slash_command("/undo -y"), SlashCommandAction::Undo { confirm: true });
+        assert_eq!(
+            dispatch_slash_command("/undo"),
+            SlashCommandAction::Undo { confirm: false }
+        );
+        assert_eq!(
+            dispatch_slash_command("/undo --confirm"),
+            SlashCommandAction::Undo { confirm: true }
+        );
+        assert_eq!(
+            dispatch_slash_command("/undo -y"),
+            SlashCommandAction::Undo { confirm: true }
+        );
     }
 
     #[test]
     fn test_dispatch_ls() {
-        assert_eq!(dispatch_slash_command("/ls /some/path"), SlashCommandAction::ShowFile { path: "/some/path" });
+        assert_eq!(
+            dispatch_slash_command("/ls /some/path"),
+            SlashCommandAction::ShowFile { path: "/some/path" }
+        );
     }
 
     #[test]
     fn test_dispatch_help() {
-        assert_eq!(dispatch_slash_command("/help"), SlashCommandAction::ShowHelp);
+        assert_eq!(
+            dispatch_slash_command("/help"),
+            SlashCommandAction::ShowHelp
+        );
     }
 
     #[test]
@@ -157,6 +204,9 @@ mod tests {
 
     #[test]
     fn test_dispatch_not_a_command() {
-        assert_eq!(dispatch_slash_command("hello world"), SlashCommandAction::NotACommand);
+        assert_eq!(
+            dispatch_slash_command("hello world"),
+            SlashCommandAction::NotACommand
+        );
     }
 }

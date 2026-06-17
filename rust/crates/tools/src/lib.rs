@@ -5654,7 +5654,7 @@ fn resolve_agent_model(model: Option<&str>) -> String {
 fn load_main_model_from_config() -> Option<String> {
     let cwd = std::env::current_dir().ok()?;
     let config = ConfigLoader::default_for(&cwd).load().ok()?;
-    config.model().map(str::to_string)
+    config.provider().model().map(str::to_string)
 }
 
 /// Read the `subagentModel` setting from merged config so the Agent tool

@@ -88,8 +88,12 @@ impl ColorDef {
     }
 }
 
-fn named(s: &str) -> ColorDef { ColorDef::Named(s.to_string()) }
-fn rgb(r: u8, g: u8, b: u8) -> ColorDef { ColorDef::Rgb { r, g, b } }
+fn named(s: &str) -> ColorDef {
+    ColorDef::Named(s.to_string())
+}
+fn rgb(r: u8, g: u8, b: u8) -> ColorDef {
+    ColorDef::Rgb { r, g, b }
+}
 
 impl TuiTheme {
     pub fn builtin(name: &str) -> Option<Self> {
@@ -111,9 +115,17 @@ impl TuiTheme {
 
     pub fn all_builtin_names() -> Vec<&'static str> {
         vec![
-            "default", "tokyonight", "catppuccin-mocha", "catppuccin-latte",
-            "nord", "gruvbox", "dracula", "solarized-dark", "solarized-light",
-            "monokai", "system",
+            "default",
+            "tokyonight",
+            "catppuccin-mocha",
+            "catppuccin-latte",
+            "nord",
+            "gruvbox",
+            "dracula",
+            "solarized-dark",
+            "solarized-light",
+            "monokai",
+            "system",
         ]
     }
 
@@ -626,7 +638,10 @@ mod tests {
 
     #[test]
     fn test_color_def_rgb() {
-        assert_eq!(ColorDef::Rgb { r: 255, g: 0, b: 0 }.to_color(), Color::Rgb(255, 0, 0));
+        assert_eq!(
+            ColorDef::Rgb { r: 255, g: 0, b: 0 }.to_color(),
+            Color::Rgb(255, 0, 0)
+        );
     }
 
     #[test]

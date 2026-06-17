@@ -18,8 +18,8 @@ use crate::theme::TuiTheme;
 use crate::tui::component::Component;
 use crate::tui::event::TuiEvent;
 use crate::tui::legacy::{ConversationContent, ConversationLine};
-use crate::tui::markdown::render_diff;
 use crate::tui::markdown::ratatui_renderer::MarkdownRenderer;
+use crate::tui::markdown::render_diff;
 
 const MAX_CONVERSATION_LINES: usize = 10_000;
 
@@ -71,20 +71,23 @@ impl ConversationPane {
     // -------------------------------------------------------------------
 
     pub fn push_banner(&mut self, text: String, color: Color) {
-        self.conversation.push(ConversationLine::plain(text, color, true));
+        self.conversation
+            .push(ConversationLine::plain(text, color, true));
         self.auto_scroll();
     }
 
     pub fn push_user_input(&mut self, text: &str, color: Color) {
         for raw_line in text.lines() {
-            self.conversation.push(ConversationLine::plain(raw_line.to_string(), color, true));
+            self.conversation
+                .push(ConversationLine::plain(raw_line.to_string(), color, true));
         }
         self.auto_scroll();
     }
 
     pub fn push_system_message(&mut self, text: &str, color: Color) {
         for raw_line in text.lines() {
-            self.conversation.push(ConversationLine::plain(raw_line.to_string(), color, false));
+            self.conversation
+                .push(ConversationLine::plain(raw_line.to_string(), color, false));
         }
         self.auto_scroll();
     }
@@ -97,21 +100,24 @@ impl ConversationPane {
         if is_error {
             let color = theme.conversation_error.to_color();
             for raw_line in clean.lines() {
-                self.conversation.push(ConversationLine::plain(raw_line.to_string(), color, false));
+                self.conversation
+                    .push(ConversationLine::plain(raw_line.to_string(), color, false));
             }
         } else if crate::tui::markdown::looks_like_markdown(&clean) {
             self.conversation.push(ConversationLine::markdown(clean));
         } else {
             let color = theme.conversation_text.to_color();
             for raw_line in clean.lines() {
-                self.conversation.push(ConversationLine::plain(raw_line.to_string(), color, false));
+                self.conversation
+                    .push(ConversationLine::plain(raw_line.to_string(), color, false));
             }
         }
         self.auto_scroll();
     }
 
     pub fn push_diff(&mut self, diff: &str) {
-        self.conversation.push(ConversationLine::diff(diff.to_string()));
+        self.conversation
+            .push(ConversationLine::diff(diff.to_string()));
         self.auto_scroll();
     }
 
@@ -157,12 +163,8 @@ impl ConversationPane {
             return;
         }
         let content_width = (width as usize).saturating_sub(2);
-        let (wrapped, expand_counts) = build_wrapped_conversation(
-            &self.conversation,
-            content_width,
-            &self.renderer,
-            theme,
-        );
+        let (wrapped, expand_counts) =
+            build_wrapped_conversation(&self.conversation, content_width, &self.renderer, theme);
         cache.wrapped_lines = wrapped;
         cache.expand_counts = expand_counts;
         cache.built_width = width;
@@ -189,7 +191,13 @@ impl Component for ConversationPane {
         let max_offset = total_visual.saturating_sub(pane_rows);
         let offset = scroll.min(max_offset);
         let start = total_visual.saturating_sub(pane_rows + offset);
-        let visible: Vec<Line> = cache.wrapped_lines.iter().skip(start).take(pane_rows).cloned().collect();
+        let visible: Vec<Line> = cache
+            .wrapped_lines
+            .iter()
+            .skip(start)
+            .take(pane_rows)
+            .cloned()
+            .collect();
 
         let conversation_widget = Paragraph::new(visible).block(
             Block::default()
@@ -211,7 +219,10 @@ impl Component for ConversationPane {
                 height: 1,
             };
             frame.render_widget(
-                Paragraph::new(Span::styled(scroll_label, Style::default().fg(theme.conversation_dim.to_color()))),
+                Paragraph::new(Span::styled(
+                    scroll_label,
+                    Style::default().fg(theme.conversation_dim.to_color()),
+                )),
                 scroll_area,
             );
         }
@@ -250,7 +261,10 @@ fn wrap_line<'a>(text: &str, width: usize, style: Style) -> Vec<Line<'a>> {
                 current_line = rest;
                 last_break_byte = 0;
             } else {
-                result.push(Line::from(Span::styled(current_line.clone(), style.clone())));
+                result.push(Line::from(Span::styled(
+                    current_line.clone(),
+                    style.clone(),
+                )));
                 current_line.clear();
                 current_width = 0;
                 last_break_byte = 0;
@@ -284,7 +298,9 @@ fn build_wrapped_conversation<'a>(
         match &cl.content {
             ConversationContent::Plain { text, color, bold } => {
                 let mut style = Style::default().fg(*color);
-                if *bold { style = style.add_modifier(Modifier::BOLD); }
+                if *bold {
+                    style = style.add_modifier(Modifier::BOLD);
+                }
                 let wrapped = wrap_line(text, content_width, style);
                 let count = wrapped.len().max(1);
                 expand_counts.push(count);
@@ -295,9 +311,12 @@ fn build_wrapped_conversation<'a>(
                 let count = rendered.len().max(1);
                 expand_counts.push(count);
                 all_lines.extend(rendered.into_iter().map(|l: Line<'static>| {
-                    Line::from(l.spans.into_iter().map(|s| {
-                        Span::styled(s.content.into_owned(), s.style)
-                    }).collect::<Vec<_>>())
+                    Line::from(
+                        l.spans
+                            .into_iter()
+                            .map(|s| Span::styled(s.content.into_owned(), s.style))
+                            .collect::<Vec<_>>(),
+                    )
                 }));
             }
             ConversationContent::CodeDiff { diff } => {
@@ -305,9 +324,12 @@ fn build_wrapped_conversation<'a>(
                 let count = rendered.len().max(1);
                 expand_counts.push(count);
                 all_lines.extend(rendered.into_iter().map(|l: Line<'static>| {
-                    Line::from(l.spans.into_iter().map(|s| {
-                        Span::styled(s.content.into_owned(), s.style)
-                    }).collect::<Vec<_>>())
+                    Line::from(
+                        l.spans
+                            .into_iter()
+                            .map(|s| Span::styled(s.content.into_owned(), s.style))
+                            .collect::<Vec<_>>(),
+                    )
                 }));
             }
         }
@@ -392,15 +414,23 @@ mod tests {
         let lines = wrap_line(&long_str, width, Style::default());
 
         for line in &lines {
-            let line_width: usize = line.spans.iter()
+            let line_width: usize = line
+                .spans
+                .iter()
                 .map(|span| {
-                    span.content.chars().map(|c| c.width().unwrap_or(0)).sum::<usize>()
+                    span.content
+                        .chars()
+                        .map(|c| c.width().unwrap_or(0))
+                        .sum::<usize>()
                 })
                 .sum();
             assert!(
                 line_width <= width,
                 "Wrapped line width {line_width} exceeds target {width}: {:?}",
-                line.spans.iter().map(|s| s.content.clone()).collect::<Vec<_>>()
+                line.spans
+                    .iter()
+                    .map(|s| s.content.clone())
+                    .collect::<Vec<_>>()
             );
         }
     }
@@ -413,7 +443,10 @@ mod tests {
 
         // With width=1, each char gets its own line
         let lines = wrap_line("ab", 1, Style::default());
-        assert!(lines.len() >= 2, "2 chars at width=1 should produce >= 2 lines");
+        assert!(
+            lines.len() >= 2,
+            "2 chars at width=1 should produce >= 2 lines"
+        );
     }
 
     /// Regression: cache is invalidated when width changes.
@@ -422,7 +455,10 @@ mod tests {
     fn test_cache_invalidated_on_width_change() {
         let theme = test_theme();
         let mut pane = ConversationPane::new(theme.clone());
-        pane.push_user_input("Hello world this is a test", theme.conversation_user.to_color());
+        pane.push_user_input(
+            "Hello world this is a test",
+            theme.conversation_user.to_color(),
+        );
 
         // Build at width 80
         pane.rebuild_cache(80, &theme);

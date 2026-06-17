@@ -91,9 +91,12 @@ impl MarkdownRenderer {
                         current_spans.push(Span::raw(format!("{indent}• ")));
                     }
                     Tag::BlockQuote(_) => {
-                        current_spans
-                            .push(Span::styled("│ ", Style::default().fg(self.theme.conversation_dim.to_color())));
-                        style_stack.push(Style::default().fg(self.theme.conversation_dim.to_color()));
+                        current_spans.push(Span::styled(
+                            "│ ",
+                            Style::default().fg(self.theme.conversation_dim.to_color()),
+                        ));
+                        style_stack
+                            .push(Style::default().fg(self.theme.conversation_dim.to_color()));
                     }
                     Tag::Emphasis => {
                         style_stack.push(Style::default().add_modifier(Modifier::ITALIC));
@@ -152,7 +155,9 @@ impl MarkdownRenderer {
                     }
                 }
                 Event::Code(code) => {
-                    let style = Style::default().fg(self.theme.conversation_system.to_color()).bg(self.theme.code_bg.to_color());
+                    let style = Style::default()
+                        .fg(self.theme.conversation_system.to_color())
+                        .bg(self.theme.code_bg.to_color());
                     current_spans.push(Span::styled(format!(" {code} "), style));
                 }
                 Event::SoftBreak | Event::HardBreak => {
@@ -253,7 +258,10 @@ pub fn looks_like_markdown(text: &str) -> bool {
     let has_inline_code = text.matches('`').count() >= 2;
     let multi_line = lines.len() > 3;
 
-    has_code_block || (has_header && multi_line) || (has_list && multi_line) || (has_bold && has_inline_code)
+    has_code_block
+        || (has_header && multi_line)
+        || (has_list && multi_line)
+        || (has_bold && has_inline_code)
 }
 
 /// Render a unified diff with color-coded lines.
@@ -310,9 +318,15 @@ mod tests {
         // At minimum: top border + at least 1 code line + bottom border
         assert!(lines.len() >= 3);
         // Should contain code border characters
-        let text: String = lines.iter().map(|l| {
-            l.spans.iter().map(|s| s.content.as_ref()).collect::<String>()
-        }).collect();
+        let text: String = lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
         assert!(text.contains("╭─") && text.contains("╰─"));
     }
 
@@ -321,9 +335,15 @@ mod tests {
         let r = MarkdownRenderer::new(test_theme());
         let lines = r.render("```python\ndef hello():\n    pass\n```", 80);
         assert!(lines.len() >= 3);
-        let text: String = lines.iter().map(|l| {
-            l.spans.iter().map(|s| s.content.as_ref()).collect::<String>()
-        }).collect();
+        let text: String = lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
         assert!(text.contains("python"));
     }
 
@@ -407,9 +427,7 @@ mod tests {
 
     #[test]
     fn test_markdown_detection_list() {
-        assert!(looks_like_markdown(
-            "Items:\n\n- one\n- two\n- three"
-        ));
+        assert!(looks_like_markdown("Items:\n\n- one\n- two\n- three"));
     }
 
     #[test]
@@ -430,28 +448,43 @@ mod tests {
     fn test_diff_additions_green() {
         let theme = test_theme();
         let lines = render_diff("+new line", &theme);
-        assert_eq!(lines[0].spans[0].style.fg, Some(theme.agent_done.to_color()));
+        assert_eq!(
+            lines[0].spans[0].style.fg,
+            Some(theme.agent_done.to_color())
+        );
     }
 
     #[test]
     fn test_diff_deletions_red() {
         let theme = test_theme();
         let lines = render_diff("-old line", &theme);
-        assert_eq!(lines[0].spans[0].style.fg, Some(theme.conversation_error.to_color()));
+        assert_eq!(
+            lines[0].spans[0].style.fg,
+            Some(theme.conversation_error.to_color())
+        );
     }
 
     #[test]
     fn test_diff_hunk_header() {
         let theme = test_theme();
         let lines = render_diff("@@ -1,3 +1,4 @@", &theme);
-        assert_eq!(lines[0].spans[0].style.fg, Some(theme.conversation_user.to_color()));
+        assert_eq!(
+            lines[0].spans[0].style.fg,
+            Some(theme.conversation_user.to_color())
+        );
     }
 
     #[test]
     fn test_diff_file_headers() {
         let theme = test_theme();
         let lines = render_diff("--- a/file.rs\n+++ b/file.rs", &theme);
-        assert_eq!(lines[0].spans[0].style.fg, Some(theme.conversation_text.to_color()));
-        assert_eq!(lines[1].spans[0].style.fg, Some(theme.conversation_text.to_color()));
+        assert_eq!(
+            lines[0].spans[0].style.fg,
+            Some(theme.conversation_text.to_color())
+        );
+        assert_eq!(
+            lines[1].spans[0].style.fg,
+            Some(theme.conversation_text.to_color())
+        );
     }
 }

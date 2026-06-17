@@ -2,17 +2,17 @@
 //! LSP (Language Server Protocol) client registry for tool dispatch.
 
 mod dispatch;
-mod types;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
 mod tests_lifecycle;
+mod types;
 
 pub use types::{
     LspAction, LspCodeAction, LspCodeLens, LspCommand, LspCompletionItem, LspDiagnostic,
-    LspFileEdit, LspHoverResult, LspLocation, LspParameterInfo, LspRenameResult,
-    LspServerState, LspServerStatus, LspSignatureHelpResult, LspSignatureInformation,
-    LspSymbol, LspTextEdit, LspWorkspaceEdit,
+    LspFileEdit, LspHoverResult, LspLocation, LspParameterInfo, LspRenameResult, LspServerState,
+    LspServerStatus, LspSignatureHelpResult, LspSignatureInformation, LspSymbol, LspTextEdit,
+    LspWorkspaceEdit,
 };
 
 use std::collections::{HashMap, HashSet};
@@ -190,7 +190,11 @@ impl LspRegistry {
     /// List all registered servers.
     pub fn list_servers(&self) -> Vec<LspServerState> {
         let inner = self.inner.lock().expect("lsp registry lock poisoned");
-        inner.servers.values().map(|entry| entry.state.clone()).collect()
+        inner
+            .servers
+            .values()
+            .map(|entry| entry.state.clone())
+            .collect()
     }
 
     /// Add diagnostics to a server.
@@ -274,14 +278,14 @@ impl LspRegistry {
         };
 
         // If no descriptor, try discovery
-        let descriptor = if let Some(d) = descriptor { d } else {
+        let descriptor = if let Some(d) = descriptor {
+            d
+        } else {
             let available = discover_available_servers();
             available
                 .into_iter()
                 .find(|d| d.language == language)
-                .ok_or_else(|| {
-                    format!("no LSP server descriptor found for language: {language}")
-                })?
+                .ok_or_else(|| format!("no LSP server descriptor found for language: {language}"))?
         };
 
         let root_path = {
@@ -447,7 +451,6 @@ impl LspRegistry {
         diagnostics
     }
 
-
     /// Notify the LSP server that a file was closed.
     /// Best-effort: returns empty vec if no server is available.
     pub fn notify_file_close(&self, path: &str) -> Vec<LspDiagnostic> {
@@ -498,8 +501,7 @@ impl LspRegistry {
                 let new_diags = process.drain_diagnostics();
                 if !new_diags.is_empty() {
                     let diag_path = path.to_owned();
-                    let mut inner =
-                        self.inner.lock().expect("lsp registry lock poisoned");
+                    let mut inner = self.inner.lock().expect("lsp registry lock poisoned");
                     if let Some(entry) = inner.servers.get_mut(&language) {
                         entry.state.diagnostics.retain(|d| d.path != diag_path);
                         entry.state.diagnostics.extend(new_diags);

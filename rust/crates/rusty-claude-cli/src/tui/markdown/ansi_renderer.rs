@@ -3,8 +3,8 @@
 //! Uses the shared `MarkdownAst` to produce ANSI-escaped `String` for the
 //! plain REPL (non-TUI) mode. This replaces the old `render.rs` TerminalRenderer.
 
-use crate::theme::TuiTheme;
 use super::parse_markdown;
+use crate::theme::TuiTheme;
 
 /// ANSI markdown renderer.
 #[derive(Debug, Default)]

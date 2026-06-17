@@ -26,7 +26,11 @@ pub struct Dashboard {
 
 impl Dashboard {
     pub fn new(state: SharedDashboardState) -> Self {
-        Self { state, spinner_frame: 0, dirty: true }
+        Self {
+            state,
+            spinner_frame: 0,
+            dirty: true,
+        }
     }
 
     pub fn tick_spinner(&mut self) {
@@ -55,10 +59,30 @@ impl Component for Dashboard {
 
         // Connection
         lines.push(section("Connection", theme));
-        lines.push(kv("Model", &state.model, theme.dashboard_value.to_color(), theme));
-        lines.push(kv("Provider", &state.provider, theme.dashboard_key.to_color(), theme));
-        lines.push(kv("URL", &state.provider_url, theme.conversation_dim.to_color(), theme));
-        lines.push(kv("Mode", &state.permission_mode, theme.conversation_system.to_color(), theme));
+        lines.push(kv(
+            "Model",
+            &state.model,
+            theme.dashboard_value.to_color(),
+            theme,
+        ));
+        lines.push(kv(
+            "Provider",
+            &state.provider,
+            theme.dashboard_key.to_color(),
+            theme,
+        ));
+        lines.push(kv(
+            "URL",
+            &state.provider_url,
+            theme.conversation_dim.to_color(),
+            theme,
+        ));
+        lines.push(kv(
+            "Mode",
+            &state.permission_mode,
+            theme.conversation_system.to_color(),
+            theme,
+        ));
         if let Some(ref branch) = state.git_branch {
             lines.push(kv("Branch", branch, theme.agent_done.to_color(), theme));
         }
@@ -66,24 +90,68 @@ impl Component for Dashboard {
 
         // Tokens
         lines.push(section("Tokens", theme));
-        lines.push(kv("Turns", &state.turn_count.to_string(), theme.dashboard_value.to_color(), theme));
-        lines.push(kv("Input", &state.input_tokens.to_string(), theme.dashboard_value.to_color(), theme));
-        lines.push(kv("Output", &state.output_tokens.to_string(), theme.dashboard_value.to_color(), theme));
-        lines.push(kv("Cache R", &state.cache_read_tokens.to_string(), theme.dashboard_key.to_color(), theme));
-        lines.push(kv("Cache W", &state.cache_creation_tokens.to_string(), theme.dashboard_key.to_color(), theme));
-        lines.push(kv("Cost", &format!("${:.4}", state.cost_usd), theme.conversation_system.to_color(), theme));
+        lines.push(kv(
+            "Turns",
+            &state.turn_count.to_string(),
+            theme.dashboard_value.to_color(),
+            theme,
+        ));
+        lines.push(kv(
+            "Input",
+            &state.input_tokens.to_string(),
+            theme.dashboard_value.to_color(),
+            theme,
+        ));
+        lines.push(kv(
+            "Output",
+            &state.output_tokens.to_string(),
+            theme.dashboard_value.to_color(),
+            theme,
+        ));
+        lines.push(kv(
+            "Cache R",
+            &state.cache_read_tokens.to_string(),
+            theme.dashboard_key.to_color(),
+            theme,
+        ));
+        lines.push(kv(
+            "Cache W",
+            &state.cache_creation_tokens.to_string(),
+            theme.dashboard_key.to_color(),
+            theme,
+        ));
+        lines.push(kv(
+            "Cost",
+            &format!("${:.4}", state.cost_usd),
+            theme.conversation_system.to_color(),
+            theme,
+        ));
         lines.push(Line::from(""));
 
         // Context
         let pct = state.context_percent;
-        let _gauge_color = if pct > 80.0 { theme.gauge_fill_red.to_color() }
-            else if pct > 50.0 { theme.gauge_fill_yellow.to_color() }
-            else { theme.gauge_fill_green.to_color() };
+        let _gauge_color = if pct > 80.0 {
+            theme.gauge_fill_red.to_color()
+        } else if pct > 50.0 {
+            theme.gauge_fill_yellow.to_color()
+        } else {
+            theme.gauge_fill_green.to_color()
+        };
         lines.push(section("Context", theme));
-        lines.push(kv("Used", &format!("{:.1}% of {}", pct, state.context_window), theme.dashboard_value.to_color(), theme));
+        lines.push(kv(
+            "Used",
+            &format!("{:.1}% of {}", pct, state.context_window),
+            theme.dashboard_value.to_color(),
+            theme,
+        ));
         gauge_row = Some(lines.len());
         lines.push(Line::from(""));
-        lines.push(kv("Compactions", &state.compaction_count.to_string(), theme.dashboard_key.to_color(), theme));
+        lines.push(kv(
+            "Compactions",
+            &state.compaction_count.to_string(),
+            theme.dashboard_key.to_color(),
+            theme,
+        ));
         lines.push(Line::from(""));
 
         // LSP
@@ -103,9 +171,16 @@ impl Component for Dashboard {
         // Team
         if let Some(ref team) = state.team {
             lines.push(section("Team", theme));
-            lines.push(kv("Name", &team.team_name, theme.dashboard_value.to_color(), theme));
-            let progress = format!("{}/{} done, {} fail, {} run",
-                team.completed_agents, team.total_agents, team.failed_agents, team.running_agents);
+            lines.push(kv(
+                "Name",
+                &team.team_name,
+                theme.dashboard_value.to_color(),
+                theme,
+            ));
+            let progress = format!(
+                "{}/{} done, {} fail, {} run",
+                team.completed_agents, team.total_agents, team.failed_agents, team.running_agents
+            );
             lines.push(kv("Status", &progress, theme.agent_done.to_color(), theme));
             for agent in &team.agents {
                 let c = match agent.status.as_str() {
@@ -116,7 +191,10 @@ impl Component for Dashboard {
                 let label = format!("● {}", agent.name);
                 let detail = format!("({})", agent.subagent_type.as_deref().unwrap_or("?"));
                 lines.push(Line::from(vec![
-                    Span::styled(format!("  {:<KV_KEY_WIDTH$}", label), Style::default().fg(c)),
+                    Span::styled(
+                        format!("  {:<KV_KEY_WIDTH$}", label),
+                        Style::default().fg(c),
+                    ),
                     Span::styled(detail, Style::default().fg(theme.dashboard_key.to_color())),
                 ]));
             }
@@ -125,7 +203,12 @@ impl Component for Dashboard {
 
         // Session
         lines.push(section("Session", theme));
-        lines.push(kv("ID", state.session_id.as_deref().unwrap_or("-"), theme.dashboard_key.to_color(), theme));
+        lines.push(kv(
+            "ID",
+            state.session_id.as_deref().unwrap_or("-"),
+            theme.dashboard_key.to_color(),
+            theme,
+        ));
 
         // Status / spinner
         if !state.status_message.is_empty() {
@@ -139,16 +222,31 @@ impl Component for Dashboard {
 
         // Key hints
         lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled("─ Keys ─", Style::default().fg(theme.key_hint.to_color()))));
-        lines.push(Line::from(Span::styled("  Enter Submit  Shift+Enter ↵", Style::default().fg(theme.key_hint.to_color()))));
-        lines.push(Line::from(Span::styled("  ^P Swap  ^T Team  ^C ⊘  ^D Exit", Style::default().fg(theme.key_hint.to_color()))));
+        lines.push(Line::from(Span::styled(
+            "─ Keys ─",
+            Style::default().fg(theme.key_hint.to_color()),
+        )));
+        lines.push(Line::from(Span::styled(
+            "  Enter Submit  Shift+Enter ↵",
+            Style::default().fg(theme.key_hint.to_color()),
+        )));
+        lines.push(Line::from(Span::styled(
+            "  ^P Swap  ^T Team  ^C ⊘  ^D Exit",
+            Style::default().fg(theme.key_hint.to_color()),
+        )));
 
         let widget = Paragraph::new(lines)
-            .block(Block::default()
-                .borders(Borders::LEFT)
-                .border_style(Style::default().fg(theme.border.to_color()))
-                .title(Span::styled(" Dashboard ",
-                    Style::default().fg(theme.dashboard_header.to_color()).add_modifier(Modifier::BOLD))))
+            .block(
+                Block::default()
+                    .borders(Borders::LEFT)
+                    .border_style(Style::default().fg(theme.border.to_color()))
+                    .title(Span::styled(
+                        " Dashboard ",
+                        Style::default()
+                            .fg(theme.dashboard_header.to_color())
+                            .add_modifier(Modifier::BOLD),
+                    )),
+            )
             .wrap(Wrap { trim: false });
         frame.render_widget(widget, area);
 
@@ -160,12 +258,24 @@ impl Component for Dashboard {
                 width: area.width.saturating_sub(4),
                 height: 1,
             };
-            let gauge_fill = if pct > 80.0 { theme.gauge_fill_red.to_color() }
-                else if pct > 50.0 { theme.gauge_fill_yellow.to_color() }
-                else { theme.gauge_fill_green.to_color() };
+            let gauge_fill = if pct > 80.0 {
+                theme.gauge_fill_red.to_color()
+            } else if pct > 50.0 {
+                theme.gauge_fill_yellow.to_color()
+            } else {
+                theme.gauge_fill_green.to_color()
+            };
             let gauge = Gauge::default()
-                .gauge_style(Style::default().fg(gauge_fill).bg(theme.gauge_bg.to_color()))
-                .ratio(if pct > 0.0 { (pct / 100.0).min(1.0) } else { 0.0 });
+                .gauge_style(
+                    Style::default()
+                        .fg(gauge_fill)
+                        .bg(theme.gauge_bg.to_color()),
+                )
+                .ratio(if pct > 0.0 {
+                    (pct / 100.0).min(1.0)
+                } else {
+                    0.0
+                });
             frame.render_widget(gauge, gauge_area);
         }
     }
@@ -182,13 +292,18 @@ impl Component for Dashboard {
 fn section<'a>(label: &str, theme: &TuiTheme) -> Line<'a> {
     Line::from(Span::styled(
         format!("─ {label} ─"),
-        Style::default().fg(theme.dashboard_header.to_color()).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(theme.dashboard_header.to_color())
+            .add_modifier(Modifier::BOLD),
     ))
 }
 
 fn kv<'a>(key: &str, val: &str, val_color: ratatui::style::Color, theme: &TuiTheme) -> Line<'a> {
     Line::from(vec![
-        Span::styled(format!("  {:<KV_KEY_WIDTH$}", key), Style::default().fg(theme.dashboard_key.to_color())),
+        Span::styled(
+            format!("  {:<KV_KEY_WIDTH$}", key),
+            Style::default().fg(theme.dashboard_key.to_color()),
+        ),
         Span::styled(val.to_string(), Style::default().fg(val_color)),
     ])
 }

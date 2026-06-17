@@ -25,7 +25,11 @@ pub struct StatusBar {
 
 impl StatusBar {
     pub fn new(state: SharedDashboardState) -> Self {
-        Self { state, spinner_frame: 0, dirty: true }
+        Self {
+            state,
+            spinner_frame: 0,
+            dirty: true,
+        }
     }
 
     pub fn tick_spinner(&mut self) {
@@ -43,9 +47,15 @@ impl Component for StatusBar {
         let state = self.state.read().unwrap_or_else(|e| e.into_inner());
         let mut spans = vec![
             Span::styled("  ", Style::default()),
-            Span::styled(state.model.clone(), Style::default().fg(theme.dashboard_value.to_color())),
+            Span::styled(
+                state.model.clone(),
+                Style::default().fg(theme.dashboard_value.to_color()),
+            ),
             Span::styled("  ", Style::default()),
-            Span::styled(state.provider.clone(), Style::default().fg(theme.dashboard_key.to_color())),
+            Span::styled(
+                state.provider.clone(),
+                Style::default().fg(theme.dashboard_key.to_color()),
+            ),
         ];
 
         if state.turn_count > 0 {
@@ -66,7 +76,9 @@ impl Component for StatusBar {
             let frame = SPINNER_FRAMES[self.spinner_frame];
             spans.push(Span::styled(
                 format!("  {frame} {}", state.status_message),
-                Style::default().fg(theme.spinner.to_color()).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(theme.spinner.to_color())
+                    .add_modifier(Modifier::BOLD),
             ));
         }
 

@@ -190,7 +190,9 @@ fn stage1_supersede(messages: &[ConversationMessage]) -> (Vec<ConversationMessag
 
         if let Some(last_write) = last_write_idx {
             for op in ops {
-                if (op.op_type == FileOp::Read || op.op_type == FileOp::Write || op.op_type == FileOp::Edit)
+                if (op.op_type == FileOp::Read
+                    || op.op_type == FileOp::Write
+                    || op.op_type == FileOp::Edit)
                     && op.index < last_write
                 {
                     obsolete_indices.insert(op.index);

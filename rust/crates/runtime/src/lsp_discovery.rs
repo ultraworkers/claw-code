@@ -28,7 +28,10 @@ pub enum LspInstallAction {
     /// The server is already available.
     Installed,
     /// The server is not found; these are the suggested install commands.
-    Missing { language: String, instructions: Vec<InstallInstruction> },
+    Missing {
+        language: String,
+        instructions: Vec<InstallInstruction>,
+    },
     /// The server binary exists but is a rustup proxy stub for an uninstalled component.
     RustupProxyMissing { language: String, component: String },
 }
@@ -166,89 +169,272 @@ const KNOWN_LSP_SERVERS_TABLE: &[StaticLspServerDescriptor] = &[
 fn install_instructions_for(language: &str) -> Vec<InstallInstruction> {
     match language {
         "rust" => vec![
-            InstallInstruction { label: "rustup".into(), command: "rustup component add rust-analyzer".into() },
-            InstallInstruction { label: "Ubuntu/Debian".into(), command: "sudo apt install rust-analyzer".into() },
-            InstallInstruction { label: "Fedora".into(), command: "sudo dnf install rust-analyzer".into() },
-            InstallInstruction { label: "Arch".into(), command: "sudo pacman -S rust-analyzer".into() },
-            InstallInstruction { label: "openSUSE".into(), command: "sudo zypper install rust-analyzer".into() },
-            InstallInstruction { label: "Alpine".into(), command: "sudo apk add rust-analyzer".into() },
-            InstallInstruction { label: "Void".into(), command: "sudo xbps-install rust-analyzer".into() },
-            InstallInstruction { label: "NixOS".into(), command: "nix-env -iA nixpkgs.rust-analyzer".into() },
-            InstallInstruction { label: "macOS".into(), command: "brew install rust-analyzer".into() },
-            InstallInstruction { label: "pip".into(), command: "pip install rust-analyzer".into() },
+            InstallInstruction {
+                label: "rustup".into(),
+                command: "rustup component add rust-analyzer".into(),
+            },
+            InstallInstruction {
+                label: "Ubuntu/Debian".into(),
+                command: "sudo apt install rust-analyzer".into(),
+            },
+            InstallInstruction {
+                label: "Fedora".into(),
+                command: "sudo dnf install rust-analyzer".into(),
+            },
+            InstallInstruction {
+                label: "Arch".into(),
+                command: "sudo pacman -S rust-analyzer".into(),
+            },
+            InstallInstruction {
+                label: "openSUSE".into(),
+                command: "sudo zypper install rust-analyzer".into(),
+            },
+            InstallInstruction {
+                label: "Alpine".into(),
+                command: "sudo apk add rust-analyzer".into(),
+            },
+            InstallInstruction {
+                label: "Void".into(),
+                command: "sudo xbps-install rust-analyzer".into(),
+            },
+            InstallInstruction {
+                label: "NixOS".into(),
+                command: "nix-env -iA nixpkgs.rust-analyzer".into(),
+            },
+            InstallInstruction {
+                label: "macOS".into(),
+                command: "brew install rust-analyzer".into(),
+            },
+            InstallInstruction {
+                label: "pip".into(),
+                command: "pip install rust-analyzer".into(),
+            },
         ],
         "c/cpp" => vec![
-            InstallInstruction { label: "Ubuntu/Debian".into(), command: "sudo apt install clangd".into() },
-            InstallInstruction { label: "Fedora".into(), command: "sudo dnf install clang-tools-extra".into() },
-            InstallInstruction { label: "Arch".into(), command: "sudo pacman -S clang".into() },
-            InstallInstruction { label: "openSUSE".into(), command: "sudo zypper install clang-tools".into() },
-            InstallInstruction { label: "Alpine".into(), command: "sudo apk add clang-extra-tools".into() },
-            InstallInstruction { label: "Void".into(), command: "sudo xbps-install clang-tools-extra".into() },
-            InstallInstruction { label: "NixOS".into(), command: "nix-env -iA nixpkgs.clang-tools".into() },
-            InstallInstruction { label: "macOS".into(), command: "brew install llvm".into() },
+            InstallInstruction {
+                label: "Ubuntu/Debian".into(),
+                command: "sudo apt install clangd".into(),
+            },
+            InstallInstruction {
+                label: "Fedora".into(),
+                command: "sudo dnf install clang-tools-extra".into(),
+            },
+            InstallInstruction {
+                label: "Arch".into(),
+                command: "sudo pacman -S clang".into(),
+            },
+            InstallInstruction {
+                label: "openSUSE".into(),
+                command: "sudo zypper install clang-tools".into(),
+            },
+            InstallInstruction {
+                label: "Alpine".into(),
+                command: "sudo apk add clang-extra-tools".into(),
+            },
+            InstallInstruction {
+                label: "Void".into(),
+                command: "sudo xbps-install clang-tools-extra".into(),
+            },
+            InstallInstruction {
+                label: "NixOS".into(),
+                command: "nix-env -iA nixpkgs.clang-tools".into(),
+            },
+            InstallInstruction {
+                label: "macOS".into(),
+                command: "brew install llvm".into(),
+            },
         ],
         "python" => vec![
-            InstallInstruction { label: "npm".into(), command: "npm install -g pyright".into() },
-            InstallInstruction { label: "pip".into(), command: "pip install pyright".into() },
-            InstallInstruction { label: "Arch".into(), command: "sudo pacman -S pyright".into() },
-            InstallInstruction { label: "NixOS".into(), command: "nix-env -iA nixpkgs.pyright".into() },
-            InstallInstruction { label: "macOS".into(), command: "brew install pyright".into() },
+            InstallInstruction {
+                label: "npm".into(),
+                command: "npm install -g pyright".into(),
+            },
+            InstallInstruction {
+                label: "pip".into(),
+                command: "pip install pyright".into(),
+            },
+            InstallInstruction {
+                label: "Arch".into(),
+                command: "sudo pacman -S pyright".into(),
+            },
+            InstallInstruction {
+                label: "NixOS".into(),
+                command: "nix-env -iA nixpkgs.pyright".into(),
+            },
+            InstallInstruction {
+                label: "macOS".into(),
+                command: "brew install pyright".into(),
+            },
         ],
         "go" => vec![
-            InstallInstruction { label: "go".into(), command: "go install golang.org/x/tools/gopls@latest".into() },
-            InstallInstruction { label: "Arch".into(), command: "sudo pacman -S gopls".into() },
-            InstallInstruction { label: "NixOS".into(), command: "nix-env -iA nixpkgs.gopls".into() },
-            InstallInstruction { label: "macOS".into(), command: "brew install gopls".into() },
+            InstallInstruction {
+                label: "go".into(),
+                command: "go install golang.org/x/tools/gopls@latest".into(),
+            },
+            InstallInstruction {
+                label: "Arch".into(),
+                command: "sudo pacman -S gopls".into(),
+            },
+            InstallInstruction {
+                label: "NixOS".into(),
+                command: "nix-env -iA nixpkgs.gopls".into(),
+            },
+            InstallInstruction {
+                label: "macOS".into(),
+                command: "brew install gopls".into(),
+            },
         ],
         "typescript" => vec![
-            InstallInstruction { label: "npm".into(), command: "npm install -g typescript-language-server typescript".into() },
-            InstallInstruction { label: "Arch".into(), command: "sudo pacman -S typescript-language-server".into() },
-            InstallInstruction { label: "NixOS".into(), command: "nix-env -iA nixpkgs.typescript-language-server".into() },
-            InstallInstruction { label: "macOS".into(), command: "brew install typescript-language-server".into() },
+            InstallInstruction {
+                label: "npm".into(),
+                command: "npm install -g typescript-language-server typescript".into(),
+            },
+            InstallInstruction {
+                label: "Arch".into(),
+                command: "sudo pacman -S typescript-language-server".into(),
+            },
+            InstallInstruction {
+                label: "NixOS".into(),
+                command: "nix-env -iA nixpkgs.typescript-language-server".into(),
+            },
+            InstallInstruction {
+                label: "macOS".into(),
+                command: "brew install typescript-language-server".into(),
+            },
         ],
         "java" => vec![
-            InstallInstruction { label: "Ubuntu/Debian".into(), command: "sudo apt install eclipse-jdtls".into() },
-            InstallInstruction { label: "Arch".into(), command: "sudo pacman -S jdtls".into() },
-            InstallInstruction { label: "NixOS".into(), command: "nix-env -iA nixpkgs.eclipse-jdtls".into() },
-            InstallInstruction { label: "macOS".into(), command: "brew install jdtls".into() },
+            InstallInstruction {
+                label: "Ubuntu/Debian".into(),
+                command: "sudo apt install eclipse-jdtls".into(),
+            },
+            InstallInstruction {
+                label: "Arch".into(),
+                command: "sudo pacman -S jdtls".into(),
+            },
+            InstallInstruction {
+                label: "NixOS".into(),
+                command: "nix-env -iA nixpkgs.eclipse-jdtls".into(),
+            },
+            InstallInstruction {
+                label: "macOS".into(),
+                command: "brew install jdtls".into(),
+            },
         ],
         "ruby" => vec![
-            InstallInstruction { label: "gem".into(), command: "gem install solargraph".into() },
-            InstallInstruction { label: "Arch".into(), command: "sudo pacman -S solargraph".into() },
-            InstallInstruction { label: "NixOS".into(), command: "nix-env -iA nixpkgs.solargraph".into() },
-            InstallInstruction { label: "macOS".into(), command: "brew install solargraph".into() },
+            InstallInstruction {
+                label: "gem".into(),
+                command: "gem install solargraph".into(),
+            },
+            InstallInstruction {
+                label: "Arch".into(),
+                command: "sudo pacman -S solargraph".into(),
+            },
+            InstallInstruction {
+                label: "NixOS".into(),
+                command: "nix-env -iA nixpkgs.solargraph".into(),
+            },
+            InstallInstruction {
+                label: "macOS".into(),
+                command: "brew install solargraph".into(),
+            },
         ],
         "lua" => vec![
-            InstallInstruction { label: "npm".into(), command: "npm install -g lua-language-server".into() },
-            InstallInstruction { label: "Ubuntu/Debian".into(), command: "sudo apt install lua-language-server".into() },
-            InstallInstruction { label: "Fedora".into(), command: "sudo dnf install lua-language-server".into() },
-            InstallInstruction { label: "Arch".into(), command: "sudo pacman -S lua-language-server".into() },
-            InstallInstruction { label: "NixOS".into(), command: "nix-env -iA nixpkgs.lua-language-server".into() },
-            InstallInstruction { label: "macOS".into(), command: "brew install lua-language-server".into() },
+            InstallInstruction {
+                label: "npm".into(),
+                command: "npm install -g lua-language-server".into(),
+            },
+            InstallInstruction {
+                label: "Ubuntu/Debian".into(),
+                command: "sudo apt install lua-language-server".into(),
+            },
+            InstallInstruction {
+                label: "Fedora".into(),
+                command: "sudo dnf install lua-language-server".into(),
+            },
+            InstallInstruction {
+                label: "Arch".into(),
+                command: "sudo pacman -S lua-language-server".into(),
+            },
+            InstallInstruction {
+                label: "NixOS".into(),
+                command: "nix-env -iA nixpkgs.lua-language-server".into(),
+            },
+            InstallInstruction {
+                label: "macOS".into(),
+                command: "brew install lua-language-server".into(),
+            },
         ],
         "html" | "css" | "json" => vec![
-            InstallInstruction { label: "npm".into(), command: "npm install -g vscode-langservers-extracted".into() },
-            InstallInstruction { label: "Arch".into(), command: "sudo pacman -S vscode-langservers-extracted".into() },
-            InstallInstruction { label: "NixOS".into(), command: "nix-env -iA nixpkgs.vscode-langservers-extracted".into() },
-            InstallInstruction { label: "macOS".into(), command: "brew install vscode-langservers-extracted".into() },
+            InstallInstruction {
+                label: "npm".into(),
+                command: "npm install -g vscode-langservers-extracted".into(),
+            },
+            InstallInstruction {
+                label: "Arch".into(),
+                command: "sudo pacman -S vscode-langservers-extracted".into(),
+            },
+            InstallInstruction {
+                label: "NixOS".into(),
+                command: "nix-env -iA nixpkgs.vscode-langservers-extracted".into(),
+            },
+            InstallInstruction {
+                label: "macOS".into(),
+                command: "brew install vscode-langservers-extracted".into(),
+            },
         ],
         "bash" => vec![
-            InstallInstruction { label: "npm".into(), command: "npm install -g bash-language-server".into() },
-            InstallInstruction { label: "Arch".into(), command: "sudo pacman -S bash-language-server".into() },
-            InstallInstruction { label: "NixOS".into(), command: "nix-env -iA nixpkgs.bash-language-server".into() },
-            InstallInstruction { label: "macOS".into(), command: "brew install bash-language-server".into() },
+            InstallInstruction {
+                label: "npm".into(),
+                command: "npm install -g bash-language-server".into(),
+            },
+            InstallInstruction {
+                label: "Arch".into(),
+                command: "sudo pacman -S bash-language-server".into(),
+            },
+            InstallInstruction {
+                label: "NixOS".into(),
+                command: "nix-env -iA nixpkgs.bash-language-server".into(),
+            },
+            InstallInstruction {
+                label: "macOS".into(),
+                command: "brew install bash-language-server".into(),
+            },
         ],
         "yaml" => vec![
-            InstallInstruction { label: "npm".into(), command: "npm install -g yaml-language-server".into() },
-            InstallInstruction { label: "Arch".into(), command: "sudo pacman -S yaml-language-server".into() },
-            InstallInstruction { label: "NixOS".into(), command: "nix-env -iA nixpkgs.yaml-language-server".into() },
-            InstallInstruction { label: "macOS".into(), command: "brew install yaml-language-server".into() },
+            InstallInstruction {
+                label: "npm".into(),
+                command: "npm install -g yaml-language-server".into(),
+            },
+            InstallInstruction {
+                label: "Arch".into(),
+                command: "sudo pacman -S yaml-language-server".into(),
+            },
+            InstallInstruction {
+                label: "NixOS".into(),
+                command: "nix-env -iA nixpkgs.yaml-language-server".into(),
+            },
+            InstallInstruction {
+                label: "macOS".into(),
+                command: "brew install yaml-language-server".into(),
+            },
         ],
         "gdscript" => vec![
-            InstallInstruction { label: "Godot Editor".into(), command: "Download from https://godotengine.org".into() },
-            InstallInstruction { label: "Arch".into(), command: "sudo pacman -S godot".into() },
-            InstallInstruction { label: "NixOS".into(), command: "nix-env -iA nixpkgs.godot".into() },
-            InstallInstruction { label: "macOS".into(), command: "brew install godot".into() },
+            InstallInstruction {
+                label: "Godot Editor".into(),
+                command: "Download from https://godotengine.org".into(),
+            },
+            InstallInstruction {
+                label: "Arch".into(),
+                command: "sudo pacman -S godot".into(),
+            },
+            InstallInstruction {
+                label: "NixOS".into(),
+                command: "nix-env -iA nixpkgs.godot".into(),
+            },
+            InstallInstruction {
+                label: "macOS".into(),
+                command: "brew install godot".into(),
+            },
         ],
         _ => Vec::new(),
     }
@@ -269,10 +455,7 @@ pub fn known_lsp_servers() -> Vec<LspServerDescriptor> {
 /// successfully, `false` otherwise.
 #[must_use]
 pub fn command_exists_on_path(command: &str) -> bool {
-    Command::new(command)
-        .arg("--version")
-        .output()
-        .is_ok()
+    Command::new(command).arg("--version").output().is_ok()
 }
 
 /// Check if a binary is a rustup proxy by running `--version` and looking for
@@ -318,7 +501,11 @@ pub fn detect_platform() -> LinuxDistro {
         LinuxDistro::Debian
     } else if contents.contains("Fedora") {
         LinuxDistro::Fedora
-    } else if contents.contains("Arch") || contents.contains("archlinux") || contents.contains("Manjaro") || contents.contains("EndeavourOS") {
+    } else if contents.contains("Arch")
+        || contents.contains("archlinux")
+        || contents.contains("Manjaro")
+        || contents.contains("EndeavourOS")
+    {
         LinuxDistro::Arch
     } else if contents.contains("openSUSE") || contents.contains("SUSE") {
         LinuxDistro::OpenSuse
@@ -407,7 +594,10 @@ pub fn format_install_prompt(actions: &[LspInstallAction]) -> String {
     for action in actions {
         match action {
             LspInstallAction::Installed => continue,
-            LspInstallAction::Missing { language, instructions } => {
+            LspInstallAction::Missing {
+                language,
+                instructions,
+            } => {
                 lines.push(format!("  {language}: not found"));
                 let best = instructions
                     .iter()
@@ -432,8 +622,13 @@ pub fn format_install_prompt(actions: &[LspInstallAction]) -> String {
                     }
                 }
             }
-            LspInstallAction::RustupProxyMissing { language, component } => {
-                lines.push(format!("  {language}: rustup proxy found but component not installed"));
+            LspInstallAction::RustupProxyMissing {
+                language,
+                component,
+            } => {
+                lines.push(format!(
+                    "  {language}: rustup proxy found but component not installed"
+                ));
                 lines.push(format!("    → rustup component add {component}"));
             }
         }
@@ -492,10 +687,7 @@ mod tests {
 
     #[test]
     fn known_servers_contains_expected_languages() {
-        let languages: Vec<&str> = KNOWN_LSP_SERVERS_TABLE
-            .iter()
-            .map(|s| s.language)
-            .collect();
+        let languages: Vec<&str> = KNOWN_LSP_SERVERS_TABLE.iter().map(|s| s.language).collect();
         assert!(languages.contains(&"rust"));
         assert!(languages.contains(&"c/cpp"));
         assert!(languages.contains(&"python"));
@@ -557,10 +749,16 @@ mod tests {
         }
         let languages: Vec<&str> = available.iter().map(|s| s.language.as_str()).collect();
         if command_exists_on_path("rust-analyzer") && !is_rustup_proxy("rust-analyzer") {
-            assert!(languages.contains(&"rust"), "rust-analyzer is on PATH but 'rust' not in discovered servers");
+            assert!(
+                languages.contains(&"rust"),
+                "rust-analyzer is on PATH but 'rust' not in discovered servers"
+            );
         }
         if command_exists_on_path("clangd") {
-            assert!(languages.contains(&"c/cpp"), "clangd is on PATH but 'c/cpp' not in discovered servers");
+            assert!(
+                languages.contains(&"c/cpp"),
+                "clangd is on PATH but 'c/cpp' not in discovered servers"
+            );
         }
     }
 
@@ -582,25 +780,43 @@ mod tests {
     #[test]
     fn descriptor_has_correct_args() {
         let servers = known_lsp_servers();
-        let rust = servers.iter().find(|s| s.language == "rust").expect("rust server should exist");
+        let rust = servers
+            .iter()
+            .find(|s| s.language == "rust")
+            .expect("rust server should exist");
         assert!(rust.args.is_empty(), "rust-analyzer should have no args");
 
-        let ts = servers.iter().find(|s| s.language == "typescript").expect("typescript server should exist");
-        assert_eq!(ts.args, vec!["--stdio"], "typescript-language-server should have --stdio arg");
+        let ts = servers
+            .iter()
+            .find(|s| s.language == "typescript")
+            .expect("typescript server should exist");
+        assert_eq!(
+            ts.args,
+            vec!["--stdio"],
+            "typescript-language-server should have --stdio arg"
+        );
     }
 
     #[test]
     fn install_instructions_cover_all_languages() {
         for desc in KNOWN_LSP_SERVERS_TABLE {
             let instructions = install_instructions_for(desc.language);
-            assert!(!instructions.is_empty(), "no install instructions for '{}'", desc.language);
+            assert!(
+                !instructions.is_empty(),
+                "no install instructions for '{}'",
+                desc.language
+            );
         }
     }
 
     #[test]
     fn best_install_returns_something_for_known_languages() {
         for desc in KNOWN_LSP_SERVERS_TABLE {
-            assert!(best_install_instruction(desc.language).is_some(), "no best install for '{}'", desc.language);
+            assert!(
+                best_install_instruction(desc.language).is_some(),
+                "no best install for '{}'",
+                desc.language
+            );
         }
     }
 
@@ -619,7 +835,10 @@ mod tests {
         }];
         let prompt = format_install_prompt(&actions);
         assert!(prompt.contains("rust"), "should mention rust");
-        assert!(prompt.contains("rustup component add rust-analyzer"), "should show rustup command");
+        assert!(
+            prompt.contains("rustup component add rust-analyzer"),
+            "should show rustup command"
+        );
     }
 
     #[test]
@@ -647,7 +866,11 @@ mod tests {
     fn server_descriptors_have_install_hints() {
         let servers = known_lsp_servers();
         for server in &servers {
-            assert!(!server.install_hint.is_empty(), "server '{}' should have install hints", server.language);
+            assert!(
+                !server.install_hint.is_empty(),
+                "server '{}' should have install hints",
+                server.language
+            );
         }
     }
 }

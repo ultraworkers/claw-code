@@ -73,7 +73,9 @@ mod tests {
 
     #[test]
     fn test_ask_mode_restrains() {
-        assert!(ChatMode::Ask.system_prompt_suffix().contains("Do NOT modify"));
+        assert!(ChatMode::Ask
+            .system_prompt_suffix()
+            .contains("Do NOT modify"));
     }
 
     #[test]

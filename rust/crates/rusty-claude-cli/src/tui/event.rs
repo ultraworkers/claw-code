@@ -4,25 +4,39 @@
 //! loop drains the channel non-blocking each tick. Components process
 //! events during the update phase before rendering.
 
-use crate::tui::legacy::DashboardState;
 use crate::agent_view::AgentSession;
-use crate::theme::TuiTheme;
-use crate::keybindings::KeyPreset;
 use crate::chat_mode::ChatMode;
+use crate::keybindings::KeyPreset;
+use crate::theme::TuiTheme;
+use crate::tui::legacy::DashboardState;
 
 /// Events that flow through the TUI event bus.
 #[derive(Debug, Clone)]
 pub enum TuiEvent {
     // --- Streaming events (Phase 4) ---
-    StreamTextDelta { text: String },
-    StreamThinking { thinking: String },
-    StreamToolUse { id: String, name: String },
-    StreamUsage { input_tokens: u32, output_tokens: u32 },
+    StreamTextDelta {
+        text: String,
+    },
+    StreamThinking {
+        thinking: String,
+    },
+    StreamToolUse {
+        id: String,
+        name: String,
+    },
+    StreamUsage {
+        input_tokens: u32,
+        output_tokens: u32,
+    },
     StreamMessageStop,
 
     // --- Turn lifecycle ---
-    TurnComplete { assistant_text: String },
-    TurnError { error: String },
+    TurnComplete {
+        assistant_text: String,
+    },
+    TurnError {
+        error: String,
+    },
     TurnStarted,
 
     // --- Dashboard ---
@@ -30,7 +44,9 @@ pub enum TuiEvent {
 
     // --- Agent lifecycle ---
     AgentSessionUpdate(AgentSession),
-    AgentSessionRemove { id: String },
+    AgentSessionRemove {
+        id: String,
+    },
 
     // --- UI state changes ---
     ThemeChanged(TuiTheme),
@@ -38,7 +54,10 @@ pub enum TuiEvent {
     ChatModeChanged(ChatMode),
 
     // --- System ---
-    Resize { width: u16, height: u16 },
+    Resize {
+        width: u16,
+        height: u16,
+    },
 }
 
 /// The central event channel.
@@ -96,7 +115,9 @@ mod tests {
     fn test_event_bus_send_recv() {
         let bus = EventBus::new();
         bus.send(TuiEvent::TurnStarted);
-        bus.send(TuiEvent::TurnError { error: "test".into() });
+        bus.send(TuiEvent::TurnError {
+            error: "test".into(),
+        });
 
         let events = bus.drain();
         assert_eq!(events.len(), 2);

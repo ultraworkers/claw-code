@@ -3,10 +3,10 @@
 //! Uses the shared `MarkdownAst` to produce `Vec<Line<'static>>` for the
 //! TUI conversation pane. This replaces the old `markdown.rs` module.
 
+use super::{parse_markdown, CodeLine, MarkdownNode, Rgb, SemanticStyle};
+use crate::theme::TuiTheme;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use crate::theme::TuiTheme;
-use super::{parse_markdown, MarkdownNode, SemanticStyle, CodeLine, Rgb};
 
 /// Ratatui markdown renderer.
 #[derive(Clone)]
@@ -39,7 +39,10 @@ impl MarkdownRenderer {
 
         for node in &ast.nodes {
             match node {
-                MarkdownNode::CodeBlock { language, lines: code_lines } => {
+                MarkdownNode::CodeBlock {
+                    language,
+                    lines: code_lines,
+                } => {
                     let lang_label = language.as_deref().unwrap_or("text");
                     lines.push(Line::from(Span::styled(
                         format!("╭─ {lang_label} ─"),
@@ -51,7 +54,9 @@ impl MarkdownRenderer {
                             Style::default().fg(self.theme.code_border.to_color()),
                         )];
                         for seg in &cl.segments {
-                            let color = seg.fg.map(|rgb| Color::Rgb(rgb.r, rgb.g, rgb.b))
+                            let color = seg
+                                .fg
+                                .map(|rgb| Color::Rgb(rgb.r, rgb.g, rgb.b))
                                 .unwrap_or(self.theme.code_fg.to_color());
                             spans.push(Span::styled(seg.text.clone(), Style::default().fg(color)));
                         }

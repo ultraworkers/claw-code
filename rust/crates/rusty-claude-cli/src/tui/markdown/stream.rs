@@ -10,7 +10,9 @@ pub struct StreamingMarkdownState {
 
 impl StreamingMarkdownState {
     pub fn new() -> Self {
-        Self { pending: String::new() }
+        Self {
+            pending: String::new(),
+        }
     }
 
     pub fn push_delta(&mut self, delta: &str) -> bool {
@@ -28,7 +30,9 @@ impl StreamingMarkdownState {
 }
 
 impl Default for StreamingMarkdownState {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[cfg(test)]

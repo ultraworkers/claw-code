@@ -18,10 +18,9 @@ use crate::lsp_transport::{LspTransport, LspTransportError};
 
 use parse::{
     canonicalize_root, language_id_for_path, parse_code_actions, parse_code_lens,
-    parse_completions, parse_hover, parse_locations, parse_signature_help,
-    parse_symbols, parse_workspace_edit, parse_workspace_symbols, path_to_uri,
-    rename_params, severity_name, text_document_position_params, uri_to_path,
-    workspace_symbol_params,
+    parse_completions, parse_hover, parse_locations, parse_signature_help, parse_symbols,
+    parse_workspace_edit, parse_workspace_symbols, path_to_uri, rename_params, severity_name,
+    text_document_position_params, uri_to_path, workspace_symbol_params,
 };
 
 #[derive(Debug)]
@@ -374,7 +373,6 @@ impl LspProcess {
         Ok(())
     }
 
-
     /// Notify the server that a file was closed. Sends `textDocument/didClose`.
     pub async fn did_close(&mut self, path: &str) -> Result<(), LspProcessError> {
         if !self.open_files.contains(path) {
@@ -523,8 +521,7 @@ impl LspProcess {
                 if let Some(params) = &n.params {
                     if let Some(uri) = params.get("uri").and_then(|v| v.as_str()) {
                         let path = uri_to_path(uri);
-                        if let Some(diags) = params.get("diagnostics").and_then(|v| v.as_array())
-                        {
+                        if let Some(diags) = params.get("diagnostics").and_then(|v| v.as_array()) {
                             for d in diags {
                                 diagnostics.push(LspDiagnostic {
                                     path: path.clone(),

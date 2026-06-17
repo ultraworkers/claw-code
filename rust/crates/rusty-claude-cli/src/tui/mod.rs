@@ -10,10 +10,10 @@ pub mod legacy;
 pub use legacy::*;
 
 // New sub-modules — built incrementally alongside the legacy code.
-pub mod component;
-pub mod event;
-pub mod slash_commands;
 pub mod app;
-pub mod components;
-pub mod markdown;
 pub mod capture;
+pub mod component;
+pub mod components;
+pub mod event;
+pub mod markdown;
+pub mod slash_commands;

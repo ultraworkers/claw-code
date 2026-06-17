@@ -34,7 +34,8 @@ pub fn install_panic_hook() -> Box<dyn Fn(&panic::PanicHookInfo<'_>) + Send + Sy
             "Box<dyn Any>".to_string()
         };
 
-        let location = info.location()
+        let location = info
+            .location()
             .map(|l| format!(" at {}:{}", l.file(), l.line()))
             .unwrap_or_default();
 

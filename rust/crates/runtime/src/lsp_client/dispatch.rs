@@ -47,7 +47,11 @@ impl super::LspRegistry {
         let language = if lsp_action == LspAction::WorkspaceSymbols {
             // Try to find any connected server for workspace symbols
             let inner = self.inner.lock().expect("lsp registry lock poisoned");
-            inner.servers.keys().next().cloned()
+            inner
+                .servers
+                .keys()
+                .next()
+                .cloned()
                 .ok_or_else(|| "no LSP servers available for workspace symbols".to_owned())?
         } else {
             let p = path.ok_or("path is required for this LSP action")?;
@@ -160,159 +164,189 @@ impl super::LspRegistry {
                         let hover = process.hover(path, line, character).await;
                         hover.map(|opt| {
                             opt.map_or_else(
-                                || serde_json::json!({
-                                    "action": "hover",
-                                    "path": path,
-                                    "line": line,
-                                    "character": character,
-                                    "language": language,
-                                    "status": "no_result",
-                                }),
-                                |h| serde_json::json!({
-                                    "action": "hover",
-                                    "path": path,
-                                    "line": line,
-                                    "character": character,
-                                    "language": language,
-                                    "status": "ok",
-                                    "result": h,
-                                }),
+                                || {
+                                    serde_json::json!({
+                                        "action": "hover",
+                                        "path": path,
+                                        "line": line,
+                                        "character": character,
+                                        "language": language,
+                                        "status": "no_result",
+                                    })
+                                },
+                                |h| {
+                                    serde_json::json!({
+                                        "action": "hover",
+                                        "path": path,
+                                        "line": line,
+                                        "character": character,
+                                        "language": language,
+                                        "status": "ok",
+                                        "result": h,
+                                    })
+                                },
                             )
                         })
                     }
                     LspAction::Definition => {
                         let locations = process.goto_definition(path, line, character).await;
-                        locations.map(|locs| serde_json::json!({
-                            "action": "definition",
-                            "path": path,
-                            "line": line,
-                            "character": character,
-                            "language": language,
-                            "status": "ok",
-                            "locations": locs,
-                        }))
+                        locations.map(|locs| {
+                            serde_json::json!({
+                                "action": "definition",
+                                "path": path,
+                                "line": line,
+                                "character": character,
+                                "language": language,
+                                "status": "ok",
+                                "locations": locs,
+                            })
+                        })
                     }
                     LspAction::References => {
                         let locations = process.references(path, line, character).await;
-                        locations.map(|locs| serde_json::json!({
-                            "action": "references",
-                            "path": path,
-                            "line": line,
-                            "character": character,
-                            "language": language,
-                            "status": "ok",
-                            "locations": locs,
-                        }))
+                        locations.map(|locs| {
+                            serde_json::json!({
+                                "action": "references",
+                                "path": path,
+                                "line": line,
+                                "character": character,
+                                "language": language,
+                                "status": "ok",
+                                "locations": locs,
+                            })
+                        })
                     }
                     LspAction::Completion => {
                         let items = process.completion(path, line, character).await;
-                        items.map(|completions| serde_json::json!({
-                            "action": "completion",
-                            "path": path,
-                            "line": line,
-                            "character": character,
-                            "language": language,
-                            "status": "ok",
-                            "items": completions,
-                        }))
+                        items.map(|completions| {
+                            serde_json::json!({
+                                "action": "completion",
+                                "path": path,
+                                "line": line,
+                                "character": character,
+                                "language": language,
+                                "status": "ok",
+                                "items": completions,
+                            })
+                        })
                     }
                     LspAction::Symbols => {
                         let symbols = process.document_symbols(path).await;
-                        symbols.map(|syms| serde_json::json!({
-                            "action": "symbols",
-                            "path": path,
-                            "line": line,
-                            "character": character,
-                            "language": language,
-                            "status": "ok",
-                            "symbols": syms,
-                        }))
+                        symbols.map(|syms| {
+                            serde_json::json!({
+                                "action": "symbols",
+                                "path": path,
+                                "line": line,
+                                "character": character,
+                                "language": language,
+                                "status": "ok",
+                                "symbols": syms,
+                            })
+                        })
                     }
                     LspAction::Format => {
                         let edits = process.format(path).await;
-                        edits.map(|text_edits| serde_json::json!({
-                            "action": "format",
-                            "path": path,
-                            "line": line,
-                            "character": character,
-                            "language": language,
-                            "status": "ok",
-                            "edits": text_edits,
-                        }))
+                        edits.map(|text_edits| {
+                            serde_json::json!({
+                                "action": "format",
+                                "path": path,
+                                "line": line,
+                                "character": character,
+                                "language": language,
+                                "status": "ok",
+                                "edits": text_edits,
+                            })
+                        })
                     }
                     LspAction::CodeAction => {
                         let end_line = if line > 0 { Some(line) } else { None };
                         let end_character = if character > 0 { Some(character) } else { None };
-                        let actions = process.code_action(path, line, character, end_line, end_character, None).await;
-                        actions.map(|acts| serde_json::json!({
-                            "action": "code_action",
-                            "path": path,
-                            "line": 0,
-                            "character": 0,
-                            "end_line": end_line,
-                            "end_character": end_character,
-                            "language": language,
-                            "status": "ok",
-                            "actions": acts,
-                        }))
+                        let actions = process
+                            .code_action(path, line, character, end_line, end_character, None)
+                            .await;
+                        actions.map(|acts| {
+                            serde_json::json!({
+                                "action": "code_action",
+                                "path": path,
+                                "line": 0,
+                                "character": 0,
+                                "end_line": end_line,
+                                "end_character": end_character,
+                                "language": language,
+                                "status": "ok",
+                                "actions": acts,
+                            })
+                        })
                     }
                     LspAction::Rename => {
-                        let new_name = _query.ok_or_else(|| LspProcessError::InvalidRequest("new_name required for rename".into()))?;
+                        let new_name = _query.ok_or_else(|| {
+                            LspProcessError::InvalidRequest("new_name required for rename".into())
+                        })?;
                         let rename_result = process.rename(path, line, character, new_name).await;
-                        rename_result.map(|r| serde_json::json!({
-                            "action": "rename",
-                            "path": path,
-                            "line": line,
-                            "character": character,
-                            "language": language,
-                            "status": "ok",
-                            "result": r,
-                        }))
+                        rename_result.map(|r| {
+                            serde_json::json!({
+                                "action": "rename",
+                                "path": path,
+                                "line": line,
+                                "character": character,
+                                "language": language,
+                                "status": "ok",
+                                "result": r,
+                            })
+                        })
                     }
                     LspAction::SignatureHelp => {
                         let sig = process.signature_help(path, line, character).await;
                         sig.map(|opt| {
                             opt.map_or_else(
-                                || serde_json::json!({
-                                    "action": "signature_help",
-                                    "path": path,
-                                    "line": line,
-                                    "character": character,
-                                    "language": language,
-                                    "status": "no_result",
-                                }),
-                                |s| serde_json::json!({
-                                    "action": "signature_help",
-                                    "path": path,
-                                    "line": line,
-                                    "character": character,
-                                    "language": language,
-                                    "status": "ok",
-                                    "result": s,
-                                }),
+                                || {
+                                    serde_json::json!({
+                                        "action": "signature_help",
+                                        "path": path,
+                                        "line": line,
+                                        "character": character,
+                                        "language": language,
+                                        "status": "no_result",
+                                    })
+                                },
+                                |s| {
+                                    serde_json::json!({
+                                        "action": "signature_help",
+                                        "path": path,
+                                        "line": line,
+                                        "character": character,
+                                        "language": language,
+                                        "status": "ok",
+                                        "result": s,
+                                    })
+                                },
                             )
                         })
                     }
                     LspAction::CodeLens => {
                         let lenses = process.code_lens(path).await;
-                        lenses.map(|l| serde_json::json!({
-                            "action": "code_lens",
-                            "path": path,
-                            "language": language,
-                            "status": "ok",
-                            "lenses": l,
-                        }))
+                        lenses.map(|l| {
+                            serde_json::json!({
+                                "action": "code_lens",
+                                "path": path,
+                                "language": language,
+                                "status": "ok",
+                                "lenses": l,
+                            })
+                        })
                     }
                     LspAction::WorkspaceSymbols => {
                         let query = _query.unwrap_or("");
                         let symbols = process.workspace_symbols(query).await;
-                        symbols.map(|syms| serde_json::json!({
-                            "action": "workspace_symbols",
-                            "language": language,
-                            "query": query,
-                            "status": "ok",
-                            "symbols": syms,
-                        }))
+                        symbols.map(|syms| {
+                            serde_json::json!({
+                                "action": "workspace_symbols",
+                                "language": language,
+                                "query": query,
+                                "status": "ok",
+                                "symbols": syms,
+                            })
+                        })
                     }
                     LspAction::Diagnostics => unreachable!(),
                 }
