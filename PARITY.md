@@ -150,16 +150,18 @@ Canonical scenario map: `rust/mock_parity_scenarios.json`
 - `mvp_tool_specs()` in `rust/crates/tools/src/lib.rs` exposes the core tool set plus Claude Code v2.1.201 compatibility contracts.
 - Core execution is present for `bash`, `read_file`, `write_file`, `edit_file`, `glob_search`, and `grep_search`.
 - Existing product tools in `mvp_tool_specs()` include `WebFetch`, `WebSearch`, `TodoWrite`, `Skill`, `Agent`, `ToolSearch`, `NotebookEdit`, `Sleep`, `SendUserMessage`, `Config`, `EnterPlanMode`, `ExitPlanMode`, `StructuredOutput`, `REPL`, and `PowerShell`.
+- Agent view now uses the Claude Code v2.1.201 background-session layout: `CLAUDE_CONFIG_DIR` or `~/.claude`, `jobs/<id>/state.json`, `jobs/<id>/tmp/`, `daemon/roster.json`, and `daemon.log`. `claw agents`, `claw agents --json [--all] [--cwd <path>]`, `claw --bg`, `claw --bg --exec`, `claw attach/logs/stop/kill/respawn/rm <id>`, and `claw daemon status/stop --any` are wired through `runtime::AgentSupervisor`; TTY `claw agents` opens a full-screen crossterm view with grouped rows, peek, dispatch, and lifecycle shortcuts.
 - The 9-lane push replaced pure fixed-payload stubs for `Task*`, `Team*`, `Cron*`, `LSP`, and MCP tools with registry-backed handlers on `main`; the v2.1.201 migration extends `TaskCreate`/`TaskUpdate` to the structured task-list payload shape.
 - The v2.1.201 host-facing contracts include `Workflow`, `Monitor`, `ScheduleWakeup`, `PushNotification`, `ReportFindings`, `ReadMcpResourceDir`, `Artifact`, `Projects`, `ClaudeDesign`, and `ShowOnboardingRolePicker`.
 - `Brief` is handled as an execution alias in `execute_tool()`, but it is not a separately exposed tool spec in `mvp_tool_specs()`.
 
 ### Still limited or intentionally shallow
 
-- `AskUserQuestion` still returns a pending response payload rather than real interactive UI wiring.
+- `AskUserQuestion` supports local stdin/stdout question flow, but it is not wired to an async host UI prompt surface.
 - `McpAuth` reports structured login/logout contract state and host-flow requirements, but it does not open a browser or complete OAuth by itself.
 - `Workflow` and `Monitor` expose compatibility payloads, but local workflow JavaScript execution and live monitor scheduling are not implemented in this runtime.
-- `RemoteTrigger` remains a stub response.
+- `RemoteTrigger` performs direct HTTP requests, but it has not been validated against every upstream host-trigger edge case.
+- Agent view has a local supervisor, official state files, shell lifecycle commands, raw `agents --json` arrays, background worker spawning, a basic full-screen TUI, and terminal attach into resumable prompt sessions once workers record their managed session id. Remaining gaps are peek-panel replies, row pin/rename/reorder/collapse shortcuts, generated row summaries/PR status, `/bg` or left-arrow handoff from an already-running foreground session, and a real supervisor socket/pre-warmed worker pool.
 - `TestingPermission` remains test-only.
 - Task, team, cron, MCP, and LSP are no longer just fixed-payload stubs in `execute_tool()`, but several remain registry-backed approximations rather than full external-runtime integrations.
 - Bash deep validation remains branch-only until `36dac6c` is merged.

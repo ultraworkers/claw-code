@@ -26,12 +26,20 @@ use std::io::{self, IsTerminal, Read, Write};
 use std::net::TcpListener;
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
+use crossterm::cursor::{Hide, MoveTo, Show};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::execute;
+use crossterm::style::Print;
+use crossterm::terminal::{
+    self, disable_raw_mode, enable_raw_mode, Clear, ClearType, EnterAlternateScreen,
+    LeaveAlternateScreen,
+};
 use log::debug;
 
 use api::{
@@ -43,12 +51,12 @@ use api::{
 };
 
 use commands::{
-    classify_skills_slash_command, handle_agents_slash_command, handle_agents_slash_command_json,
-    handle_mcp_slash_command, handle_mcp_slash_command_json, handle_plugins_slash_command,
-    handle_skills_slash_command, handle_skills_slash_command_json, render_slash_command_help,
-    render_slash_command_help_filtered, resolve_skill_invocation, resume_supported_slash_commands,
-    slash_command_specs, validate_slash_command_input, PluginsCommandResult, SkillSlashDispatch,
-    SlashCommand,
+    classify_skills_slash_command, handle_agent_view_json_array, handle_agents_slash_command,
+    handle_agents_slash_command_json, handle_mcp_slash_command, handle_mcp_slash_command_json,
+    handle_plugins_slash_command, handle_skills_slash_command, handle_skills_slash_command_json,
+    render_slash_command_help, render_slash_command_help_filtered, resolve_skill_invocation,
+    resume_supported_slash_commands, slash_command_specs, validate_slash_command_input,
+    PluginsCommandResult, SkillSlashDispatch, SlashCommand,
 };
 use init::initialize_repo;
 use plugins::{PluginHooks, PluginManager, PluginManagerConfig, PluginRegistry};
@@ -304,6 +312,11 @@ const CLI_OPTION_SUGGESTIONS: &[&str] = &[
     "--resume",
     "--acp",
     "-acp",
+    "--bg",
+    "--background",
+    "--exec",
+    "--name",
+    "--agent",
     "--print",
     "--compact",
     "--base-commit",
@@ -1012,7 +1025,57 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         CliAction::Agents {
             args,
             output_format,
-        } => LiveCli::print_agents(args.as_deref(), output_format)?,
+            model,
+            permission_mode,
+            reasoning_effort,
+            agent,
+        } => LiveCli::print_agents(AgentViewPrintRequest {
+            args: args.as_deref(),
+            output_format,
+            model: &model,
+            permission_mode,
+            reasoning_effort: reasoning_effort.as_deref(),
+            agent: agent.as_deref(),
+        })?,
+        CliAction::Background {
+            prompt,
+            exec,
+            name,
+            agent,
+            model,
+            output_format,
+            permission_mode,
+            reasoning_effort,
+        } => run_background_agent(BackgroundAgentRequest {
+            prompt: prompt.as_deref(),
+            exec: exec.as_deref(),
+            name: name.as_deref(),
+            agent: agent.as_deref(),
+            model: &model,
+            output_format,
+            permission_mode,
+            reasoning_effort: reasoning_effort.as_deref(),
+        })?,
+        CliAction::AgentAttach { id, output_format } => run_agent_attach(&id, output_format)?,
+        CliAction::AgentLogs { id, output_format } => run_agent_logs(&id, output_format)?,
+        CliAction::AgentStop {
+            id,
+            signal,
+            output_format,
+        } => run_agent_stop(&id, signal, output_format)?,
+        CliAction::AgentRespawn {
+            id,
+            all,
+            output_format,
+        } => run_agent_respawn(id.as_deref(), all, output_format)?,
+        CliAction::AgentRemove { id, output_format } => run_agent_remove(&id, output_format)?,
+        CliAction::DaemonStatus { output_format } => run_agent_daemon_status(output_format)?,
+        CliAction::DaemonStop {
+            any,
+            keep_workers,
+            output_format,
+        } => run_agent_daemon_stop(any, keep_workers, output_format)?,
+        CliAction::AgentWorker { id } => run_agent_worker(&id)?,
         CliAction::Mcp {
             args,
             output_format,
@@ -1171,6 +1234,53 @@ enum CliAction {
     Agents {
         args: Option<String>,
         output_format: CliOutputFormat,
+        model: String,
+        permission_mode: PermissionMode,
+        reasoning_effort: Option<String>,
+        agent: Option<String>,
+    },
+    Background {
+        prompt: Option<String>,
+        exec: Option<String>,
+        name: Option<String>,
+        agent: Option<String>,
+        model: String,
+        output_format: CliOutputFormat,
+        permission_mode: PermissionMode,
+        reasoning_effort: Option<String>,
+    },
+    AgentAttach {
+        id: String,
+        output_format: CliOutputFormat,
+    },
+    AgentLogs {
+        id: String,
+        output_format: CliOutputFormat,
+    },
+    AgentStop {
+        id: String,
+        signal: AgentStopSignal,
+        output_format: CliOutputFormat,
+    },
+    AgentRespawn {
+        id: Option<String>,
+        all: bool,
+        output_format: CliOutputFormat,
+    },
+    AgentRemove {
+        id: String,
+        output_format: CliOutputFormat,
+    },
+    DaemonStatus {
+        output_format: CliOutputFormat,
+    },
+    DaemonStop {
+        any: bool,
+        keep_workers: bool,
+        output_format: CliOutputFormat,
+    },
+    AgentWorker {
+        id: String,
     },
     Mcp {
         args: Option<String>,
@@ -1313,6 +1423,12 @@ enum LocalHelpTopic {
 enum CliOutputFormat {
     Text,
     Json,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentStopSignal {
+    Term,
+    Kill,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1496,6 +1612,11 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
     let mut base_commit: Option<String> = None;
     let mut reasoning_effort: Option<String> = None;
     let mut allow_broad_cwd = false;
+    let mut background = false;
+    let mut background_exec: Option<String> = None;
+    let mut background_name: Option<String> = None;
+    let mut background_agent: Option<String> = None;
+    let mut print_requested = false;
 
     // #755: -p prompt text captured as single token; remaining args continue
     // flag parsing. None until `-p <text>` is seen.
@@ -1594,6 +1715,56 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             }
             "--dangerously-skip-permissions" | "--skip-permissions" => {
                 permission_mode_override = Some(PermissionMode::DangerFullAccess);
+                index += 1;
+            }
+            "--bg" | "--background" => {
+                background = true;
+                index += 1;
+            }
+            "--exec" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "missing_flag_value: missing value for --exec.\nUsage: claw --bg --exec '<command>'".to_string())?;
+                if value.trim().is_empty() {
+                    return Err(
+                        "missing_flag_value: --exec requires a non-empty command.\nUsage: claw --bg --exec '<command>'"
+                            .to_string(),
+                    );
+                }
+                background_exec = Some(value.clone());
+                index += 2;
+            }
+            flag if flag.starts_with("--exec=") => {
+                let value = flag["--exec=".len()..].trim();
+                if value.is_empty() {
+                    return Err(
+                        "missing_flag_value: --exec requires a non-empty command.\nUsage: claw --bg --exec '<command>'"
+                            .to_string(),
+                    );
+                }
+                background_exec = Some(value.to_string());
+                index += 1;
+            }
+            "--name" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "missing_flag_value: missing value for --name.\nUsage: claw --bg --name <name> '<prompt>'".to_string())?;
+                background_name = Some(value.clone());
+                index += 2;
+            }
+            flag if flag.starts_with("--name=") => {
+                background_name = Some(flag["--name=".len()..].to_string());
+                index += 1;
+            }
+            "--agent" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "missing_flag_value: missing value for --agent.\nUsage: claw --bg --agent <name> '<prompt>'".to_string())?;
+                background_agent = Some(value.clone());
+                index += 2;
+            }
+            flag if flag.starts_with("--agent=") => {
+                background_agent = Some(flag["--agent=".len()..].to_string());
                 index += 1;
             }
             "--compact" => {
@@ -1695,6 +1866,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             }
             "--print" => {
                 // Claw Code compat: --print makes output non-interactive
+                print_requested = true;
                 output_format = CliOutputFormat::Text;
                 index += 1;
             }
@@ -1807,6 +1979,57 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
     }
 
     let allowed_tools = normalize_allowed_tools(&allowed_tool_values)?;
+
+    if background_exec.is_some() && !background {
+        return Err(
+            "invalid_flag_value: --exec is only supported with --bg/--background.\nUsage: claw --bg --exec '<command>'"
+                .to_string(),
+        );
+    }
+
+    if background {
+        if print_requested || short_p_prompt.is_some() {
+            return Err(
+                "invalid_flag_value: --bg cannot be combined with -p/--print.\nUsage: claw --bg '<prompt>' or claw --bg --exec '<command>'"
+                    .to_string(),
+            );
+        }
+        if compact {
+            return Err(
+                "invalid_flag_value: --compact is only supported with foreground prompt mode.\nUsage: claw --bg '<prompt>' or claw --compact '<prompt>'"
+                    .to_string(),
+            );
+        }
+        let positional_prompt = rest.join(" ");
+        if background_exec.is_some() && !positional_prompt.trim().is_empty() {
+            return Err(
+                "unexpected_extra_args: --bg --exec does not accept a separate prompt.\nUsage: claw --bg --exec '<command>'"
+                    .to_string(),
+            );
+        }
+        let prompt = if background_exec.is_none() {
+            let prompt = positional_prompt.trim().to_string();
+            if prompt.is_empty() {
+                return Err(
+                    "missing_prompt: --bg requires a prompt unless --exec is used.\nUsage: claw --bg '<prompt>' or claw --bg --exec '<command>'"
+                        .to_string(),
+                );
+            }
+            Some(prompt)
+        } else {
+            None
+        };
+        return Ok(CliAction::Background {
+            prompt,
+            exec: background_exec,
+            name: background_name,
+            agent: background_agent,
+            model: resolve_model_alias_with_config(&model),
+            output_format,
+            permission_mode: permission_mode_override.unwrap_or_else(default_permission_mode),
+            reasoning_effort,
+        });
+    }
 
     // #755: -p consumed exactly one token; dispatch now that all flags are parsed
     if let Some(prompt) = short_p_prompt {
@@ -1947,11 +2170,23 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
     }
 
     match rest[0].as_str() {
+        "__agent-worker" => parse_agent_worker_args(&rest[1..]),
         "dump-manifests" => parse_dump_manifests_args(&rest[1..], output_format),
         "bootstrap-plan" => Ok(CliAction::BootstrapPlan { output_format }),
+        "attach" => parse_agent_id_action("attach", &rest[1..], output_format),
+        "logs" => parse_agent_id_action("logs", &rest[1..], output_format),
+        "stop" => parse_agent_stop_args(&rest[1..], AgentStopSignal::Term, output_format),
+        "kill" => parse_agent_stop_args(&rest[1..], AgentStopSignal::Kill, output_format),
+        "respawn" => parse_agent_respawn_args(&rest[1..], output_format),
+        "rm" | "remove" => parse_agent_id_action("rm", &rest[1..], output_format),
+        "daemon" => parse_agent_daemon_args(&rest[1..], output_format),
         "agents" => Ok(CliAction::Agents {
             args: join_optional_args(&rest[1..]),
             output_format,
+            model: resolve_model_alias_with_config(&model),
+            permission_mode: permission_mode(),
+            reasoning_effort: reasoning_effort.clone(),
+            agent: background_agent.clone(),
         }),
         "mcp" => Ok(CliAction::Mcp {
             args: join_optional_args(&rest[1..]),
@@ -2488,6 +2723,14 @@ fn bare_slash_command_guidance(command_name: &str) -> Option<String> {
         command_name,
         "dump-manifests"
             | "bootstrap-plan"
+            | "attach"
+            | "logs"
+            | "stop"
+            | "kill"
+            | "respawn"
+            | "rm"
+            | "remove"
+            | "daemon"
             | "agents"
             | "mcp"
             | "plugin"
@@ -2547,6 +2790,131 @@ fn parse_acp_args(args: &[String], output_format: CliOutputFormat) -> Result<Cli
         _ => Err(String::from(
             "unsupported_acp_invocation: unsupported ACP invocation. Use `claw acp` or `claw acp serve`.\nACP/Zed editor integration is not implemented yet; `claw acp serve` reports status only.",
         )),
+    }
+}
+
+fn parse_agent_worker_args(args: &[String]) -> Result<CliAction, String> {
+    match args {
+        [id] if !id.trim().is_empty() => Ok(CliAction::AgentWorker { id: id.clone() }),
+        [] => Err("missing_argument: __agent-worker requires a session id".to_string()),
+        _ => {
+            Err("unexpected_extra_args: __agent-worker accepts exactly one session id".to_string())
+        }
+    }
+}
+
+fn parse_agent_id_action(
+    action: &str,
+    args: &[String],
+    output_format: CliOutputFormat,
+) -> Result<CliAction, String> {
+    match args {
+        [id] if !id.trim().is_empty() => match action {
+            "attach" => Ok(CliAction::AgentAttach {
+                id: id.clone(),
+                output_format,
+            }),
+            "logs" => Ok(CliAction::AgentLogs {
+                id: id.clone(),
+                output_format,
+            }),
+            "rm" => Ok(CliAction::AgentRemove {
+                id: id.clone(),
+                output_format,
+            }),
+            _ => unreachable!("unsupported agent id action"),
+        },
+        [] => Err(format!(
+            "missing_argument: {action} requires a background session id.\nUsage: claw {action} <id>"
+        )),
+        _ => Err(format!(
+            "unexpected_extra_args: claw {action} accepts exactly one session id.\nUsage: claw {action} <id>"
+        )),
+    }
+}
+
+fn parse_agent_stop_args(
+    args: &[String],
+    signal: AgentStopSignal,
+    output_format: CliOutputFormat,
+) -> Result<CliAction, String> {
+    match args {
+        [id] if !id.trim().is_empty() => Ok(CliAction::AgentStop {
+            id: id.clone(),
+            signal,
+            output_format,
+        }),
+        [] => Err("missing_argument: stop requires a background session id.\nUsage: claw stop <id> or claw kill <id>".to_string()),
+        _ => Err("unexpected_extra_args: stop/kill accepts exactly one session id.\nUsage: claw stop <id> or claw kill <id>".to_string()),
+    }
+}
+
+fn parse_agent_respawn_args(
+    args: &[String],
+    output_format: CliOutputFormat,
+) -> Result<CliAction, String> {
+    match args {
+        [flag] if flag == "--all" => Ok(CliAction::AgentRespawn {
+            id: None,
+            all: true,
+            output_format,
+        }),
+        [id] if !id.trim().is_empty() => Ok(CliAction::AgentRespawn {
+            id: Some(id.clone()),
+            all: false,
+            output_format,
+        }),
+        [] => Err(
+            "missing_argument: respawn requires a session id or --all.\nUsage: claw respawn <id> or claw respawn --all"
+                .to_string(),
+        ),
+        _ => Err(
+            "unexpected_extra_args: respawn accepts a session id or --all.\nUsage: claw respawn <id> or claw respawn --all"
+                .to_string(),
+        ),
+    }
+}
+
+fn parse_agent_daemon_args(
+    args: &[String],
+    output_format: CliOutputFormat,
+) -> Result<CliAction, String> {
+    match args {
+        [action] if action == "status" => Ok(CliAction::DaemonStatus { output_format }),
+        [action, flags @ ..] if action == "stop" => {
+            let mut any = false;
+            let mut keep_workers = false;
+            for flag in flags {
+                match flag.as_str() {
+                    "--any" => any = true,
+                    "--keep-workers" => keep_workers = true,
+                    other => {
+                        return Err(format!(
+                            "unknown_option: unsupported daemon stop option `{other}`.\nUsage: claw daemon stop --any [--keep-workers]"
+                        ));
+                    }
+                }
+            }
+            if !any {
+                return Err(
+                    "missing_argument: daemon stop requires --any.\nUsage: claw daemon stop --any [--keep-workers]"
+                        .to_string(),
+                );
+            }
+            Ok(CliAction::DaemonStop {
+                any,
+                keep_workers,
+                output_format,
+            })
+        }
+        [] => Err(
+            "missing_argument: daemon requires status or stop.\nUsage: claw daemon status | claw daemon stop --any [--keep-workers]"
+                .to_string(),
+        ),
+        _ => Err(
+            "unknown subcommand: daemon supports status or stop.\nUsage: claw daemon status | claw daemon stop --any [--keep-workers]"
+                .to_string(),
+        ),
     }
 }
 
@@ -2634,6 +3002,10 @@ fn parse_direct_slash_cli_action(
         Ok(Some(SlashCommand::Agents { args })) => Ok(CliAction::Agents {
             args,
             output_format,
+            model,
+            permission_mode: permission_mode.mode,
+            reasoning_effort,
+            agent: None,
         }),
         Ok(Some(SlashCommand::Mcp { action, target })) => Ok(CliAction::Mcp {
             args: match (action, target) {
@@ -4830,7 +5202,7 @@ fn build_rust_resolver_manifest(workspace_dir: &Path) -> Result<Value, Box<dyn s
         })
         .collect::<Vec<_>>();
 
-    let agent_report = handle_agents_slash_command_json(None, workspace_dir)?;
+    let agent_report = handle_agents_slash_command_json(Some("list"), workspace_dir)?;
     let skill_report = handle_skills_slash_command_json(None, workspace_dir)?;
     let agents = agent_report
         .get("agents")
@@ -7088,11 +7460,14 @@ fn run_repl(
     let resolved_model = resolve_repl_model(model)?;
     let mut cli = LiveCli::new(resolved_model, true, allowed_tools, permission_mode)?;
     cli.set_reasoning_effort(reasoning_effort);
-    let mut editor =
-        input::LineEditor::new("> ", cli.repl_completion_candidates().unwrap_or_default());
     println!("{}", cli.startup_banner());
     println!("{}", format_connected_line(&cli.model));
+    run_live_cli_loop(&mut cli)
+}
 
+fn run_live_cli_loop(cli: &mut LiveCli) -> Result<(), Box<dyn std::error::Error>> {
+    let mut editor =
+        input::LineEditor::new("> ", cli.repl_completion_candidates().unwrap_or_default());
     loop {
         editor.set_completions(cli.repl_completion_candidates().unwrap_or_default());
         match editor.read_line()? {
@@ -7282,6 +7657,513 @@ impl Drop for BuiltRuntime {
         let _ = self.shutdown_mcp();
         let _ = self.shutdown_plugins();
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AgentViewPrintRequest<'a> {
+    args: Option<&'a str>,
+    output_format: CliOutputFormat,
+    model: &'a str,
+    permission_mode: PermissionMode,
+    reasoning_effort: Option<&'a str>,
+    agent: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct AgentViewTuiOptions {
+    include_all: bool,
+    cwd: Option<PathBuf>,
+}
+
+#[derive(Debug)]
+struct AgentViewTuiState {
+    options: AgentViewTuiOptions,
+    selected: usize,
+    peek_open: bool,
+    input: String,
+    status: Option<String>,
+    confirm_remove_id: Option<String>,
+}
+
+#[derive(Debug)]
+enum AgentViewTuiExit {
+    Quit,
+    Attach(String),
+}
+
+struct AgentViewTerminalGuard {
+    active: bool,
+}
+
+impl AgentViewTerminalGuard {
+    fn enter() -> Result<Self, Box<dyn std::error::Error>> {
+        enable_raw_mode()?;
+        execute!(io::stdout(), EnterAlternateScreen, Hide)?;
+        Ok(Self { active: true })
+    }
+}
+
+impl Drop for AgentViewTerminalGuard {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = execute!(io::stdout(), Show, LeaveAlternateScreen);
+            let _ = disable_raw_mode();
+        }
+    }
+}
+
+fn should_open_agent_view_tui(args: Option<&str>, output_format: CliOutputFormat) -> bool {
+    if output_format != CliOutputFormat::Text
+        || !io::stdin().is_terminal()
+        || !io::stdout().is_terminal()
+    {
+        return false;
+    }
+    let Some(args) = args.map(str::trim).filter(|value| !value.is_empty()) else {
+        return true;
+    };
+    if args.split_whitespace().any(|part| part == "--json") {
+        return false;
+    }
+    let first = args.split_whitespace().next().unwrap_or_default();
+    first.starts_with("--") && !matches!(first, "--help" | "-h")
+}
+
+fn parse_agent_view_tui_options(args: Option<&str>) -> Result<AgentViewTuiOptions, String> {
+    let mut options = AgentViewTuiOptions::default();
+    let mut parts = args
+        .unwrap_or_default()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .into_iter();
+    while let Some(part) = parts.next() {
+        match part {
+            "--all" => options.include_all = true,
+            "--cwd" => {
+                let Some(value) = parts.next() else {
+                    return Err("missing_flag_value: agents --cwd requires a path".to_string());
+                };
+                options.cwd = Some(PathBuf::from(value));
+            }
+            value if value.starts_with("--cwd=") => {
+                options.cwd = Some(PathBuf::from(&value["--cwd=".len()..]));
+            }
+            "--json" => {}
+            other => {
+                return Err(format!(
+                    "unknown agents option: {other}\nUsage: claw agents [--json] [--all] [--cwd <path>]"
+                ));
+            }
+        }
+    }
+    Ok(options)
+}
+
+fn run_agent_view_tui(
+    request: &AgentViewPrintRequest<'_>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let options = parse_agent_view_tui_options(request.args)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    let supervisor = runtime::AgentSupervisor::from_default_config()?;
+    let mut state = AgentViewTuiState {
+        options,
+        selected: 0,
+        peek_open: false,
+        input: String::new(),
+        status: None,
+        confirm_remove_id: None,
+    };
+    let attach = {
+        let _terminal = AgentViewTerminalGuard::enter()?;
+        run_agent_view_tui_loop(&supervisor, request, &mut state)?
+    };
+    match attach {
+        AgentViewTuiExit::Quit => Ok(()),
+        AgentViewTuiExit::Attach(id) => run_agent_attach(&id, CliOutputFormat::Text),
+    }
+}
+
+fn run_agent_view_tui_loop(
+    supervisor: &runtime::AgentSupervisor,
+    request: &AgentViewPrintRequest<'_>,
+    state: &mut AgentViewTuiState,
+) -> Result<AgentViewTuiExit, Box<dyn std::error::Error>> {
+    let mut stdout = io::stdout();
+    loop {
+        let jobs = load_agent_view_tui_jobs(supervisor, &state.options)?;
+        if state.selected >= jobs.len() {
+            state.selected = jobs.len().saturating_sub(1);
+        }
+        render_agent_view_tui(&mut stdout, state, &jobs)?;
+        if !event::poll(Duration::from_millis(500))? {
+            continue;
+        }
+        let Event::Key(key) = event::read()? else {
+            continue;
+        };
+        if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c')) {
+            return Ok(AgentViewTuiExit::Quit);
+        }
+        if let Some(exit) = handle_agent_view_key(supervisor, request, state, &jobs, key)? {
+            return Ok(exit);
+        }
+    }
+}
+
+fn load_agent_view_tui_jobs(
+    supervisor: &runtime::AgentSupervisor,
+    options: &AgentViewTuiOptions,
+) -> Result<Vec<runtime::AgentJobRecord>, Box<dyn std::error::Error>> {
+    let mut jobs = supervisor.list_jobs(&runtime::AgentListFilter {
+        cwd: options.cwd.clone(),
+        include_all: options.include_all,
+    })?;
+    jobs.sort_by(|left, right| {
+        agent_view_group_rank(left)
+            .cmp(&agent_view_group_rank(right))
+            .then(right.updated_at.cmp(&left.updated_at))
+            .then(left.id.cmp(&right.id))
+    });
+    Ok(jobs)
+}
+
+fn handle_agent_view_key(
+    supervisor: &runtime::AgentSupervisor,
+    request: &AgentViewPrintRequest<'_>,
+    state: &mut AgentViewTuiState,
+    jobs: &[runtime::AgentJobRecord],
+    key: KeyEvent,
+) -> Result<Option<AgentViewTuiExit>, Box<dyn std::error::Error>> {
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') if state.input.is_empty() => {
+            return Ok(Some(AgentViewTuiExit::Quit));
+        }
+        KeyCode::Up if state.input.is_empty() => {
+            state.selected = state.selected.saturating_sub(1);
+            state.confirm_remove_id = None;
+        }
+        KeyCode::Down if state.input.is_empty() => {
+            if !jobs.is_empty() {
+                state.selected = (state.selected + 1).min(jobs.len() - 1);
+            }
+            state.confirm_remove_id = None;
+        }
+        KeyCode::Char(' ') if state.input.is_empty() => {
+            state.peek_open = !state.peek_open;
+            state.confirm_remove_id = None;
+        }
+        KeyCode::Left if state.input.is_empty() => {
+            state.peek_open = false;
+            state.confirm_remove_id = None;
+        }
+        KeyCode::Right | KeyCode::Enter if state.input.trim().is_empty() => {
+            if let Some(job) = jobs.get(state.selected) {
+                return Ok(Some(AgentViewTuiExit::Attach(job.id.clone())));
+            }
+        }
+        KeyCode::Enter => {
+            let prompt = state.input.trim().to_string();
+            if !prompt.is_empty() {
+                let job = start_background_agent_job(BackgroundAgentRequest {
+                    prompt: Some(&prompt),
+                    exec: None,
+                    name: None,
+                    agent: request.agent,
+                    model: request.model,
+                    output_format: request.output_format,
+                    permission_mode: request.permission_mode,
+                    reasoning_effort: request.reasoning_effort,
+                })?;
+                state.status = Some(format!("started background session {}", job.id));
+                state.input.clear();
+                state.selected = 0;
+                state.peek_open = false;
+                state.confirm_remove_id = None;
+            }
+        }
+        KeyCode::Backspace => {
+            state.input.pop();
+            state.confirm_remove_id = None;
+        }
+        KeyCode::Char('s') if state.input.is_empty() => {
+            if let Some(job) = jobs.get(state.selected) {
+                stop_agent_view_job(supervisor, job, AgentStopSignal::Term, state)?;
+            }
+        }
+        KeyCode::Char('k') if state.input.is_empty() => {
+            if let Some(job) = jobs.get(state.selected) {
+                stop_agent_view_job(supervisor, job, AgentStopSignal::Kill, state)?;
+            }
+        }
+        KeyCode::Char('r') if state.input.is_empty() => {
+            if let Some(job) = jobs.get(state.selected) {
+                let queued = supervisor.respawn_job(&job.id)?;
+                let child = spawn_agent_worker(&queued.id, Path::new(&queued.cwd))?;
+                let job = supervisor.set_process(&queued.id, child.id())?;
+                state.status = Some(format!(
+                    "respawned {} with pid {}",
+                    job.id,
+                    job.pid
+                        .map_or_else(|| "<none>".to_string(), |pid| pid.to_string())
+                ));
+                state.peek_open = false;
+                state.confirm_remove_id = None;
+            }
+        }
+        KeyCode::Char('d') if state.input.is_empty() => {
+            if let Some(job) = jobs.get(state.selected) {
+                if state.confirm_remove_id.as_deref() == Some(job.id.as_str()) {
+                    supervisor.remove_job(&job.id)?;
+                    state.status = Some(format!("removed background session {}", job.id));
+                    state.confirm_remove_id = None;
+                    state.peek_open = false;
+                } else {
+                    state.confirm_remove_id = Some(job.id.clone());
+                    state.status = Some(format!("press d again to remove {}", job.id));
+                }
+            }
+        }
+        KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            state.input.push(ch);
+            state.confirm_remove_id = None;
+        }
+        _ => {}
+    }
+    Ok(None)
+}
+
+fn stop_agent_view_job(
+    supervisor: &runtime::AgentSupervisor,
+    job: &runtime::AgentJobRecord,
+    signal: AgentStopSignal,
+    state: &mut AgentViewTuiState,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(pid) = job.pid {
+        let _ = signal_process(pid, signal);
+    }
+    let stopped = supervisor.stop_job(&job.id)?;
+    state.status = Some(format!(
+        "stopped {} with {}",
+        stopped.id,
+        match signal {
+            AgentStopSignal::Term => "TERM",
+            AgentStopSignal::Kill => "KILL",
+        }
+    ));
+    state.peek_open = false;
+    state.confirm_remove_id = None;
+    Ok(())
+}
+
+fn render_agent_view_tui(
+    stdout: &mut io::Stdout,
+    state: &AgentViewTuiState,
+    jobs: &[runtime::AgentJobRecord],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (cols, rows) = terminal::size().unwrap_or((100, 30));
+    let screen = render_agent_view_screen(state, jobs, cols as usize, rows as usize);
+    execute!(stdout, MoveTo(0, 0), Clear(ClearType::All), Print(screen))?;
+    stdout.flush()?;
+    Ok(())
+}
+
+fn render_agent_view_screen(
+    state: &AgentViewTuiState,
+    jobs: &[runtime::AgentJobRecord],
+    width: usize,
+    height: usize,
+) -> String {
+    let width = width.max(40);
+    let height = height.max(12);
+    let mut lines = Vec::new();
+    let summary = summarize_agent_jobs(jobs);
+    lines.push(truncate_chars(
+        &format!(
+            "Claude Code Agent View  count={} working={} needs_input={} completed={}",
+            jobs.len(),
+            summary.working,
+            summary.blocked,
+            summary.completed
+        ),
+        width,
+    ));
+    lines.push(truncate_chars(
+        &format!(
+            "Scope: {}",
+            state.options.cwd.as_ref().map_or_else(
+                || "all projects".to_string(),
+                |path| path.display().to_string()
+            )
+        ),
+        width,
+    ));
+    if let Some(status) = &state.status {
+        lines.push(truncate_chars(&format!("Status: {status}"), width));
+    }
+    lines.push(String::new());
+
+    if jobs.is_empty() {
+        lines
+            .push("No background sessions. Type a prompt and press Enter to dispatch.".to_string());
+    } else {
+        let mut current_group = "";
+        for (index, job) in jobs.iter().enumerate() {
+            let group = agent_view_group_label(job);
+            if group != current_group {
+                if !current_group.is_empty() {
+                    lines.push(String::new());
+                }
+                lines.push(group.to_string());
+                current_group = group;
+            }
+            lines.push(render_agent_view_row(job, index == state.selected, width));
+        }
+    }
+
+    if state.peek_open {
+        lines.push(String::new());
+        lines.push(truncate_chars(&"-".repeat(width), width));
+        if let Some(job) = jobs.get(state.selected) {
+            lines.extend(render_agent_view_peek(job, width));
+        } else {
+            lines.push("Peek: no session selected".to_string());
+        }
+    }
+
+    while lines.len() + 3 < height {
+        lines.push(String::new());
+    }
+    lines.truncate(height.saturating_sub(2));
+    lines.push(truncate_chars(&format!("Dispatch: {}", state.input), width));
+    lines.push(truncate_chars(
+        "Enter dispatch/attach  Space peek  Up/Down select  s stop  k kill  r respawn  d rm  q quit",
+        width,
+    ));
+    lines.join("\n")
+}
+
+#[derive(Default)]
+struct AgentViewSummaryCounts {
+    working: usize,
+    blocked: usize,
+    completed: usize,
+}
+
+fn summarize_agent_jobs(jobs: &[runtime::AgentJobRecord]) -> AgentViewSummaryCounts {
+    let mut summary = AgentViewSummaryCounts::default();
+    for job in jobs {
+        match job.state {
+            runtime::AgentJobState::Working => summary.working += 1,
+            runtime::AgentJobState::Blocked => summary.blocked += 1,
+            runtime::AgentJobState::Done
+            | runtime::AgentJobState::Failed
+            | runtime::AgentJobState::Stopped => summary.completed += 1,
+        }
+    }
+    summary
+}
+
+fn render_agent_view_row(job: &runtime::AgentJobRecord, selected: bool, width: usize) -> String {
+    let selector = if selected { ">" } else { " " };
+    let pid = job
+        .pid
+        .map_or_else(|| ".".to_string(), |pid| format!("*{pid}"));
+    let name = job
+        .name
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(&job.id);
+    let detail = job
+        .waiting_for
+        .as_deref()
+        .or(job.output_tail.as_deref())
+        .or(job.prompt.as_deref())
+        .or(job.command.as_deref())
+        .unwrap_or_default()
+        .replace('\n', " ");
+    truncate_chars(
+        &format!(
+            "{selector} {pid:<9} {name:<22} {:<8} {}",
+            agent_state_label(&job.state),
+            detail
+        ),
+        width,
+    )
+}
+
+fn render_agent_view_peek(job: &runtime::AgentJobRecord, width: usize) -> Vec<String> {
+    let mut lines = vec![
+        truncate_chars(&format!("Peek {}", job.id), width),
+        truncate_chars(
+            &format!("  Name       {}", job.name.as_deref().unwrap_or(&job.id)),
+            width,
+        ),
+        truncate_chars(
+            &format!("  State      {}", agent_state_label(&job.state)),
+            width,
+        ),
+        truncate_chars(&format!("  Cwd        {}", job.cwd), width),
+    ];
+    if let Some(session_id) = &job.session_id {
+        lines.push(truncate_chars(&format!("  Session    {session_id}"), width));
+    }
+    if let Some(prompt) = &job.prompt {
+        lines.push(truncate_chars(&format!("  Prompt     {prompt}"), width));
+    }
+    if let Some(command) = &job.command {
+        lines.push(truncate_chars(&format!("  Command    {command}"), width));
+    }
+    if let Some(output) = &job.output_tail {
+        lines.push("  Output".to_string());
+        lines.extend(
+            output
+                .lines()
+                .rev()
+                .take(8)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .map(|line| truncate_chars(&format!("    {line}"), width)),
+        );
+    } else {
+        lines.push("  Output     <none yet>".to_string());
+    }
+    lines
+}
+
+fn agent_view_group_rank(job: &runtime::AgentJobRecord) -> u8 {
+    match job.state {
+        runtime::AgentJobState::Blocked => 0,
+        runtime::AgentJobState::Working => 1,
+        runtime::AgentJobState::Done => 2,
+        runtime::AgentJobState::Failed => 3,
+        runtime::AgentJobState::Stopped => 4,
+    }
+}
+
+fn agent_view_group_label(job: &runtime::AgentJobRecord) -> &'static str {
+    match job.state {
+        runtime::AgentJobState::Blocked => "Needs input",
+        runtime::AgentJobState::Working => "Working",
+        runtime::AgentJobState::Done => "Completed",
+        runtime::AgentJobState::Failed | runtime::AgentJobState::Stopped => "Stopped or failed",
+    }
+}
+
+fn truncate_chars(value: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let count = value.chars().count();
+    if count <= width {
+        return value.to_string();
+    }
+    if width <= 1 {
+        return value.chars().take(width).collect();
+    }
+    let mut output = value.chars().take(width - 1).collect::<String>();
+    output.push('~');
+    output
 }
 
 #[derive(Debug, Deserialize)]
@@ -7678,6 +8560,7 @@ impl LiveCli {
         let system_prompt = build_system_prompt(&model)?;
         let session_state = new_cli_session()?;
         let session = create_managed_session_handle(&session_state.session_id)?;
+        link_current_agent_job_session(&session);
         let runtime = build_runtime(
             session_state.with_persistence_path(session.path.clone()),
             &session.id,
@@ -8206,7 +9089,14 @@ impl LiveCli {
                 self.handle_plugins_command(action.as_deref(), target.as_deref())?
             }
             SlashCommand::Agents { args } => {
-                if let Err(error) = Self::print_agents(args.as_deref(), CliOutputFormat::Text) {
+                if let Err(error) = Self::print_agents(AgentViewPrintRequest {
+                    args: args.as_deref(),
+                    output_format: CliOutputFormat::Text,
+                    model: &self.model,
+                    permission_mode: self.permission_mode,
+                    reasoning_effort: None,
+                    agent: None,
+                }) {
                     eprintln!("{error}");
                 }
                 false
@@ -8578,15 +9468,23 @@ impl LiveCli {
         Ok(())
     }
 
-    fn print_agents(
-        args: Option<&str>,
-        output_format: CliOutputFormat,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    fn print_agents(request: AgentViewPrintRequest<'_>) -> Result<(), Box<dyn std::error::Error>> {
+        if agent_view_requests_json_array(request.args) {
+            let value = handle_agent_view_json_array(request.args)?;
+            println!("{}", serde_json::to_string_pretty(&value)?);
+            return Ok(());
+        }
+        if should_open_agent_view_tui(request.args, request.output_format) {
+            run_agent_view_tui(&request)?;
+            return Ok(());
+        }
         let cwd = env::current_dir()?;
-        match output_format {
-            CliOutputFormat::Text => println!("{}", handle_agents_slash_command(args, &cwd)?),
+        match request.output_format {
+            CliOutputFormat::Text => {
+                println!("{}", handle_agents_slash_command(request.args, &cwd)?)
+            }
             CliOutputFormat::Json => {
-                let value = handle_agents_slash_command_json(args, &cwd)?;
+                let value = handle_agents_slash_command_json(request.args, &cwd)?;
                 // #789: parity with print_mcp/#788 print_skills — exit 1 when envelope
                 // reports an error so automation can rely on exit code instead of
                 // parsing the JSON status field.
@@ -9172,6 +10070,19 @@ fn create_managed_session_handle(
     })
 }
 
+fn link_current_agent_job_session(session: &SessionHandle) {
+    let Ok(job_id) = env::var("CLAW_AGENT_JOB_ID") else {
+        return;
+    };
+    if job_id.trim().is_empty() {
+        return;
+    }
+    let Ok(supervisor) = runtime::AgentSupervisor::from_default_config() else {
+        return;
+    };
+    let _ = supervisor.set_session_id(&job_id, &session.id);
+}
+
 fn resolve_session_reference(reference: &str) -> Result<SessionHandle, Box<dyn std::error::Error>> {
     let handle = current_session_store()?
         .resolve_reference(reference)
@@ -9468,6 +10379,584 @@ fn render_session_list(active_session_id: &str) -> Result<String, Box<dyn std::e
         ));
     }
     Ok(lines.join("\n"))
+}
+
+struct BackgroundAgentRequest<'a> {
+    prompt: Option<&'a str>,
+    exec: Option<&'a str>,
+    name: Option<&'a str>,
+    agent: Option<&'a str>,
+    model: &'a str,
+    output_format: CliOutputFormat,
+    permission_mode: PermissionMode,
+    reasoning_effort: Option<&'a str>,
+}
+
+fn run_background_agent(
+    request: BackgroundAgentRequest<'_>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let output_format = request.output_format;
+    let job = start_background_agent_job(request)?;
+    print_agent_background_started(&job, output_format)?;
+    Ok(())
+}
+
+fn start_background_agent_job(
+    request: BackgroundAgentRequest<'_>,
+) -> Result<runtime::AgentJobRecord, Box<dyn std::error::Error>> {
+    let supervisor = runtime::AgentSupervisor::from_default_config()?;
+    let cwd = env::current_dir()?;
+    let job = supervisor.create_job(runtime::AgentJobCreate {
+        cwd: cwd.clone(),
+        kind: if request.exec.is_some() {
+            runtime::AgentJobKind::Exec
+        } else {
+            runtime::AgentJobKind::Claude
+        },
+        prompt: request.prompt.map(ToOwned::to_owned),
+        command: request.exec.map(ToOwned::to_owned),
+        name: request.name.map(ToOwned::to_owned),
+        model: (!request.model.trim().is_empty()).then(|| request.model.to_string()),
+        agent: request.agent.map(ToOwned::to_owned),
+        permission_mode: Some(request.permission_mode.as_str().to_string()),
+        reasoning_effort: request.reasoning_effort.map(ToOwned::to_owned),
+    })?;
+    let child = spawn_agent_worker(&job.id, Path::new(&job.cwd))?;
+    let job = supervisor.set_process(&job.id, child.id())?;
+    Ok(job)
+}
+
+fn spawn_agent_worker(
+    id: &str,
+    cwd: &Path,
+) -> Result<std::process::Child, Box<dyn std::error::Error>> {
+    let executable = env::current_exe()?;
+    let mut command = Command::new(executable);
+    command
+        .arg("__agent-worker")
+        .arg(id)
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    Ok(command.spawn()?)
+}
+
+fn print_agent_background_started(
+    job: &runtime::AgentJobRecord,
+    output_format: CliOutputFormat,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match output_format {
+        CliOutputFormat::Text => {
+            println!(
+                "Started background session {id}\n  State            {state}\n  Working dir      {cwd}\n  View             claw agents\n  Attach           claw attach {id}\n  Logs             claw logs {id}\n  Stop             claw stop {id}",
+                id = job.id,
+                state = agent_state_label(&job.state),
+                cwd = job.cwd,
+            );
+        }
+        CliOutputFormat::Json => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "kind": "agents",
+                    "action": "background",
+                    "status": "ok",
+                    "session": agent_job_json(job),
+                    "commands": agent_management_commands(&job.id),
+                }))?
+            );
+        }
+    }
+    Ok(())
+}
+
+fn run_agent_attach(
+    id: &str,
+    output_format: CliOutputFormat,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let supervisor = runtime::AgentSupervisor::from_default_config()?;
+    let job = supervisor.load_job(id)?;
+    if output_format == CliOutputFormat::Text
+        && io::stdin().is_terminal()
+        && io::stdout().is_terminal()
+        && job.session_id.is_some()
+    {
+        run_attached_agent_session(&job)?;
+        return Ok(());
+    }
+    let logs = supervisor.read_logs(id)?;
+    match output_format {
+        CliOutputFormat::Text => {
+            println!(
+                "Attach {id}\n  State            {state}\n  Working dir      {cwd}\n  Session          {session}\n\n{logs}",
+                id = job.id,
+                state = agent_state_label(&job.state),
+                cwd = job.cwd,
+                session = job.session_id.as_deref().unwrap_or("<not recorded>"),
+            );
+        }
+        CliOutputFormat::Json => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "kind": "agents",
+                    "action": "attach",
+                    "status": "ok",
+                    "session": agent_job_json(&job),
+                    "logs": logs,
+                    "interactive": false,
+                }))?
+            );
+        }
+    }
+    Ok(())
+}
+
+struct CurrentDirGuard {
+    previous: PathBuf,
+}
+
+impl CurrentDirGuard {
+    fn enter(path: &Path) -> io::Result<Self> {
+        let previous = env::current_dir()?;
+        env::set_current_dir(path)?;
+        Ok(Self { previous })
+    }
+}
+
+impl Drop for CurrentDirGuard {
+    fn drop(&mut self) {
+        let _ = env::set_current_dir(&self.previous);
+    }
+}
+
+fn run_attached_agent_session(
+    job: &runtime::AgentJobRecord,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let session_id = job.session_id.as_deref().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("background session {} has no resumable session id", job.id),
+        )
+    })?;
+    let _cwd_guard = CurrentDirGuard::enter(Path::new(&job.cwd))?;
+    let (handle, session) = load_session_reference(session_id)?;
+    let model = job
+        .model
+        .clone()
+        .or_else(|| session.model.clone())
+        .unwrap_or_else(|| DEFAULT_MODEL.to_string());
+    let model = resolve_repl_model(model)?;
+    let permission_mode = job
+        .permission_mode
+        .as_deref()
+        .map(parse_permission_mode_arg)
+        .transpose()
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?
+        .unwrap_or_else(default_permission_mode);
+    let system_prompt = build_system_prompt(&model)?;
+    let runtime = build_runtime(
+        session.with_persistence_path(handle.path.clone()),
+        &handle.id,
+        model.clone(),
+        system_prompt.clone(),
+        true,
+        true,
+        None,
+        permission_mode,
+        None,
+    )?;
+    let mut cli = LiveCli {
+        model,
+        allowed_tools: None,
+        permission_mode,
+        system_prompt,
+        runtime,
+        session: SessionHandle {
+            id: handle.id,
+            path: handle.path,
+        },
+        prompt_history: Vec::new(),
+    };
+    println!(
+        "Attached background session {}\n  State            {}\n  Working dir      {}\n  Detach           /exit",
+        job.id,
+        agent_state_label(&job.state),
+        job.cwd
+    );
+    println!("{}", format_connected_line(&cli.model));
+    run_live_cli_loop(&mut cli)
+}
+
+fn run_agent_logs(
+    id: &str,
+    output_format: CliOutputFormat,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let supervisor = runtime::AgentSupervisor::from_default_config()?;
+    let job = supervisor.load_job(id)?;
+    let logs = supervisor.read_logs(id)?;
+    match output_format {
+        CliOutputFormat::Text => print!("{logs}"),
+        CliOutputFormat::Json => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "kind": "agents",
+                    "action": "logs",
+                    "status": "ok",
+                    "session": agent_job_json(&job),
+                    "logs": logs,
+                }))?
+            );
+        }
+    }
+    Ok(())
+}
+
+fn run_agent_stop(
+    id: &str,
+    signal: AgentStopSignal,
+    output_format: CliOutputFormat,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let supervisor = runtime::AgentSupervisor::from_default_config()?;
+    let before = supervisor.load_job(id)?;
+    if let Some(pid) = before.pid {
+        signal_process(pid, signal)?;
+    }
+    let job = supervisor.stop_job(id)?;
+    match output_format {
+        CliOutputFormat::Text => {
+            println!(
+                "Stopped background session {id}\n  Signal           {signal}\n  Previous pid     {pid}",
+                id = job.id,
+                signal = match signal {
+                    AgentStopSignal::Term => "TERM",
+                    AgentStopSignal::Kill => "KILL",
+                },
+                pid = before
+                    .pid
+                    .map(|pid| pid.to_string())
+                    .unwrap_or_else(|| "<none>".to_string()),
+            );
+        }
+        CliOutputFormat::Json => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "kind": "agents",
+                    "action": "stop",
+                    "status": "ok",
+                    "signal": match signal {
+                        AgentStopSignal::Term => "term",
+                        AgentStopSignal::Kill => "kill",
+                    },
+                    "session": agent_job_json(&job),
+                }))?
+            );
+        }
+    }
+    Ok(())
+}
+
+fn run_agent_respawn(
+    id: Option<&str>,
+    all: bool,
+    output_format: CliOutputFormat,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let supervisor = runtime::AgentSupervisor::from_default_config()?;
+    let jobs = if all {
+        supervisor
+            .list_jobs(&runtime::AgentListFilter {
+                cwd: None,
+                include_all: true,
+            })?
+            .into_iter()
+            .filter(|job| {
+                !matches!(
+                    job.state,
+                    runtime::AgentJobState::Working | runtime::AgentJobState::Blocked
+                ) || job.pid.is_none()
+            })
+            .collect::<Vec<_>>()
+    } else {
+        vec![supervisor.load_job(id.expect("id required when all=false"))?]
+    };
+
+    let mut respawned = Vec::new();
+    for job in jobs {
+        if matches!(
+            job.state,
+            runtime::AgentJobState::Working | runtime::AgentJobState::Blocked
+        ) && job.pid.is_some()
+        {
+            continue;
+        }
+        let queued = supervisor.respawn_job(&job.id)?;
+        let child = spawn_agent_worker(&queued.id, Path::new(&queued.cwd))?;
+        respawned.push(supervisor.set_process(&queued.id, child.id())?);
+    }
+
+    match output_format {
+        CliOutputFormat::Text => {
+            println!("Respawned {} background session(s)", respawned.len());
+            for job in &respawned {
+                println!(
+                    "  {}  state={} pid={}",
+                    job.id,
+                    agent_state_label(&job.state),
+                    job.pid
+                        .map_or_else(|| "<none>".to_string(), |pid| pid.to_string())
+                );
+            }
+        }
+        CliOutputFormat::Json => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "kind": "agents",
+                    "action": "respawn",
+                    "status": "ok",
+                    "count": respawned.len(),
+                    "sessions": respawned.iter().map(agent_job_json).collect::<Vec<_>>(),
+                }))?
+            );
+        }
+    }
+    Ok(())
+}
+
+fn run_agent_remove(
+    id: &str,
+    output_format: CliOutputFormat,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let supervisor = runtime::AgentSupervisor::from_default_config()?;
+    supervisor.remove_job(id)?;
+    match output_format {
+        CliOutputFormat::Text => println!("Removed background session {id}"),
+        CliOutputFormat::Json => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "kind": "agents",
+                    "action": "rm",
+                    "status": "ok",
+                    "removed": id,
+                }))?
+            );
+        }
+    }
+    Ok(())
+}
+
+fn run_agent_daemon_status(
+    output_format: CliOutputFormat,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let supervisor = runtime::AgentSupervisor::from_default_config()?;
+    let status = supervisor.daemon_status(VERSION)?;
+    match output_format {
+        CliOutputFormat::Text => {
+            println!(
+                "Agent supervisor\n  Reachable        {}\n  Version          {}\n  Config           {}\n  Roster           {}\n  Log              {}\n  Live sessions    {}\n  Workers          {}",
+                status.reachable,
+                status.version,
+                status.config_dir,
+                status.roster_path,
+                status.log_path,
+                status.live_sessions,
+                status.worker_count,
+            );
+        }
+        CliOutputFormat::Json => {
+            let mut value = serde_json::to_value(&status)?;
+            if let Some(object) = value.as_object_mut() {
+                object.insert("kind".to_string(), json!("agents"));
+                object.insert("action".to_string(), json!("daemon_status"));
+                object.insert("status".to_string(), json!("ok"));
+            }
+            println!("{}", serde_json::to_string_pretty(&value)?);
+        }
+    }
+    Ok(())
+}
+
+fn run_agent_daemon_stop(
+    any: bool,
+    keep_workers: bool,
+    output_format: CliOutputFormat,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let supervisor = runtime::AgentSupervisor::from_default_config()?;
+    let mut stopped = Vec::new();
+    if any && !keep_workers {
+        for job in supervisor.list_jobs(&runtime::AgentListFilter {
+            cwd: None,
+            include_all: false,
+        })? {
+            if let Some(pid) = job.pid {
+                let _ = signal_process(pid, AgentStopSignal::Term);
+            }
+            stopped.push(supervisor.stop_job(&job.id)?);
+        }
+    }
+    match output_format {
+        CliOutputFormat::Text => {
+            println!(
+                "Stopped agent supervisor\n  Keep workers     {}\n  Sessions stopped {}",
+                keep_workers,
+                stopped.len()
+            );
+        }
+        CliOutputFormat::Json => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "kind": "agents",
+                    "action": "daemon_stop",
+                    "status": "ok",
+                    "keep_workers": keep_workers,
+                    "stopped_count": stopped.len(),
+                    "sessions": stopped.iter().map(agent_job_json).collect::<Vec<_>>(),
+                }))?
+            );
+        }
+    }
+    Ok(())
+}
+
+fn run_agent_worker(id: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let supervisor = runtime::AgentSupervisor::from_default_config()?;
+    let job = supervisor.load_job(id)?;
+    let output = match job.kind {
+        runtime::AgentJobKind::Exec => run_agent_exec_worker(&job)?,
+        runtime::AgentJobKind::Claude | runtime::AgentJobKind::Interactive => {
+            run_agent_prompt_worker(&job)?
+        }
+    };
+    supervisor.append_log(id, &output.text)?;
+    supervisor.finish_job(id, output.exit_code, Some(&output.text))?;
+    Ok(())
+}
+
+struct AgentWorkerOutput {
+    exit_code: i32,
+    text: String,
+}
+
+fn run_agent_exec_worker(
+    job: &runtime::AgentJobRecord,
+) -> Result<AgentWorkerOutput, Box<dyn std::error::Error>> {
+    let command = job.command.as_deref().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "agent exec job missing command",
+        )
+    })?;
+    let output = Command::new("sh")
+        .arg("-c")
+        .arg(command)
+        .current_dir(&job.cwd)
+        .output()?;
+    Ok(command_output_to_worker_output(output))
+}
+
+fn run_agent_prompt_worker(
+    job: &runtime::AgentJobRecord,
+) -> Result<AgentWorkerOutput, Box<dyn std::error::Error>> {
+    let prompt = job.prompt.as_deref().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "agent prompt job missing prompt",
+        )
+    })?;
+    let executable = env::current_exe()?;
+    let mut command = Command::new(executable);
+    if let Some(model) = &job.model {
+        command.arg("--model").arg(model);
+    }
+    if let Some(permission_mode) = &job.permission_mode {
+        command.arg("--permission-mode").arg(permission_mode);
+    }
+    if let Some(reasoning_effort) = &job.reasoning_effort {
+        command.arg("--reasoning-effort").arg(reasoning_effort);
+    }
+    command
+        .arg("prompt")
+        .arg(prompt)
+        .current_dir(&job.cwd)
+        .env("CLAW_AGENT_JOB_ID", &job.id);
+    let output = command.output()?;
+    Ok(command_output_to_worker_output(output))
+}
+
+fn command_output_to_worker_output(output: std::process::Output) -> AgentWorkerOutput {
+    let mut text = String::new();
+    text.push_str(&String::from_utf8_lossy(&output.stdout));
+    text.push_str(&String::from_utf8_lossy(&output.stderr));
+    AgentWorkerOutput {
+        exit_code: output.status.code().unwrap_or(1),
+        text,
+    }
+}
+
+fn signal_process(pid: u32, signal: AgentStopSignal) -> Result<(), Box<dyn std::error::Error>> {
+    let signal_arg = match signal {
+        AgentStopSignal::Term => "-TERM",
+        AgentStopSignal::Kill => "-KILL",
+    };
+    let status = Command::new("kill")
+        .arg(signal_arg)
+        .arg(pid.to_string())
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("failed to signal process {pid} with {signal_arg}").into())
+    }
+}
+
+fn agent_management_commands(id: &str) -> Value {
+    json!({
+        "view": "claw agents",
+        "attach": format!("claw attach {id}"),
+        "logs": format!("claw logs {id}"),
+        "stop": format!("claw stop {id}"),
+        "kill": format!("claw kill {id}"),
+        "respawn": format!("claw respawn {id}"),
+        "remove": format!("claw rm {id}"),
+    })
+}
+
+fn agent_job_json(job: &runtime::AgentJobRecord) -> Value {
+    serde_json::to_value(job).unwrap_or_else(|_| json!({ "id": job.id }))
+}
+
+fn agent_state_label(state: &runtime::AgentJobState) -> &'static str {
+    match state {
+        runtime::AgentJobState::Working => "working",
+        runtime::AgentJobState::Blocked => "blocked",
+        runtime::AgentJobState::Done => "done",
+        runtime::AgentJobState::Failed => "failed",
+        runtime::AgentJobState::Stopped => "stopped",
+    }
+}
+
+fn agent_view_requests_json_array(args: Option<&str>) -> bool {
+    let Some(args) = args else {
+        return false;
+    };
+    let mut saw_json = false;
+    for token in args.split_whitespace() {
+        if matches!(
+            token,
+            "list" | "show" | "info" | "describe" | "create" | "help"
+        ) {
+            return false;
+        }
+        if token == "--json" {
+            saw_json = true;
+        }
+    }
+    saw_json
 }
 
 /// #449: credentials-free session list that works without API keys.
@@ -14257,7 +15746,11 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     )?;
     writeln!(out, "  claw dump-manifests [--manifests-dir PATH]")?;
     writeln!(out, "  claw bootstrap-plan")?;
-    writeln!(out, "  claw agents")?;
+    writeln!(out, "  claw agents [--json] [--all] [--cwd PATH]")?;
+    writeln!(out, "  claw --bg \"prompt\"")?;
+    writeln!(out, "  claw --bg --exec \"command\"")?;
+    writeln!(out, "  claw attach|logs|stop|kill|respawn|rm <agent-id>")?;
+    writeln!(out, "  claw daemon status")?;
     writeln!(out, "  claw mcp")?;
     writeln!(out, "  claw skills")?;
     writeln!(out, "  claw system-prompt [--cwd PATH] [--date YYYY-MM-DD]")?;
@@ -14295,6 +15788,18 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(
         out,
         "  --compact                  Strip tool call details; print only the final assistant text (text mode only; useful for piping)"
+    )?;
+    writeln!(
+        out,
+        "  --bg, --background         Start a Claude Code background session"
+    )?;
+    writeln!(
+        out,
+        "  --exec COMMAND             With --bg, run a background shell command"
+    )?;
+    writeln!(
+        out,
+        "  --name NAME, --agent NAME   Name a background session or request a configured agent"
     )?;
     writeln!(
         out,
@@ -14357,7 +15862,9 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
         out,
         "  claw --resume {LATEST_SESSION_REFERENCE} /status /diff /export notes.txt"
     )?;
-    writeln!(out, "  claw agents")?;
+    writeln!(out, "  claw agents --json --all")?;
+    writeln!(out, "  claw --bg \"fix the parser regression\"")?;
+    writeln!(out, "  claw logs <agent-id>")?;
     writeln!(out, "  claw mcp show my-server")?;
     writeln!(out, "  claw /skills")?;
     writeln!(out, "  claw doctor")?;
@@ -14419,22 +15926,23 @@ mod tests {
         format_pr_report, format_resume_report, format_status_report, format_tool_call_start,
         format_tool_result, format_ultraplan_report, format_unknown_slash_command,
         format_unknown_slash_command_message, format_user_visible_api_error,
-        merge_prompt_with_stdin, normalize_permission_mode, parse_args, parse_export_args,
-        parse_git_status_branch, parse_git_status_metadata_for, parse_git_workspace_summary,
-        parse_history_count, permission_policy, print_help_to, push_output_block,
-        render_config_report, render_diff_report, render_diff_report_for, render_help_topic,
-        render_help_topic_json, render_memory_report, render_prompt_history_report,
-        render_repl_help, render_resume_usage, render_session_list, render_session_markdown,
-        resolve_model_alias, resolve_model_alias_with_config, resolve_repl_model,
-        resolve_session_reference, response_to_events, resume_supported_slash_commands,
-        run_resume_command, short_tool_id, slash_command_completion_candidates_with_sessions,
-        split_error_hint, status_context, status_json_value, summarize_tool_payload_for_markdown,
-        try_resolve_bare_skill_prompt, validate_no_args, write_mcp_server_fixture, CliAction,
-        CliOutputFormat, CliToolExecutor, GitOperation, GitWorkspaceSummary,
-        InternalPromptProgressEvent, InternalPromptProgressState, LiveCli, LocalHelpTopic,
-        PermissionModeProvenance, PromptHistoryEntry, SessionLifecycleKind,
-        SessionLifecycleSummary, SlashCommand, StatusUsage, TmuxPaneSnapshot, DEFAULT_MODEL,
-        LATEST_SESSION_REFERENCE, STUB_COMMANDS,
+        link_current_agent_job_session, merge_prompt_with_stdin, normalize_permission_mode,
+        parse_args, parse_export_args, parse_git_status_branch, parse_git_status_metadata_for,
+        parse_git_workspace_summary, parse_history_count, permission_policy, print_help_to,
+        push_output_block, render_agent_view_screen, render_config_report, render_diff_report,
+        render_diff_report_for, render_help_topic, render_help_topic_json, render_memory_report,
+        render_prompt_history_report, render_repl_help, render_resume_usage, render_session_list,
+        render_session_markdown, resolve_model_alias, resolve_model_alias_with_config,
+        resolve_repl_model, resolve_session_reference, response_to_events,
+        resume_supported_slash_commands, run_resume_command, short_tool_id,
+        slash_command_completion_candidates_with_sessions, split_error_hint, status_context,
+        status_json_value, summarize_tool_payload_for_markdown, try_resolve_bare_skill_prompt,
+        validate_no_args, write_mcp_server_fixture, AgentStopSignal, AgentViewTuiOptions,
+        AgentViewTuiState, CliAction, CliOutputFormat, CliToolExecutor, GitOperation,
+        GitWorkspaceSummary, InternalPromptProgressEvent, InternalPromptProgressState, LiveCli,
+        LocalHelpTopic, PermissionModeProvenance, PromptHistoryEntry, SessionHandle,
+        SessionLifecycleKind, SessionLifecycleSummary, SlashCommand, StatusUsage, TmuxPaneSnapshot,
+        DEFAULT_MODEL, LATEST_SESSION_REFERENCE, STUB_COMMANDS,
     };
     use api::{ApiError, MessageResponse, OutputContentBlock, Usage};
     use plugins::{
@@ -15467,7 +16975,11 @@ mod tests {
             parse_args(&["agents".to_string()]).expect("agents should parse"),
             CliAction::Agents {
                 args: None,
-                output_format: CliOutputFormat::Text
+                output_format: CliOutputFormat::Text,
+                model: DEFAULT_MODEL.to_string(),
+                permission_mode: crate::default_permission_mode(),
+                reasoning_effort: None,
+                agent: None,
             }
         );
         assert_eq!(
@@ -15509,6 +17021,26 @@ mod tests {
             CliAction::Agents {
                 args: Some("--help".to_string()),
                 output_format: CliOutputFormat::Text,
+                model: DEFAULT_MODEL.to_string(),
+                permission_mode: crate::default_permission_mode(),
+                reasoning_effort: None,
+                agent: None,
+            }
+        );
+        assert_eq!(
+            parse_args(&[
+                "agents".to_string(),
+                "--json".to_string(),
+                "--all".to_string()
+            ])
+            .expect("agents --json --all should parse"),
+            CliAction::Agents {
+                args: Some("--json --all".to_string()),
+                output_format: CliOutputFormat::Text,
+                model: DEFAULT_MODEL.to_string(),
+                permission_mode: crate::default_permission_mode(),
+                reasoning_effort: None,
+                agent: None,
             }
         );
         // #145: `plugins` must parse as CliAction::Plugins (not fall through
@@ -15729,6 +17261,225 @@ mod tests {
             }
             other => panic!("expected CliAction::Status, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_agent_view_background_and_lifecycle_commands() {
+        let _guard = env_lock();
+        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+
+        match parse_args(&[
+            "--bg".to_string(),
+            "--name".to_string(),
+            "parser-fix".to_string(),
+            "--agent".to_string(),
+            "Explore".to_string(),
+            "--reasoning-effort".to_string(),
+            "medium".to_string(),
+            "fix parser".to_string(),
+        ])
+        .expect("--bg prompt should parse")
+        {
+            CliAction::Background {
+                prompt,
+                exec,
+                name,
+                agent,
+                reasoning_effort,
+                ..
+            } => {
+                assert_eq!(prompt.as_deref(), Some("fix parser"));
+                assert_eq!(exec, None);
+                assert_eq!(name.as_deref(), Some("parser-fix"));
+                assert_eq!(agent.as_deref(), Some("Explore"));
+                assert_eq!(reasoning_effort.as_deref(), Some("medium"));
+            }
+            other => panic!("expected background prompt action, got {other:?}"),
+        }
+
+        match parse_args(&[
+            "--background".to_string(),
+            "--exec".to_string(),
+            "cargo test -p runtime".to_string(),
+        ])
+        .expect("--bg --exec should parse")
+        {
+            CliAction::Background { prompt, exec, .. } => {
+                assert_eq!(prompt, None);
+                assert_eq!(exec.as_deref(), Some("cargo test -p runtime"));
+            }
+            other => panic!("expected background exec action, got {other:?}"),
+        }
+
+        assert!(
+            parse_args(&["--bg".to_string(), "-p".to_string(), "hi".to_string()])
+                .expect_err("--bg -p should reject")
+                .contains("--bg cannot be combined")
+        );
+        assert!(
+            parse_args(&["--bg".to_string(), "--print".to_string(), "hi".to_string()])
+                .expect_err("--bg --print should reject")
+                .contains("--bg cannot be combined")
+        );
+
+        assert_eq!(
+            parse_args(&["attach".to_string(), "abc123".to_string()]).expect("attach"),
+            CliAction::AgentAttach {
+                id: "abc123".to_string(),
+                output_format: CliOutputFormat::Text,
+            }
+        );
+        assert_eq!(
+            parse_args(&["logs".to_string(), "abc123".to_string()]).expect("logs"),
+            CliAction::AgentLogs {
+                id: "abc123".to_string(),
+                output_format: CliOutputFormat::Text,
+            }
+        );
+        assert_eq!(
+            parse_args(&["stop".to_string(), "abc123".to_string()]).expect("stop"),
+            CliAction::AgentStop {
+                id: "abc123".to_string(),
+                signal: AgentStopSignal::Term,
+                output_format: CliOutputFormat::Text,
+            }
+        );
+        assert_eq!(
+            parse_args(&["kill".to_string(), "abc123".to_string()]).expect("kill"),
+            CliAction::AgentStop {
+                id: "abc123".to_string(),
+                signal: AgentStopSignal::Kill,
+                output_format: CliOutputFormat::Text,
+            }
+        );
+        assert_eq!(
+            parse_args(&["respawn".to_string(), "--all".to_string()]).expect("respawn"),
+            CliAction::AgentRespawn {
+                id: None,
+                all: true,
+                output_format: CliOutputFormat::Text,
+            }
+        );
+        assert_eq!(
+            parse_args(&["rm".to_string(), "abc123".to_string()]).expect("rm"),
+            CliAction::AgentRemove {
+                id: "abc123".to_string(),
+                output_format: CliOutputFormat::Text,
+            }
+        );
+        assert_eq!(
+            parse_args(&["daemon".to_string(), "status".to_string()]).expect("daemon status"),
+            CliAction::DaemonStatus {
+                output_format: CliOutputFormat::Text,
+            }
+        );
+        assert_eq!(
+            parse_args(&[
+                "daemon".to_string(),
+                "stop".to_string(),
+                "--any".to_string(),
+                "--keep-workers".to_string(),
+            ])
+            .expect("daemon stop"),
+            CliAction::DaemonStop {
+                any: true,
+                keep_workers: true,
+                output_format: CliOutputFormat::Text,
+            }
+        );
+    }
+
+    #[test]
+    fn agent_view_tui_screen_groups_sessions_and_shows_peek() {
+        let state = AgentViewTuiState {
+            options: AgentViewTuiOptions {
+                include_all: true,
+                cwd: Some(PathBuf::from("/tmp/project")),
+            },
+            selected: 0,
+            peek_open: true,
+            input: "write tests".to_string(),
+            status: Some("started background session abc123".to_string()),
+            confirm_remove_id: None,
+        };
+        let job = runtime::AgentJobRecord {
+            id: "abc123".to_string(),
+            kind: runtime::AgentJobKind::Claude,
+            cwd: "/tmp/project".to_string(),
+            started_at: "100".to_string(),
+            updated_at: "120".to_string(),
+            state: runtime::AgentJobState::Working,
+            pid: Some(42),
+            status: Some("running".to_string()),
+            waiting_for: None,
+            session_id: Some("session-abc".to_string()),
+            name: Some("parser fix".to_string()),
+            prompt: Some("fix parser".to_string()),
+            command: None,
+            model: Some(DEFAULT_MODEL.to_string()),
+            agent: Some("Explore".to_string()),
+            permission_mode: Some("manual".to_string()),
+            reasoning_effort: Some("medium".to_string()),
+            output_tail: Some("latest output".to_string()),
+            exit_code: None,
+            stopped_at: None,
+            completed_at: None,
+            extra: std::collections::BTreeMap::new(),
+        };
+
+        let screen = render_agent_view_screen(&state, &[job], 100, 24);
+
+        assert!(screen.contains("Claude Code Agent View"));
+        assert!(screen.contains("Working"));
+        assert!(screen.contains("> *42"));
+        assert!(screen.contains("Peek abc123"));
+        assert!(screen.contains("Session    session-abc"));
+        assert!(screen.contains("Dispatch: write tests"));
+    }
+
+    #[test]
+    fn agent_worker_session_id_links_back_to_supervisor_job() {
+        let _guard = env_lock();
+        let root = temp_dir();
+        let config = root.join("claude-config");
+        let workspace = root.join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace should exist");
+        let supervisor = runtime::AgentSupervisor::from_config_dir(&config);
+        let job = supervisor
+            .create_job(runtime::AgentJobCreate {
+                cwd: workspace,
+                kind: runtime::AgentJobKind::Claude,
+                prompt: Some("fix parser".to_string()),
+                command: None,
+                name: Some("parser".to_string()),
+                model: Some(DEFAULT_MODEL.to_string()),
+                agent: None,
+                permission_mode: Some("manual".to_string()),
+                reasoning_effort: None,
+            })
+            .expect("job should create");
+        let previous_config = std::env::var("CLAUDE_CONFIG_DIR").ok();
+        let previous_job = std::env::var("CLAW_AGENT_JOB_ID").ok();
+        std::env::set_var("CLAUDE_CONFIG_DIR", &config);
+        std::env::set_var("CLAW_AGENT_JOB_ID", &job.id);
+
+        link_current_agent_job_session(&SessionHandle {
+            id: "session-linked".to_string(),
+            path: root.join("session-linked.jsonl"),
+        });
+
+        let linked = supervisor.load_job(&job.id).expect("job should load");
+        assert_eq!(linked.session_id.as_deref(), Some("session-linked"));
+
+        match previous_config {
+            Some(value) => std::env::set_var("CLAUDE_CONFIG_DIR", value),
+            None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
+        }
+        match previous_job {
+            Some(value) => std::env::set_var("CLAW_AGENT_JOB_ID", value),
+            None => std::env::remove_var("CLAW_AGENT_JOB_ID"),
+        }
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -16500,7 +18251,9 @@ mod tests {
         );
         // #774: agents now uses \n-delimited format — update test string to match real emission
         assert_eq!(
-            classify_error_kind("unknown agents subcommand: bogus.\nSupported: list, show, help"),
+            classify_error_kind(
+                "unknown agents subcommand: bogus.\nSupported: list, show, create, views, help"
+            ),
             "unknown_agents_subcommand"
         );
         assert_eq!(
@@ -16953,7 +18706,11 @@ mod tests {
             parse_args(&["/agents".to_string()]).expect("/agents should parse"),
             CliAction::Agents {
                 args: None,
-                output_format: CliOutputFormat::Text
+                output_format: CliOutputFormat::Text,
+                model: DEFAULT_MODEL.to_string(),
+                permission_mode: crate::default_permission_mode(),
+                reasoning_effort: None,
+                agent: None,
             }
         );
         assert_eq!(

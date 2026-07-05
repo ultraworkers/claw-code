@@ -240,7 +240,7 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "agents",
         aliases: &[],
-        summary: "List, show, or create configured agents",
+        summary: "Open agent view or manage configured agents",
         argument_hint: Some("[list|show <name>|create <name>|help]"),
         resume_supported: true,
     },
@@ -1833,7 +1833,8 @@ fn parse_list_or_help_args(
                 || value.starts_with("show ")
                 || value.starts_with("info ")
                 || value.starts_with("describe ")
-                || value.starts_with("create ") =>
+                || value.starts_with("create ")
+                || value.starts_with("--") =>
         {
             Ok(args)
         }
@@ -2228,6 +2229,40 @@ pub(crate) struct AgentCollection {
     pub(crate) invalid_agents: Vec<InvalidAgentConfig>,
 }
 
+#[derive(Debug, Clone)]
+struct AgentViewCollection {
+    config_dir: PathBuf,
+    store_dir: PathBuf,
+    views: Vec<AgentRunView>,
+}
+
+#[derive(Debug, Clone)]
+struct AgentRunView {
+    agent_id: String,
+    name: String,
+    description: String,
+    subagent_type: Option<String>,
+    model: Option<String>,
+    status: String,
+    state: String,
+    output_file: Option<String>,
+    manifest_file: String,
+    started_at: Option<String>,
+    completed_at: Option<String>,
+    pid: Option<u32>,
+    waiting_for: Option<String>,
+    session_id: Option<String>,
+    cwd: String,
+    kind: String,
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct AgentViewOptions {
+    include_all: bool,
+    cwd: Option<PathBuf>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SkillSummary {
     name: String,
@@ -2482,7 +2517,17 @@ pub fn handle_agents_slash_command(args: Option<&str>, cwd: &Path) -> std::io::R
     }
 
     match normalize_optional_args(args) {
-        None | Some("list") => {
+        None => {
+            let options = parse_agent_view_options(None)?;
+            let collection = load_agent_views(&options)?;
+            Ok(render_agent_views_report(&collection, None))
+        }
+        Some(view_args) if view_args.starts_with("--") => {
+            let options = parse_agent_view_options(Some(view_args))?;
+            let collection = load_agent_views(&options)?;
+            Ok(render_agent_views_report(&collection, None))
+        }
+        Some("list") => {
             let roots = discover_definition_roots(cwd, "agents");
             let agents = load_agents_from_roots(&roots)?;
             Ok(render_agents_report(&agents))
@@ -2583,7 +2628,17 @@ pub fn handle_agents_slash_command_json(args: Option<&str>, cwd: &Path) -> std::
     }
 
     match normalize_optional_args(args) {
-        None | Some("list") => {
+        None => {
+            let options = parse_agent_view_options(None)?;
+            let collection = load_agent_views(&options)?;
+            Ok(render_agent_views_report_json(cwd, &collection, None))
+        }
+        Some(view_args) if view_args.starts_with("--") => {
+            let options = parse_agent_view_options(Some(view_args))?;
+            let collection = load_agent_views(&options)?;
+            Ok(render_agent_views_report_json(cwd, &collection, None))
+        }
+        Some("list") => {
             let roots = discover_definition_roots(cwd, "agents");
             let collection = load_agents_from_roots_with_invalids(&roots)?;
             Ok(render_agents_report_json(cwd, &collection))
@@ -2710,6 +2765,18 @@ pub fn handle_agents_slash_command_json(args: Option<&str>, cwd: &Path) -> std::
             format!("unknown agents subcommand: {args}.\nSupported: list, show, create, help"),
         )),
     }
+}
+
+pub fn handle_agent_view_json_array(args: Option<&str>) -> std::io::Result<Value> {
+    let options = parse_agent_view_options(args)?;
+    let collection = load_agent_views(&options)?;
+    Ok(Value::Array(
+        collection
+            .views
+            .iter()
+            .map(agent_view_json)
+            .collect::<Vec<_>>(),
+    ))
 }
 
 pub fn handle_mcp_slash_command(
@@ -3936,6 +4003,99 @@ fn create_agent(name: &str, cwd: &Path) -> std::io::Result<CreatedAgent> {
     Ok(CreatedAgent { name, path })
 }
 
+fn parse_agent_view_options(args: Option<&str>) -> std::io::Result<AgentViewOptions> {
+    let mut options = AgentViewOptions::default();
+    let mut parts = args
+        .unwrap_or_default()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .into_iter();
+    while let Some(part) = parts.next() {
+        match part {
+            "--json" => {}
+            "--all" => options.include_all = true,
+            "--cwd" => {
+                let Some(value) = parts.next() else {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "missing_flag_value: agents --cwd requires a path",
+                    ));
+                };
+                options.cwd = Some(PathBuf::from(value));
+            }
+            value if value.starts_with("--cwd=") => {
+                options.cwd = Some(PathBuf::from(&value["--cwd=".len()..]));
+            }
+            other => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "unknown agents option: {other}\nUsage: claw agents [--json] [--all] [--cwd <path>]"
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(options)
+}
+
+fn load_agent_views(options: &AgentViewOptions) -> std::io::Result<AgentViewCollection> {
+    let supervisor = runtime::AgentSupervisor::from_default_config()
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    let filter = runtime::AgentListFilter {
+        cwd: options.cwd.clone(),
+        include_all: options.include_all,
+    };
+    let jobs = supervisor
+        .list_jobs(&filter)
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    let views = jobs
+        .into_iter()
+        .map(|job| AgentRunView {
+            agent_id: job.id.clone(),
+            name: job.name.clone().unwrap_or_else(|| job.id.clone()),
+            description: job
+                .prompt
+                .clone()
+                .or(job.command.clone())
+                .unwrap_or_default(),
+            subagent_type: job.agent.clone(),
+            model: job.model.clone(),
+            status: job.status.unwrap_or_else(|| "unknown".to_string()),
+            state: serde_json::to_value(&job.state)
+                .ok()
+                .and_then(|value| value.as_str().map(ToString::to_string))
+                .unwrap_or_else(|| "unknown".to_string()),
+            output_file: Some(
+                supervisor
+                    .job_dir(&job.id)
+                    .join("output.log")
+                    .display()
+                    .to_string(),
+            ),
+            manifest_file: supervisor.state_path(&job.id).display().to_string(),
+            started_at: Some(job.started_at),
+            completed_at: job.completed_at,
+            pid: job.pid,
+            waiting_for: job.waiting_for,
+            session_id: job.session_id,
+            cwd: job.cwd,
+            kind: serde_json::to_value(&job.kind)
+                .ok()
+                .and_then(|value| value.as_str().map(ToString::to_string))
+                .unwrap_or_else(|| "unknown".to_string()),
+            error: job
+                .output_tail
+                .filter(|_| matches!(job.state, runtime::AgentJobState::Failed)),
+        })
+        .collect::<Vec<_>>();
+    Ok(AgentViewCollection {
+        config_dir: supervisor.config_dir().to_path_buf(),
+        store_dir: supervisor.jobs_dir(),
+        views,
+    })
+}
+
 fn default_skill_install_root() -> std::io::Result<PathBuf> {
     if let Ok(claw_config_home) = env::var("CLAW_CONFIG_HOME") {
         return Ok(PathBuf::from(claw_config_home).join("skills"));
@@ -4510,6 +4670,170 @@ fn render_agents_report_json_with_action(
     })
 }
 
+fn render_agent_views_report(collection: &AgentViewCollection, target: Option<&str>) -> String {
+    let views = filtered_agent_views(collection, target);
+    let summary = agent_view_summary(&views);
+    let mut lines = vec![
+        "Agent view".to_string(),
+        format!("  Config           {}", collection.config_dir.display()),
+        format!("  Jobs             {}", collection.store_dir.display()),
+        format!("  Count            {}", views.len()),
+        format!(
+            "  Summary          working={} blocked={} done={} failed={} stopped={}",
+            summary.working, summary.blocked, summary.done, summary.failed, summary.stopped
+        ),
+    ];
+    if views.is_empty() {
+        lines.push("  Message          No background sessions found.".to_string());
+        return lines.join("\n");
+    }
+
+    lines.push(String::new());
+    for view in views {
+        lines.push(format!(
+            "  {}  {}  state={} status={}",
+            view.agent_id, view.name, view.state, view.status
+        ));
+        lines.push(format!("    cwd            {}", view.cwd));
+        lines.push(format!("    kind           {}", view.kind));
+        lines.push(format!(
+            "    started        {}",
+            view.started_at.as_deref().unwrap_or("<unknown>")
+        ));
+        if !view.description.is_empty() {
+            lines.push(format!("    prompt         {}", view.description));
+        }
+        if let Some(model) = &view.model {
+            lines.push(format!("    model          {model}"));
+        }
+        if let Some(agent) = &view.subagent_type {
+            lines.push(format!("    agent          {agent}"));
+        }
+        if let Some(pid) = view.pid {
+            lines.push(format!("    pid            {pid}"));
+        }
+        if let Some(waiting_for) = &view.waiting_for {
+            lines.push(format!("    waiting_for    {waiting_for}"));
+        }
+        if let Some(output_file) = &view.output_file {
+            lines.push(format!("    output         {output_file}"));
+        }
+        lines.push(format!("    state          {}", view.manifest_file));
+        if let Some(error) = &view.error {
+            lines.push(format!("    error          {error}"));
+        }
+    }
+
+    lines.join("\n")
+}
+
+fn render_agent_views_report_json(
+    cwd: &Path,
+    collection: &AgentViewCollection,
+    target: Option<&str>,
+) -> Value {
+    let views = filtered_agent_views(collection, target);
+    let summary = agent_view_summary(&views);
+    json!({
+        "kind": "agents",
+        "action": "view",
+        "status": "ok",
+        "working_directory": cwd.display().to_string(),
+        "config_dir": collection.config_dir.display().to_string(),
+        "store": collection.store_dir.display().to_string(),
+        "requested": target,
+        "count": views.len(),
+        "summary": {
+            "total": views.len(),
+            "working": summary.working,
+            "blocked": summary.blocked,
+            "done": summary.done,
+            "failed": summary.failed,
+            "stopped": summary.stopped,
+            "unknown": summary.unknown,
+        },
+        "sessions": views.iter().map(|view| agent_view_json(view)).collect::<Vec<_>>(),
+    })
+}
+
+fn filtered_agent_views<'a>(
+    collection: &'a AgentViewCollection,
+    target: Option<&str>,
+) -> Vec<&'a AgentRunView> {
+    collection
+        .views
+        .iter()
+        .filter(|view| target.is_none_or(|target| view.agent_id == target || view.name == target))
+        .collect()
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct AgentViewSummary {
+    working: usize,
+    blocked: usize,
+    done: usize,
+    failed: usize,
+    stopped: usize,
+    unknown: usize,
+}
+
+fn agent_view_summary(views: &[&AgentRunView]) -> AgentViewSummary {
+    let mut summary = AgentViewSummary::default();
+    for view in views {
+        match view.state.as_str() {
+            "working" => summary.working += 1,
+            "blocked" => summary.blocked += 1,
+            "done" => summary.done += 1,
+            "failed" => summary.failed += 1,
+            "stopped" => summary.stopped += 1,
+            _ => summary.unknown += 1,
+        }
+    }
+    summary
+}
+
+fn agent_view_json(view: &AgentRunView) -> Value {
+    let mut value = serde_json::Map::new();
+    value.insert("cwd".to_string(), json!(&view.cwd));
+    value.insert("kind".to_string(), json!(&view.kind));
+    value.insert("startedAt".to_string(), json!(&view.started_at));
+    value.insert("id".to_string(), json!(&view.agent_id));
+    value.insert("state".to_string(), json!(&view.state));
+    if let Some(pid) = view.pid {
+        value.insert("pid".to_string(), json!(pid));
+    }
+    if !view.status.is_empty() {
+        value.insert("status".to_string(), json!(&view.status));
+    }
+    if let Some(waiting_for) = &view.waiting_for {
+        value.insert("waitingFor".to_string(), json!(waiting_for));
+    }
+    if let Some(session_id) = &view.session_id {
+        value.insert("sessionId".to_string(), json!(session_id));
+    }
+    value.insert("name".to_string(), json!(&view.name));
+    if !view.description.is_empty() {
+        value.insert("prompt".to_string(), json!(&view.description));
+    }
+    if let Some(model) = &view.model {
+        value.insert("model".to_string(), json!(model));
+    }
+    if let Some(agent) = &view.subagent_type {
+        value.insert("agent".to_string(), json!(agent));
+    }
+    if let Some(completed_at) = &view.completed_at {
+        value.insert("completedAt".to_string(), json!(completed_at));
+    }
+    if let Some(output_file) = &view.output_file {
+        value.insert("outputFile".to_string(), json!(output_file));
+    }
+    value.insert("stateFile".to_string(), json!(&view.manifest_file));
+    if let Some(error) = &view.error {
+        value.insert("error".to_string(), json!(error));
+    }
+    Value::Object(value)
+}
+
 fn render_agents_missing_argument_json(action: &str, argument: &str) -> Value {
     json!({
         "kind": "agents",
@@ -4992,11 +5316,16 @@ fn help_path_from_args(args: &str) -> Option<Vec<&str>> {
 fn render_agents_usage(unexpected: Option<&str>) -> String {
     let mut lines = vec![
         "Agents".to_string(),
-        "  Usage            /agents [list|show <name>|create <name>|help]".to_string(),
-        "  Direct CLI       claw agents [list|show <name>|create <name>|help]".to_string(),
+        "  Usage            /agents [--all] [--cwd <path>] [list|show <name>|create <name>|help]"
+            .to_string(),
+        "  Direct CLI       claw agents [--json] [--all] [--cwd <path>] [list|show <name>|create <name>|help]"
+            .to_string(),
+        "  Background       claw --bg \"<prompt>\"; claw --bg --exec '<command>'".to_string(),
+        "  Lifecycle        claw attach|logs|stop|kill|respawn|rm <id>; claw daemon status".to_string(),
         "  Format           TOML files (.toml); create scaffolds .claw/agents/<name>.toml"
             .to_string(),
         "  Sources          .claw/agents, ~/.claw/agents, $CLAW_CONFIG_HOME/agents".to_string(),
+        "  Session state    $CLAUDE_CONFIG_DIR/jobs/<id>/state.json or ~/.claude/jobs/<id>/state.json".to_string(),
     ];
     if let Some(args) = unexpected {
         lines.push(format!("  Unexpected       {args}"));
@@ -5011,10 +5340,11 @@ fn render_agents_usage_json(unexpected: Option<&str>) -> Value {
         "ok": unexpected.is_none(),
         "status": if unexpected.is_some() { "error" } else { "ok" },
         "usage": {
-            "slash_command": "/agents [list|show <name>|create <name>|help]",
-            "direct_cli": "claw agents [list|show <name>|create <name>|help]",
+            "slash_command": "/agents [--all] [--cwd <path>] [list|show <name>|create <name>|help]",
+            "direct_cli": "claw agents [--json] [--all] [--cwd <path>] [list|show <name>|create <name>|help]",
             "format": "toml",
             "create": "claw agents create <name>",
+            "background": "claw --bg \"<prompt>\"",
             "sources": [".claw/agents", "~/.claw/agents", "~/.codex/agents", "$CLAW_CONFIG_HOME/agents"],
         },
         "unexpected": unexpected,
@@ -5955,6 +6285,14 @@ mod tests {
         ));
         assert!(agents_error
             .contains("  Usage            /agents [list|show <name>|create <name>|help]"));
+
+        assert!(SlashCommand::parse("/agents views").is_err());
+        assert_eq!(
+            SlashCommand::parse("/agents --all").expect("agents options should parse"),
+            Some(SlashCommand::Agents {
+                args: Some("--all".to_string())
+            })
+        );
     }
 
     #[test]
@@ -6535,7 +6873,7 @@ mod tests {
         assert_eq!(help["status"], "ok");
         assert_eq!(
             help["usage"]["direct_cli"],
-            "claw agents [list|show <name>|create <name>|help]"
+            "claw agents [--json] [--all] [--cwd <path>] [list|show <name>|create <name>|help]"
         );
 
         // `show <name>` is now valid. Known agent returns ok with matching entry.
@@ -6566,6 +6904,82 @@ mod tests {
         let _ = fs::remove_dir_all(config_home);
         let _ = fs::remove_dir_all(codex_home);
         let _ = fs::remove_dir_all(claude_config);
+    }
+
+    #[test]
+    fn renders_background_agent_view_from_supervisor_state() {
+        let _guard = env_guard();
+        let workspace = temp_dir("agent-view-workspace");
+        let config = temp_dir("agent-view-config");
+        fs::create_dir_all(&workspace).expect("workspace");
+        let canonical_workspace = fs::canonicalize(&workspace).expect("canonical workspace");
+        let original_claude_config_dir = std::env::var_os("CLAUDE_CONFIG_DIR");
+        std::env::set_var("CLAUDE_CONFIG_DIR", &config);
+        let supervisor = runtime::AgentSupervisor::from_config_dir(&config);
+        let old = supervisor
+            .create_job(runtime::AgentJobCreate {
+                cwd: workspace.clone(),
+                kind: runtime::AgentJobKind::Exec,
+                prompt: None,
+                command: Some("echo older".to_string()),
+                name: Some("shell-old".to_string()),
+                model: None,
+                agent: None,
+                permission_mode: None,
+                reasoning_effort: None,
+            })
+            .expect("old job");
+        supervisor
+            .finish_job(&old.id, 0, Some("older\n"))
+            .expect("finish old job");
+        let new = supervisor
+            .create_job(runtime::AgentJobCreate {
+                cwd: workspace.clone(),
+                kind: runtime::AgentJobKind::Claude,
+                prompt: Some("fix parser".to_string()),
+                command: None,
+                name: Some("explore-new".to_string()),
+                model: Some("anthropic/claude-sonnet-5".to_string()),
+                agent: Some("Explore".to_string()),
+                permission_mode: Some("manual".to_string()),
+                reasoning_effort: Some("medium".to_string()),
+            })
+            .expect("new job");
+        supervisor.set_process(&new.id, 4242).expect("pid");
+
+        let report = handle_agents_slash_command_json(Some("--all"), &workspace)
+            .expect("agent view should render");
+        assert_eq!(report["kind"], "agents");
+        assert_eq!(report["action"], "view");
+        assert_eq!(report["status"], "ok");
+        assert_eq!(report["count"], 2);
+        assert_eq!(report["summary"]["working"], 1);
+        assert_eq!(report["summary"]["done"], 1);
+        let sessions = report["sessions"].as_array().expect("sessions");
+        let new_session = sessions
+            .iter()
+            .find(|session| session["id"] == new.id)
+            .expect("new session");
+        assert_eq!(new_session["state"], "working");
+        assert_eq!(
+            new_session["cwd"],
+            canonical_workspace.display().to_string()
+        );
+        assert_eq!(new_session["kind"], "claude");
+        let raw = super::handle_agent_view_json_array(Some("--json")).expect("raw array");
+        let raw = raw.as_array().expect("array");
+        assert_eq!(raw.len(), 1);
+        assert_eq!(raw[0]["id"], new.id);
+
+        let text = super::handle_agents_slash_command(Some("--all"), &workspace)
+            .expect("agent view text should render");
+        assert!(text.contains("Agent view"));
+        assert!(text.contains("explore-new"));
+        assert!(text.contains("state=working"));
+
+        restore_env_var("CLAUDE_CONFIG_DIR", original_claude_config_dir);
+        let _ = fs::remove_dir_all(workspace);
+        let _ = fs::remove_dir_all(config);
     }
 
     #[test]
@@ -6712,11 +7126,12 @@ mod tests {
 
         let agents_help =
             super::handle_agents_slash_command(Some("help"), &cwd).expect("agents help");
-        assert!(
-            agents_help.contains("Usage            /agents [list|show <name>|create <name>|help]")
-        );
-        assert!(agents_help
-            .contains("Direct CLI       claw agents [list|show <name>|create <name>|help]"));
+        assert!(agents_help.contains(
+            "Usage            /agents [--all] [--cwd <path>] [list|show <name>|create <name>|help]"
+        ));
+        assert!(agents_help.contains(
+            "Direct CLI       claw agents [--json] [--all] [--cwd <path>] [list|show <name>|create <name>|help]"
+        ));
         assert!(agents_help.contains(
             "Format           TOML files (.toml); create scaffolds .claw/agents/<name>.toml"
         ));

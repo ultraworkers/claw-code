@@ -513,6 +513,10 @@ cd rust
 ./target/debug/claw status
 ./target/debug/claw sandbox
 ./target/debug/claw agents
+./target/debug/claw agents --json --all
+./target/debug/claw --bg "fix the parser regression"
+./target/debug/claw --bg --exec "cargo test -p runtime"
+./target/debug/claw logs <agent-id>
 ./target/debug/claw agents create my-agent
 ./target/debug/claw mcp
 ./target/debug/claw skills
@@ -549,6 +553,24 @@ avoid pasting API keys into chat.
 ./target/debug/claw agents create release-checker
 ./target/debug/claw agents list
 ```
+
+Agent view follows the Claude Code background-session layout. `CLAUDE_CONFIG_DIR` overrides the default `~/.claude`; sessions are stored under `jobs/<id>/state.json`, per-session temp files under `jobs/<id>/tmp/`, and the supervisor roster under `daemon/roster.json`.
+
+```bash
+./target/debug/claw agents
+./target/debug/claw agents --json --all
+./target/debug/claw agents --cwd "$PWD"
+./target/debug/claw --bg "fix the parser regression"
+./target/debug/claw --bg --exec "cargo test -p runtime"
+./target/debug/claw attach <agent-id>
+./target/debug/claw logs <agent-id>
+./target/debug/claw stop <agent-id>
+./target/debug/claw respawn <agent-id>
+./target/debug/claw rm <agent-id>
+./target/debug/claw daemon status
+```
+
+When stdout/stdin are attached to a terminal, `claw agents` opens a full-screen view. Type a prompt and press Enter to dispatch a new background session, use Up/Down to select rows, Space to peek at captured output, Enter or Right to attach, `s`/`k` to stop or kill, `r` to respawn, and `d` twice to remove a row. In JSON mode or non-TTY automation it keeps the structured list behavior.
 
 ## Session management
 

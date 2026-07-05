@@ -891,7 +891,7 @@ fn inventory_commands_emit_structured_json_when_requested() {
 
     let agents = assert_json_command_with_env(
         &root,
-        &["--output-format", "json", "agents"],
+        &["--output-format", "json", "agents", "list"],
         &[
             ("HOME", isolated_home.to_str().expect("utf8 home")),
             (
@@ -1156,7 +1156,7 @@ fn agents_command_emits_structured_agent_entries_when_requested() {
 
     let parsed = assert_json_command_with_env(
         &workspace,
-        &["--output-format", "json", "agents"],
+        &["--output-format", "json", "agents", "list"],
         &[
             ("HOME", home.to_str().expect("utf8 home")),
             (
@@ -1184,6 +1184,99 @@ fn agents_command_emits_structured_agent_entries_when_requested() {
     assert_eq!(parsed["agents"][2]["name"], "planner");
     assert_eq!(parsed["agents"][2]["active"], false);
     assert_eq!(parsed["agents"][2]["shadowed_by"]["id"], "project_claw");
+}
+
+#[test]
+fn agent_view_background_exec_writes_official_state_and_json_array() {
+    let root = unique_temp_dir("agent-view-bg-exec");
+    let config = root.join("claude-config");
+    fs::create_dir_all(&root).expect("root should exist");
+    fs::create_dir_all(&config).expect("config should exist");
+    let canonical_root = fs::canonicalize(&root).expect("canonical root");
+    let envs = [("CLAUDE_CONFIG_DIR", config.to_str().expect("utf8 config"))];
+
+    let created = run_claw(
+        &root,
+        &[
+            "--output-format",
+            "json",
+            "--bg",
+            "--name",
+            "smoke-exec",
+            "--exec",
+            "printf agent-hi",
+        ],
+        &envs,
+    );
+    assert!(
+        created.status.success(),
+        "stdout:\n{}\n\nstderr:\n{}",
+        String::from_utf8_lossy(&created.stdout),
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let created_json = parse_json_stdout(&created, "agent background create");
+    assert_eq!(created_json["kind"], "agents");
+    assert_eq!(created_json["action"], "background");
+    let id = created_json["session"]["id"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+
+    let state_path = config.join("jobs").join(&id).join("state.json");
+    let tmp_dir = config.join("jobs").join(&id).join("tmp");
+    let roster_path = config.join("daemon").join("roster.json");
+    assert!(tmp_dir.is_dir(), "official tmp dir should exist");
+    assert!(roster_path.is_file(), "official roster should exist");
+
+    let mut state = Value::Null;
+    for _ in 0..100 {
+        if state_path.is_file() {
+            let contents = fs::read_to_string(&state_path).expect("state should read");
+            state = serde_json::from_str(&contents).expect("state json");
+            if state["state"] == "done" {
+                break;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert_eq!(state["id"], id);
+    assert_eq!(state["kind"], "exec");
+    assert_eq!(state["cwd"], canonical_root.display().to_string());
+    assert_eq!(state["name"], "smoke-exec");
+    assert_eq!(state["state"], "done");
+    assert_eq!(state["exitCode"], 0);
+
+    let raw_agents = run_claw(&root, &["agents", "--json", "--all"], &envs);
+    assert!(raw_agents.status.success());
+    let raw = parse_json_stdout(&raw_agents, "agents --json --all");
+    let sessions = raw
+        .as_array()
+        .expect("official agents --json returns array");
+    let session = sessions
+        .iter()
+        .find(|session| session["id"] == id)
+        .expect("background session listed");
+    assert_eq!(session["cwd"], canonical_root.display().to_string());
+    assert_eq!(session["kind"], "exec");
+    assert_eq!(session["state"], "done");
+    assert!(session["startedAt"].is_string());
+
+    let logs =
+        assert_json_command_with_env(&root, &["--output-format", "json", "logs", &id], &envs);
+    assert_eq!(logs["kind"], "agents");
+    assert_eq!(logs["action"], "logs");
+    assert!(logs["logs"]
+        .as_str()
+        .expect("logs text")
+        .contains("agent-hi"));
+
+    let daemon = assert_json_command_with_env(
+        &root,
+        &["--output-format", "json", "daemon", "status"],
+        &envs,
+    );
+    assert_eq!(daemon["configDir"], config.display().to_string());
+    assert_eq!(daemon["rosterPath"], roster_path.display().to_string());
 }
 
 #[test]
@@ -1220,8 +1313,11 @@ fn agents_and_skills_inventory_share_source_schema_702() {
             isolated_codex.to_str().expect("utf8 codex home"),
         ),
     ];
-    let agents =
-        assert_json_command_with_env(&workspace, &["--output-format", "json", "agents"], &envs);
+    let agents = assert_json_command_with_env(
+        &workspace,
+        &["--output-format", "json", "agents", "list"],
+        &envs,
+    );
     let skills =
         assert_json_command_with_env(&workspace, &["--output-format", "json", "skills"], &envs);
 
@@ -1660,6 +1756,7 @@ fn resumed_inventory_commands_emit_structured_json_when_requested() {
             "--resume",
             session_path.to_str().expect("utf8 session path"),
             "/agents",
+            "list",
         ],
         &[
             (

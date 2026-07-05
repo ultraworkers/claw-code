@@ -4,6 +4,7 @@
 //! MCP plumbing, tool-facing file operations, and the core conversation loop
 //! that drives interactive and one-shot turns.
 
+pub mod agent_supervisor;
 mod approval_tokens;
 mod bash;
 pub mod bash_validation;
@@ -53,6 +54,11 @@ mod trust_resolver;
 mod usage;
 pub mod worker_boot;
 
+pub use agent_supervisor::{
+    default_claude_config_dir, AgentDaemonStatus, AgentJobCreate, AgentJobKind, AgentJobRecord,
+    AgentJobState, AgentListFilter, AgentRoster, AgentRosterEntry, AgentSupervisor,
+    AgentSupervisorError,
+};
 pub use approval_tokens::{
     ApprovalDelegationHop, ApprovalScope, ApprovalTokenAudit, ApprovalTokenError,
     ApprovalTokenGrant, ApprovalTokenLedger, ApprovalTokenStatus,

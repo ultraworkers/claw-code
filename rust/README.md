@@ -181,7 +181,7 @@ The REPL now exposes a much broader surface than the original minimal shell:
 
 Notable claw-first surfaces now available directly in slash form:
 - `/skills [list|show <name>|install <path>|uninstall <name>|help]`
-- `/agents [list|show <name>|create <name>|help]`
+- `/agents [--all] [--cwd <path>] [list|show <name>|create <name>|help]`
 - `/mcp [list|show <server>|help]`
 - `/doctor`
 - `/plugin [list|install <path>|enable <name>|disable <name>|uninstall <id>|update <id>]`
