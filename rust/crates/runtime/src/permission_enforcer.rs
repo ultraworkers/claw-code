@@ -39,7 +39,10 @@ impl PermissionEnforcer {
     pub fn check(&self, tool_name: &str, input: &str) -> EnforcementResult {
         // When the active mode is Prompt, defer to the caller's interactive
         // prompt flow rather than hard-denying (the enforcer has no prompter).
-        if self.policy.active_mode() == PermissionMode::Prompt {
+        if matches!(
+            self.policy.active_mode(),
+            PermissionMode::Manual | PermissionMode::Prompt
+        ) {
             return EnforcementResult::Allowed;
         }
 
@@ -75,14 +78,17 @@ impl PermissionEnforcer {
     ) -> EnforcementResult {
         // When the active mode is Prompt, defer to the caller's interactive
         // prompt flow rather than hard-denying.
-        if self.policy.active_mode() == PermissionMode::Prompt {
+        if matches!(
+            self.policy.active_mode(),
+            PermissionMode::Manual | PermissionMode::Prompt
+        ) {
             return EnforcementResult::Allowed;
         }
 
         let active_mode = self.policy.active_mode();
 
-        // Check if active mode meets the dynamically determined required mode
-        if active_mode >= required_mode {
+        // Check if active mode meets the dynamically determined required mode.
+        if active_mode.grants(required_mode) {
             return EnforcementResult::Allowed;
         }
 
@@ -114,6 +120,12 @@ impl PermissionEnforcer {
                 active_mode: mode.as_str().to_owned(),
                 required_mode: PermissionMode::WorkspaceWrite.as_str().to_owned(),
                 reason: format!("file writes are not allowed in '{}' mode", mode.as_str()),
+            },
+            PermissionMode::Manual => EnforcementResult::Denied {
+                tool: "write_file".to_owned(),
+                active_mode: mode.as_str().to_owned(),
+                required_mode: PermissionMode::WorkspaceWrite.as_str().to_owned(),
+                reason: "file write requires confirmation in manual mode".to_owned(),
             },
             PermissionMode::WorkspaceWrite => {
                 if is_within_workspace(path, workspace_root) {
@@ -161,11 +173,11 @@ impl PermissionEnforcer {
                     }
                 }
             }
-            PermissionMode::Prompt => EnforcementResult::Denied {
+            PermissionMode::Manual | PermissionMode::Prompt => EnforcementResult::Denied {
                 tool: "bash".to_owned(),
                 active_mode: mode.as_str().to_owned(),
                 required_mode: PermissionMode::DangerFullAccess.as_str().to_owned(),
-                reason: "bash requires confirmation in prompt mode".to_owned(),
+                reason: format!("bash requires confirmation in {} mode", mode.as_str()),
             },
             // WorkspaceWrite, Allow, DangerFullAccess: permit bash
             _ => EnforcementResult::Allowed,

@@ -147,6 +147,15 @@ const MODEL_REGISTRY: &[(&str, ProviderMetadata)] = &[
         },
     ),
     (
+        "fable",
+        ProviderMetadata {
+            provider: ProviderKind::Anthropic,
+            auth_env: "ANTHROPIC_API_KEY",
+            base_url_env: "ANTHROPIC_BASE_URL",
+            default_base_url: anthropic::DEFAULT_BASE_URL,
+        },
+    ),
+    (
         "grok",
         ProviderMetadata {
             provider: ProviderKind::Xai,
@@ -211,9 +220,10 @@ pub fn resolve_model_alias(model: &str) -> String {
         .find_map(|(alias, metadata)| {
             (*alias == lower).then_some(match metadata.provider {
                 ProviderKind::Anthropic => match *alias {
-                    "opus" => "claude-opus-4-7",
-                    "sonnet" => "claude-sonnet-4-6",
-                    "haiku" => "claude-haiku-4-5-20251213",
+                    "opus" => "claude-opus-4-8",
+                    "sonnet" => "claude-sonnet-5",
+                    "haiku" => "claude-haiku-4-5-20251001",
+                    "fable" => "claude-fable-5",
                     _ => trimmed,
                 },
                 ProviderKind::Xai => match *alias {
@@ -634,11 +644,15 @@ pub fn model_token_limit(model: &str) -> Option<ModelTokenLimit> {
     let canonical = resolve_model_alias(model);
     let base_model = canonical.rsplit('/').next().unwrap_or(canonical.as_str());
     match base_model {
-        "claude-opus-4-7" | "claude-opus-4-6" => Some(ModelTokenLimit {
-            max_output_tokens: 32_000,
-            context_window_tokens: 200_000,
+        "claude-opus-4-8" | "claude-opus-4-7" | "claude-opus-4-6" => Some(ModelTokenLimit {
+            max_output_tokens: 128_000,
+            context_window_tokens: 1_000_000,
         }),
-        "claude-sonnet-4-6" | "claude-haiku-4-5-20251213" => Some(ModelTokenLimit {
+        "claude-sonnet-5" | "claude-fable-5" | "claude-sonnet-4-6" => Some(ModelTokenLimit {
+            max_output_tokens: 128_000,
+            context_window_tokens: 1_000_000,
+        }),
+        "claude-haiku-4-5-20251001" | "claude-haiku-4-5-20251213" => Some(ModelTokenLimit {
             max_output_tokens: 64_000,
             context_window_tokens: 200_000,
         }),
@@ -1222,7 +1236,7 @@ mod tests {
             model_token_limit("claude-sonnet-4-6")
                 .expect("claude-sonnet-4-6 should be registered")
                 .context_window_tokens,
-            200_000
+            1_000_000
         );
         assert_eq!(
             model_token_limit("grok-mini")
@@ -1252,7 +1266,7 @@ mod tests {
             messages: vec![InputMessage {
                 role: "user".to_string(),
                 content: vec![InputContentBlock::Text {
-                    text: "x".repeat(600_000),
+                    text: "x".repeat(3_900_000),
                 }],
             }],
             system: Some("Keep the answer short.".to_string()),
@@ -1281,10 +1295,10 @@ mod tests {
                 context_window_tokens,
             } => {
                 assert_eq!(model, "claude-sonnet-4-6");
-                assert!(estimated_input_tokens > 136_000);
+                assert!(estimated_input_tokens > 900_000);
                 assert_eq!(requested_output_tokens, 64_000);
                 assert!(estimated_total_tokens > context_window_tokens);
-                assert_eq!(context_window_tokens, 200_000);
+                assert_eq!(context_window_tokens, 1_000_000);
             }
             other => panic!("expected context-window preflight failure, got {other:?}"),
         }

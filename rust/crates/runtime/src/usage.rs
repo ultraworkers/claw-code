@@ -66,12 +66,28 @@ pub fn pricing_for_model(model: &str) -> Option<ModelPricing> {
             cache_read_cost_per_million: 0.1,
         });
     }
+    if normalized.contains("fable") {
+        return Some(ModelPricing {
+            input_cost_per_million: 15.0,
+            output_cost_per_million: 75.0,
+            cache_creation_cost_per_million: 18.75,
+            cache_read_cost_per_million: 1.5,
+        });
+    }
     if normalized.contains("opus") {
         return Some(ModelPricing {
             input_cost_per_million: 15.0,
             output_cost_per_million: 75.0,
             cache_creation_cost_per_million: 18.75,
             cache_read_cost_per_million: 1.5,
+        });
+    }
+    if normalized.contains("sonnet-5") {
+        return Some(ModelPricing {
+            input_cost_per_million: 2.0,
+            output_cost_per_million: 10.0,
+            cache_creation_cost_per_million: 2.5,
+            cache_read_cost_per_million: 0.2,
         });
     }
     if normalized.contains("sonnet") {
@@ -304,6 +320,8 @@ mod tests {
                 cache_creation_input_tokens: 1,
                 cache_read_input_tokens: 0,
             }),
+            incomplete: false,
+            incomplete_reason: None,
         }];
 
         let tracker = UsageTracker::from_session(&session);

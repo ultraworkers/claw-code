@@ -209,17 +209,19 @@ Global workspace override flags: `--cwd PATH`, `-C PATH`, and `--directory PATH`
 
 `--output-format` accepts `text` or `json` case-insensitively and normalizes to the canonical lowercase modes. `CLAW_OUTPUT_FORMAT=json` sets the default output format for scripts, while an explicit `--output-format` flag takes precedence. Repeating the flag emits a stderr warning and JSON status envelopes expose `format_source`, `format_raw`, and `format_overridden` so composed flag arrays are auditable; invalid values return typed `invalid_output_format` JSON with `value` and `expected:["text","json"]`.
 
-Supported permission modes (default: `workspace-write`):
+Supported permission modes (default: `manual`):
 
 - `read-only` allows inspection-only local tools such as file reads, glob/grep searches, local skills, and status-style reporting. It does not allow workspace mutation, network-fetch/search tools, or arbitrary command execution.
-- `workspace-write` is the safe default. It allows reads plus direct file-editing tools inside the current workspace, including write/edit/notebook/config/plan-mode updates, while still gating network-fetch/search tools, arbitrary shell execution, subagent launches, REPL subprocesses, and other full-access tools behind an explicit escalation.
+- `manual` is the default. It allows read-only tools automatically and requires confirmation before file writes, shell execution, network tools, subagent launches, REPL subprocesses, or other tools that mutate state or cross trust boundaries.
+- `workspace-write` allows reads plus direct file-editing tools inside the current workspace, including write/edit/notebook/config/plan-mode updates, while still gating network-fetch/search tools, arbitrary shell execution, subagent launches, REPL subprocesses, and other full-access tools behind an explicit escalation.
 - `danger-full-access` allows every registered tool requirement, including arbitrary command execution, web fetch/search, subagent launches, subprocess REPLs, and unrestricted tool access. Select it only with an explicit `--permission-mode danger-full-access`, `--dangerously-skip-permissions`, `--skip-permissions`, env, or config opt-in.
 
 Model aliases currently supported by the CLI:
 
-- `opus` → `claude-opus-4-7`
-- `sonnet` → `claude-sonnet-4-6`
-- `haiku` → `claude-haiku-4-5-20251213`
+- `opus` -> `claude-opus-4-8`
+- `sonnet` -> `claude-sonnet-5`
+- `haiku` -> `claude-haiku-4-5-20251001`
+- `fable` -> `claude-fable-5`
 
 ## Authentication
 
@@ -290,7 +292,7 @@ export ANTHROPIC_BASE_URL="http://127.0.0.1:8080"
 export ANTHROPIC_AUTH_TOKEN="local-dev-token"
 
 cd rust
-./target/debug/claw --model "claude-sonnet-4-6" prompt "reply with the word ready"
+./target/debug/claw --model "claude-sonnet-5" prompt "reply with the word ready"
 ```
 
 ### OpenAI-compatible endpoint
@@ -375,9 +377,10 @@ These are the models registered in the built-in alias table with known token lim
 
 | Alias | Resolved model name | Provider | Max output tokens | Context window |
 |---|---|---|---|---|
-| `opus` | `claude-opus-4-7` | Anthropic | 32 000 | 200 000 |
-| `sonnet` | `claude-sonnet-4-6` | Anthropic | 64 000 | 200 000 |
-| `haiku` | `claude-haiku-4-5-20251213` | Anthropic | 64 000 | 200 000 |
+| `opus` | `claude-opus-4-8` | Anthropic | 128 000 | 1 000 000 |
+| `sonnet` | `claude-sonnet-5` | Anthropic | 128 000 | 1 000 000 |
+| `haiku` | `claude-haiku-4-5-20251001` | Anthropic | 64 000 | 200 000 |
+| `fable` | `claude-fable-5` | Anthropic | 128 000 | 1 000 000 |
 | `grok` / `grok-3` | `grok-3` | xAI | 64 000 | 131 072 |
 | `grok-mini` / `grok-3-mini` | `grok-3-mini` | xAI | 64 000 | 131 072 |
 | `grok-2` | `grok-2` | xAI | — | — |
@@ -396,8 +399,8 @@ You can add custom aliases in any settings file (`~/.claw/settings.json`, `.claw
 ```json
 {
   "aliases": {
-    "fast": "claude-haiku-4-5-20251213",
-    "smart": "claude-opus-4-7",
+    "fast": "claude-haiku-4-5-20251001",
+    "smart": "claude-opus-4-8",
     "cheap": "grok-3-mini"
   }
 }

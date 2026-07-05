@@ -51,6 +51,7 @@ pub enum ConfigSource {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResolvedPermissionMode {
     ReadOnly,
+    Manual,
     WorkspaceWrite,
     DangerFullAccess,
 }
@@ -123,6 +124,10 @@ pub struct RuntimePluginConfig {
     registry_path: Option<String>,
     bundled_root: Option<String>,
     max_output_tokens: Option<u32>,
+    suggestion_marketplaces: Vec<String>,
+    skip_lfs: bool,
+    default_enabled: Option<bool>,
+    disable_bundled_skills: bool,
 }
 
 /// API timeout and retry configuration.
@@ -1082,6 +1087,26 @@ impl RuntimePluginConfig {
         self.max_output_tokens
     }
 
+    #[must_use]
+    pub fn suggestion_marketplaces(&self) -> &[String] {
+        &self.suggestion_marketplaces
+    }
+
+    #[must_use]
+    pub fn skip_lfs(&self) -> bool {
+        self.skip_lfs
+    }
+
+    #[must_use]
+    pub fn default_enabled(&self) -> Option<bool> {
+        self.default_enabled
+    }
+
+    #[must_use]
+    pub fn disable_bundled_skills(&self) -> bool {
+        self.disable_bundled_skills
+    }
+
     pub fn set_max_output_tokens(&mut self, max_output_tokens: Option<u32>) {
         self.max_output_tokens = max_output_tokens;
     }
@@ -1994,6 +2019,11 @@ fn parse_optional_plugin_config(root: &JsonValue) -> Result<RuntimePluginConfig,
     if let Some(enabled_plugins) = object.get("enabledPlugins") {
         config.enabled_plugins = parse_bool_map(enabled_plugins, "merged settings.enabledPlugins")?;
     }
+    config.suggestion_marketplaces =
+        optional_string_array(object, "pluginSuggestionMarketplaces", "merged settings")?
+            .unwrap_or_default();
+    config.disable_bundled_skills =
+        optional_bool(object, "disableBundledSkills", "merged settings")?.unwrap_or(false);
 
     let Some(plugins_value) = object.get("plugins") else {
         return Ok(config);
@@ -2013,6 +2043,9 @@ fn parse_optional_plugin_config(root: &JsonValue) -> Result<RuntimePluginConfig,
     config.bundled_root =
         optional_string(plugins, "bundledRoot", "merged settings.plugins")?.map(str::to_string);
     config.max_output_tokens = optional_u32(plugins, "maxOutputTokens", "merged settings.plugins")?;
+    config.skip_lfs =
+        optional_bool(plugins, "skipLfs", "merged settings.plugins")?.unwrap_or(false);
+    config.default_enabled = optional_bool(plugins, "defaultEnabled", "merged settings.plugins")?;
     Ok(config)
 }
 
@@ -2041,7 +2074,8 @@ fn parse_permission_mode_label(
     context: &str,
 ) -> Result<ResolvedPermissionMode, ConfigError> {
     match mode {
-        "default" | "plan" | "read-only" => Ok(ResolvedPermissionMode::ReadOnly),
+        "plan" | "read-only" => Ok(ResolvedPermissionMode::ReadOnly),
+        "default" | "manual" | "prompt" => Ok(ResolvedPermissionMode::Manual),
         "acceptEdits" | "auto" | "workspace-write" => Ok(ResolvedPermissionMode::WorkspaceWrite),
         "dontAsk" | "danger-full-access" => Ok(ResolvedPermissionMode::DangerFullAccess),
         other => Err(ConfigError::Parse(format!(
@@ -2915,7 +2949,7 @@ mod tests {
             home.join("settings.json"),
             r#"{
               "providerFallbacks": {
-                "primary": "claude-opus-4-6",
+                "primary": "claude-opus-4-8",
                 "fallbacks": ["grok-3", "grok-3-mini"]
               }
             }"#,
@@ -2929,7 +2963,7 @@ mod tests {
 
         // then
         let chain = loaded.provider_fallbacks();
-        assert_eq!(chain.primary(), Some("claude-opus-4-6"));
+        assert_eq!(chain.primary(), Some("claude-opus-4-8"));
         assert_eq!(
             chain.fallbacks(),
             &["grok-3".to_string(), "grok-3-mini".to_string()]
@@ -3305,11 +3339,15 @@ mod tests {
               "enabledPlugins": {
                 "core-helpers@builtin": true
               },
+              "pluginSuggestionMarketplaces": ["team-marketplace"],
+              "disableBundledSkills": true,
               "plugins": {
                 "externalDirectories": ["./external-plugins"],
                 "installRoot": "plugin-cache/installed",
                 "registryPath": "plugin-cache/installed.json",
-                "bundledRoot": "./bundled-plugins"
+                "bundledRoot": "./bundled-plugins",
+                "skipLfs": true,
+                "defaultEnabled": false
               }
             }"#,
         )
@@ -3339,6 +3377,13 @@ mod tests {
             Some("plugin-cache/installed.json")
         );
         assert_eq!(loaded.plugins().bundled_root(), Some("./bundled-plugins"));
+        assert_eq!(
+            loaded.plugins().suggestion_marketplaces(),
+            &["team-marketplace".to_string()]
+        );
+        assert!(loaded.plugins().skip_lfs());
+        assert_eq!(loaded.plugins().default_enabled(), Some(false));
+        assert!(loaded.plugins().disable_bundled_skills());
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
@@ -3435,12 +3480,12 @@ mod tests {
 
         fs::write(
             home.join("settings.json"),
-            r#"{"aliases":{"fast":"claude-haiku-4-5-20251213","smart":"claude-opus-4-6"}}"#,
+            r#"{"aliases":{"fast":"claude-haiku-4-5-20251001","smart":"claude-opus-4-8"}}"#,
         )
         .expect("write user settings");
         fs::write(
             cwd.join(".claw").join("settings.local.json"),
-            r#"{"aliases":{"smart":"claude-sonnet-4-6","cheap":"grok-3-mini"}}"#,
+            r#"{"aliases":{"smart":"claude-sonnet-5","cheap":"grok-3-mini"}}"#,
         )
         .expect("write local settings");
 
@@ -3453,11 +3498,11 @@ mod tests {
         let aliases = loaded.aliases();
         assert_eq!(
             aliases.get("fast").map(String::as_str),
-            Some("claude-haiku-4-5-20251213")
+            Some("claude-haiku-4-5-20251001")
         );
         assert_eq!(
             aliases.get("smart").map(String::as_str),
-            Some("claude-sonnet-4-6")
+            Some("claude-sonnet-5")
         );
         assert_eq!(
             aliases.get("cheap").map(String::as_str),
@@ -3573,6 +3618,14 @@ mod tests {
         assert_eq!(
             parse_permission_mode_label("plan", "test").expect("plan should resolve"),
             ResolvedPermissionMode::ReadOnly
+        );
+        assert_eq!(
+            parse_permission_mode_label("manual", "test").expect("manual should resolve"),
+            ResolvedPermissionMode::Manual
+        );
+        assert_eq!(
+            parse_permission_mode_label("default", "test").expect("default should resolve"),
+            ResolvedPermissionMode::Manual
         );
         assert_eq!(
             parse_permission_mode_label("acceptEdits", "test").expect("acceptEdits should resolve"),

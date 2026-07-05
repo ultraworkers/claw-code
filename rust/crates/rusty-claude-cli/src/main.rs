@@ -70,7 +70,7 @@ use tools::{
     RuntimeToolDefinition, ToolSearchOutput,
 };
 
-const DEFAULT_MODEL: &str = "anthropic/claude-opus-4-7";
+const DEFAULT_MODEL: &str = "anthropic/claude-sonnet-5";
 
 /// #148: Model provenance for `claw status` JSON/text output. Records where
 /// the resolved model string came from so claws don't have to re-read argv
@@ -154,7 +154,7 @@ impl PermissionModeProvenance {
 
     fn default_fallback() -> Self {
         Self {
-            mode: PermissionMode::WorkspaceWrite,
+            mode: PermissionMode::Manual,
             source: PermissionModeSource::Default,
             env_var: None,
         }
@@ -1532,7 +1532,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             "--model" => {
                 let value = args
                     .get(index + 1)
-                    .ok_or_else(|| "missing_flag_value: missing value for --model.\nUsage: --model <provider/model>  e.g. --model anthropic/claude-opus-4-7".to_string())?;
+                    .ok_or_else(|| "missing_flag_value: missing value for --model.\nUsage: --model <provider/model>  e.g. --model anthropic/claude-opus-4-8".to_string())?;
                 // #468: track duplicate --model flags
                 if model_flag_raw.is_some() {
                     push_duplicate_flag(&format!(
@@ -1574,7 +1574,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             "--permission-mode" => {
                 let value = args
                     .get(index + 1)
-                    .ok_or_else(|| "missing_flag_value: missing value for --permission-mode.\nUsage: --permission-mode read-only|workspace-write|danger-full-access".to_string())?;
+                    .ok_or_else(|| "missing_flag_value: missing value for --permission-mode.\nUsage: --permission-mode manual|read-only|workspace-write|danger-full-access".to_string())?;
                 // #468: track duplicate --permission-mode flags
                 if permission_mode_override.is_some() {
                     push_duplicate_flag("--permission-mode (overwriting previous value)");
@@ -1939,9 +1939,10 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         // Only reject for known top-level subcommands that don't use compact.
         let first = rest[0].as_str();
         if is_known_top_level_subcommand(first) && first != "prompt" {
-            return Err(format!(
+            return Err(
                 "invalid_flag_value: --compact is only supported with prompt mode.\nUsage: claw --compact \"<prompt>\" or echo \"<prompt>\" | claw --compact"
-            ));
+                    .to_string(),
+            );
         }
     }
 
@@ -2024,7 +2025,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         // forms here and return a structured guidance error so no network
         // call or session is created.
         "permissions" => Err(
-            "`claw permissions` is a slash command. Start `claw` and run `/permissions` inside the REPL.\n  Usage  /permissions [read-only|workspace-write|danger-full-access]"
+            "`claw permissions` is a slash command. Start `claw` and run `/permissions` inside the REPL.\n  Usage  /permissions [manual|read-only|workspace-write|danger-full-access]"
                 .to_string(),
         ),
         // #767: `claw session bogus` bypassed parse_single_word_command_alias (rest.len()>1),
@@ -2565,6 +2566,36 @@ fn try_resolve_bare_skill_prompt(cwd: &Path, trimmed: &str) -> Option<String> {
     }
 }
 
+fn try_resolve_leading_skill_prompt(cwd: &Path, input: &str) -> Result<Option<String>, String> {
+    let tokens = input.split_whitespace().collect::<Vec<_>>();
+    let mut skill_count = 0;
+
+    for token in &tokens {
+        if !token.starts_with(['/', '$']) || commands::resolve_skill_path(cwd, token).is_err() {
+            break;
+        }
+        skill_count += 1;
+        if skill_count > 5 {
+            return Err("At most 5 leading skills can be invoked in one prompt.".to_string());
+        }
+    }
+
+    if skill_count == 0 {
+        return Ok(None);
+    }
+
+    let mut prompt = tokens[..skill_count]
+        .iter()
+        .map(|token| format!("${}", token.trim_start_matches(['/', '$'])))
+        .collect::<Vec<_>>();
+    prompt.extend(
+        tokens[skill_count..]
+            .iter()
+            .map(|token| (*token).to_string()),
+    );
+    Ok(Some(prompt.join(" ")))
+}
+
 fn join_optional_args(args: &[String]) -> Option<String> {
     let joined = args.join(" ");
     let trimmed = joined.trim();
@@ -2901,9 +2932,10 @@ fn levenshtein_distance(left: &str, right: &str) -> usize {
 
 fn resolve_model_alias(model: &str) -> &str {
     match model {
-        "opus" => "anthropic/claude-opus-4-7",
-        "sonnet" => "anthropic/claude-sonnet-4-6",
-        "haiku" => "anthropic/claude-haiku-4-5-20251213",
+        "opus" => "anthropic/claude-opus-4-8",
+        "sonnet" => "anthropic/claude-sonnet-5",
+        "haiku" => "anthropic/claude-haiku-4-5-20251001",
+        "fable" => "anthropic/claude-fable-5",
         _ => model,
     }
 }
@@ -2933,12 +2965,12 @@ fn validate_model_syntax(model: &str) -> Result<(), String> {
         return Ok(());
     }
     if trimmed.is_empty() {
-        return Err("invalid model syntax: model string cannot be empty.\nUsage: --model <provider/model>  e.g. --model anthropic/claude-opus-4-7".to_string());
+        return Err("invalid model syntax: model string cannot be empty.\nUsage: --model <provider/model>  e.g. --model anthropic/claude-opus-4-8".to_string());
     }
     // Check for spaces (malformed)
     if trimmed.contains(' ') {
         return Err(format!(
-            "invalid model syntax: '{}' contains spaces.\nUse provider/model format (e.g., anthropic/claude-opus-4-7) or a known alias.",
+            "invalid model syntax: '{}' contains spaces.\nUse provider/model format (e.g., anthropic/claude-opus-4-8) or a known alias.",
             trimmed
         ));
     }
@@ -2953,7 +2985,7 @@ fn validate_model_syntax(model: &str) -> Result<(), String> {
     if parts.len() != 2 || parts[0].is_empty() || parts[1].is_empty() {
         // #154: hint if the model looks like it belongs to a different provider
         let mut err_msg = format!(
-            "invalid model syntax: '{}'.\nExpected provider/model (e.g., anthropic/claude-opus-4-7)",
+            "invalid model syntax: '{}'.\nExpected provider/model (e.g., anthropic/claude-opus-4-8)",
             trimmed
         );
         if trimmed.starts_with("gpt-") || trimmed.starts_with("gpt_") {
@@ -3046,7 +3078,7 @@ fn parse_permission_mode_arg(value: &str) -> Result<PermissionMode, String> {
     normalize_permission_mode(value)
         .ok_or_else(|| {
             format!(
-                "invalid_permission_mode: unsupported permission mode '{value}'.\nUsage: --permission-mode read-only|workspace-write|danger-full-access"
+                "invalid_permission_mode: unsupported permission mode '{value}'.\nUsage: --permission-mode manual|read-only|workspace-write|danger-full-access"
             )
         })
         .map(permission_mode_from_label)
@@ -3055,6 +3087,7 @@ fn parse_permission_mode_arg(value: &str) -> Result<PermissionMode, String> {
 fn permission_mode_from_label(mode: &str) -> PermissionMode {
     match mode {
         "read-only" => PermissionMode::ReadOnly,
+        "manual" => PermissionMode::Manual,
         "workspace-write" => PermissionMode::WorkspaceWrite,
         "danger-full-access" => PermissionMode::DangerFullAccess,
         other => panic!("unsupported permission mode label: {other}"),
@@ -3064,6 +3097,7 @@ fn permission_mode_from_label(mode: &str) -> PermissionMode {
 fn permission_mode_from_resolved(mode: ResolvedPermissionMode) -> PermissionMode {
     match mode {
         ResolvedPermissionMode::ReadOnly => PermissionMode::ReadOnly,
+        ResolvedPermissionMode::Manual => PermissionMode::Manual,
         ResolvedPermissionMode::WorkspaceWrite => PermissionMode::WorkspaceWrite,
         ResolvedPermissionMode::DangerFullAccess => PermissionMode::DangerFullAccess,
     }
@@ -3213,9 +3247,10 @@ fn parse_system_prompt_args(
                 })?;
                 // #99: validate --date is a plausible date string (no newlines, reasonable length)
                 if value.contains('\n') || value.contains('\r') {
-                    return Err(format!(
+                    return Err(
                         "invalid_flag_value: --date value contains invalid characters.\nUsage: --date <YYYY-MM-DD>"
-                    ));
+                            .to_string(),
+                    );
                 }
                 if value.len() > 20 {
                     return Err(format!(
@@ -3452,11 +3487,7 @@ impl DiagnosticCheck {
 
     fn json_value(&self) -> Value {
         // Derive a stable snake_case id from the check name for machine-readable keying (#704).
-        let id = self
-            .name
-            .to_ascii_lowercase()
-            .replace(' ', "_")
-            .replace('-', "_");
+        let id = self.name.to_ascii_lowercase().replace([' ', '-'], "_");
         let mut value = Map::from_iter([
             ("id".to_string(), Value::String(id.clone())),
             (
@@ -4213,8 +4244,8 @@ fn check_permission_health(permission_mode: PermissionModeProvenance) -> Diagnos
         "running with full access without explicit opt-in"
     } else if matches!(permission_mode.mode, PermissionMode::DangerFullAccess) {
         "danger-full-access was explicitly selected"
-    } else if matches!(permission_mode.mode, PermissionMode::WorkspaceWrite) && !explicit {
-        "default permission mode is workspace-write"
+    } else if matches!(permission_mode.mode, PermissionMode::Manual) && !explicit {
+        "default permission mode is manual"
     } else {
         "permission mode is explicitly bounded below danger-full-access"
     };
@@ -4225,12 +4256,12 @@ fn check_permission_health(permission_mode: PermissionModeProvenance) -> Diagnos
     let specs = mvp_tool_specs();
     let tools_satisfied = specs
         .iter()
-        .filter(|spec| permission_mode.mode >= spec.required_permission)
+        .filter(|spec| permission_mode.mode.grants(spec.required_permission))
         .map(|spec| spec.name)
         .collect::<Vec<_>>();
     let tools_gated = specs
         .iter()
-        .filter(|spec| permission_mode.mode < spec.required_permission)
+        .filter(|spec| !permission_mode.mode.grants(spec.required_permission))
         .map(|spec| spec.name)
         .collect::<Vec<_>>();
 
@@ -4251,9 +4282,9 @@ fn check_permission_health(permission_mode: PermissionModeProvenance) -> Diagnos
         format!("Tools gated      {}", tools_gated.join(", ")),
     ])
     .with_hint(if warning {
-        "Use the workspace-write default, or pass --permission-mode danger-full-access / --dangerously-skip-permissions only when full filesystem, network, and command access is intentional."
+        "Use the manual default, or pass --permission-mode danger-full-access / --dangerously-skip-permissions only when full filesystem, network, and command access is intentional."
     } else {
-        "Use --permission-mode read-only|workspace-write|danger-full-access to make the runtime permission boundary explicit."
+        "Use --permission-mode manual|read-only|workspace-write|danger-full-access to make the runtime permission boundary explicit."
     })
     .with_data(Map::from_iter([
         ("mode".to_string(), json!(mode)),
@@ -6730,16 +6761,15 @@ fn run_resume_command(
         }
         SlashCommand::Plugins { action, target } => {
             // Only list is supported in resume mode (no runtime to reload)
-            match action.as_deref() {
-                Some(action @ ("install" | "uninstall" | "enable" | "disable" | "update")) => {
-                    // #777: use interactive_only: prefix + \n hint so #776's classify/split
-                    // emits error_kind:interactive_only + non-null hint instead of unknown+null.
-                    // Orchestrators can now detect this and switch to a live REPL instead of retrying.
-                    return Err(format!(
-                        "interactive_only: /plugins {action} requires a live session to reload the plugin runtime.\nStart `claw` and run `/plugins {action}` inside the REPL, or use `claw plugins {action}` as a direct CLI command."
-                    ).into());
-                }
-                _ => {}
+            if let Some(action @ ("install" | "uninstall" | "enable" | "disable" | "update")) =
+                action.as_deref()
+            {
+                // #777: use interactive_only: prefix + \n hint so #776's classify/split
+                // emits error_kind:interactive_only + non-null hint instead of unknown+null.
+                // Orchestrators can now detect this and switch to a live REPL instead of retrying.
+                return Err(format!(
+                    "interactive_only: /plugins {action} requires a live session to reload the plugin runtime.\nStart `claw` and run `/plugins {action}` inside the REPL, or use `claw plugins {action}` as a direct CLI command."
+                ).into());
             }
             let cwd = env::current_dir()?;
             let payload = plugins_command_payload_for(
@@ -7075,6 +7105,20 @@ fn run_repl(
                     cli.persist_session()?;
                     break;
                 }
+                let cwd = std::env::current_dir().unwrap_or_default();
+                match try_resolve_leading_skill_prompt(&cwd, &trimmed) {
+                    Ok(Some(prompt)) => {
+                        editor.push_history(input);
+                        cli.record_prompt_history(&trimmed);
+                        cli.run_turn(&prompt)?;
+                        continue;
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        eprintln!("{error}");
+                        continue;
+                    }
+                }
                 match SlashCommand::parse(&trimmed) {
                     Ok(Some(command)) => {
                         if cli.handle_repl_command(command)? {
@@ -7091,7 +7135,6 @@ fn run_repl(
                 // Bare-word skill dispatch: if the first token of the input
                 // matches a known skill name, invoke it as `/skills <input>`
                 // rather than forwarding raw text to the LLM (ROADMAP #36).
-                let cwd = std::env::current_dir().unwrap_or_default();
                 if let Some(prompt) = try_resolve_bare_skill_prompt(&cwd, &trimmed) {
                     editor.push_history(input);
                     cli.record_prompt_history(&trimmed);
@@ -7852,8 +7895,12 @@ impl LiveCli {
                     let max_compact_rounds = 4;
                     let preserve_schedule = [4, 2, 1, 0];
 
-                    for round in 0..max_compact_rounds {
-                        let preserve = preserve_schedule[round];
+                    for (round, preserve) in preserve_schedule
+                        .iter()
+                        .copied()
+                        .enumerate()
+                        .take(max_compact_rounds)
+                    {
                         println!(
                             "  Auto-compacting session (round {}/{}, preserving {} recent messages)...",
                             round + 1,
@@ -8203,6 +8250,11 @@ impl LiveCli {
                 println!("{}", format_cost_report(usage));
                 false
             }
+            SlashCommand::Review { scope } => {
+                let scope = scope.unwrap_or_else(|| "medium".to_string());
+                self.run_turn(&format!("$code-review {scope}"))?;
+                false
+            }
             SlashCommand::Login
             | SlashCommand::Logout
             | SlashCommand::Vim
@@ -8224,7 +8276,6 @@ impl LiveCli {
             | SlashCommand::Keybindings
             | SlashCommand::PrivacySettings
             | SlashCommand::Plan { .. }
-            | SlashCommand::Review { .. }
             | SlashCommand::Tasks { .. }
             | SlashCommand::Theme { .. }
             | SlashCommand::Voice { .. }
@@ -8406,7 +8457,7 @@ impl LiveCli {
 
         let normalized = normalize_permission_mode(&mode).ok_or_else(|| {
             format!(
-                "invalid_flag_value: unsupported permission mode '{mode}'.\nUsage: --permission-mode read-only|workspace-write|danger-full-access"
+                "invalid_flag_value: unsupported permission mode '{mode}'.\nUsage: --permission-mode manual|read-only|workspace-write|danger-full-access"
             )
         })?;
 
@@ -8611,8 +8662,8 @@ impl LiveCli {
         let cwd = env::current_dir()?;
         // #803: reject flag-shaped tokens in list filter for BOTH text and JSON modes.
         // Previously the guard was JSON-only (#793); text mode silently returned empty success.
-        if action.as_deref() == Some("list") {
-            if let Some(filter) = target.as_deref() {
+        if action == Some("list") {
+            if let Some(filter) = target {
                 if filter.starts_with('-') {
                     if matches!(output_format, CliOutputFormat::Json) {
                         // ROADMAP #817: this is a handled local inventory parse error.
@@ -9577,6 +9628,7 @@ fn print_status_snapshot(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn status_json_value(
     model: Option<&str>,
     usage: StatusUsage,
@@ -10073,9 +10125,7 @@ fn sandbox_json_value(status: &runtime::SandboxStatus) -> serde_json::Value {
     //        (#731: "not supported on macOS" is a degraded state, not a hard error;
     //         filesystem_active:true means partial containment is working)
     // error = enabled but unsupported AND no filesystem sandbox either (nothing active)
-    let top_status = if !status.enabled {
-        "ok"
-    } else if status.active {
+    let top_status = if !status.enabled || status.active {
         "ok"
     } else if status.supported {
         "warn"
@@ -10325,7 +10375,7 @@ fn print_models(
         CliOutputFormat::Text => {
             println!("Models");
             println!("  Default          {DEFAULT_MODEL}");
-            println!("  Built-in aliases opus, sonnet, haiku");
+            println!("  Built-in aliases opus, sonnet, haiku, fable");
             if let Some(raw) = configured_model.as_deref() {
                 println!(
                     "  Config model     {raw}{}",
@@ -10351,7 +10401,8 @@ fn print_models(
                     "aliases": [
                         {"name": "opus", "model": resolve_model_alias("opus")},
                         {"name": "sonnet", "model": resolve_model_alias("sonnet")},
-                        {"name": "haiku", "model": resolve_model_alias("haiku")}
+                        {"name": "haiku", "model": resolve_model_alias("haiku")},
+                        {"name": "fable", "model": resolve_model_alias("fable")}
                     ],
                     "configured_model": configured_model,
                     "resolved_configured_model": resolved_config_model,
@@ -10449,10 +10500,7 @@ fn render_doctor_help_json() -> serde_json::Value {
     })
 }
 
-/// #683-#692: extract structured metadata from help prose
-fn extract_help_metadata(
-    topic: LocalHelpTopic,
-) -> (
+type HelpMetadata = (
     Option<String>,      // usage
     Option<String>,      // purpose
     Option<String>,      // output description
@@ -10461,7 +10509,10 @@ fn extract_help_metadata(
     Option<Vec<String>>, // aliases
     bool,                // local_only
     bool,                // requires_credentials
-) {
+);
+
+/// #683-#692: extract structured metadata from help prose
+fn extract_help_metadata(topic: LocalHelpTopic) -> HelpMetadata {
     let text = render_help_topic(topic);
     let mut usage = None;
     let mut purpose = None;
@@ -11076,7 +11127,8 @@ fn init_json_value(report: &crate::init::InitReport, message: &str) -> serde_jso
 
 fn normalize_permission_mode(mode: &str) -> Option<&'static str> {
     match mode.trim() {
-        "default" | "plan" | "read-only" => Some("read-only"),
+        "plan" | "read-only" => Some("read-only"),
+        "default" | "manual" | "prompt" => Some("manual"),
         "acceptEdits" | "auto" | "workspace-write" => Some("workspace-write"),
         "dontAsk" | "bypassPermissions" | "dangerFullAccess" | "danger-full-access" => {
             Some("danger-full-access")
@@ -12710,9 +12762,27 @@ impl AnthropicRuntimeClient {
         loop {
             let next = if apply_stall_timeout && !received_any_event {
                 match tokio::time::timeout(POST_TOOL_STALL_TIMEOUT, stream.next_event()).await {
-                    Ok(inner) => inner.map_err(|error| {
-                        RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
-                    })?,
+                    Ok(inner) => match inner {
+                        Ok(next) => next,
+                        Err(error) => {
+                            if let Some(events) = finish_incomplete_stream(
+                                &self.session_id,
+                                &error,
+                                out,
+                                &renderer,
+                                &mut markdown_stream,
+                                &mut events,
+                                &mut pending_thinking,
+                                &mut pending_tool,
+                            )? {
+                                return Ok(events);
+                            }
+                            return Err(RuntimeError::new(format_user_visible_api_error(
+                                &self.session_id,
+                                &error,
+                            )));
+                        }
+                    },
                     Err(_elapsed) => {
                         return Err(RuntimeError::new(
                             "post-tool stall: model did not respond within timeout",
@@ -12720,9 +12790,27 @@ impl AnthropicRuntimeClient {
                     }
                 }
             } else {
-                stream.next_event().await.map_err(|error| {
-                    RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
-                })?
+                match stream.next_event().await {
+                    Ok(next) => next,
+                    Err(error) => {
+                        if let Some(events) = finish_incomplete_stream(
+                            &self.session_id,
+                            &error,
+                            out,
+                            &renderer,
+                            &mut markdown_stream,
+                            &mut events,
+                            &mut pending_thinking,
+                            &mut pending_tool,
+                        )? {
+                            return Ok(events);
+                        }
+                        return Err(RuntimeError::new(format_user_visible_api_error(
+                            &self.session_id,
+                            &error,
+                        )));
+                    }
+                }
             };
 
             let Some(event) = next else {
@@ -12869,6 +12957,63 @@ impl AnthropicRuntimeClient {
         push_prompt_cache_record(&self.client, &mut events);
         Ok(events)
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_incomplete_stream(
+    session_id: &str,
+    error: &api::ApiError,
+    out: &mut dyn Write,
+    renderer: &TerminalRenderer,
+    markdown_stream: &mut MarkdownStreamState,
+    events: &mut Vec<AssistantEvent>,
+    pending_thinking: &mut Option<(String, Option<String>)>,
+    pending_tool: &mut Option<(String, String, String)>,
+) -> Result<Option<Vec<AssistantEvent>>, RuntimeError> {
+    let has_partial = events.iter().any(|event| {
+        matches!(event, AssistantEvent::TextDelta(text) if !text.is_empty())
+            || matches!(
+                event,
+                AssistantEvent::Thinking { .. } | AssistantEvent::ToolUse { .. }
+            )
+    }) || pending_thinking.is_some()
+        || pending_tool.is_some();
+
+    if !has_partial {
+        return Ok(None);
+    }
+
+    if let Some(rendered) = markdown_stream.flush(renderer) {
+        write!(out, "{rendered}")
+            .and_then(|()| out.flush())
+            .map_err(|io_error| RuntimeError::new(io_error.to_string()))?;
+    }
+    if let Some((thinking, signature)) = pending_thinking.take() {
+        events.push(AssistantEvent::Thinking {
+            thinking,
+            signature,
+        });
+    }
+    if let Some((id, name, input)) = pending_tool.take() {
+        let summary = format!(
+            "\n\n[Incomplete tool call preserved after stream error: {name} ({id}) with partial input `{input}`]"
+        );
+        write!(out, "{summary}")
+            .and_then(|()| out.flush())
+            .map_err(|io_error| RuntimeError::new(io_error.to_string()))?;
+        events.push(AssistantEvent::TextDelta(summary));
+    }
+
+    let reason = format_user_visible_api_error(session_id, error);
+    let notice = format!("\n\n[Incomplete response preserved after stream error: {reason}]");
+    write!(out, "{notice}")
+        .and_then(|()| out.flush())
+        .map_err(|io_error| RuntimeError::new(io_error.to_string()))?;
+    events.push(AssistantEvent::TextDelta(notice));
+    events.push(AssistantEvent::IncompleteResponse { reason });
+    events.push(AssistantEvent::MessageStop);
+
+    Ok(Some(std::mem::take(events)))
 }
 
 /// Returns `true` when the conversation ends with a tool-result message,
@@ -14008,39 +14153,37 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
             let content = message
                 .blocks
                 .iter()
-                .filter_map(|block| match block {
-                    ContentBlock::Text { text } => {
-                        Some(InputContentBlock::Text { text: text.clone() })
-                    }
+                .map(|block| match block {
+                    ContentBlock::Text { text } => InputContentBlock::Text { text: text.clone() },
                     ContentBlock::Thinking {
                         thinking,
                         signature,
                     } => {
                         // 保留 Thinking 块：OpenAI 兼容协议会把它转成 reasoning_content 字段
                         // 回传给 DeepSeek V4（避免 400 "reasoning_content must be passed back" 错误）
-                        Some(InputContentBlock::Thinking {
+                        InputContentBlock::Thinking {
                             thinking: thinking.clone(),
                             signature: signature.clone(),
-                        })
+                        }
                     }
-                    ContentBlock::ToolUse { id, name, input } => Some(InputContentBlock::ToolUse {
+                    ContentBlock::ToolUse { id, name, input } => InputContentBlock::ToolUse {
                         id: id.clone(),
                         name: name.clone(),
                         input: serde_json::from_str(input)
                             .unwrap_or_else(|_| serde_json::json!({ "raw": input })),
-                    }),
+                    },
                     ContentBlock::ToolResult {
                         tool_use_id,
                         output,
                         is_error,
                         ..
-                    } => Some(InputContentBlock::ToolResult {
+                    } => InputContentBlock::ToolResult {
                         tool_use_id: tool_use_id.clone(),
                         content: vec![ToolResultContentBlock::Text {
                             text: output.clone(),
                         }],
                         is_error: *is_error,
-                    }),
+                    },
                 })
                 .collect::<Vec<_>>();
             (!content.is_empty()).then(|| InputMessage {
@@ -14386,7 +14529,7 @@ mod tests {
     #[test]
     fn context_window_preflight_errors_render_recovery_steps() {
         let error = ApiError::ContextWindowExceeded {
-            model: "anthropic/claude-sonnet-4-6".to_string(),
+            model: "anthropic/claude-sonnet-5".to_string(),
             estimated_input_tokens: 182_000,
             requested_output_tokens: 64_000,
             estimated_total_tokens: 246_000,
@@ -14401,7 +14544,7 @@ mod tests {
             "{rendered}"
         );
         assert!(
-            rendered.contains("Model            anthropic/claude-sonnet-4-6"),
+            rendered.contains("Model            anthropic/claude-sonnet-5"),
             "{rendered}"
         );
         assert!(
@@ -14637,7 +14780,7 @@ mod tests {
             CliAction::Repl {
                 model: DEFAULT_MODEL.to_string(),
                 allowed_tools: None,
-                permission_mode: PermissionMode::WorkspaceWrite,
+                permission_mode: PermissionMode::Manual,
                 base_commit: None,
                 reasoning_effort: None,
                 allow_broad_cwd: false,
@@ -14770,7 +14913,7 @@ mod tests {
                 model: DEFAULT_MODEL.to_string(),
                 output_format: CliOutputFormat::Text,
                 allowed_tools: None,
-                permission_mode: PermissionMode::WorkspaceWrite,
+                permission_mode: PermissionMode::Manual,
                 compact: false,
                 base_commit: None,
                 reasoning_effort: None,
@@ -14858,10 +15001,10 @@ mod tests {
             parse_args(&args).expect("args should parse"),
             CliAction::Prompt {
                 prompt: "explain this".to_string(),
-                model: "anthropic/claude-opus-4-7".to_string(),
+                model: "anthropic/claude-opus-4-8".to_string(),
                 output_format: CliOutputFormat::Json,
                 allowed_tools: None,
-                permission_mode: PermissionMode::WorkspaceWrite,
+                permission_mode: PermissionMode::Manual,
                 compact: false,
                 base_commit: None,
                 reasoning_effort: None,
@@ -14883,7 +15026,7 @@ mod tests {
                 model: DEFAULT_MODEL.to_string(),
                 output_format: CliOutputFormat::Text,
                 allowed_tools: None,
-                permission_mode: PermissionMode::WorkspaceWrite,
+                permission_mode: PermissionMode::Manual,
                 compact: false,
                 base_commit: None,
                 reasoning_effort: None,
@@ -14899,7 +15042,7 @@ mod tests {
                 model: DEFAULT_MODEL.to_string(),
                 output_format: CliOutputFormat::Text,
                 allowed_tools: None,
-                permission_mode: PermissionMode::WorkspaceWrite,
+                permission_mode: PermissionMode::Manual,
                 compact: false,
                 base_commit: None,
                 reasoning_effort: None,
@@ -14915,7 +15058,7 @@ mod tests {
                 model: DEFAULT_MODEL.to_string(),
                 output_format: CliOutputFormat::Text,
                 allowed_tools: None,
-                permission_mode: PermissionMode::WorkspaceWrite,
+                permission_mode: PermissionMode::Manual,
                 compact: false,
                 base_commit: None,
                 reasoning_effort: None,
@@ -14953,7 +15096,7 @@ mod tests {
                 model: DEFAULT_MODEL.to_string(),
                 output_format: CliOutputFormat::Text,
                 allowed_tools: None,
-                permission_mode: PermissionMode::WorkspaceWrite,
+                permission_mode: PermissionMode::Manual,
                 compact: true,
                 base_commit: None,
                 reasoning_effort: None,
@@ -14968,7 +15111,7 @@ mod tests {
                 model: DEFAULT_MODEL.to_string(),
                 output_format: CliOutputFormat::Text,
                 allowed_tools: None,
-                permission_mode: PermissionMode::WorkspaceWrite,
+                permission_mode: PermissionMode::Manual,
                 compact: true,
                 base_commit: None,
                 reasoning_effort: None,
@@ -15008,10 +15151,10 @@ mod tests {
             parse_args(&args).expect("args should parse"),
             CliAction::Prompt {
                 prompt: "explain this".to_string(),
-                model: "anthropic/claude-opus-4-7".to_string(),
+                model: "anthropic/claude-opus-4-8".to_string(),
                 output_format: CliOutputFormat::Text,
                 allowed_tools: None,
-                permission_mode: PermissionMode::WorkspaceWrite,
+                permission_mode: PermissionMode::Manual,
                 compact: false,
                 base_commit: None,
                 reasoning_effort: None,
@@ -15022,19 +15165,19 @@ mod tests {
 
     #[test]
     fn resolves_known_model_aliases() {
-        assert_eq!(resolve_model_alias("opus"), "anthropic/claude-opus-4-7");
-        assert_eq!(resolve_model_alias("sonnet"), "anthropic/claude-sonnet-4-6");
+        assert_eq!(resolve_model_alias("opus"), "anthropic/claude-opus-4-8");
+        assert_eq!(resolve_model_alias("sonnet"), "anthropic/claude-sonnet-5");
         assert_eq!(
             resolve_model_alias("haiku"),
-            "anthropic/claude-haiku-4-5-20251213"
+            "anthropic/claude-haiku-4-5-20251001"
         );
         assert_eq!(resolve_model_alias("claude-opus"), "claude-opus");
     }
 
     #[test]
     fn default_model_alias_uses_anthropic_routing_prefix() {
-        assert_eq!(DEFAULT_MODEL, "anthropic/claude-opus-4-7");
-        assert_eq!(resolve_model_alias("opus"), "anthropic/claude-opus-4-7");
+        assert_eq!(DEFAULT_MODEL, "anthropic/claude-sonnet-5");
+        assert_eq!(resolve_model_alias("opus"), "anthropic/claude-opus-4-8");
     }
 
     #[test]
@@ -15048,7 +15191,7 @@ mod tests {
         std::fs::create_dir_all(&config_home).expect("config home should exist");
         std::fs::write(
             cwd.join(".claw").join("settings.json"),
-            r#"{"aliases":{"fast":"anthropic/claude-haiku-4-5-20251213","smart":"opus","cheap":"grok-3-mini"}}"#,
+            r#"{"aliases":{"fast":"anthropic/claude-haiku-4-5-20251001","smart":"opus","cheap":"grok-3-mini"}}"#,
         )
         .expect("project config should write");
 
@@ -15069,11 +15212,11 @@ mod tests {
         std::fs::remove_dir_all(root).expect("temp config root should clean up");
 
         // then
-        assert_eq!(direct, "anthropic/claude-haiku-4-5-20251213");
-        assert_eq!(chained, "anthropic/claude-opus-4-7");
+        assert_eq!(direct, "anthropic/claude-haiku-4-5-20251001");
+        assert_eq!(chained, "anthropic/claude-opus-4-8");
         assert_eq!(cross_provider, "grok-3-mini");
         assert_eq!(unknown, "unknown-model");
-        assert_eq!(builtin, "anthropic/claude-haiku-4-5-20251213");
+        assert_eq!(builtin, "anthropic/claude-haiku-4-5-20251001");
     }
 
     #[test]
@@ -15178,7 +15321,7 @@ mod tests {
                         .map(str::to_string)
                         .collect()
                 ),
-                permission_mode: PermissionMode::WorkspaceWrite,
+                permission_mode: PermissionMode::Manual,
                 base_commit: None,
                 reasoning_effort: None,
                 allow_broad_cwd: false,
@@ -15541,7 +15684,7 @@ mod tests {
                 ..
             } => {
                 assert_eq!(
-                    model, "anthropic/claude-sonnet-4-6",
+                    model, "anthropic/claude-sonnet-5",
                     "sonnet alias should resolve"
                 );
                 assert_eq!(
@@ -15554,7 +15697,7 @@ mod tests {
         }
         // --model= form should also capture raw.
         match parse_args(&[
-            "--model=anthropic/claude-opus-4-6".to_string(),
+            "--model=anthropic/claude-opus-4-8".to_string(),
             "status".to_string(),
         ])
         .expect("--model=... status should parse")
@@ -15564,16 +15707,16 @@ mod tests {
                 model_flag_raw,
                 ..
             } => {
-                assert_eq!(model, "anthropic/claude-opus-4-6");
+                assert_eq!(model, "anthropic/claude-opus-4-8");
                 assert_eq!(
                     model_flag_raw.as_deref(),
-                    Some("anthropic/claude-opus-4-6"),
+                    Some("anthropic/claude-opus-4-8"),
                     "--model= form should also preserve raw input"
                 );
             }
             other => panic!("expected CliAction::Status, got: {other:?}"),
         }
-        match parse_args(&["--model=claude-opus-4-6".to_string(), "status".to_string()])
+        match parse_args(&["--model=claude-opus-4-8".to_string(), "status".to_string()])
             .expect("bare Anthropic model should parse")
         {
             CliAction::Status {
@@ -15581,8 +15724,8 @@ mod tests {
                 model_flag_raw,
                 ..
             } => {
-                assert_eq!(model, "claude-opus-4-6");
-                assert_eq!(model_flag_raw.as_deref(), Some("claude-opus-4-6"));
+                assert_eq!(model, "claude-opus-4-8");
+                assert_eq!(model_flag_raw.as_deref(), Some("claude-opus-4-8"));
             }
             other => panic!("expected CliAction::Status, got: {other:?}"),
         }
@@ -16317,7 +16460,7 @@ mod tests {
             "missing_flag_value"
         );
         assert_eq!(
-            classify_error_kind("invalid_permission_mode: unsupported permission mode 'bogus'.\nUsage: --permission-mode read-only|workspace-write|danger-full-access"),
+            classify_error_kind("invalid_permission_mode: unsupported permission mode 'bogus'.\nUsage: --permission-mode manual|read-only|workspace-write|danger-full-access"),
             "invalid_permission_mode"
         );
         assert_eq!(
@@ -16650,6 +16793,8 @@ mod tests {
                     is_error: false,
                 }],
                 usage: None,
+                incomplete: false,
+                incomplete_reason: None,
             },
         ];
 
@@ -16690,6 +16835,8 @@ mod tests {
                 is_error: true,
             }],
             usage: None,
+            incomplete: false,
+            incomplete_reason: None,
         }];
 
         // when
@@ -16785,7 +16932,7 @@ mod tests {
             .expect("prompt shorthand should still work"),
             CliAction::Prompt {
                 prompt: "please debug this".to_string(),
-                model: "anthropic/claude-opus-4-7".to_string(),
+                model: "anthropic/claude-opus-4-8".to_string(),
                 output_format: CliOutputFormat::Text,
                 allowed_tools: None,
                 permission_mode: crate::default_permission_mode(),
@@ -16972,7 +17119,7 @@ mod tests {
         for action in ["remove", "uninstall", "delete"] {
             assert_eq!(
                 parse_args(&["skills".to_string(), action.to_string()])
-                    .expect(&format!("skills {action} should parse")),
+                    .unwrap_or_else(|_| panic!("skills {action} should parse")),
                 CliAction::Skills {
                     args: Some(action.to_string()),
                     output_format: CliOutputFormat::Text,
@@ -17040,7 +17187,7 @@ mod tests {
                 model: DEFAULT_MODEL.to_string(),
                 output_format: CliOutputFormat::Text,
                 allowed_tools: None,
-                permission_mode: PermissionMode::WorkspaceWrite,
+                permission_mode: PermissionMode::Manual,
                 compact: false,
                 base_commit: None,
                 reasoning_effort: None,
@@ -17069,7 +17216,7 @@ mod tests {
                 model: DEFAULT_MODEL.to_string(),
                 output_format: CliOutputFormat::Text,
                 allowed_tools: None,
-                permission_mode: PermissionMode::WorkspaceWrite,
+                permission_mode: PermissionMode::Manual,
                 compact: false,
                 base_commit: None,
                 reasoning_effort: None,
@@ -17291,12 +17438,12 @@ mod tests {
         assert!(help.contains("/status"));
         assert!(help.contains("/sandbox"));
         assert!(help.contains("/model [model]"));
-        assert!(help.contains("/permissions [read-only|workspace-write|danger-full-access]"));
+        assert!(help.contains("/permissions [manual|read-only|workspace-write|danger-full-access]"));
         assert!(help.contains("/clear [--confirm]"));
         assert!(help.contains("/cost"));
         assert!(help.contains("/resume <session-path>"));
         assert!(help.contains("/config [env|hooks|model|plugins]"));
-        assert!(help.contains("/mcp [list|show <server>|help]"));
+        assert!(help.contains("/mcp [list|show <server>|login <server>|logout <server>|help]"));
         assert!(help.contains("/memory"));
         assert!(help.contains("/init"));
         assert!(help.contains("/diff"));
@@ -17327,7 +17474,7 @@ mod tests {
             vec!["session-old".to_string()],
         );
 
-        assert!(completions.contains(&"/model anthropic/claude-sonnet-4-6".to_string()));
+        assert!(completions.contains(&"/model anthropic/claude-sonnet-5".to_string()));
         assert!(completions.contains(&"/permissions workspace-write".to_string()));
         assert!(completions.contains(&"/session list".to_string()));
         assert!(completions.contains(&"/session switch session-current".to_string()));
@@ -17346,7 +17493,7 @@ mod tests {
 
         let banner = with_current_dir(&root, || {
             LiveCli::new(
-                "anthropic/claude-sonnet-4-6".to_string(),
+                "anthropic/claude-sonnet-5".to_string(),
                 true,
                 None,
                 PermissionMode::DangerFullAccess,
@@ -17364,11 +17511,11 @@ mod tests {
 
     #[test]
     fn format_connected_line_renders_anthropic_provider_for_claude_model() {
-        let model = "anthropic/claude-sonnet-4-6";
+        let model = "anthropic/claude-sonnet-5";
 
         let line = format_connected_line(model);
 
-        assert_eq!(line, "Connected: anthropic/claude-sonnet-4-6 via anthropic");
+        assert_eq!(line, "Connected: anthropic/claude-sonnet-5 via anthropic");
     }
 
     #[test]
@@ -17382,11 +17529,11 @@ mod tests {
 
     #[test]
     fn resolve_repl_model_returns_user_supplied_model_unchanged_when_explicit() {
-        let user_model = "anthropic/claude-sonnet-4-6".to_string();
+        let user_model = "anthropic/claude-sonnet-5".to_string();
 
         let resolved = resolve_repl_model(user_model).expect("explicit model should resolve");
 
-        assert_eq!(resolved, "anthropic/claude-sonnet-4-6");
+        assert_eq!(resolved, "anthropic/claude-sonnet-5");
     }
 
     #[test]
@@ -17403,7 +17550,7 @@ mod tests {
         let resolved = with_current_dir(&root, || resolve_repl_model(DEFAULT_MODEL.to_string()))
             .expect("env model should resolve");
 
-        assert_eq!(resolved, "anthropic/claude-sonnet-4-6");
+        assert_eq!(resolved, "anthropic/claude-sonnet-5");
 
         std::env::remove_var("ANTHROPIC_MODEL");
         std::env::remove_var("CLAW_CONFIG_HOME");
@@ -18625,6 +18772,8 @@ UU conflicted.rs",
                     is_error: false,
                 }],
                 usage: None,
+                incomplete: false,
+                incomplete_reason: None,
             },
         ];
 
@@ -19028,7 +19177,7 @@ UU conflicted.rs",
             MessageResponse {
                 id: "msg-1".to_string(),
                 kind: "message".to_string(),
-                model: "anthropic/claude-opus-4-6".to_string(),
+                model: "anthropic/claude-opus-4-8".to_string(),
                 role: "assistant".to_string(),
                 content: vec![OutputContentBlock::ToolUse {
                     id: "tool-1".to_string(),
@@ -19063,7 +19212,7 @@ UU conflicted.rs",
             MessageResponse {
                 id: "msg-2".to_string(),
                 kind: "message".to_string(),
-                model: "anthropic/claude-opus-4-6".to_string(),
+                model: "anthropic/claude-opus-4-8".to_string(),
                 role: "assistant".to_string(),
                 content: vec![OutputContentBlock::ToolUse {
                     id: "tool-2".to_string(),
@@ -19098,7 +19247,7 @@ UU conflicted.rs",
             MessageResponse {
                 id: "msg-3".to_string(),
                 kind: "message".to_string(),
-                model: "anthropic/claude-opus-4-6".to_string(),
+                model: "anthropic/claude-opus-4-8".to_string(),
                 role: "assistant".to_string(),
                 content: vec![
                     OutputContentBlock::Thinking {
@@ -19750,15 +19899,15 @@ mod alias_resolution_tests {
         // Built-in aliases should resolve to their full IDs
         assert_eq!(
             resolve_model_alias_with_config("opus"),
-            "anthropic/claude-opus-4-7"
+            "anthropic/claude-opus-4-8"
         );
         assert_eq!(
             resolve_model_alias_with_config("sonnet"),
-            "anthropic/claude-sonnet-4-6"
+            "anthropic/claude-sonnet-5"
         );
         assert_eq!(
             resolve_model_alias_with_config("haiku"),
-            "anthropic/claude-haiku-4-5-20251213"
+            "anthropic/claude-haiku-4-5-20251001"
         );
     }
 

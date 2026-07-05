@@ -40,6 +40,9 @@ pub enum AssistantEvent {
     },
     Usage(TokenUsage),
     PromptCache(PromptCacheEvent),
+    IncompleteResponse {
+        reason: String,
+    },
     MessageStop,
 }
 
@@ -733,6 +736,7 @@ fn build_assistant_message(
     let mut blocks = Vec::new();
     let mut prompt_cache_events = Vec::new();
     let mut finished = false;
+    let mut incomplete_reason = None;
     let mut usage = None;
 
     for event in events {
@@ -754,6 +758,7 @@ fn build_assistant_message(
             }
             AssistantEvent::Usage(value) => usage = Some(value),
             AssistantEvent::PromptCache(event) => prompt_cache_events.push(event),
+            AssistantEvent::IncompleteResponse { reason } => incomplete_reason = Some(reason),
             AssistantEvent::MessageStop => {
                 finished = true;
             }
@@ -772,7 +777,7 @@ fn build_assistant_message(
     }
 
     Ok((
-        ConversationMessage::assistant_with_usage(blocks, usage),
+        ConversationMessage::assistant_with_usage_status(blocks, usage, incomplete_reason),
         usage,
         prompt_cache_events,
     ))

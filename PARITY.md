@@ -9,6 +9,7 @@ Last updated: 2026-04-03
 - Current `main` HEAD: `ee31e00` (stub implementations replaced with real AskUserQuestion + RemoteTrigger).
 - Repository stats at this checkpoint: **292 commits on `main` / 293 across all branches**, **9 crates**, **48,599 tracked Rust LOC**, **2,568 test LOC**, **3 authors**, date range **2026-03-31 → 2026-04-03**.
 - Mock parity harness stats: **12 scripted scenarios**, **21 captured `/v1/messages` requests** in `rust/crates/rusty-claude-cli/tests/mock_parity_harness.rs`.
+- Claude Code v2.1.201 migration branch note: `TaskCreate`/`TaskUpdate` accept the structured `subject`/`activeForm`/`metadata` contract, `McpAuth` exposes login/logout host-flow payloads, and new host-facing contracts (`Workflow`, `Monitor`, `ScheduleWakeup`, `PushNotification`, `ReportFindings`, `ReadMcpResourceDir`, `Artifact`, `Projects`, `ClaudeDesign`, `ShowOnboardingRolePicker`) are registered with stable JSON responses.
 
 ## Mock parity harness — milestone 1
 
@@ -144,17 +145,20 @@ Canonical scenario map: `rust/mock_parity_scenarios.json`
 - `PermissionEnforcer::check()` delegates to `PermissionPolicy::authorize()` and returns structured allow/deny results.
 - `check_file_write()` enforces workspace boundaries and read-only denial; `check_bash()` denies mutating commands in read-only mode and blocks prompt-mode bash without confirmation.
 
-## Tool Surface: 40 exposed tool specs on `main`
+## Tool Surface
 
-- `mvp_tool_specs()` in `rust/crates/tools/src/lib.rs` exposes **40** tool specs.
+- `mvp_tool_specs()` in `rust/crates/tools/src/lib.rs` exposes the core tool set plus Claude Code v2.1.201 compatibility contracts.
 - Core execution is present for `bash`, `read_file`, `write_file`, `edit_file`, `glob_search`, and `grep_search`.
 - Existing product tools in `mvp_tool_specs()` include `WebFetch`, `WebSearch`, `TodoWrite`, `Skill`, `Agent`, `ToolSearch`, `NotebookEdit`, `Sleep`, `SendUserMessage`, `Config`, `EnterPlanMode`, `ExitPlanMode`, `StructuredOutput`, `REPL`, and `PowerShell`.
-- The 9-lane push replaced pure fixed-payload stubs for `Task*`, `Team*`, `Cron*`, `LSP`, and MCP tools with registry-backed handlers on `main`.
+- The 9-lane push replaced pure fixed-payload stubs for `Task*`, `Team*`, `Cron*`, `LSP`, and MCP tools with registry-backed handlers on `main`; the v2.1.201 migration extends `TaskCreate`/`TaskUpdate` to the structured task-list payload shape.
+- The v2.1.201 host-facing contracts include `Workflow`, `Monitor`, `ScheduleWakeup`, `PushNotification`, `ReportFindings`, `ReadMcpResourceDir`, `Artifact`, `Projects`, `ClaudeDesign`, and `ShowOnboardingRolePicker`.
 - `Brief` is handled as an execution alias in `execute_tool()`, but it is not a separately exposed tool spec in `mvp_tool_specs()`.
 
 ### Still limited or intentionally shallow
 
 - `AskUserQuestion` still returns a pending response payload rather than real interactive UI wiring.
+- `McpAuth` reports structured login/logout contract state and host-flow requirements, but it does not open a browser or complete OAuth by itself.
+- `Workflow` and `Monitor` expose compatibility payloads, but local workflow JavaScript execution and live monitor scheduling are not implemented in this runtime.
 - `RemoteTrigger` remains a stub response.
 - `TestingPermission` remains test-only.
 - Task, team, cron, MCP, and LSP are no longer just fixed-payload stubs in `execute_tool()`, but several remain registry-backed approximations rather than full external-runtime integrations.

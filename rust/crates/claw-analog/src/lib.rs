@@ -248,6 +248,7 @@ pub const ANALOG_DEFAULT_MODEL: &str = "sonnet";
 pub fn permission_mode_from_toml_str(s: &str) -> Option<PermissionMode> {
     match s.to_ascii_lowercase().replace('_', "-").as_str() {
         "read-only" | "readonly" => Some(PermissionMode::ReadOnly),
+        "manual" | "default" => Some(PermissionMode::Manual),
         "workspace-write" | "write" => Some(PermissionMode::WorkspaceWrite),
         "prompt" => Some(PermissionMode::Prompt),
         "danger-full-access" | "danger" => Some(PermissionMode::DangerFullAccess),
@@ -1042,6 +1043,10 @@ fn system_prompt(
         PermissionMode::ReadOnly => format!(
             "You are a read-only coding assistant. Workspace root: {root_s}. \
              Tools: `read_file`, `list_dir`, `glob_workspace`, `grep_workspace` / `grep_search` (literal substring){git_blurb}{rag_blurb}. Paths relative; use `/`; no `..`."
+        ),
+        PermissionMode::Manual => format!(
+            "You are a coding assistant in manual permission mode (workspace root: {root_s}). \
+             Read/list/glob/grep{git_blurb}{rag_blurb} tools are available; write, shell, and external operations require explicit approval."
         ),
         PermissionMode::WorkspaceWrite => format!(
             "You are a coding assistant with read/list/glob/grep/write{git_blurb}{rag_blurb}. Workspace root: {root_s}. \
@@ -2744,7 +2749,7 @@ glob_max_paths = 100
         let _g2 = EnvVarGuard::set("ANTHROPIC_BASE_URL", url.as_str());
 
         let config = AnalogConfig {
-            model: "claude-sonnet-4-6".into(),
+            model: "claude-sonnet-5".into(),
             workspace: root.clone(),
             permission_mode: PermissionMode::ReadOnly,
             accept_danger_non_interactive: false,
@@ -2796,7 +2801,7 @@ glob_max_paths = 100
         let export = dir.path().join("export-session.json");
 
         let config = AnalogConfig {
-            model: "claude-sonnet-4-6".into(),
+            model: "claude-sonnet-5".into(),
             workspace: root,
             permission_mode: PermissionMode::ReadOnly,
             accept_danger_non_interactive: false,
@@ -2849,7 +2854,7 @@ glob_max_paths = 100
         let _g2 = EnvVarGuard::set("ANTHROPIC_BASE_URL", url.as_str());
 
         let config = AnalogConfig {
-            model: "claude-sonnet-4-6".into(),
+            model: "claude-sonnet-5".into(),
             workspace: root,
             permission_mode: PermissionMode::ReadOnly,
             accept_danger_non_interactive: false,

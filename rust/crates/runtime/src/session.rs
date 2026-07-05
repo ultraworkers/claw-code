@@ -57,6 +57,8 @@ pub struct ConversationMessage {
     pub role: MessageRole,
     pub blocks: Vec<ContentBlock>,
     pub usage: Option<TokenUsage>,
+    pub incomplete: bool,
+    pub incomplete_reason: Option<String>,
 }
 
 /// Metadata describing the latest compaction that summarized a session.
@@ -715,6 +717,8 @@ impl ConversationMessage {
             role: MessageRole::User,
             blocks: vec![ContentBlock::Text { text: text.into() }],
             usage: None,
+            incomplete: false,
+            incomplete_reason: None,
         }
     }
 
@@ -724,15 +728,28 @@ impl ConversationMessage {
             role: MessageRole::Assistant,
             blocks,
             usage: None,
+            incomplete: false,
+            incomplete_reason: None,
         }
     }
 
     #[must_use]
     pub fn assistant_with_usage(blocks: Vec<ContentBlock>, usage: Option<TokenUsage>) -> Self {
+        Self::assistant_with_usage_status(blocks, usage, None)
+    }
+
+    #[must_use]
+    pub fn assistant_with_usage_status(
+        blocks: Vec<ContentBlock>,
+        usage: Option<TokenUsage>,
+        incomplete_reason: Option<String>,
+    ) -> Self {
         Self {
             role: MessageRole::Assistant,
             blocks,
             usage,
+            incomplete: incomplete_reason.is_some(),
+            incomplete_reason,
         }
     }
 
@@ -752,6 +769,8 @@ impl ConversationMessage {
                 is_error,
             }],
             usage: None,
+            incomplete: false,
+            incomplete_reason: None,
         }
     }
 
@@ -776,6 +795,15 @@ impl ConversationMessage {
         );
         if let Some(usage) = self.usage {
             object.insert("usage".to_string(), usage_to_json(usage));
+        }
+        if self.incomplete {
+            object.insert("incomplete".to_string(), JsonValue::Bool(true));
+        }
+        if let Some(reason) = &self.incomplete_reason {
+            object.insert(
+                "incomplete_reason".to_string(),
+                JsonValue::String(reason.clone()),
+            );
         }
         JsonValue::Object(object)
     }
@@ -807,10 +835,20 @@ impl ConversationMessage {
             .map(ContentBlock::from_json)
             .collect::<Result<Vec<_>, _>>()?;
         let usage = object.get("usage").map(usage_from_json).transpose()?;
+        let incomplete = object
+            .get("incomplete")
+            .and_then(JsonValue::as_bool)
+            .unwrap_or(false);
+        let incomplete_reason = object
+            .get("incomplete_reason")
+            .and_then(JsonValue::as_str)
+            .map(ToOwned::to_owned);
         Ok(Self {
             role,
             blocks,
             usage,
+            incomplete,
+            incomplete_reason,
         })
     }
 }
@@ -1059,6 +1097,15 @@ fn persisted_message_json(message: &ConversationMessage) -> JsonValue {
     );
     if let Some(usage) = message.usage {
         object.insert("usage".to_string(), usage_to_json(usage));
+    }
+    if message.incomplete {
+        object.insert("incomplete".to_string(), JsonValue::Bool(true));
+    }
+    if let Some(reason) = &message.incomplete_reason {
+        object.insert(
+            "incomplete_reason".to_string(),
+            JsonValue::String(sanitize_jsonl_field(reason)),
+        );
     }
     JsonValue::Object(object)
 }

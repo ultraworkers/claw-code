@@ -15,7 +15,7 @@ cargo run -p rusty-claude-cli -- --help
 cargo build --workspace
 
 # Run the interactive REPL
-cargo run -p rusty-claude-cli -- --model claude-opus-4-7
+cargo run -p rusty-claude-cli -- --model sonnet
 
 # One-shot prompt
 cargo run -p rusty-claude-cli -- prompt "explain this codebase"
@@ -100,7 +100,7 @@ Primary artifacts:
 | Cost / usage / stats surfaces | ✅ |
 | Git integration | ✅ |
 | Markdown terminal rendering (ANSI) | ✅ |
-| Model aliases (opus/sonnet/haiku) | ✅ |
+| Model aliases (opus/sonnet/haiku/fable) | ✅ |
 | Direct CLI subcommands (`status`, `sandbox`, `agents`, `mcp`, `skills`, `doctor`) | ✅ |
 | Slash commands (including `/skills`, `/agents`, `/mcp`, `/doctor`, `/plugin`, `/subagent`) | ✅ |
 | Hooks (`/hooks`, config-backed lifecycle hooks) | ✅ |
@@ -114,9 +114,10 @@ Short names resolve to the latest model versions:
 
 | Alias | Resolves To |
 |-------|------------|
-| `opus` | `claude-opus-4-7` |
-| `sonnet` | `claude-sonnet-4-6` |
-| `haiku` | `claude-haiku-4-5-20251213` |
+| `opus` | `claude-opus-4-8` |
+| `sonnet` | `claude-sonnet-5` |
+| `haiku` | `claude-haiku-4-5-20251001` |
+| `fable` | `claude-fable-5` |
 
 ## CLI Flags and Commands
 
@@ -223,8 +224,8 @@ rust/
 - **~20K lines** of Rust
 - **9 crates** in workspace
 - **Binary name:** `claw`
-- **Default model:** `claude-opus-4-7`
-- **Default permissions:** `workspace-write`
+- **Default model:** `anthropic/claude-sonnet-5`
+- **Default permissions:** `manual`
 
 ## License
 

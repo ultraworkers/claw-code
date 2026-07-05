@@ -185,6 +185,14 @@ const TOP_LEVEL_FIELDS: &[FieldSpec] = &[
         expected: FieldType::Object,
     },
     FieldSpec {
+        name: "pluginSuggestionMarketplaces",
+        expected: FieldType::StringArray,
+    },
+    FieldSpec {
+        name: "disableBundledSkills",
+        expected: FieldType::Bool,
+    },
+    FieldSpec {
         name: "plugins",
         expected: FieldType::Object,
     },
@@ -284,6 +292,14 @@ const PLUGINS_FIELDS: &[FieldSpec] = &[
     FieldSpec {
         name: "maxOutputTokens",
         expected: FieldType::Number,
+    },
+    FieldSpec {
+        name: "skipLfs",
+        expected: FieldType::Bool,
+    },
+    FieldSpec {
+        name: "defaultEnabled",
+        expected: FieldType::Bool,
     },
 ];
 

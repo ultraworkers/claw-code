@@ -8,6 +8,7 @@ use crate::config::RuntimePermissionRuleConfig;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum PermissionMode {
     ReadOnly,
+    Manual,
     WorkspaceWrite,
     DangerFullAccess,
     Prompt,
@@ -19,10 +20,20 @@ impl PermissionMode {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::ReadOnly => "read-only",
+            Self::Manual => "manual",
             Self::WorkspaceWrite => "workspace-write",
             Self::DangerFullAccess => "danger-full-access",
             Self::Prompt => "prompt",
             Self::Allow => "allow",
+        }
+    }
+
+    #[must_use]
+    pub const fn grants(self, required: Self) -> bool {
+        match self {
+            Self::Allow | Self::DangerFullAccess => true,
+            Self::WorkspaceWrite => matches!(required, Self::ReadOnly | Self::WorkspaceWrite),
+            Self::Manual | Self::Prompt | Self::ReadOnly => matches!(required, Self::ReadOnly),
         }
     }
 }
@@ -253,7 +264,7 @@ impl PermissionPolicy {
                 }
                 if allow_rule.is_some()
                     || current_mode == PermissionMode::Allow
-                    || current_mode >= required_mode
+                    || current_mode.grants(required_mode)
                 {
                     return PermissionOutcome::Allow;
                 }
@@ -278,14 +289,16 @@ impl PermissionPolicy {
 
         if allow_rule.is_some()
             || current_mode == PermissionMode::Allow
-            || current_mode >= required_mode
+            || current_mode.grants(required_mode)
         {
             return PermissionOutcome::Allow;
         }
 
-        if current_mode == PermissionMode::Prompt
-            || (current_mode == PermissionMode::WorkspaceWrite
-                && required_mode == PermissionMode::DangerFullAccess)
+        if matches!(
+            current_mode,
+            PermissionMode::Manual | PermissionMode::Prompt
+        ) || (current_mode == PermissionMode::WorkspaceWrite
+            && required_mode == PermissionMode::DangerFullAccess)
         {
             let reason = Some(format!(
                 "tool '{tool_name}' requires approval to escalate from {} to {}",

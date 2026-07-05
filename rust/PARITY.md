@@ -42,7 +42,7 @@ Hashes below come from `git log --oneline`. Merge line counts come from `git sho
 | LSP client | ✅ complete | `2d66503` | `d7f0dc6` | `461 insertions, 9 deletions` |
 | Permission enforcement | ✅ complete | `66283f4` | `336f820` | `357 insertions` |
 
-## Tool Surface: 40/40 (spec parity)
+## Tool Surface (spec parity plus v2.1.201 host contracts)
 
 ### Real Implementations (behavioral parity — varying depth)
 
@@ -73,6 +73,8 @@ Hashes below come from `git log --oneline`. Merge line counts come from `git sho
 | **LSP** | `runtime::lsp_client` + `tools` | registry + dispatch for diagnostics, hover, definition, references, completion, symbols, formatting — **good parity** |
 | **ListMcpResources** | `runtime::mcp_tool_bridge` + `tools` | connected-server resource listing — **good parity** |
 | **ReadMcpResource** | `runtime::mcp_tool_bridge` + `tools` | connected-server resource reads — **good parity** |
+| **ReadMcpResourceDir** | `runtime::mcp_tool_bridge` + `tools` | prefix-filtered MCP resource directory listing — **contract parity** |
+| **McpAuth** | `runtime::mcp_tool_bridge` + `tools` | structured status/login/logout host-flow payloads — **contract parity**, no browser/OAuth host integration |
 | **MCP** | `runtime::mcp_tool_bridge` + `tools` | stateful MCP tool invocation bridge — **good parity** |
 | **ToolSearch** | `tools` | tool discovery — **good parity** |
 | **NotebookEdit** | `tools` | jupyter notebook cell editing — **moderate parity** |
@@ -84,13 +86,14 @@ Hashes below come from `git log --oneline`. Merge line counts come from `git sho
 | **StructuredOutput** | `tools` | passthrough JSON — **good parity** |
 | **REPL** | `tools` | subprocess code execution — **moderate parity** |
 | **PowerShell** | `tools` | Windows PowerShell execution — **moderate parity** |
+| **Workflow / Monitor** | `tools` | v2.1.201 compatibility contracts with stable unsupported payloads; local workflow JS and live monitor scheduling are not implemented |
+| **ScheduleWakeup / PushNotification / ReportFindings / Artifact / Projects / ClaudeDesign / ShowOnboardingRolePicker** | `tools` | host-facing v2.1.201 contract payloads — **contract parity** |
 
 ### Stubs Only (surface parity, no behavior)
 
 | Tool | Status | Notes |
 |------|--------|-------|
 | **AskUserQuestion** | stub | needs live user I/O integration |
-| **McpAuth** | stub | needs full auth UX beyond the MCP lifecycle bridge |
 | **RemoteTrigger** | stub | needs HTTP client |
 | **TestingPermission** | stub | test-only, low priority |
 

@@ -18,11 +18,11 @@ use runtime::{
     check_freshness, dedupe_superseded_commit_events, edit_file_in_workspace, execute_bash,
     glob_search_in_workspace, grep_search_in_workspace, load_system_prompt,
     lsp_client::LspRegistry,
-    mcp_tool_bridge::McpToolRegistry,
+    mcp_tool_bridge::{McpConnectionStatus, McpToolRegistry},
     permission_enforcer::{EnforcementResult, PermissionEnforcer},
     read_file_in_workspace,
     summary_compression::compress_summary_text,
-    task_registry::TaskRegistry,
+    task_registry::{TaskRegistry, TaskStatus, TaskUpdate as RegistryTaskUpdate},
     team_cron_registry::{CronRegistry, TeamRegistry},
     worker_boot::{WorkerReadySnapshot, WorkerRegistry, WorkerTaskReceipt},
     write_file_in_workspace, ApiClient, ApiRequest, AssistantEvent, BashCommandInput,
@@ -677,7 +677,10 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                     "prompt": { "type": "string" },
                     "subagent_type": { "type": "string" },
                     "name": { "type": "string" },
-                    "model": { "type": "string" }
+                    "model": { "type": "string" },
+                    "effort": { "type": "string", "enum": ["low", "medium", "high", "xhigh", "max"] },
+                    "run_in_background": { "type": "boolean" },
+                    "isolation": { "type": "string", "enum": ["worktree", "none"] }
                 },
                 "required": ["description", "prompt"],
                 "additionalProperties": false
@@ -844,17 +847,19 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "TaskCreate",
-            description: "Create a background task that runs in a separate subprocess.",
+            description: "Create a structured session task or background task. Accepts both the legacy prompt field and the v2.1.201 subject/activeForm task-list contract.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "prompt": { "type": "string" },
-                    "description": { "type": "string" }
+                    "subject": { "type": "string" },
+                    "description": { "type": "string" },
+                    "activeForm": { "type": "string" },
+                    "metadata": { "type": "object" }
                 },
-                "required": ["prompt"],
                 "additionalProperties": false
             }),
-            required_permission: PermissionMode::DangerFullAccess,
+            required_permission: PermissionMode::WorkspaceWrite,
         },
         ToolSpec {
             name: "RunTaskPacket",
@@ -926,17 +931,24 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "TaskUpdate",
-            description: "Send a message or update to a running background task.",
+            description: "Send a message or update status/details for a structured session task.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "task_id": { "type": "string" },
-                    "message": { "type": "string" }
+                    "taskId": { "type": "string" },
+                    "message": { "type": "string" },
+                    "status": { "type": "string", "enum": ["pending", "in_progress", "completed", "deleted", "running", "blocked", "failed", "stopped"] },
+                    "subject": { "type": "string" },
+                    "description": { "type": "string" },
+                    "activeForm": { "type": "string" },
+                    "metadata": { "type": "object" },
+                    "addBlocks": { "type": "array", "items": { "type": "string" } },
+                    "addBlockedBy": { "type": "array", "items": { "type": "string" } }
                 },
-                "required": ["task_id", "message"],
                 "additionalProperties": false
             }),
-            required_permission: PermissionMode::DangerFullAccess,
+            required_permission: PermissionMode::WorkspaceWrite,
         },
         ToolSpec {
             name: "TaskOutput",
@@ -1190,7 +1202,8 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "server": { "type": "string" }
+                    "server": { "type": "string" },
+                    "action": { "type": "string", "enum": ["status", "login", "logout"] }
                 },
                 "additionalProperties": false
             }),
@@ -1238,6 +1251,147 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                 "additionalProperties": false
             }),
             required_permission: PermissionMode::DangerFullAccess,
+        },
+        ToolSpec {
+            name: "Workflow",
+            description: "Run a deterministic multi-agent workflow script. v2.1.201 contract surface; local execution is reported as unsupported unless a workflow runner is configured.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "script": { "type": "string" },
+                    "name": { "type": "string" },
+                    "scriptPath": { "type": "string" },
+                    "resumeFromRunId": { "type": "string" },
+                    "args": {}
+                },
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::DangerFullAccess,
+        },
+        ToolSpec {
+            name: "Monitor",
+            description: "Register a live monitor for an external process or condition. v2.1.201 contract surface.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "command": { "type": "string" },
+                    "path": { "type": "string" },
+                    "pattern": { "type": "string" },
+                    "timeout_ms": { "type": "integer", "minimum": 1 }
+                },
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::DangerFullAccess,
+        },
+        ToolSpec {
+            name: "ScheduleWakeup",
+            description: "Schedule a dynamic-loop wakeup prompt for later continuation.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "delaySeconds": { "type": "integer", "minimum": 60 },
+                    "reason": { "type": "string" },
+                    "prompt": { "type": "string" }
+                },
+                "required": ["delaySeconds", "reason", "prompt"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::WorkspaceWrite,
+        },
+        ToolSpec {
+            name: "PushNotification",
+            description: "Send a local push notification event to the host UI contract.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "title": { "type": "string" },
+                    "message": { "type": "string" },
+                    "kind": { "type": "string" }
+                },
+                "required": ["message"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
+            name: "ReportFindings",
+            description: "Report structured code-review findings for host rendering.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "level": { "type": "string" },
+                    "findings": { "type": "array", "items": { "type": "object" } }
+                },
+                "required": ["findings"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
+            name: "ReadMcpResourceDir",
+            description: "List MCP resources under a directory/prefix URI.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "server": { "type": "string" },
+                    "uri": { "type": "string" }
+                },
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
+            name: "Artifact",
+            description: "Create or update a host-rendered artifact contract record.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "title": { "type": "string" },
+                    "content": { "type": "string" },
+                    "type": { "type": "string" },
+                    "id": { "type": "string" }
+                },
+                "required": ["content"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::WorkspaceWrite,
+        },
+        ToolSpec {
+            name: "Projects",
+            description: "Inspect project metadata known to the local runtime.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string" },
+                    "path": { "type": "string" }
+                },
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
+            name: "ClaudeDesign",
+            description: "Return design-guidance payloads for Claude design/dataviz workflows.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "prompt": { "type": "string" },
+                    "kind": { "type": "string" }
+                },
+                "required": ["prompt"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
+            name: "ShowOnboardingRolePicker",
+            description: "Expose the onboarding role-picker contract without mutating runtime state.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
         },
         ToolSpec {
             name: "MCP",
@@ -1486,6 +1640,21 @@ fn execute_tool_with_enforcer(
         "ReadMcpResource" => from_value::<McpResourceInput>(input).and_then(run_read_mcp_resource),
         "McpAuth" => from_value::<McpAuthInput>(input).and_then(run_mcp_auth),
         "RemoteTrigger" => from_value::<RemoteTriggerInput>(input).and_then(run_remote_trigger),
+        "Workflow" => from_value::<WorkflowInput>(input).and_then(run_workflow),
+        "Monitor" => from_value::<MonitorInput>(input).and_then(run_monitor),
+        "ScheduleWakeup" => from_value::<ScheduleWakeupInput>(input).and_then(run_schedule_wakeup),
+        "PushNotification" => {
+            from_value::<PushNotificationInput>(input).and_then(run_push_notification)
+        }
+        "ReportFindings" => from_value::<ReportFindingsInput>(input).and_then(run_report_findings),
+        "ReadMcpResourceDir" => {
+            from_value::<McpResourceInput>(input).and_then(run_read_mcp_resource_dir)
+        }
+        "Artifact" => from_value::<ArtifactInput>(input).and_then(run_artifact),
+        "Projects" => from_value::<ProjectsInput>(input).and_then(run_projects),
+        "ClaudeDesign" => from_value::<ClaudeDesignInput>(input).and_then(run_claude_design),
+        "ShowOnboardingRolePicker" => from_value::<ShowOnboardingRolePickerInput>(input)
+            .and_then(run_show_onboarding_role_picker),
         "MCP" => from_value::<McpToolInput>(input).and_then(run_mcp_tool),
         "TestingPermission" => {
             from_value::<TestingPermissionInput>(input).and_then(run_testing_permission)
@@ -1575,12 +1744,26 @@ fn run_ask_user_question(input: AskUserQuestionInput) -> Result<String, String> 
 #[allow(clippy::needless_pass_by_value)]
 fn run_task_create(input: TaskCreateInput) -> Result<String, String> {
     let registry = global_task_registry();
-    let task = registry.create(&input.prompt, input.description.as_deref());
+    let prompt = input
+        .subject
+        .clone()
+        .or(input.prompt.clone())
+        .ok_or_else(|| "TaskCreate requires either subject or prompt".to_string())?;
+    let task = registry.create_structured(
+        &prompt,
+        input.description.as_deref(),
+        input.active_form,
+        input.metadata,
+    );
     to_pretty_json(json!({
         "task_id": task.task_id,
+        "taskId": task.task_id,
         "status": task.status,
         "prompt": task.prompt,
+        "subject": prompt,
         "description": task.description,
+        "activeForm": task.active_form,
+        "metadata": task.metadata,
         "task_packet": task.task_packet,
         "created_at": task.created_at
     }))
@@ -1616,7 +1799,11 @@ fn run_task_get(input: TaskIdInput) -> Result<String, String> {
             "created_at": task.created_at,
             "updated_at": task.updated_at,
             "messages": task.messages,
-            "team_id": task.team_id
+            "team_id": task.team_id,
+            "activeForm": task.active_form,
+            "metadata": task.metadata,
+            "blocks": task.blocks,
+            "blockedBy": task.blocked_by
         })),
         None => Err(format!("task not found: {}", input.task_id)),
     }
@@ -1636,7 +1823,11 @@ fn run_task_list(_input: Value) -> Result<String, String> {
                 "task_packet": t.task_packet,
                 "created_at": t.created_at,
                 "updated_at": t.updated_at,
-                "team_id": t.team_id
+                "team_id": t.team_id,
+                "activeForm": t.active_form,
+                "metadata": t.metadata,
+                "blocks": t.blocks,
+                "blockedBy": t.blocked_by
             })
         })
         .collect();
@@ -1662,14 +1853,60 @@ fn run_task_stop(input: TaskIdInput) -> Result<String, String> {
 #[allow(clippy::needless_pass_by_value)]
 fn run_task_update(input: TaskUpdateInput) -> Result<String, String> {
     let registry = global_task_registry();
-    match registry.update(&input.task_id, &input.message) {
+    if input.status.as_deref() == Some("deleted") {
+        return registry
+            .remove(&input.task_id)
+            .map(|task| {
+                to_pretty_json(json!({
+                    "task_id": task.task_id,
+                    "taskId": task.task_id,
+                    "status": "deleted"
+                }))
+            })
+            .unwrap_or_else(|| Err(format!("task not found: {}", input.task_id)));
+    }
+
+    let status = input.status.as_deref().map(parse_task_status).transpose()?;
+    let last_message = input.message.clone();
+    match registry.update_task(
+        &input.task_id,
+        RegistryTaskUpdate {
+            message: input.message,
+            status,
+            subject: input.subject,
+            description: input.description,
+            active_form: input.active_form,
+            metadata: input.metadata,
+            add_blocks: input.add_blocks,
+            add_blocked_by: input.add_blocked_by,
+        },
+    ) {
         Ok(task) => to_pretty_json(json!({
             "task_id": task.task_id,
+            "taskId": task.task_id,
             "status": task.status,
             "message_count": task.messages.len(),
-            "last_message": input.message
+            "last_message": last_message,
+            "subject": task.prompt,
+            "description": task.description,
+            "activeForm": task.active_form,
+            "metadata": task.metadata,
+            "blocks": task.blocks,
+            "blockedBy": task.blocked_by
         })),
         Err(e) => Err(e),
+    }
+}
+
+fn parse_task_status(status: &str) -> Result<TaskStatus, String> {
+    match status {
+        "pending" | "created" => Ok(TaskStatus::Created),
+        "in_progress" | "running" => Ok(TaskStatus::Running),
+        "blocked" => Ok(TaskStatus::Blocked),
+        "completed" => Ok(TaskStatus::Completed),
+        "failed" => Ok(TaskStatus::Failed),
+        "stopped" => Ok(TaskStatus::Stopped),
+        other => Err(format!("unsupported task status: {other}")),
     }
 }
 
@@ -1922,14 +2159,28 @@ fn run_read_mcp_resource(input: McpResourceInput) -> Result<String, String> {
 #[allow(clippy::needless_pass_by_value)]
 fn run_mcp_auth(input: McpAuthInput) -> Result<String, String> {
     let registry = global_mcp_registry();
+    let action = input.action.as_deref().unwrap_or("status");
+    if action == "logout" {
+        registry.set_auth_status(&input.server, McpConnectionStatus::AuthRequired)?;
+    }
     match registry.get_server(&input.server) {
-        Some(state) => to_pretty_json(json!({
-            "server": input.server,
-            "status": state.status,
-            "server_info": state.server_info,
-            "tool_count": state.tools.len(),
-            "resource_count": state.resources.len()
-        })),
+        Some(state) => {
+            let status = match action {
+                "login" => "authorization_required".to_string(),
+                "logout" => "credentials_cleared".to_string(),
+                _ => state.status.to_string(),
+            };
+            to_pretty_json(json!({
+                "server": input.server,
+                "action": action,
+                "status": status,
+                "connection_status": state.status,
+                "host_flow_required": action == "login",
+                "server_info": state.server_info,
+                "tool_count": state.tools.len(),
+                "resource_count": state.resources.len()
+            }))
+        }
         None => to_pretty_json(json!({
             "server": input.server,
             "status": "disconnected",
@@ -2000,6 +2251,148 @@ fn run_remote_trigger(input: RemoteTriggerInput) -> Result<String, String> {
             "success": false
         })),
     }
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_workflow(input: WorkflowInput) -> Result<String, String> {
+    to_pretty_json(json!({
+        "status": "unsupported",
+        "kind": "workflow",
+        "message": "Workflow tool contract is registered for Claude Code v2.1.201 compatibility, but this local runtime does not execute workflow JavaScript yet.",
+        "name": input.name,
+        "has_script": input.script.as_ref().is_some_and(|script| !script.trim().is_empty()),
+        "scriptPath": input.script_path,
+        "resumeFromRunId": input.resume_from_run_id,
+        "args": input.args,
+    }))
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_monitor(input: MonitorInput) -> Result<String, String> {
+    to_pretty_json(json!({
+        "status": "unsupported",
+        "kind": "monitor",
+        "message": "Monitor contract is registered for Claude Code v2.1.201 compatibility; live monitor execution is not available in this runtime.",
+        "command": input.command,
+        "path": input.path,
+        "pattern": input.pattern,
+        "timeout_ms": input.timeout_ms,
+    }))
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_schedule_wakeup(input: ScheduleWakeupInput) -> Result<String, String> {
+    let clamped = input.delay_seconds.clamp(60, 3600);
+    to_pretty_json(json!({
+        "status": "scheduled_contract_only",
+        "kind": "schedule_wakeup",
+        "delaySeconds": clamped,
+        "reason": input.reason,
+        "prompt": input.prompt,
+        "message": "ScheduleWakeup contract captured; this local runtime does not yet enqueue dynamic-loop wakeups."
+    }))
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_push_notification(input: PushNotificationInput) -> Result<String, String> {
+    to_pretty_json(json!({
+        "status": "ok",
+        "kind": input.kind.unwrap_or_else(|| "notification".to_string()),
+        "title": input.title,
+        "message": input.message,
+    }))
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_report_findings(input: ReportFindingsInput) -> Result<String, String> {
+    to_pretty_json(json!({
+        "status": "ok",
+        "kind": "report_findings",
+        "level": input.level,
+        "finding_count": input.findings.len(),
+        "findings": input.findings,
+    }))
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_read_mcp_resource_dir(input: McpResourceInput) -> Result<String, String> {
+    let registry = global_mcp_registry();
+    let server = input.server.as_deref().unwrap_or("default");
+    let prefix = input.uri.as_deref().unwrap_or("");
+    match registry.list_resources(server) {
+        Ok(resources) => {
+            let items: Vec<_> = resources
+                .iter()
+                .filter(|resource| resource.uri.starts_with(prefix))
+                .map(|resource| {
+                    json!({
+                        "uri": resource.uri,
+                        "name": resource.name,
+                        "description": resource.description,
+                        "mime_type": resource.mime_type,
+                    })
+                })
+                .collect();
+            to_pretty_json(json!({
+                "server": server,
+                "uri": prefix,
+                "resources": items,
+                "count": items.len(),
+            }))
+        }
+        Err(error) => to_pretty_json(json!({
+            "server": server,
+            "uri": prefix,
+            "resources": [],
+            "error": error,
+        })),
+    }
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_artifact(input: ArtifactInput) -> Result<String, String> {
+    to_pretty_json(json!({
+        "status": "ok",
+        "kind": "artifact",
+        "id": input.id.unwrap_or_else(make_agent_id),
+        "title": input.title,
+        "type": input.artifact_type.unwrap_or_else(|| "text".to_string()),
+        "content": input.content,
+    }))
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_projects(input: ProjectsInput) -> Result<String, String> {
+    let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
+    to_pretty_json(json!({
+        "status": "ok",
+        "kind": "projects",
+        "action": input.action.unwrap_or_else(|| "inspect".to_string()),
+        "path": input.path.unwrap_or_else(|| cwd.display().to_string()),
+        "cwd": cwd.display().to_string(),
+    }))
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_claude_design(input: ClaudeDesignInput) -> Result<String, String> {
+    to_pretty_json(json!({
+        "status": "ok",
+        "kind": input.kind.unwrap_or_else(|| "design".to_string()),
+        "prompt": input.prompt,
+        "guidance": "Use accessible contrast, clear hierarchy, and validate data visualizations against user goals."
+    }))
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_show_onboarding_role_picker(
+    _input: ShowOnboardingRolePickerInput,
+) -> Result<String, String> {
+    to_pretty_json(json!({
+        "status": "ok",
+        "kind": "onboarding_role_picker",
+        "roles": ["coding", "learning", "data", "writing", "other"],
+        "message": "Role picker contract exposed for host UI compatibility."
+    }))
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -2828,13 +3221,16 @@ struct SkillInput {
     args: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 struct AgentInput {
     description: String,
     prompt: String,
     subagent_type: Option<String>,
     name: Option<String>,
     model: Option<String>,
+    effort: Option<String>,
+    run_in_background: Option<bool>,
+    isolation: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2936,20 +3332,44 @@ struct AskUserQuestionInput {
 
 #[derive(Debug, Deserialize)]
 struct TaskCreateInput {
-    prompt: String,
+    #[serde(default)]
+    prompt: Option<String>,
+    #[serde(default)]
+    subject: Option<String>,
     #[serde(default)]
     description: Option<String>,
+    #[serde(default, rename = "activeForm")]
+    active_form: Option<String>,
+    #[serde(default)]
+    metadata: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
 struct TaskIdInput {
+    #[serde(alias = "taskId")]
     task_id: String,
 }
 
 #[derive(Debug, Deserialize)]
 struct TaskUpdateInput {
+    #[serde(alias = "taskId")]
     task_id: String,
-    message: String,
+    #[serde(default)]
+    message: Option<String>,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    subject: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default, rename = "activeForm")]
+    active_form: Option<String>,
+    #[serde(default)]
+    metadata: Option<Value>,
+    #[serde(default, rename = "addBlocks")]
+    add_blocks: Vec<String>,
+    #[serde(default, rename = "addBlockedBy")]
+    add_blocked_by: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3040,6 +3460,8 @@ struct McpResourceInput {
 #[derive(Debug, Deserialize)]
 struct McpAuthInput {
     server: String,
+    #[serde(default)]
+    action: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3052,6 +3474,80 @@ struct RemoteTriggerInput {
     #[serde(default)]
     body: Option<String>,
 }
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct WorkflowInput {
+    script: Option<String>,
+    name: Option<String>,
+    #[serde(rename = "scriptPath")]
+    script_path: Option<String>,
+    #[serde(rename = "resumeFromRunId")]
+    resume_from_run_id: Option<String>,
+    args: Option<Value>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct MonitorInput {
+    command: Option<String>,
+    path: Option<String>,
+    pattern: Option<String>,
+    timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ScheduleWakeupInput {
+    #[serde(rename = "delaySeconds")]
+    delay_seconds: u64,
+    reason: String,
+    prompt: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct PushNotificationInput {
+    #[serde(default)]
+    title: Option<String>,
+    message: String,
+    #[serde(default)]
+    kind: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReportFindingsInput {
+    #[serde(default)]
+    level: Option<String>,
+    findings: Vec<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ArtifactInput {
+    #[serde(default)]
+    title: Option<String>,
+    content: String,
+    #[serde(default, rename = "type")]
+    artifact_type: Option<String>,
+    #[serde(default)]
+    id: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct ProjectsInput {
+    action: Option<String>,
+    path: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClaudeDesignInput {
+    prompt: String,
+    #[serde(default)]
+    kind: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct ShowOnboardingRolePickerInput {}
 
 #[derive(Debug, Deserialize)]
 struct McpToolInput {
@@ -3184,6 +3680,8 @@ struct SkillOutput {
     path: String,
     args: Option<String>,
     description: Option<String>,
+    #[serde(rename = "disallowedTools", skip_serializing_if = "Vec::is_empty")]
+    disallowed_tools: Vec<String>,
     prompt: String,
 }
 
@@ -3196,6 +3694,12 @@ struct AgentOutput {
     #[serde(rename = "subagentType")]
     subagent_type: Option<String>,
     model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    effort: Option<String>,
+    #[serde(rename = "runInBackground", default)]
+    run_in_background: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    isolation: Option<String>,
     status: String,
     #[serde(rename = "outputFile")]
     output_file: String,
@@ -3791,12 +4295,14 @@ fn execute_skill(input: SkillInput) -> Result<SkillOutput, String> {
     let skill_path = resolve_skill_path(&input.skill)?;
     let prompt = std::fs::read_to_string(&skill_path).map_err(|error| error.to_string())?;
     let description = parse_skill_description(&prompt);
+    let disallowed_tools = parse_skill_frontmatter_list(&prompt, "disallowed-tools");
 
     Ok(SkillOutput {
         skill: input.skill,
         path: skill_path.display().to_string(),
         args: input.args,
         description,
+        disallowed_tools,
         prompt,
     })
 }
@@ -4084,6 +4590,19 @@ fn parse_skill_frontmatter_value(contents: &str, key: &str) -> Option<String> {
     None
 }
 
+fn parse_skill_frontmatter_list(contents: &str, key: &str) -> Vec<String> {
+    let Some(value) = parse_skill_frontmatter_value(contents, key) else {
+        return Vec::new();
+    };
+    value
+        .trim_matches(|ch| matches!(ch, '[' | ']'))
+        .split(',')
+        .map(|item| item.trim().trim_matches(|ch| matches!(ch, '"' | '\'')))
+        .filter(|item| !item.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
 const DEFAULT_AGENT_MODEL: &str = "claude-opus-4-6";
 const DEFAULT_AGENT_SYSTEM_DATE: &str = "2026-03-31";
 const DEFAULT_AGENT_MAX_ITERATIONS: usize = 32;
@@ -4110,6 +4629,9 @@ where
     let manifest_file = output_dir.join(format!("{agent_id}.json"));
     let normalized_subagent_type = normalize_subagent_type(input.subagent_type.as_deref());
     let model = resolve_agent_model(input.model.as_deref());
+    let effort = input.effort.clone();
+    let run_in_background = input.run_in_background.unwrap_or(true);
+    let isolation = input.isolation.clone();
     let agent_name = input
         .name
         .as_deref()
@@ -4143,6 +4665,9 @@ where
         description: input.description,
         subagent_type: Some(normalized_subagent_type),
         model: Some(model),
+        effort,
+        run_in_background,
+        isolation,
         status: String::from("running"),
         output_file: output_file.display().to_string(),
         manifest_file: manifest_file.display().to_string(),
@@ -6591,11 +7116,25 @@ fn detect_powershell_shell() -> std::io::Result<&'static str> {
 }
 
 fn command_exists(command: &str) -> bool {
-    std::process::Command::new("sh")
-        .arg("-lc")
-        .arg(format!("command -v {command} >/dev/null 2>&1"))
-        .status()
-        .is_ok_and(|status| status.success())
+    std::env::var_os("PATH").is_some_and(|paths| {
+        std::env::split_paths(&paths).any(|dir| {
+            let candidate = dir.join(command);
+            candidate.is_file() && is_executable(&candidate)
+        })
+    })
+}
+
+#[cfg(unix)]
+fn is_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    path.metadata()
+        .is_ok_and(|metadata| metadata.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(not(unix))]
+fn is_executable(path: &Path) -> bool {
+    path.is_file()
 }
 
 #[allow(clippy::too_many_lines)]
@@ -6841,13 +7380,14 @@ mod tests {
     use super::{
         agent_permission_policy, allowed_tools_for_subagent, build_agent_system_prompt,
         classify_lane_failure, derive_agent_state, execute_agent_with_spawn, execute_tool,
-        extract_recovery_outcome, final_assistant_text, global_cron_registry,
+        extract_recovery_outcome, final_assistant_text, global_cron_registry, global_mcp_registry,
         maybe_commit_provenance, mvp_tool_specs, permission_mode_from_plugin,
         persist_agent_terminal_state, push_output_block, run_task_packet, AgentInput, AgentJob,
         GlobalToolRegistry, LaneEventName, LaneFailureClass, ProviderRuntimeClient,
         SubagentToolExecutor,
     };
     use api::OutputContentBlock;
+    use runtime::mcp_tool_bridge::{McpConnectionStatus, McpResourceInfo, McpToolInfo};
     use runtime::ProviderFallbackConfig;
     use runtime::{
         permission_enforcer::PermissionEnforcer, ApiRequest, AssistantEvent, ConversationRuntime,
@@ -6950,6 +7490,225 @@ mod tests {
         assert!(names.contains(&"WorkerObserve"));
         assert!(names.contains(&"WorkerAwaitReady"));
         assert!(names.contains(&"WorkerSendPrompt"));
+    }
+
+    #[test]
+    fn v201_task_tools_accept_structured_subject_and_update_contract() {
+        let created = execute_tool(
+            "TaskCreate",
+            &json!({
+                "subject": "Review v2.1.201 migration",
+                "description": "Check the compatibility contract",
+                "activeForm": "Reviewing migration",
+                "metadata": {"priority": "P1"}
+            }),
+        )
+        .expect("structured TaskCreate should succeed");
+        let created: serde_json::Value = serde_json::from_str(&created).expect("task json");
+        let task_id = created["taskId"].as_str().expect("taskId").to_string();
+        assert_eq!(created["task_id"], task_id);
+        assert_eq!(created["status"], "created");
+        assert_eq!(created["subject"], "Review v2.1.201 migration");
+        assert_eq!(created["activeForm"], "Reviewing migration");
+        assert_eq!(created["metadata"]["priority"], "P1");
+
+        let updated = execute_tool(
+            "TaskUpdate",
+            &json!({
+                "taskId": task_id,
+                "status": "in_progress",
+                "message": "Started validation",
+                "subject": "Validate v2.1.201 migration",
+                "activeForm": "Running checks",
+                "metadata": {"priority": "P0"},
+                "addBlocks": ["fmt"],
+                "addBlockedBy": ["tools-test"]
+            }),
+        )
+        .expect("structured TaskUpdate should succeed");
+        let updated: serde_json::Value = serde_json::from_str(&updated).expect("updated json");
+        assert_eq!(updated["status"], "running");
+        assert_eq!(updated["message_count"], 1);
+        assert_eq!(updated["last_message"], "Started validation");
+        assert_eq!(updated["subject"], "Validate v2.1.201 migration");
+        assert_eq!(updated["activeForm"], "Running checks");
+        assert_eq!(updated["metadata"]["priority"], "P0");
+        assert_eq!(updated["blocks"][0], "fmt");
+        assert_eq!(updated["blockedBy"][0], "tools-test");
+
+        let deleted = execute_tool(
+            "TaskUpdate",
+            &json!({
+                "taskId": updated["taskId"].as_str().expect("updated taskId"),
+                "status": "deleted"
+            }),
+        )
+        .expect("TaskUpdate deleted status should remove the task");
+        let deleted: serde_json::Value = serde_json::from_str(&deleted).expect("deleted json");
+        assert_eq!(deleted["status"], "deleted");
+    }
+
+    #[test]
+    fn v201_host_contract_tools_return_stable_payloads() {
+        let workflow = execute_tool(
+            "Workflow",
+            &json!({
+                "name": "release-check",
+                "script": "step('test')",
+                "args": {"target": "tools"}
+            }),
+        )
+        .expect("Workflow contract should be registered");
+        let workflow: serde_json::Value = serde_json::from_str(&workflow).expect("workflow json");
+        assert_eq!(workflow["status"], "unsupported");
+        assert_eq!(workflow["kind"], "workflow");
+        assert_eq!(workflow["has_script"], true);
+
+        let monitor = execute_tool(
+            "Monitor",
+            &json!({"command": "cargo test", "pattern": "finished", "timeout_ms": 250}),
+        )
+        .expect("Monitor contract should be registered");
+        let monitor: serde_json::Value = serde_json::from_str(&monitor).expect("monitor json");
+        assert_eq!(monitor["status"], "unsupported");
+        assert_eq!(monitor["kind"], "monitor");
+        assert_eq!(monitor["timeout_ms"], 250);
+
+        let wakeup = execute_tool(
+            "ScheduleWakeup",
+            &json!({"delaySeconds": 30, "reason": "continue verification", "prompt": "resume"}),
+        )
+        .expect("ScheduleWakeup contract should be captured");
+        let wakeup: serde_json::Value = serde_json::from_str(&wakeup).expect("wakeup json");
+        assert_eq!(wakeup["status"], "scheduled_contract_only");
+        assert_eq!(wakeup["delaySeconds"], 60);
+
+        let notification = execute_tool(
+            "PushNotification",
+            &json!({"message": "Migration check done", "kind": "migration"}),
+        )
+        .expect("PushNotification should return host event payload");
+        let notification: serde_json::Value =
+            serde_json::from_str(&notification).expect("notification json");
+        assert_eq!(notification["status"], "ok");
+        assert_eq!(notification["kind"], "migration");
+
+        let findings = execute_tool(
+            "ReportFindings",
+            &json!({"level": "warn", "findings": [{"path": "src/lib.rs"}]}),
+        )
+        .expect("ReportFindings should return findings payload");
+        let findings: serde_json::Value = serde_json::from_str(&findings).expect("findings json");
+        assert_eq!(findings["status"], "ok");
+        assert_eq!(findings["finding_count"], 1);
+
+        let artifact = execute_tool(
+            "Artifact",
+            &json!({"id": "artifact-1", "title": "Report", "type": "markdown", "content": "# OK"}),
+        )
+        .expect("Artifact should return artifact contract");
+        let artifact: serde_json::Value = serde_json::from_str(&artifact).expect("artifact json");
+        assert_eq!(artifact["status"], "ok");
+        assert_eq!(artifact["id"], "artifact-1");
+        assert_eq!(artifact["type"], "markdown");
+
+        let root = temp_path("projects-tool");
+        fs::create_dir_all(&root).expect("create project dir");
+        let previous = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&root).expect("enter project dir");
+        let projects = execute_tool("Projects", &json!({"action": "inspect"}))
+            .expect("Projects should inspect cwd");
+        std::env::set_current_dir(previous).expect("restore cwd");
+        let projects: serde_json::Value = serde_json::from_str(&projects).expect("projects json");
+        let canonical_root = root.canonicalize().expect("canonical project dir");
+        assert_eq!(projects["status"], "ok");
+        assert_eq!(projects["path"], canonical_root.display().to_string());
+        let _ = fs::remove_dir_all(root);
+
+        let design = execute_tool(
+            "ClaudeDesign",
+            &json!({"prompt": "chart revenue", "kind": "dataviz"}),
+        )
+        .expect("ClaudeDesign should return design guidance");
+        let design: serde_json::Value = serde_json::from_str(&design).expect("design json");
+        assert_eq!(design["status"], "ok");
+        assert_eq!(design["kind"], "dataviz");
+
+        let onboarding = execute_tool("ShowOnboardingRolePicker", &json!({}))
+            .expect("ShowOnboardingRolePicker should return role picker contract");
+        let onboarding: serde_json::Value =
+            serde_json::from_str(&onboarding).expect("onboarding json");
+        assert_eq!(onboarding["status"], "ok");
+        assert!(onboarding["roles"]
+            .as_array()
+            .expect("roles")
+            .contains(&json!("coding")));
+    }
+
+    #[test]
+    fn v201_mcp_auth_and_resource_dir_contracts_are_structured() {
+        let server_name = format!(
+            "v201-mcp-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        );
+        global_mcp_registry().register_server(
+            &server_name,
+            McpConnectionStatus::Connected,
+            vec![McpToolInfo {
+                name: "echo".to_string(),
+                description: Some("Echo input".to_string()),
+                input_schema: None,
+            }],
+            vec![
+                McpResourceInfo {
+                    uri: "file:///repo/a.md".to_string(),
+                    name: "a.md".to_string(),
+                    description: None,
+                    mime_type: Some("text/markdown".to_string()),
+                },
+                McpResourceInfo {
+                    uri: "file:///repo/nested/b.md".to_string(),
+                    name: "b.md".to_string(),
+                    description: Some("Nested".to_string()),
+                    mime_type: Some("text/markdown".to_string()),
+                },
+            ],
+            Some("test server".to_string()),
+        );
+
+        let resources = execute_tool(
+            "ReadMcpResourceDir",
+            &json!({"server": server_name, "uri": "file:///repo/"}),
+        )
+        .expect("ReadMcpResourceDir should list resources by prefix");
+        let resources: serde_json::Value =
+            serde_json::from_str(&resources).expect("resources json");
+        assert_eq!(resources["count"], 2);
+        assert_eq!(resources["resources"][0]["uri"], "file:///repo/a.md");
+
+        let login = execute_tool(
+            "McpAuth",
+            &json!({"server": server_name, "action": "login"}),
+        )
+        .expect("McpAuth login contract should be structured");
+        let login: serde_json::Value = serde_json::from_str(&login).expect("login json");
+        assert_eq!(login["action"], "login");
+        assert_eq!(login["status"], "authorization_required");
+        assert_eq!(login["connection_status"], "connected");
+        assert_eq!(login["host_flow_required"], true);
+
+        let logout = execute_tool(
+            "McpAuth",
+            &json!({"server": server_name, "action": "logout"}),
+        )
+        .expect("McpAuth logout contract should be structured");
+        let logout: serde_json::Value = serde_json::from_str(&logout).expect("logout json");
+        assert_eq!(logout["action"], "logout");
+        assert_eq!(logout["status"], "credentials_cleared");
+        assert_eq!(logout["connection_status"], "auth_required");
     }
 
     #[test]
@@ -8699,6 +9458,7 @@ mod tests {
                 subagent_type: Some("Explore".to_string()),
                 name: Some("ship-audit".to_string()),
                 model: None,
+                ..AgentInput::default()
             },
             move |job| {
                 *captured_for_spawn
@@ -8779,7 +9539,8 @@ mod tests {
                 prompt: "Do the work".to_string(),
                 subagent_type: Some("Explore".to_string()),
                 name: Some("complete-task".to_string()),
-                model: Some("claude-sonnet-4-6".to_string()),
+                model: Some("claude-sonnet-5".to_string()),
+                ..AgentInput::default()
             },
             |job| {
                 persist_agent_terminal_state(
@@ -8837,6 +9598,7 @@ mod tests {
                 subagent_type: Some("Verification".to_string()),
                 name: Some("fail-task".to_string()),
                 model: None,
+                ..AgentInput::default()
             },
             |job| {
                 persist_agent_terminal_state(
@@ -8884,6 +9646,7 @@ mod tests {
                 subagent_type: Some("Explore".to_string()),
                 name: Some("summary-floor".to_string()),
                 model: None,
+                ..AgentInput::default()
             },
             |job| {
                 persist_agent_terminal_state(
@@ -8929,6 +9692,7 @@ mod tests {
                 subagent_type: Some("Explore".to_string()),
                 name: Some("recovery-lane".to_string()),
                 model: None,
+                ..AgentInput::default()
             },
             |job| {
                 persist_agent_terminal_state(
@@ -8977,6 +9741,7 @@ mod tests {
                 subagent_type: Some("Verification".to_string()),
                 name: Some("review-lane".to_string()),
                 model: None,
+                ..AgentInput::default()
             },
             |job| {
                 persist_agent_terminal_state(
@@ -9017,6 +9782,7 @@ mod tests {
                 subagent_type: Some("Explore".to_string()),
                 name: Some("backlog-scan".to_string()),
                 model: None,
+                ..AgentInput::default()
             },
             |job| {
                 persist_agent_terminal_state(
@@ -9063,6 +9829,7 @@ mod tests {
                 subagent_type: Some("Explore".to_string()),
                 name: Some("artifact-lane".to_string()),
                 model: None,
+                ..AgentInput::default()
             },
             |job| {
                 persist_agent_terminal_state(
@@ -9133,6 +9900,7 @@ mod tests {
                 subagent_type: Some("Explore".to_string()),
                 name: Some("cron-closeout".to_string()),
                 model: None,
+                ..AgentInput::default()
             },
             |job| {
                 persist_agent_terminal_state(
@@ -9174,6 +9942,7 @@ mod tests {
                 subagent_type: None,
                 name: Some("spawn-error".to_string()),
                 model: None,
+                ..AgentInput::default()
             },
             |_| Err(String::from("thread creation failed")),
         )
@@ -10595,7 +11364,7 @@ printf 'pwsh:%s' "$1"
 
         // when
         let client = ProviderRuntimeClient::new_with_fallback_config(
-            "claude-sonnet-4-6".to_string(),
+            "claude-sonnet-5".to_string(),
             BTreeSet::new(),
             &fallback_config,
         )
@@ -10603,7 +11372,7 @@ printf 'pwsh:%s' "$1"
 
         // then
         assert_eq!(client.chain.len(), 1);
-        assert_eq!(client.chain[0].model, "claude-sonnet-4-6");
+        assert_eq!(client.chain[0].model, "claude-sonnet-5");
 
         match original_anthropic {
             Some(value) => std::env::set_var("ANTHROPIC_API_KEY", value),
@@ -10628,7 +11397,7 @@ printf 'pwsh:%s' "$1"
 
         // when
         let client = ProviderRuntimeClient::new_with_fallback_config(
-            "claude-sonnet-4-6".to_string(),
+            "claude-sonnet-5".to_string(),
             BTreeSet::new(),
             &fallback_config,
         )
@@ -10636,7 +11405,7 @@ printf 'pwsh:%s' "$1"
 
         // then
         assert_eq!(client.chain.len(), 3);
-        assert_eq!(client.chain[0].model, "claude-sonnet-4-6");
+        assert_eq!(client.chain[0].model, "claude-sonnet-5");
         assert_eq!(client.chain[1].model, "grok-3");
         assert_eq!(client.chain[2].model, "grok-3-mini");
 
@@ -10662,12 +11431,12 @@ printf 'pwsh:%s' "$1"
         std::env::set_var("XAI_API_KEY", "xai-test-key");
         let fallback_config = ProviderFallbackConfig::new(
             Some("grok-3".to_string()),
-            vec!["claude-sonnet-4-6".to_string()],
+            vec!["claude-sonnet-5".to_string()],
         );
 
         // when
         let client = ProviderRuntimeClient::new_with_fallback_config(
-            "claude-haiku-4-5-20251213".to_string(),
+            "claude-haiku-4-5-20251001".to_string(),
             BTreeSet::new(),
             &fallback_config,
         )
@@ -10676,7 +11445,7 @@ printf 'pwsh:%s' "$1"
         // then
         assert_eq!(client.chain.len(), 2);
         assert_eq!(client.chain[0].model, "grok-3");
-        assert_eq!(client.chain[1].model, "claude-sonnet-4-6");
+        assert_eq!(client.chain[1].model, "claude-sonnet-5");
 
         match original_anthropic {
             Some(value) => std::env::set_var("ANTHROPIC_API_KEY", value),
@@ -10702,13 +11471,13 @@ printf 'pwsh:%s' "$1"
             None,
             vec![
                 "grok-3".to_string(),
-                "claude-haiku-4-5-20251213".to_string(),
+                "claude-haiku-4-5-20251001".to_string(),
             ],
         );
 
         // when
         let client = ProviderRuntimeClient::new_with_fallback_config(
-            "claude-sonnet-4-6".to_string(),
+            "claude-sonnet-5".to_string(),
             BTreeSet::new(),
             &fallback_config,
         )
@@ -10716,8 +11485,8 @@ printf 'pwsh:%s' "$1"
 
         // then
         assert_eq!(client.chain.len(), 2);
-        assert_eq!(client.chain[0].model, "claude-sonnet-4-6");
-        assert_eq!(client.chain[1].model, "claude-haiku-4-5-20251213");
+        assert_eq!(client.chain[0].model, "claude-sonnet-5");
+        assert_eq!(client.chain[1].model, "claude-haiku-4-5-20251001");
 
         match original_anthropic {
             Some(value) => std::env::set_var("ANTHROPIC_API_KEY", value),

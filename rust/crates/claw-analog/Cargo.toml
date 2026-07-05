@@ -10,6 +10,9 @@ description = "Minimal agent harness: tool loop with explicit permissions and wo
 name = "claw_analog"
 path = "src/lib.rs"
 
+[lints]
+workspace = true
+
 [[bin]]
 name = "claw-analog"
 path = "src/main.rs"

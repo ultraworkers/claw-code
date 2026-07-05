@@ -1,3 +1,5 @@
+#![allow(unused_variables)]
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -512,7 +514,7 @@ fn status_json_surfaces_permission_mode_override_for_security_audit() {
 }
 
 #[test]
-fn default_permission_mode_is_workspace_write_and_audited_428() {
+fn default_permission_mode_is_manual_and_audited_428() {
     let root = unique_temp_dir("default-permission-mode-428");
     let config_home = root.join("config-home");
     let home = root.join("home");
@@ -529,7 +531,7 @@ fn default_permission_mode_is_workspace_write_and_audited_428() {
     ];
 
     let status = assert_json_command_with_env(&root, &["--output-format", "json", "status"], &envs);
-    assert_eq!(status["permission_mode"], "workspace-write");
+    assert_eq!(status["permission_mode"], "manual");
     assert_eq!(status["permission_mode_source"], "default");
 
     let doctor = assert_json_command_with_env(&root, &["--output-format", "json", "doctor"], &envs);
@@ -540,12 +542,9 @@ fn default_permission_mode_is_workspace_write_and_audited_428() {
         .find(|check| check["name"] == "permissions")
         .expect("permissions check");
     assert_eq!(permissions["status"], "ok");
-    assert_eq!(permissions["mode"], "workspace-write");
+    assert_eq!(permissions["mode"], "manual");
     assert_eq!(permissions["source"], "default");
-    assert_eq!(
-        permissions["message"],
-        "default permission mode is workspace-write"
-    );
+    assert_eq!(permissions["message"], "default permission mode is manual");
 }
 
 #[test]
@@ -780,12 +779,12 @@ fn status_json_accepts_namespaced_model_env_and_surfaces_alias_426() {
     let parsed = assert_json_command_with_env(&root, &["--output-format", "json", "status"], &envs);
 
     assert_eq!(parsed["status"], "ok");
-    assert_eq!(parsed["model"], "anthropic/claude-opus-4-7");
+    assert_eq!(parsed["model"], "anthropic/claude-opus-4-8");
     assert_eq!(parsed["model_source"], "env");
     assert_eq!(parsed["model_raw"], "opus");
     assert_eq!(
         parsed["model_alias_resolved_to"],
-        "anthropic/claude-opus-4-7"
+        "anthropic/claude-opus-4-8"
     );
     assert_eq!(parsed["model_env_var"], "CLAW_MODEL");
 }
@@ -1007,13 +1006,13 @@ fn inventory_commands_emit_structured_json_when_requested() {
     assert!(
         !plugins
             .as_object()
-            .map_or(false, |o| o.contains_key("reload_runtime")),
+            .is_some_and(|o| o.contains_key("reload_runtime")),
         "plugins list should not include reload_runtime"
     );
     assert!(
         !plugins
             .as_object()
-            .map_or(false, |o| o.contains_key("target")),
+            .is_some_and(|o| o.contains_key("target")),
         "plugins list should not include target"
     );
     // #703: structured summary replaces prose message
@@ -1706,13 +1705,13 @@ fn resumed_inventory_commands_emit_structured_json_when_requested() {
     assert!(
         !plugins
             .as_object()
-            .map_or(false, |o| o.contains_key("reload_runtime")),
+            .is_some_and(|o| o.contains_key("reload_runtime")),
         "plugins list should not include reload_runtime"
     );
     assert!(
         !plugins
             .as_object()
-            .map_or(false, |o| o.contains_key("target")),
+            .is_some_and(|o| o.contains_key("target")),
         "plugins list should not include target"
     );
     assert!(
@@ -2252,7 +2251,7 @@ fn config_json_attributes_precedence_and_shadowed_keys_425() {
     fs::create_dir_all(&home).expect("home should exist");
     fs::write(
         root.join(".claw.json"),
-        r#"{"model":"anthropic/claude-sonnet-4-6","env":{"A":"legacy","B":"legacy"}}"#,
+        r#"{"model":"anthropic/claude-sonnet-5","env":{"A":"legacy","B":"legacy"}}"#,
     )
     .expect("legacy project config fixture should write");
     fs::write(
@@ -2945,7 +2944,7 @@ fn prompt_empty_arg_json_stdout_missing_prompt_823() {
         "claw prompt empty arg must retain abort action (#823); got: {parsed}"
     );
     assert!(
-        parsed["hint"].as_str().map_or(false, |h| !h.is_empty()),
+        parsed["hint"].as_str().is_some_and(|h| !h.is_empty()),
         "claw prompt empty arg missing_prompt hint must be non-empty (#823)"
     );
 }
@@ -2983,9 +2982,9 @@ fn flag_value_errors_have_error_kind_and_hint_756() {
         "invalid --reasoning-effort must be invalid_flag_value (#756): {parsed}"
     );
     assert!(
-        parsed["hint"].as_str().map_or(false, |h| h.contains("low")
-            || h.contains("medium")
-            || h.contains("high")),
+        parsed["hint"]
+            .as_str()
+            .is_some_and(|h| h.contains("low") || h.contains("medium") || h.contains("high")),
         "hint must mention valid values (#756): {parsed}"
     );
 
@@ -3011,7 +3010,7 @@ fn flag_value_errors_have_error_kind_and_hint_756() {
         "missing --model value must be missing_flag_value (#756): {parsed2}"
     );
     assert!(
-        parsed2["hint"].as_str().map_or(false, |h| !h.is_empty()),
+        parsed2["hint"].as_str().is_some_and(|h| !h.is_empty()),
         "missing --model hint must be non-empty (#756): {parsed2}"
     );
 }
@@ -3255,7 +3254,7 @@ fn short_p_flag_swallows_no_flags_755() {
         "flag-like token after -p must be rejected as missing_prompt (#755): {parsed2}"
     );
     assert!(
-        parsed2["hint"].as_str().map_or(false, |h| !h.is_empty()),
+        parsed2["hint"].as_str().is_some_and(|h| !h.is_empty()),
         "missing_prompt hint must be non-empty (#755)"
     );
 }
@@ -3397,7 +3396,7 @@ fn config_unsupported_section_json_hint_741() {
         assert!(
             parsed["supported_sections"]
                 .as_array()
-                .map_or(false, |a| !a.is_empty()),
+                .is_some_and(|a| !a.is_empty()),
             "config {section} JSON must include supported_sections (#741)"
         );
     }
@@ -5360,14 +5359,15 @@ fn agents_create_scaffolds_toml_and_lists_locally_431() {
         assert_json_command_with_env(&root, &["--output-format", "json", "agents", "list"], &envs);
     assert_eq!(list["kind"], "agents");
     assert_eq!(list["action"], "list");
+    let canonical_agent_path = fs::canonicalize(&agent_path).expect("canonical listed agent path");
     assert!(list["agents"]
         .as_array()
         .expect("agents array")
         .iter()
         .any(|agent| {
             agent["name"] == "my-agent"
-                && PathBuf::from(agent["path"].as_str().expect("listed agent path"))
-                    == fs::canonicalize(&agent_path).expect("canonical listed agent path")
+                && Path::new(agent["path"].as_str().expect("listed agent path"))
+                    == canonical_agent_path.as_path()
         }));
 }
 

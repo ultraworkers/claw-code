@@ -1,6 +1,6 @@
 # Model Compatibility Guide
 
-This document describes model-specific handling in the OpenAI-compatible provider. When adding new models or providers, review this guide to ensure proper compatibility.
+This document describes model-specific handling in the OpenAI-compatible provider and shared model registry. When adding new models or providers, review this guide to ensure proper compatibility.
 
 ## Table of Contents
 
@@ -9,6 +9,7 @@ This document describes model-specific handling in the OpenAI-compatible provide
   - [Kimi Models (is_error Exclusion)](#kimi-models-is_error-exclusion)
   - [Reasoning Models (Tuning Parameter Stripping)](#reasoning-models-tuning-parameter-stripping)
   - [GPT-5 (max_completion_tokens)](#gpt-5-max_completion_tokens)
+  - [Anthropic Aliases and Token Limits](#anthropic-aliases-and-token-limits)
   - [Qwen and Kimi Models (DashScope Routing)](#qwen-and-kimi-models-dashscope-routing)
   - [Custom Gateway Slugs and Extra Body Parameters](#custom-gateway-slugs-and-extra-body-parameters)
 - [Implementation Details](#implementation-details)
@@ -120,6 +121,25 @@ let max_tokens_key = if wire_model.starts_with("gpt-5") {
 ```
 
 **Testing:** See `gpt5_uses_max_completion_tokens_not_max_tokens` and `non_gpt5_uses_max_tokens` tests.
+
+---
+
+### Anthropic Aliases and Token Limits
+
+**Affected aliases:** `opus`, `sonnet`, `haiku`, and `fable`
+
+**Behavior:** Built-in aliases resolve through the shared provider registry before request construction:
+
+| Alias | Resolved model | Max output tokens | Context window |
+|---|---|---:|---:|
+| `opus` | `claude-opus-4-8` | 128 000 | 1 000 000 |
+| `sonnet` | `claude-sonnet-5` | 128 000 | 1 000 000 |
+| `haiku` | `claude-haiku-4-5-20251001` | 64 000 | 200 000 |
+| `fable` | `claude-fable-5` | 128 000 | 1 000 000 |
+
+**Rationale:** The CLI default and short aliases must stay aligned with the provider token-limit registry so context-window preflight, status output, and request construction agree.
+
+**Testing:** See alias and `model_token_limit()` tests in `providers/mod.rs`, plus CLI alias tests in `rusty-claude-cli/src/main.rs`.
 
 ---
 
@@ -256,6 +276,6 @@ fn my_new_model_is_detected() {
 
 ---
 
-*Last updated: 2026-05-15*
+*Last updated: 2026-07-05*
 
 For questions or updates, see the implementation in `rust/crates/api/src/providers/openai_compat.rs`.

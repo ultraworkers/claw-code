@@ -1509,7 +1509,7 @@ mod tests {
     #[test]
     fn strip_unsupported_beta_body_fields_removes_betas_array() {
         let mut body = serde_json::json!({
-            "model": "claude-sonnet-4-6",
+            "model": "claude-sonnet-5",
             "max_tokens": 1024,
             "betas": ["claude-code-20250219", "prompt-caching-scope-2026-01-05"],
             "metadata": {"source": "test"},
@@ -1523,7 +1523,7 @@ mod tests {
         );
         assert_eq!(
             body.get("model").and_then(serde_json::Value::as_str),
-            Some("claude-sonnet-4-6")
+            Some("claude-sonnet-5")
         );
         assert_eq!(body["max_tokens"], serde_json::json!(1024));
         assert_eq!(body["metadata"]["source"], serde_json::json!("test"));
@@ -1532,7 +1532,7 @@ mod tests {
     #[test]
     fn strip_unsupported_beta_body_fields_is_a_noop_when_betas_absent() {
         let mut body = serde_json::json!({
-            "model": "claude-sonnet-4-6",
+            "model": "claude-sonnet-5",
             "max_tokens": 1024,
         });
         let original = body.clone();
@@ -1545,7 +1545,7 @@ mod tests {
     #[test]
     fn strip_removes_openai_only_fields_and_converts_stop() {
         let mut body = serde_json::json!({
-            "model": "claude-sonnet-4-6",
+            "model": "claude-sonnet-5",
             "max_tokens": 1024,
             "temperature": 0.7,
             "frequency_penalty": 0.5,
@@ -1574,7 +1574,7 @@ mod tests {
     #[test]
     fn strip_does_not_add_empty_stop_sequences() {
         let mut body = serde_json::json!({
-            "model": "claude-sonnet-4-6",
+            "model": "claude-sonnet-5",
             "max_tokens": 1024,
             "stop": [],
         });
@@ -1592,7 +1592,7 @@ mod tests {
     fn rendered_request_body_strips_betas_for_standard_messages_endpoint() {
         let client = AnthropicClient::new("test-key").with_beta("tools-2026-04-01");
         let request = MessageRequest {
-            model: "claude-sonnet-4-6".to_string(),
+            model: "claude-sonnet-5".to_string(),
             max_tokens: 64,
             messages: vec![],
             system: None,
@@ -1618,7 +1618,7 @@ mod tests {
         );
         assert_eq!(
             rendered.get("model").and_then(serde_json::Value::as_str),
-            Some("claude-sonnet-4-6")
+            Some("claude-sonnet-5")
         );
     }
 
@@ -1626,7 +1626,7 @@ mod tests {
     fn standard_messages_body_strips_anthropic_routing_prefix() {
         let client = AnthropicClient::new("test-key");
         let request = MessageRequest {
-            model: "anthropic/claude-opus-4-6".to_string(),
+            model: "anthropic/claude-opus-4-8".to_string(),
             max_tokens: 64,
             messages: vec![],
             system: None,
@@ -1639,7 +1639,7 @@ mod tests {
         let rendered = super::render_standard_messages_body(client.request_profile(), &request)
             .expect("body should render");
 
-        assert_eq!(rendered["model"], serde_json::json!("claude-opus-4-6"));
+        assert_eq!(rendered["model"], serde_json::json!("claude-opus-4-8"));
         assert!(rendered.get("betas").is_none());
     }
 

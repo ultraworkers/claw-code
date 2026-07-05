@@ -11,7 +11,7 @@ use tokio::sync::{oneshot, Mutex};
 use tokio::task::JoinHandle;
 
 pub const SCENARIO_PREFIX: &str = "PARITY_SCENARIO:";
-pub const DEFAULT_MODEL: &str = "claude-sonnet-4-6";
+pub const DEFAULT_MODEL: &str = "claude-sonnet-5";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CapturedRequest {

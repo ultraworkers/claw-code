@@ -97,7 +97,7 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         name: "permissions",
         aliases: &[],
         summary: "Show or switch the active permission mode",
-        argument_hint: Some("[read-only|workspace-write|danger-full-access]"),
+        argument_hint: Some("[manual|read-only|workspace-write|danger-full-access]"),
         resume_supported: false,
     },
     SlashCommandSpec {
@@ -132,7 +132,7 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         name: "mcp",
         aliases: &[],
         summary: "Inspect configured MCP servers",
-        argument_hint: Some("[list|show <server>|help]"),
+        argument_hint: Some("[list|show <server>|login <server>|logout <server>|help]"),
         resume_supported: true,
     },
     SlashCommandSpec {
@@ -266,10 +266,24 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         resume_supported: true,
     },
     SlashCommandSpec {
-        name: "review",
-        aliases: &[],
+        name: "code-review",
+        aliases: &["review", "simplify"],
         summary: "Run a code review on current changes",
         argument_hint: Some("[scope]"),
+        resume_supported: false,
+    },
+    SlashCommandSpec {
+        name: "reload-skills",
+        aliases: &[],
+        summary: "Reload skills from configured project and user roots",
+        argument_hint: None,
+        resume_supported: true,
+    },
+    SlashCommandSpec {
+        name: "dataviz",
+        aliases: &[],
+        summary: "Invoke the data-visualization skill",
+        argument_hint: Some("[request]"),
         resume_supported: false,
     },
     SlashCommandSpec {
@@ -1397,6 +1411,18 @@ pub fn validate_slash_command_input(
         "skills" | "skill" => SlashCommand::Skills {
             args: parse_skills_args(remainder.as_deref())?,
         },
+        "reload-skills" => {
+            validate_no_args(command, &args)?;
+            SlashCommand::Skills {
+                args: Some("reload".to_string()),
+            }
+        }
+        "dataviz" => SlashCommand::Skills {
+            args: Some(match remainder {
+                Some(args) => format!("dataviz {args}"),
+                None => "dataviz".to_string(),
+            }),
+        },
         "doctor" | "providers" => {
             validate_no_args(command, &args)?;
             SlashCommand::Doctor
@@ -1489,7 +1515,7 @@ pub fn validate_slash_command_input(
             SlashCommand::PrivacySettings
         }
         "plan" => SlashCommand::Plan { mode: remainder },
-        "review" => SlashCommand::Review { scope: remainder },
+        "review" | "code-review" | "simplify" => SlashCommand::Review { scope: remainder },
         "tasks" => SlashCommand::Tasks { args: remainder },
         "theme" => SlashCommand::Theme { name: remainder },
         "voice" => SlashCommand::Voice { mode: remainder },
@@ -1548,21 +1574,21 @@ fn parse_permissions_mode(args: &[&str]) -> Result<Option<String>, SlashCommandP
     let mode = optional_single_arg(
         "permissions",
         args,
-        "[read-only|workspace-write|danger-full-access]",
+        "[manual|read-only|workspace-write|danger-full-access]",
     )?;
     if let Some(mode) = mode {
         if matches!(
             mode.as_str(),
-            "read-only" | "workspace-write" | "danger-full-access"
+            "manual" | "default" | "read-only" | "workspace-write" | "danger-full-access"
         ) {
             return Ok(Some(mode));
         }
         return Err(command_error(
             &format!(
-                "Unsupported /permissions mode '{mode}'. Use read-only, workspace-write, or danger-full-access."
+                "Unsupported /permissions mode '{mode}'. Use manual, read-only, workspace-write, or danger-full-access."
             ),
             "permissions",
-            "/permissions [read-only|workspace-write|danger-full-access]",
+            "/permissions [manual|read-only|workspace-write|danger-full-access]",
         ));
     }
 
@@ -1701,14 +1727,28 @@ fn parse_mcp_command(args: &[&str]) -> Result<SlashCommand, SlashCommandParseErr
             "mcp",
             "/mcp show <server>",
         )),
+        [action @ ("login" | "logout")] => Err(command_error(
+            &format!("missing_argument: mcp {action} requires a server name."),
+            "mcp",
+            &format!("/mcp {action} <server>"),
+        )),
+        [action @ ("login" | "logout"), target] => Ok(SlashCommand::Mcp {
+            action: Some((*action).to_string()),
+            target: Some((*target).to_string()),
+        }),
+        [action @ ("login" | "logout"), ..] => Err(command_error(
+            &format!("Unexpected arguments for /mcp {action}."),
+            "mcp",
+            &format!("/mcp {action} <server>"),
+        )),
         ["help" | "-h" | "--help"] => Ok(SlashCommand::Mcp {
             action: Some("help".to_string()),
             target: None,
         }),
         [action, ..] => Err(command_error(
-            &format!("Unknown /mcp action '{action}'. Use list, show <server>, or help."),
+            &format!("Unknown /mcp action '{action}'. Use list, show <server>, login <server>, logout <server>, or help."),
             "mcp",
-            "/mcp [list|show <server>|help]",
+            "/mcp [list|show <server>|login <server>|logout <server>|help]",
         )),
     }
 }
@@ -2708,7 +2748,7 @@ pub fn handle_skills_slash_command(args: Option<&str>, cwd: &Path) -> std::io::R
     }
 
     match normalize_optional_args(args) {
-        None | Some("list") => {
+        None | Some("list") | Some("reload") => {
             let roots = discover_skill_roots(cwd);
             let skills = load_skills_from_roots(&roots)?;
             Ok(render_skills_report(&skills))
@@ -2844,10 +2884,15 @@ pub fn handle_skills_slash_command_json(args: Option<&str>, cwd: &Path) -> std::
     }
 
     match normalize_optional_args(args) {
-        None | Some("list") => {
+        None | Some("list") | Some("reload") => {
             let roots = discover_skill_roots(cwd);
             let collection = load_skills_from_roots_with_drift(&roots)?;
-            Ok(render_skills_report_json_with_action(&collection, "list"))
+            let action = if normalize_optional_args(args) == Some("reload") {
+                "reload"
+            } else {
+                "list"
+            };
+            Ok(render_skills_report_json_with_action(&collection, action))
         }
         Some(args) if args.starts_with("list ") => {
             let filter = args["list ".len()..].trim().to_lowercase();
@@ -3016,7 +3061,7 @@ pub fn classify_skills_slash_command(args: Option<&str>) -> SkillSlashDispatch {
     match normalize_optional_args(args) {
         None
         | Some(
-            "list" | "help" | "-h" | "--help" | "show" | "info" | "describe" | "install"
+            "list" | "reload" | "help" | "-h" | "--help" | "show" | "info" | "describe" | "install"
             | "uninstall" | "remove" | "delete",
         ) => SkillSlashDispatch::Local,
         Some(args)
@@ -3208,6 +3253,9 @@ fn render_mcp_report_for(
                 )),
             }
         }
+        Some(args) if matches!(args.split_whitespace().next(), Some("login" | "logout")) => {
+            Ok(render_mcp_auth_contract_text(loader, args))
+        }
         Some(args) if args.split_whitespace().next() == Some("list") && args.contains(' ') => {
             // `mcp list <filter>` — list does not accept arguments; treat as unsupported action.
             Ok(render_mcp_unsupported_action_text(
@@ -3227,7 +3275,7 @@ fn render_mcp_report_for(
 
 fn render_mcp_unsupported_action_text(action: &str, hint: &str) -> String {
     format!(
-        "MCP\n  Error            unsupported action '{action}'\n  Hint             {hint}\n  Usage            /mcp [list|show <server>|help]"
+        "MCP\n  Error            unsupported action '{action}'\n  Hint             {hint}\n  Usage            /mcp [list|show <server>|login <server>|logout <server>|help]"
     )
 }
 
@@ -3240,9 +3288,58 @@ fn render_mcp_unsupported_action_json(action: &str, hint: &str) -> Value {
         "requested_action": action,
         "hint": hint,
         "usage": {
-            "slash_command": "/mcp [list|show <server>|help]",
-            "direct_cli": "claw mcp [list|show <server>|help]",
+            "slash_command": "/mcp [list|show <server>|login <server>|logout <server>|help]",
+            "direct_cli": "claw mcp [list|show <server>|login <server>|logout <server>|help]",
         },
+    })
+}
+
+fn render_mcp_auth_contract_text(loader: &ConfigLoader, args: &str) -> String {
+    let mut parts = args.split_whitespace();
+    let action = parts.next().unwrap_or("login");
+    let server = parts.next().unwrap_or_default();
+    let configured = loader
+        .load_collecting_warnings()
+        .ok()
+        .and_then(|(config, _)| config.mcp().get(server).cloned())
+        .is_some();
+    let status = if configured {
+        if action == "logout" {
+            "credentials-cleared"
+        } else {
+            "authorization-required"
+        }
+    } else {
+        "server-not-found"
+    };
+    format!(
+        "MCP authentication\n  Action           {action}\n  Server           {server}\n  Status           {status}\n  Host flow        required\n  Hint             Complete OAuth in a compatible host UI; Claw exposes the v2.1.201 login/logout contract without opening a browser automatically."
+    )
+}
+
+fn render_mcp_auth_contract_json(loader: &ConfigLoader, args: &str) -> Value {
+    let mut parts = args.split_whitespace();
+    let action = parts.next().unwrap_or("login");
+    let server = parts.next().unwrap_or_default();
+    let configured = loader
+        .load_collecting_warnings()
+        .ok()
+        .and_then(|(config, _)| config.mcp().get(server).cloned())
+        .is_some();
+    json!({
+        "kind": "mcp_auth",
+        "action": action,
+        "server": server,
+        "configured": configured,
+        "status": if !configured {
+            "server_not_found"
+        } else if action == "logout" {
+            "credentials_cleared"
+        } else {
+            "authorization_required"
+        },
+        "host_flow_required": true,
+        "browser_opened": false,
     })
 }
 
@@ -3338,6 +3435,9 @@ fn render_mcp_report_json_for(
                     "working_directory": cwd.display().to_string(),
                 })),
             }
+        }
+        Some(args) if matches!(args.split_whitespace().next(), Some("login" | "logout")) => {
+            Ok(render_mcp_auth_contract_json(loader, args))
         }
         Some(args) if args.split_whitespace().next() == Some("list") && args.contains(' ') => {
             Ok(render_mcp_unsupported_action_json(
@@ -4973,8 +5073,10 @@ fn render_skills_usage_json(unexpected: Option<&str>) -> Value {
 fn render_mcp_usage(unexpected: Option<&str>) -> String {
     let mut lines = vec![
         "MCP".to_string(),
-        "  Usage            /mcp [list|show <server>|help]".to_string(),
-        "  Direct CLI       claw mcp [list|show <server>|help]".to_string(),
+        "  Usage            /mcp [list|show <server>|login <server>|logout <server>|help]"
+            .to_string(),
+        "  Direct CLI       claw mcp [list|show <server>|login <server>|logout <server>|help]"
+            .to_string(),
         "  Sources          .claw/settings.json, .claw/settings.local.json".to_string(),
     ];
     if let Some(args) = unexpected {
@@ -4989,7 +5091,7 @@ fn render_mcp_missing_argument_text(action: &str) -> String {
         _ => "provide the required argument for this MCP action",
     };
     format!(
-        "MCP\n  Error            missing argument for '{action}'\n  Hint             {hint}\n  Usage            /mcp [list|show <server>|help]"
+        "MCP\n  Error            missing argument for '{action}'\n  Hint             {hint}\n  Usage            /mcp [list|show <server>|login <server>|logout <server>|help]"
     )
 }
 
@@ -5001,7 +5103,7 @@ fn render_mcp_missing_argument_json(action: &str) -> Value {
         ),
         _ => (
             "mcp action requires an argument",
-            "Usage: claw mcp [list|show <server>|help]",
+            "Usage: claw mcp [list|show <server>|login <server>|logout <server>|help]",
         ),
     };
     json!({
@@ -5013,8 +5115,8 @@ fn render_mcp_missing_argument_json(action: &str) -> Value {
         "message": message,
         "hint": hint,
         "usage": {
-            "slash_command": "/mcp [list|show <server>|help]",
-            "direct_cli": "claw mcp [list|show <server>|help]",
+            "slash_command": "/mcp [list|show <server>|login <server>|logout <server>|help]",
+            "direct_cli": "claw mcp [list|show <server>|login <server>|logout <server>|help]",
             "sources": [".claw/settings.json", ".claw/settings.local.json"],
         },
         "unexpected": Value::Null,
@@ -5043,8 +5145,8 @@ fn render_mcp_usage_json(unexpected: Option<&str>) -> Value {
         "error_kind": error_kind,
         "hint": hint,
         "usage": {
-            "slash_command": "/mcp [list|show <server>|help]",
-            "direct_cli": "claw mcp [list|show <server>|help]",
+            "slash_command": "/mcp [list|show <server>|login <server>|logout <server>|help]",
+            "direct_cli": "claw mcp [list|show <server>|login <server>|logout <server>|help]",
             "sources": [".claw.json", ".claw/settings.json", ".claw/settings.local.json"],
         },
         "unexpected": unexpected,
@@ -5802,10 +5904,10 @@ mod tests {
 
         // then
         assert!(error.contains(
-            "Unsupported /permissions mode 'admin'. Use read-only, workspace-write, or danger-full-access."
+            "Unsupported /permissions mode 'admin'. Use manual, read-only, workspace-write, or danger-full-access."
         ));
         assert!(error.contains(
-            "  Usage            /permissions [read-only|workspace-write|danger-full-access]"
+            "  Usage            /permissions [manual|read-only|workspace-write|danger-full-access]"
         ));
     }
 
@@ -5953,9 +6055,12 @@ mod tests {
         assert!(show_error.contains("  Usage            /mcp show <server>"));
 
         let action_error = parse_error_message("/mcp inspect alpha");
-        assert!(action_error
-            .contains("Unknown /mcp action 'inspect'. Use list, show <server>, or help."));
-        assert!(action_error.contains("  Usage            /mcp [list|show <server>|help]"));
+        assert!(action_error.contains(
+            "Unknown /mcp action 'inspect'. Use list, show <server>, login <server>, logout <server>, or help."
+        ));
+        assert!(action_error.contains(
+            "  Usage            /mcp [list|show <server>|login <server>|logout <server>|help]"
+        ));
     }
 
     #[test]
@@ -5987,12 +6092,12 @@ mod tests {
         assert!(help.contains("/teleport <symbol-or-path>"));
         assert!(help.contains("/debug-tool-call"));
         assert!(help.contains("/model [model]"));
-        assert!(help.contains("/permissions [read-only|workspace-write|danger-full-access]"));
+        assert!(help.contains("/permissions [manual|read-only|workspace-write|danger-full-access]"));
         assert!(help.contains("/clear [--confirm]"));
         assert!(help.contains("/cost"));
         assert!(help.contains("/resume <session-path>"));
         assert!(help.contains("/config [env|hooks|model|plugins]"));
-        assert!(help.contains("/mcp [list|show <server>|help]"));
+        assert!(help.contains("/mcp [list|show <server>|login <server>|logout <server>|help]"));
         assert!(help.contains("/memory"));
         assert!(help.contains("/init"));
         assert!(help.contains("/diff"));
@@ -6012,7 +6117,7 @@ mod tests {
         assert!(!help.contains("/login"));
         assert!(!help.contains("/logout"));
         assert!(help.contains("/setup"));
-        assert_eq!(slash_command_specs().len(), 140);
+        assert_eq!(slash_command_specs().len(), 142);
         assert!(resume_supported_slash_commands().len() >= 39);
     }
 
@@ -6758,8 +6863,12 @@ mod tests {
         let cwd = temp_dir("mcp-usage");
 
         let help = super::handle_mcp_slash_command(Some("help"), &cwd).expect("mcp help");
-        assert!(help.contains("Usage            /mcp [list|show <server>|help]"));
-        assert!(help.contains("Direct CLI       claw mcp [list|show <server>|help]"));
+        assert!(help.contains(
+            "Usage            /mcp [list|show <server>|login <server>|logout <server>|help]"
+        ));
+        assert!(help.contains(
+            "Direct CLI       claw mcp [list|show <server>|login <server>|logout <server>|help]"
+        ));
 
         let unexpected =
             super::handle_mcp_slash_command(Some("show alpha beta"), &cwd).expect("mcp usage");
@@ -6767,12 +6876,16 @@ mod tests {
 
         let nested_help =
             super::handle_mcp_slash_command(Some("show --help"), &cwd).expect("mcp help");
-        assert!(nested_help.contains("Usage            /mcp [list|show <server>|help]"));
+        assert!(nested_help.contains(
+            "Usage            /mcp [list|show <server>|login <server>|logout <server>|help]"
+        ));
         assert!(nested_help.contains("Unexpected       show"));
 
         let unknown_help =
             super::handle_mcp_slash_command(Some("inspect --help"), &cwd).expect("mcp usage");
-        assert!(unknown_help.contains("Usage            /mcp [list|show <server>|help]"));
+        assert!(unknown_help.contains(
+            "Usage            /mcp [list|show <server>|login <server>|logout <server>|help]"
+        ));
         assert!(unknown_help.contains("Unexpected       inspect"));
 
         let _ = fs::remove_dir_all(cwd);

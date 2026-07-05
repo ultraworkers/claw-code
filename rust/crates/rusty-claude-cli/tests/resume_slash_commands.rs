@@ -108,7 +108,7 @@ fn status_command_applies_cli_flags_end_to_end() {
 
     let stdout = String::from_utf8(output.stdout).expect("stdout should be utf8");
     assert!(stdout.contains("Status"));
-    assert!(stdout.contains("Model            anthropic/claude-sonnet-4-6"));
+    assert!(stdout.contains("Model            anthropic/claude-sonnet-5"));
     assert!(stdout.contains("Permission mode  read-only"));
 }
 
@@ -335,7 +335,7 @@ fn resumed_status_command_emits_structured_json_when_requested() {
     assert_eq!(parsed["kind"], "status");
     // model is null in resume mode (not known without --model flag)
     assert!(parsed["model"].is_null());
-    assert_eq!(parsed["permission_mode"], "workspace-write");
+    assert_eq!(parsed["permission_mode"], "manual");
     assert_eq!(parsed["usage"]["messages"], 1);
     assert!(parsed["usage"]["turns"].is_number());
     assert!(parsed["workspace"]["cwd"].as_str().is_some());
@@ -356,7 +356,7 @@ fn resumed_status_surfaces_persisted_model() {
     let session_path = temp_dir.join("session.jsonl");
 
     let mut session = workspace_session(&temp_dir);
-    session.model = Some("anthropic/claude-sonnet-4-6".to_string());
+    session.model = Some("anthropic/claude-sonnet-5".to_string());
     session
         .push_user_text("model persistence fixture")
         .expect("write ok");
@@ -384,7 +384,7 @@ fn resumed_status_surfaces_persisted_model() {
     let parsed: Value = serde_json::from_str(stdout.trim()).expect("should be json");
     assert_eq!(parsed["kind"], "status");
     assert_eq!(
-        parsed["model"], "anthropic/claude-sonnet-4-6",
+        parsed["model"], "anthropic/claude-sonnet-5",
         "model should round-trip through session metadata"
     );
 }

@@ -39,7 +39,7 @@ fn provider_client_uses_explicit_anthropic_auth_without_env_lookup() {
     let _anthropic_auth_token = EnvVarGuard::set("ANTHROPIC_AUTH_TOKEN", None);
 
     let client = ProviderClient::from_model_with_anthropic_auth(
-        "claude-sonnet-4-6",
+        "claude-sonnet-5",
         Some(AuthSource::ApiKey("anthropic-test-key".to_string())),
     )
     .expect("explicit anthropic auth should avoid env lookup");

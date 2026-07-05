@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::{validate_packet, TaskPacket, TaskPacketValidationError};
 
@@ -46,6 +47,26 @@ pub struct Task {
     pub output: String,
     pub team_id: Option<String>,
     pub heartbeat: Option<LaneHeartbeat>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_form: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocks: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocked_by: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct TaskUpdate {
+    pub message: Option<String>,
+    pub status: Option<TaskStatus>,
+    pub subject: Option<String>,
+    pub description: Option<String>,
+    pub active_form: Option<String>,
+    pub metadata: Option<Value>,
+    pub add_blocks: Vec<String>,
+    pub add_blocked_by: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -120,6 +141,14 @@ fn now_secs() -> u64 {
         .as_secs()
 }
 
+fn extend_unique(target: &mut Vec<String>, additions: Vec<String>) {
+    for value in additions {
+        if !target.contains(&value) {
+            target.push(value);
+        }
+    }
+}
+
 impl TaskRegistry {
     #[must_use]
     pub fn new() -> Self {
@@ -127,7 +156,29 @@ impl TaskRegistry {
     }
 
     pub fn create(&self, prompt: &str, description: Option<&str>) -> Task {
-        self.create_task(prompt.to_owned(), description.map(str::to_owned), None)
+        self.create_task(
+            prompt.to_owned(),
+            description.map(str::to_owned),
+            None,
+            None,
+            None,
+        )
+    }
+
+    pub fn create_structured(
+        &self,
+        subject: &str,
+        description: Option<&str>,
+        active_form: Option<String>,
+        metadata: Option<Value>,
+    ) -> Task {
+        self.create_task(
+            subject.to_owned(),
+            description.map(str::to_owned),
+            None,
+            active_form,
+            metadata,
+        )
     }
 
     pub fn create_from_packet(
@@ -140,7 +191,13 @@ impl TaskRegistry {
             .scope_path
             .clone()
             .or_else(|| Some(packet.scope.to_string()));
-        Ok(self.create_task(packet.objective.clone(), description, Some(packet)))
+        Ok(self.create_task(
+            packet.objective.clone(),
+            description,
+            Some(packet),
+            None,
+            None,
+        ))
     }
 
     fn create_task(
@@ -148,6 +205,8 @@ impl TaskRegistry {
         prompt: String,
         description: Option<String>,
         task_packet: Option<TaskPacket>,
+        active_form: Option<String>,
+        metadata: Option<Value>,
     ) -> Task {
         let mut inner = self.inner.lock().expect("registry lock poisoned");
         inner.counter += 1;
@@ -165,6 +224,10 @@ impl TaskRegistry {
             output: String::new(),
             team_id: None,
             heartbeat: None,
+            active_form,
+            metadata,
+            blocks: Vec::new(),
+            blocked_by: Vec::new(),
         };
         inner.tasks.insert(task_id, task.clone());
         task
@@ -269,17 +332,46 @@ impl TaskRegistry {
     }
 
     pub fn update(&self, task_id: &str, message: &str) -> Result<Task, String> {
+        self.update_task(
+            task_id,
+            TaskUpdate {
+                message: Some(message.to_owned()),
+                ..TaskUpdate::default()
+            },
+        )
+    }
+
+    pub fn update_task(&self, task_id: &str, update: TaskUpdate) -> Result<Task, String> {
         let mut inner = self.inner.lock().expect("registry lock poisoned");
         let task = inner
             .tasks
             .get_mut(task_id)
             .ok_or_else(|| format!("task not found: {task_id}"))?;
 
-        task.messages.push(TaskMessage {
-            role: String::from("user"),
-            content: message.to_owned(),
-            timestamp: now_secs(),
-        });
+        if let Some(message) = update.message {
+            task.messages.push(TaskMessage {
+                role: String::from("user"),
+                content: message,
+                timestamp: now_secs(),
+            });
+        }
+        if let Some(status) = update.status {
+            task.status = status;
+        }
+        if let Some(subject) = update.subject {
+            task.prompt = subject;
+        }
+        if let Some(description) = update.description {
+            task.description = Some(description);
+        }
+        if let Some(active_form) = update.active_form {
+            task.active_form = Some(active_form);
+        }
+        if let Some(metadata) = update.metadata {
+            task.metadata = Some(metadata);
+        }
+        extend_unique(&mut task.blocks, update.add_blocks);
+        extend_unique(&mut task.blocked_by, update.add_blocked_by);
         task.updated_at = now_secs();
         Ok(task.clone())
     }
