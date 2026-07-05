@@ -7683,12 +7683,28 @@ struct AgentViewTuiState {
     input: String,
     status: Option<String>,
     confirm_remove_id: Option<String>,
+    group_by_directory: bool,
+    collapsed_groups: BTreeSet<String>,
+    rename_mode: bool,
 }
 
 #[derive(Debug)]
 enum AgentViewTuiExit {
     Quit,
     Attach(String),
+}
+
+#[derive(Debug, Clone)]
+enum AgentViewRow {
+    Header {
+        key: String,
+        label: String,
+        collapsed: bool,
+        count: usize,
+    },
+    Job {
+        job_index: usize,
+    },
 }
 
 struct AgentViewTerminalGuard {
@@ -7772,6 +7788,9 @@ fn run_agent_view_tui(
         input: String::new(),
         status: None,
         confirm_remove_id: None,
+        group_by_directory: false,
+        collapsed_groups: BTreeSet::new(),
+        rename_mode: false,
     };
     let attach = {
         let _terminal = AgentViewTerminalGuard::enter()?;
@@ -7790,9 +7809,10 @@ fn run_agent_view_tui_loop(
 ) -> Result<AgentViewTuiExit, Box<dyn std::error::Error>> {
     let mut stdout = io::stdout();
     loop {
-        let jobs = load_agent_view_tui_jobs(supervisor, &state.options)?;
-        if state.selected >= jobs.len() {
-            state.selected = jobs.len().saturating_sub(1);
+        let jobs = load_agent_view_tui_jobs(supervisor, state)?;
+        let rows = build_agent_view_rows(state, &jobs);
+        if state.selected >= rows.len() {
+            state.selected = rows.len().saturating_sub(1);
         }
         render_agent_view_tui(&mut stdout, state, &jobs)?;
         if !event::poll(Duration::from_millis(500))? {
@@ -7812,15 +7832,16 @@ fn run_agent_view_tui_loop(
 
 fn load_agent_view_tui_jobs(
     supervisor: &runtime::AgentSupervisor,
-    options: &AgentViewTuiOptions,
+    state: &AgentViewTuiState,
 ) -> Result<Vec<runtime::AgentJobRecord>, Box<dyn std::error::Error>> {
     let mut jobs = supervisor.list_jobs(&runtime::AgentListFilter {
-        cwd: options.cwd.clone(),
-        include_all: options.include_all,
+        cwd: state.options.cwd.clone(),
+        include_all: true,
     })?;
     jobs.sort_by(|left, right| {
-        agent_view_group_rank(left)
-            .cmp(&agent_view_group_rank(right))
+        agent_view_group_sort_key(left, state.group_by_directory)
+            .cmp(&agent_view_group_sort_key(right, state.group_by_directory))
+            .then_with(|| agent_view_order_key(left).cmp(&agent_view_order_key(right)))
             .then(right.updated_at.cmp(&left.updated_at))
             .then(left.id.cmp(&right.id))
     });
@@ -7834,50 +7855,161 @@ fn handle_agent_view_key(
     jobs: &[runtime::AgentJobRecord],
     key: KeyEvent,
 ) -> Result<Option<AgentViewTuiExit>, Box<dyn std::error::Error>> {
+    let rows = build_agent_view_rows(state, jobs);
     match key.code {
-        KeyCode::Esc | KeyCode::Char('q') if state.input.is_empty() => {
+        KeyCode::Esc if state.rename_mode => {
+            state.rename_mode = false;
+            state.input.clear();
+            state.status = Some("rename canceled".to_string());
+            state.confirm_remove_id = None;
+        }
+        KeyCode::Esc | KeyCode::Char('q') if state.input.is_empty() && !state.rename_mode => {
             return Ok(Some(AgentViewTuiExit::Quit));
         }
-        KeyCode::Up if state.input.is_empty() => {
+        KeyCode::Up if state.input.is_empty() && key.modifiers.contains(KeyModifiers::SHIFT) => {
+            reorder_agent_view_job(supervisor, state, jobs, &rows, -1)?;
+        }
+        KeyCode::Down if state.input.is_empty() && key.modifiers.contains(KeyModifiers::SHIFT) => {
+            reorder_agent_view_job(supervisor, state, jobs, &rows, 1)?;
+        }
+        KeyCode::Char('s')
+            if state.input.is_empty() && key.modifiers.contains(KeyModifiers::CONTROL) =>
+        {
+            state.group_by_directory = !state.group_by_directory;
+            state.collapsed_groups.clear();
+            state.selected = 0;
+            state.status = Some(if state.group_by_directory {
+                "grouping by directory".to_string()
+            } else {
+                "grouping by state".to_string()
+            });
+            state.confirm_remove_id = None;
+        }
+        KeyCode::Char('t')
+            if state.input.is_empty() && key.modifiers.contains(KeyModifiers::CONTROL) =>
+        {
+            if let Some(job) = selected_agent_view_job(state, jobs, &rows) {
+                let updated = supervisor.set_pinned(&job.id, !job.pinned)?;
+                state.status = Some(format!(
+                    "{} {}",
+                    if updated.pinned { "pinned" } else { "unpinned" },
+                    updated.id
+                ));
+                state.confirm_remove_id = None;
+            }
+        }
+        KeyCode::Char('r')
+            if state.input.is_empty() && key.modifiers.contains(KeyModifiers::CONTROL) =>
+        {
+            if let Some(job) = selected_agent_view_job(state, jobs, &rows) {
+                state.rename_mode = true;
+                state.peek_open = false;
+                state.input = job.name.clone().unwrap_or_else(|| job.id.clone());
+                state.status = Some(format!("renaming {}; press Enter to save", job.id));
+                state.confirm_remove_id = None;
+            }
+        }
+        KeyCode::Char('x')
+            if state.input.is_empty() && key.modifiers.contains(KeyModifiers::CONTROL) =>
+        {
+            if let Some(job) = selected_agent_view_job(state, jobs, &rows) {
+                if state.confirm_remove_id.as_deref() == Some(job.id.as_str()) {
+                    supervisor.remove_job(&job.id)?;
+                    state.status = Some(format!("removed background session {}", job.id));
+                    state.confirm_remove_id = None;
+                    state.peek_open = false;
+                } else {
+                    if let Some(pid) = job.pid {
+                        let _ = signal_process(pid, AgentStopSignal::Term);
+                    }
+                    let stopped = supervisor.stop_job(&job.id)?;
+                    state.status = Some(format!(
+                        "stopped {}; press Ctrl+X again to remove",
+                        stopped.id
+                    ));
+                    state.confirm_remove_id = Some(job.id.clone());
+                    state.peek_open = false;
+                }
+            }
+        }
+        KeyCode::Up if state.input.is_empty() && !state.rename_mode => {
             state.selected = state.selected.saturating_sub(1);
             state.confirm_remove_id = None;
         }
-        KeyCode::Down if state.input.is_empty() => {
-            if !jobs.is_empty() {
-                state.selected = (state.selected + 1).min(jobs.len() - 1);
+        KeyCode::Down if state.input.is_empty() && !state.rename_mode => {
+            if !rows.is_empty() {
+                state.selected = (state.selected + 1).min(rows.len() - 1);
             }
             state.confirm_remove_id = None;
         }
-        KeyCode::Char(' ') if state.input.is_empty() => {
-            state.peek_open = !state.peek_open;
+        KeyCode::Char(' ') if state.input.is_empty() && !state.rename_mode => {
+            if let Some(row) = rows.get(state.selected) {
+                match row {
+                    AgentViewRow::Header { key, .. } => {
+                        toggle_agent_view_group(state, key);
+                        state.peek_open = false;
+                    }
+                    AgentViewRow::Job { .. } => {
+                        state.peek_open = !state.peek_open;
+                    }
+                }
+            }
             state.confirm_remove_id = None;
         }
-        KeyCode::Left if state.input.is_empty() => {
+        KeyCode::Left if state.input.is_empty() && !state.rename_mode => {
             state.peek_open = false;
             state.confirm_remove_id = None;
         }
-        KeyCode::Right | KeyCode::Enter if state.input.trim().is_empty() => {
-            if let Some(job) = jobs.get(state.selected) {
-                return Ok(Some(AgentViewTuiExit::Attach(job.id.clone())));
+        KeyCode::Right if state.input.trim().is_empty() && !state.rename_mode => {
+            if let Some(row) = rows.get(state.selected) {
+                match row {
+                    AgentViewRow::Header { key, .. } => toggle_agent_view_group(state, key),
+                    AgentViewRow::Job { .. } => {
+                        if let Some(job) = selected_agent_view_job(state, jobs, &rows) {
+                            return Ok(Some(AgentViewTuiExit::Attach(job.id.clone())));
+                        }
+                    }
+                }
+            }
+        }
+        KeyCode::Enter if state.rename_mode => {
+            if let Some(job) = selected_agent_view_job(state, jobs, &rows) {
+                let renamed = supervisor.rename_job(&job.id, state.input.clone())?;
+                state.status = Some(format!(
+                    "renamed {} to {}",
+                    renamed.id,
+                    renamed.name.as_deref().unwrap_or(&renamed.id)
+                ));
+            }
+            state.rename_mode = false;
+            state.input.clear();
+            state.confirm_remove_id = None;
+        }
+        KeyCode::Enter if state.input.trim().is_empty() => {
+            if let Some(row) = rows.get(state.selected) {
+                match row {
+                    AgentViewRow::Header { key, .. } => toggle_agent_view_group(state, key),
+                    AgentViewRow::Job { .. } => {
+                        if let Some(job) = selected_agent_view_job(state, jobs, &rows) {
+                            return Ok(Some(AgentViewTuiExit::Attach(job.id.clone())));
+                        }
+                    }
+                }
             }
         }
         KeyCode::Enter => {
             let prompt = state.input.trim().to_string();
             if !prompt.is_empty() {
-                let job = start_background_agent_job(BackgroundAgentRequest {
-                    prompt: Some(&prompt),
-                    exec: None,
-                    name: None,
-                    agent: request.agent,
-                    model: request.model,
-                    output_format: request.output_format,
-                    permission_mode: request.permission_mode,
-                    reasoning_effort: request.reasoning_effort,
-                })?;
-                state.status = Some(format!("started background session {}", job.id));
+                if state.peek_open {
+                    if let Some(job) = selected_agent_view_job(state, jobs, &rows) {
+                        queue_agent_view_reply(supervisor, job, &prompt, state)?;
+                    } else {
+                        start_agent_view_dispatch(request, state, &prompt)?;
+                    }
+                } else {
+                    start_agent_view_dispatch(request, state, &prompt)?;
+                }
                 state.input.clear();
-                state.selected = 0;
-                state.peek_open = false;
                 state.confirm_remove_id = None;
             }
         }
@@ -7885,18 +8017,18 @@ fn handle_agent_view_key(
             state.input.pop();
             state.confirm_remove_id = None;
         }
-        KeyCode::Char('s') if state.input.is_empty() => {
-            if let Some(job) = jobs.get(state.selected) {
+        KeyCode::Char('s') if state.input.is_empty() && !state.rename_mode => {
+            if let Some(job) = selected_agent_view_job(state, jobs, &rows) {
                 stop_agent_view_job(supervisor, job, AgentStopSignal::Term, state)?;
             }
         }
-        KeyCode::Char('k') if state.input.is_empty() => {
-            if let Some(job) = jobs.get(state.selected) {
+        KeyCode::Char('k') if state.input.is_empty() && !state.rename_mode => {
+            if let Some(job) = selected_agent_view_job(state, jobs, &rows) {
                 stop_agent_view_job(supervisor, job, AgentStopSignal::Kill, state)?;
             }
         }
-        KeyCode::Char('r') if state.input.is_empty() => {
-            if let Some(job) = jobs.get(state.selected) {
+        KeyCode::Char('r') if state.input.is_empty() && !state.rename_mode => {
+            if let Some(job) = selected_agent_view_job(state, jobs, &rows) {
                 let queued = supervisor.respawn_job(&job.id)?;
                 let child = spawn_agent_worker(&queued.id, Path::new(&queued.cwd))?;
                 let job = supervisor.set_process(&queued.id, child.id())?;
@@ -7910,8 +8042,8 @@ fn handle_agent_view_key(
                 state.confirm_remove_id = None;
             }
         }
-        KeyCode::Char('d') if state.input.is_empty() => {
-            if let Some(job) = jobs.get(state.selected) {
+        KeyCode::Char('d') if state.input.is_empty() && !state.rename_mode => {
+            if let Some(job) = selected_agent_view_job(state, jobs, &rows) {
                 if state.confirm_remove_id.as_deref() == Some(job.id.as_str()) {
                     supervisor.remove_job(&job.id)?;
                     state.status = Some(format!("removed background session {}", job.id));
@@ -7930,6 +8062,140 @@ fn handle_agent_view_key(
         _ => {}
     }
     Ok(None)
+}
+
+fn start_agent_view_dispatch(
+    request: &AgentViewPrintRequest<'_>,
+    state: &mut AgentViewTuiState,
+    prompt: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let job = start_background_agent_job(BackgroundAgentRequest {
+        prompt: Some(prompt),
+        exec: None,
+        name: None,
+        agent: request.agent,
+        model: request.model,
+        output_format: request.output_format,
+        permission_mode: request.permission_mode,
+        reasoning_effort: request.reasoning_effort,
+    })?;
+    state.status = Some(format!("started background session {}", job.id));
+    state.selected = 0;
+    Ok(())
+}
+
+fn selected_agent_view_job<'a>(
+    state: &AgentViewTuiState,
+    jobs: &'a [runtime::AgentJobRecord],
+    rows: &[AgentViewRow],
+) -> Option<&'a runtime::AgentJobRecord> {
+    match rows.get(state.selected) {
+        Some(AgentViewRow::Job { job_index }) => jobs.get(*job_index),
+        _ => None,
+    }
+}
+
+fn toggle_agent_view_group(state: &mut AgentViewTuiState, key: &str) {
+    if !state.collapsed_groups.insert(key.to_string()) {
+        state.collapsed_groups.remove(key);
+    }
+    state.peek_open = false;
+    state.confirm_remove_id = None;
+}
+
+fn reorder_agent_view_job(
+    supervisor: &runtime::AgentSupervisor,
+    state: &mut AgentViewTuiState,
+    jobs: &[runtime::AgentJobRecord],
+    rows: &[AgentViewRow],
+    direction: isize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(job) = selected_agent_view_job(state, jobs, rows) else {
+        state.status = Some("select a session row to reorder".to_string());
+        return Ok(());
+    };
+    let group_key = agent_view_group_key(job, state.group_by_directory);
+    let mut group_indices = jobs
+        .iter()
+        .enumerate()
+        .filter_map(|(index, candidate)| {
+            (agent_view_group_key(candidate, state.group_by_directory) == group_key)
+                .then_some(index)
+        })
+        .collect::<Vec<_>>();
+    let Some(current_group_index) = group_indices
+        .iter()
+        .position(|index| jobs[*index].id == job.id)
+    else {
+        return Ok(());
+    };
+    let target_group_index = if direction < 0 {
+        current_group_index.checked_sub(1)
+    } else {
+        (current_group_index + 1 < group_indices.len()).then_some(current_group_index + 1)
+    };
+    let Some(target_group_index) = target_group_index else {
+        state.status = Some(format!("{} is already at this edge", job.id));
+        return Ok(());
+    };
+    group_indices.swap(current_group_index, target_group_index);
+    for (order, job_index) in group_indices.iter().enumerate() {
+        supervisor.set_display_order(&jobs[*job_index].id, (order as i64) * 10)?;
+    }
+    state.status = Some(format!("reordered {}", job.id));
+    state.selected = if direction < 0 {
+        state.selected.saturating_sub(1)
+    } else {
+        (state.selected + 1).min(rows.len().saturating_sub(1))
+    };
+    state.confirm_remove_id = None;
+    Ok(())
+}
+
+fn queue_agent_view_reply(
+    supervisor: &runtime::AgentSupervisor,
+    job: &runtime::AgentJobRecord,
+    prompt: &str,
+    state: &mut AgentViewTuiState,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !matches!(
+        job.kind,
+        runtime::AgentJobKind::Claude | runtime::AgentJobKind::Interactive
+    ) {
+        state.status = Some(format!(
+            "{} is an exec session; attach or respawn it instead",
+            job.id
+        ));
+        return Ok(());
+    }
+    if job.session_id.is_none() {
+        state.status = Some(format!(
+            "{} has no resumable session id yet; wait for the worker to start",
+            job.id
+        ));
+        return Ok(());
+    }
+    if job.pending_prompt.is_some() {
+        state.status = Some(format!("{} already has a queued reply", job.id));
+        return Ok(());
+    }
+    if job.pid.is_some() {
+        state.status = Some(format!(
+            "{} still has a live worker; attach or wait for it to finish before replying",
+            job.id
+        ));
+        return Ok(());
+    }
+    let queued = supervisor.queue_reply(&job.id, prompt.to_string())?;
+    let child = spawn_agent_worker(&queued.id, Path::new(&queued.cwd))?;
+    let job = supervisor.set_process(&queued.id, child.id())?;
+    state.status = Some(format!(
+        "sent reply to {} with pid {}",
+        job.id,
+        job.pid
+            .map_or_else(|| "<none>".to_string(), |pid| pid.to_string())
+    ));
+    Ok(())
 }
 
 fn stop_agent_view_job(
@@ -8006,24 +8272,50 @@ fn render_agent_view_screen(
         lines
             .push("No background sessions. Type a prompt and press Enter to dispatch.".to_string());
     } else {
-        let mut current_group = "";
-        for (index, job) in jobs.iter().enumerate() {
-            let group = agent_view_group_label(job);
-            if group != current_group {
-                if !current_group.is_empty() {
-                    lines.push(String::new());
+        let rows = build_agent_view_rows(state, jobs);
+        let mut last_was_header = false;
+        for (row_index, row) in rows.iter().enumerate() {
+            match row {
+                AgentViewRow::Header {
+                    label,
+                    collapsed,
+                    count,
+                    ..
+                } => {
+                    if !lines.last().is_some_and(String::is_empty) && !last_was_header {
+                        lines.push(String::new());
+                    }
+                    let selector = if row_index == state.selected {
+                        ">"
+                    } else {
+                        " "
+                    };
+                    let marker = if *collapsed { "+" } else { "-" };
+                    lines.push(truncate_chars(
+                        &format!("{selector} {marker} {label} ({count})"),
+                        width,
+                    ));
+                    last_was_header = true;
                 }
-                lines.push(group.to_string());
-                current_group = group;
+                AgentViewRow::Job { job_index } => {
+                    if let Some(job) = jobs.get(*job_index) {
+                        lines.push(render_agent_view_row(
+                            job,
+                            row_index == state.selected,
+                            width,
+                        ));
+                    }
+                    last_was_header = false;
+                }
             }
-            lines.push(render_agent_view_row(job, index == state.selected, width));
         }
     }
 
     if state.peek_open {
         lines.push(String::new());
         lines.push(truncate_chars(&"-".repeat(width), width));
-        if let Some(job) = jobs.get(state.selected) {
+        let rows = build_agent_view_rows(state, jobs);
+        if let Some(job) = selected_agent_view_job(state, jobs, &rows) {
             lines.extend(render_agent_view_peek(job, width));
         } else {
             lines.push("Peek: no session selected".to_string());
@@ -8034,9 +8326,20 @@ fn render_agent_view_screen(
         lines.push(String::new());
     }
     lines.truncate(height.saturating_sub(2));
-    lines.push(truncate_chars(&format!("Dispatch: {}", state.input), width));
     lines.push(truncate_chars(
-        "Enter dispatch/attach  Space peek  Up/Down select  s stop  k kill  r respawn  d rm  q quit",
+        &format!(
+            "{}: {}",
+            if state.rename_mode {
+                "Rename"
+            } else {
+                "Dispatch"
+            },
+            state.input
+        ),
+        width,
+    ));
+    lines.push(truncate_chars(
+        "Enter dispatch/reply/attach/fold  Space peek  Ctrl+S group  Ctrl+T pin  Ctrl+R rename  Shift+Up/Down move  Ctrl+X stop/rm  q quit",
         width,
     ));
     lines.join("\n")
@@ -8063,6 +8366,35 @@ fn summarize_agent_jobs(jobs: &[runtime::AgentJobRecord]) -> AgentViewSummaryCou
     summary
 }
 
+fn build_agent_view_rows(
+    state: &AgentViewTuiState,
+    jobs: &[runtime::AgentJobRecord],
+) -> Vec<AgentViewRow> {
+    let mut rows = Vec::new();
+    let mut index = 0;
+    while index < jobs.len() {
+        let key = agent_view_group_key(&jobs[index], state.group_by_directory);
+        let label = agent_view_group_label(&jobs[index], state.group_by_directory);
+        let start = index;
+        while index < jobs.len()
+            && agent_view_group_key(&jobs[index], state.group_by_directory) == key
+        {
+            index += 1;
+        }
+        let collapsed = state.collapsed_groups.contains(&key);
+        rows.push(AgentViewRow::Header {
+            key,
+            label,
+            collapsed,
+            count: index - start,
+        });
+        if !collapsed {
+            rows.extend((start..index).map(|job_index| AgentViewRow::Job { job_index }));
+        }
+    }
+    rows
+}
+
 fn render_agent_view_row(job: &runtime::AgentJobRecord, selected: bool, width: usize) -> String {
     let selector = if selected { ">" } else { " " };
     let pid = job
@@ -8081,9 +8413,10 @@ fn render_agent_view_row(job: &runtime::AgentJobRecord, selected: bool, width: u
         .or(job.command.as_deref())
         .unwrap_or_default()
         .replace('\n', " ");
+    let pin = if job.pinned { "^" } else { " " };
     truncate_chars(
         &format!(
-            "{selector} {pid:<9} {name:<22} {:<8} {}",
+            "{selector} {pin} {pid:<9} {name:<22} {:<8} {}",
             agent_state_label(&job.state),
             detail
         ),
@@ -8107,8 +8440,23 @@ fn render_agent_view_peek(job: &runtime::AgentJobRecord, width: usize) -> Vec<St
     if let Some(session_id) = &job.session_id {
         lines.push(truncate_chars(&format!("  Session    {session_id}"), width));
     }
+    if job.pinned {
+        lines.push("  Pinned     true".to_string());
+    }
+    if let Some(display_order) = job.display_order {
+        lines.push(truncate_chars(
+            &format!("  Order      {display_order}"),
+            width,
+        ));
+    }
     if let Some(prompt) = &job.prompt {
         lines.push(truncate_chars(&format!("  Prompt     {prompt}"), width));
+    }
+    if let Some(pending_prompt) = &job.pending_prompt {
+        lines.push(truncate_chars(
+            &format!("  Pending    {pending_prompt}"),
+            width,
+        ));
     }
     if let Some(command) = &job.command {
         lines.push(truncate_chars(&format!("  Command    {command}"), width));
@@ -8131,17 +8479,53 @@ fn render_agent_view_peek(job: &runtime::AgentJobRecord, width: usize) -> Vec<St
     lines
 }
 
-fn agent_view_group_rank(job: &runtime::AgentJobRecord) -> u8 {
-    match job.state {
-        runtime::AgentJobState::Blocked => 0,
-        runtime::AgentJobState::Working => 1,
-        runtime::AgentJobState::Done => 2,
-        runtime::AgentJobState::Failed => 3,
-        runtime::AgentJobState::Stopped => 4,
-    }
+fn agent_view_order_key(job: &runtime::AgentJobRecord) -> i64 {
+    job.display_order.unwrap_or(i64::MAX)
 }
 
-fn agent_view_group_label(job: &runtime::AgentJobRecord) -> &'static str {
+fn agent_view_group_sort_key(
+    job: &runtime::AgentJobRecord,
+    group_by_directory: bool,
+) -> (u8, String) {
+    if job.pinned {
+        return (0, String::new());
+    }
+    if group_by_directory {
+        return (1, job.cwd.clone());
+    }
+    (
+        match job.state {
+            runtime::AgentJobState::Blocked => 1,
+            runtime::AgentJobState::Working => 2,
+            runtime::AgentJobState::Done => 3,
+            runtime::AgentJobState::Failed => 4,
+            runtime::AgentJobState::Stopped => 4,
+        },
+        String::new(),
+    )
+}
+
+fn agent_view_group_key(job: &runtime::AgentJobRecord, group_by_directory: bool) -> String {
+    if job.pinned {
+        return "pinned".to_string();
+    }
+    if group_by_directory {
+        return format!("dir:{}", job.cwd);
+    }
+    format!("state:{}", agent_view_state_group_label(job))
+}
+
+fn agent_view_group_label(job: &runtime::AgentJobRecord, group_by_directory: bool) -> String {
+    if job.pinned {
+        return "Pinned".to_string();
+    }
+    if group_by_directory {
+        return job.cwd.clone();
+    }
+    agent_view_state_group_label(job).to_string()
+}
+
+fn agent_view_state_group_label(job: &runtime::AgentJobRecord) -> &'static str {
     match job.state {
         runtime::AgentJobState::Blocked => "Needs input",
         runtime::AgentJobState::Working => "Working",
@@ -10826,11 +11210,17 @@ fn run_agent_daemon_stop(
 fn run_agent_worker(id: &str) -> Result<(), Box<dyn std::error::Error>> {
     let supervisor = runtime::AgentSupervisor::from_default_config()?;
     let job = supervisor.load_job(id)?;
-    let output = match job.kind {
-        runtime::AgentJobKind::Exec => run_agent_exec_worker(&job)?,
+    let output = match match job.kind {
+        runtime::AgentJobKind::Exec => run_agent_exec_worker(&job),
         runtime::AgentJobKind::Claude | runtime::AgentJobKind::Interactive => {
-            run_agent_prompt_worker(&job)?
+            run_agent_prompt_worker(&job)
         }
+    } {
+        Ok(output) => output,
+        Err(error) => AgentWorkerOutput {
+            exit_code: 1,
+            text: format!("agent worker failed: {error}\n"),
+        },
     };
     supervisor.append_log(id, &output.text)?;
     supervisor.finish_job(id, output.exit_code, Some(&output.text))?;
@@ -10862,12 +11252,25 @@ fn run_agent_exec_worker(
 fn run_agent_prompt_worker(
     job: &runtime::AgentJobRecord,
 ) -> Result<AgentWorkerOutput, Box<dyn std::error::Error>> {
-    let prompt = job.prompt.as_deref().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "agent prompt job missing prompt",
-        )
-    })?;
+    let prompt = job
+        .pending_prompt
+        .as_deref()
+        .or(job.prompt.as_deref())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "agent prompt job missing prompt",
+            )
+        })?;
+    if job.pending_prompt.is_some() {
+        let session_id = job.session_id.as_deref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "agent reply job missing resumable session id",
+            )
+        })?;
+        return run_agent_follow_up_worker(job, session_id, prompt);
+    }
     let executable = env::current_exe()?;
     let mut command = Command::new(executable);
     if let Some(model) = &job.model {
@@ -10886,6 +11289,50 @@ fn run_agent_prompt_worker(
         .env("CLAW_AGENT_JOB_ID", &job.id);
     let output = command.output()?;
     Ok(command_output_to_worker_output(output))
+}
+
+fn run_agent_follow_up_worker(
+    job: &runtime::AgentJobRecord,
+    session_id: &str,
+    prompt: &str,
+) -> Result<AgentWorkerOutput, Box<dyn std::error::Error>> {
+    let _cwd_guard = CurrentDirGuard::enter(Path::new(&job.cwd))?;
+    let (handle, session) = load_session_reference(session_id)?;
+    let model = job
+        .model
+        .clone()
+        .or_else(|| session.model.clone())
+        .unwrap_or_else(|| DEFAULT_MODEL.to_string());
+    let model = resolve_repl_model(model)?;
+    let permission_mode = job
+        .permission_mode
+        .as_deref()
+        .map(parse_permission_mode_arg)
+        .transpose()
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?
+        .unwrap_or_else(default_permission_mode);
+    let system_prompt = build_system_prompt(&model)?;
+    let mut runtime = build_runtime(
+        session.with_persistence_path(handle.path.clone()),
+        &handle.id,
+        model.clone(),
+        system_prompt,
+        true,
+        false,
+        None,
+        permission_mode,
+        None,
+    )?;
+    let mut permission_prompter = CliPermissionPrompter::new(permission_mode);
+    let summary = runtime.run_turn(prompt, Some(&mut permission_prompter))?;
+    runtime.session().save_to_path(&handle.path)?;
+    let mut text = String::new();
+    text.push_str("User reply:\n");
+    text.push_str(prompt);
+    text.push_str("\n\nAssistant:\n");
+    text.push_str(&final_assistant_text(&summary));
+    text.push('\n');
+    Ok(AgentWorkerOutput { exit_code: 0, text })
 }
 
 fn command_output_to_worker_output(output: std::process::Output) -> AgentWorkerOutput {
@@ -17396,11 +17843,14 @@ mod tests {
                 include_all: true,
                 cwd: Some(PathBuf::from("/tmp/project")),
             },
-            selected: 0,
+            selected: 1,
             peek_open: true,
             input: "write tests".to_string(),
             status: Some("started background session abc123".to_string()),
             confirm_remove_id: None,
+            group_by_directory: false,
+            collapsed_groups: std::collections::BTreeSet::new(),
+            rename_mode: false,
         };
         let job = runtime::AgentJobRecord {
             id: "abc123".to_string(),
@@ -17414,7 +17864,10 @@ mod tests {
             waiting_for: None,
             session_id: Some("session-abc".to_string()),
             name: Some("parser fix".to_string()),
+            pinned: true,
+            display_order: Some(10),
             prompt: Some("fix parser".to_string()),
+            pending_prompt: None,
             command: None,
             model: Some(DEFAULT_MODEL.to_string()),
             agent: Some("Explore".to_string()),
@@ -17430,10 +17883,12 @@ mod tests {
         let screen = render_agent_view_screen(&state, &[job], 100, 24);
 
         assert!(screen.contains("Claude Code Agent View"));
-        assert!(screen.contains("Working"));
-        assert!(screen.contains("> *42"));
+        assert!(screen.contains("Pinned"));
+        assert!(screen.contains("> ^ *42"));
         assert!(screen.contains("Peek abc123"));
         assert!(screen.contains("Session    session-abc"));
+        assert!(screen.contains("Pinned     true"));
+        assert!(screen.contains("Order      10"));
         assert!(screen.contains("Dispatch: write tests"));
     }
 

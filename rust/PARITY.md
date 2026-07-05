@@ -58,7 +58,7 @@ Hashes below come from `git log --oneline`. Merge line counts come from `git sho
 | **WebSearch** | `tools` | search query execution — **moderate parity** |
 | **TodoWrite** | `tools` | todo/note persistence — **moderate parity** |
 | **Skill** | `tools` | skill discovery/install — **moderate parity** |
-| **Agent** | `tools` + `runtime::agent_supervisor` + `commands` | agent delegation plus Claude Code agent-view state under `~/.claude/jobs/<id>/state.json`, `daemon/roster.json`, `claw agents --json`, `--bg`, shell lifecycle commands, basic full-screen TUI, and attach into resumable prompt sessions — **moderate parity**; peek replies, row organization shortcuts, `/bg` foreground handoff, and real supervisor socket/worker-pool semantics remain partial |
+| **Agent** | `tools` + `runtime::agent_supervisor` + `commands` | agent delegation plus Claude Code agent-view state under `~/.claude/jobs/<id>/state.json`, `daemon/roster.json`, `claw agents --json`, `--bg`, shell lifecycle commands, basic full-screen TUI, queued peek replies into resumable prompt sessions without live workers, row pin/rename/reorder/collapse/grouping shortcuts, and attach into resumable prompt sessions — **moderate parity**; live in-process reply routing, generated row summaries/PR status, notifications, `/bg` foreground handoff, and real supervisor socket/worker-pool semantics remain partial |
 | **TaskCreate** | `runtime::task_registry` + `tools` | in-memory task creation wired into tool dispatch — **good parity** |
 | **TaskGet** | `runtime::task_registry` + `tools` | task lookup + metadata payload — **good parity** |
 | **TaskList** | `runtime::task_registry` + `tools` | registry-backed task listing — **good parity** |

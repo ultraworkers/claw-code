@@ -2241,6 +2241,9 @@ struct AgentRunView {
     agent_id: String,
     name: String,
     description: String,
+    pending_prompt: Option<String>,
+    pinned: bool,
+    display_order: Option<i64>,
     subagent_type: Option<String>,
     model: Option<String>,
     status: String,
@@ -4059,6 +4062,9 @@ fn load_agent_views(options: &AgentViewOptions) -> std::io::Result<AgentViewColl
                 .clone()
                 .or(job.command.clone())
                 .unwrap_or_default(),
+            pending_prompt: job.pending_prompt.clone(),
+            pinned: job.pinned,
+            display_order: job.display_order,
             subagent_type: job.agent.clone(),
             model: job.model.clone(),
             status: job.status.unwrap_or_else(|| "unknown".to_string()),
@@ -4712,6 +4718,15 @@ fn render_agent_views_report(collection: &AgentViewCollection, target: Option<&s
         if let Some(pid) = view.pid {
             lines.push(format!("    pid            {pid}"));
         }
+        if view.pinned {
+            lines.push("    pinned         true".to_string());
+        }
+        if let Some(display_order) = view.display_order {
+            lines.push(format!("    order          {display_order}"));
+        }
+        if let Some(pending_prompt) = &view.pending_prompt {
+            lines.push(format!("    pending        {pending_prompt}"));
+        }
         if let Some(waiting_for) = &view.waiting_for {
             lines.push(format!("    waiting_for    {waiting_for}"));
         }
@@ -4812,8 +4827,15 @@ fn agent_view_json(view: &AgentRunView) -> Value {
         value.insert("sessionId".to_string(), json!(session_id));
     }
     value.insert("name".to_string(), json!(&view.name));
+    value.insert("pinned".to_string(), json!(view.pinned));
+    if let Some(display_order) = view.display_order {
+        value.insert("displayOrder".to_string(), json!(display_order));
+    }
     if !view.description.is_empty() {
         value.insert("prompt".to_string(), json!(&view.description));
+    }
+    if let Some(pending_prompt) = &view.pending_prompt {
+        value.insert("pendingPrompt".to_string(), json!(pending_prompt));
     }
     if let Some(model) = &view.model {
         value.insert("model".to_string(), json!(model));
@@ -6945,6 +6967,16 @@ mod tests {
                 reasoning_effort: Some("medium".to_string()),
             })
             .expect("new job");
+        supervisor
+            .set_session_id(&new.id, "session-new")
+            .expect("session id");
+        supervisor
+            .queue_reply(&new.id, "follow up")
+            .expect("reply queued");
+        supervisor.set_pinned(&new.id, true).expect("pin");
+        supervisor
+            .set_display_order(&new.id, 10)
+            .expect("display order");
         supervisor.set_process(&new.id, 4242).expect("pid");
 
         let report = handle_agents_slash_command_json(Some("--all"), &workspace)
@@ -6961,6 +6993,9 @@ mod tests {
             .find(|session| session["id"] == new.id)
             .expect("new session");
         assert_eq!(new_session["state"], "working");
+        assert_eq!(new_session["pendingPrompt"], "follow up");
+        assert_eq!(new_session["pinned"], true);
+        assert_eq!(new_session["displayOrder"], 10);
         assert_eq!(
             new_session["cwd"],
             canonical_workspace.display().to_string()
@@ -6970,12 +7005,18 @@ mod tests {
         let raw = raw.as_array().expect("array");
         assert_eq!(raw.len(), 1);
         assert_eq!(raw[0]["id"], new.id);
+        assert_eq!(raw[0]["pendingPrompt"], "follow up");
+        assert_eq!(raw[0]["pinned"], true);
+        assert_eq!(raw[0]["displayOrder"], 10);
 
         let text = super::handle_agents_slash_command(Some("--all"), &workspace)
             .expect("agent view text should render");
         assert!(text.contains("Agent view"));
         assert!(text.contains("explore-new"));
         assert!(text.contains("state=working"));
+        assert!(text.contains("pinned         true"));
+        assert!(text.contains("order          10"));
+        assert!(text.contains("pending        follow up"));
 
         restore_env_var("CLAUDE_CONFIG_DIR", original_claude_config_dir);
         let _ = fs::remove_dir_all(workspace);

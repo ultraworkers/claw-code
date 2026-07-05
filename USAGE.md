@@ -570,7 +570,7 @@ Agent view follows the Claude Code background-session layout. `CLAUDE_CONFIG_DIR
 ./target/debug/claw daemon status
 ```
 
-When stdout/stdin are attached to a terminal, `claw agents` opens a full-screen view. Type a prompt and press Enter to dispatch a new background session, use Up/Down to select rows, Space to peek at captured output, Enter or Right to attach, `s`/`k` to stop or kill, `r` to respawn, and `d` twice to remove a row. In JSON mode or non-TTY automation it keeps the structured list behavior.
+When stdout/stdin are attached to a terminal, `claw agents` opens a full-screen view. Type a prompt and press Enter to dispatch a new background session, use Up/Down to select rows, Space to peek at captured output, type while peek is open and press Enter to send a reply to a resumable session without a live worker, Enter or Right on an empty input to attach or fold a group header, `Ctrl+S` to group by directory/state, `Ctrl+T` to pin a row, `Ctrl+R` to rename it, `Shift+Up`/`Shift+Down` to reorder within a group, `Ctrl+X` to stop and press `Ctrl+X` again to remove, `s`/`k` to stop or kill, `r` to respawn, and `d` twice to remove a row. In JSON mode or non-TTY automation it keeps the structured list behavior.
 
 ## Session management
 

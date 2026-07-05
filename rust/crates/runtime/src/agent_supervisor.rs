@@ -109,8 +109,14 @@ pub struct AgentJobRecord {
     pub session_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub pinned: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_order: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pending_prompt: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -153,6 +159,10 @@ pub struct AgentRosterEntry {
     pub pid: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub pinned: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_order: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub started_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -249,7 +259,10 @@ impl AgentSupervisor {
             waiting_for: None,
             session_id: None,
             name: request.name,
+            pinned: false,
+            display_order: None,
             prompt: request.prompt,
+            pending_prompt: None,
             command: request.command,
             model: request.model,
             agent: request.agent,
@@ -347,6 +360,59 @@ impl AgentSupervisor {
         })
     }
 
+    pub fn queue_reply(
+        &self,
+        id: &str,
+        prompt: impl Into<String>,
+    ) -> Result<AgentJobRecord, AgentSupervisorError> {
+        self.update_job(id, |record| {
+            record.pending_prompt = Some(prompt.into());
+            record.pid = None;
+            record.state = AgentJobState::Working;
+            record.status = Some("reply_queued".to_string());
+            record.waiting_for = None;
+            record.stopped_at = None;
+            record.completed_at = None;
+            record.exit_code = None;
+        })
+    }
+
+    pub fn set_pinned(
+        &self,
+        id: &str,
+        pinned: bool,
+    ) -> Result<AgentJobRecord, AgentSupervisorError> {
+        self.update_job(id, |record| {
+            record.pinned = pinned;
+        })
+    }
+
+    pub fn rename_job(
+        &self,
+        id: &str,
+        name: impl Into<String>,
+    ) -> Result<AgentJobRecord, AgentSupervisorError> {
+        let name = name.into();
+        self.update_job(id, |record| {
+            let trimmed = name.trim();
+            record.name = if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            };
+        })
+    }
+
+    pub fn set_display_order(
+        &self,
+        id: &str,
+        display_order: i64,
+    ) -> Result<AgentJobRecord, AgentSupervisorError> {
+        self.update_job(id, |record| {
+            record.display_order = Some(display_order);
+        })
+    }
+
     pub fn append_log(&self, id: &str, text: &str) -> Result<AgentJobRecord, AgentSupervisorError> {
         let log_path = self.job_dir(id).join("output.log");
         if let Some(parent) = log_path.parent() {
@@ -371,6 +437,7 @@ impl AgentSupervisor {
             record.exit_code = Some(exit_code);
             record.completed_at = Some(timestamp());
             record.status = Some("exited".to_string());
+            record.pending_prompt = None;
             record.state = if exit_code == 0 {
                 AgentJobState::Done
             } else {
@@ -387,6 +454,7 @@ impl AgentSupervisor {
             record.pid = None;
             record.state = AgentJobState::Stopped;
             record.status = Some("stopped".to_string());
+            record.pending_prompt = None;
             record.stopped_at = Some(timestamp());
         })
     }
@@ -461,6 +529,8 @@ impl AgentSupervisor {
                     cwd: job.cwd.clone(),
                     pid: job.pid,
                     name: job.name.clone(),
+                    pinned: job.pinned,
+                    display_order: job.display_order,
                     started_at: Some(job.started_at.clone()),
                     updated_at: Some(job.updated_at.clone()),
                     extra: BTreeMap::new(),
@@ -530,6 +600,10 @@ fn tail(value: &str, max_chars: usize) -> String {
         .collect()
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -573,6 +647,21 @@ mod tests {
             .expect("list");
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].name.as_deref(), Some("parser-fix"));
+        assert!(!listed[0].pinned);
+
+        let pinned = supervisor.set_pinned(&job.id, true).expect("pin");
+        assert!(pinned.pinned);
+        let renamed = supervisor
+            .rename_job(&job.id, "parser review")
+            .expect("rename");
+        assert_eq!(renamed.name.as_deref(), Some("parser review"));
+        let ordered = supervisor
+            .set_display_order(&job.id, 20)
+            .expect("display order");
+        assert_eq!(ordered.display_order, Some(20));
+        let roster = supervisor.rewrite_roster().expect("roster");
+        assert!(roster.sessions[0].pinned);
+        assert_eq!(roster.sessions[0].display_order, Some(20));
 
         let _ = fs::remove_dir_all(config);
     }
@@ -598,11 +687,18 @@ mod tests {
             .expect("job");
 
         supervisor.set_process(&job.id, 1234).expect("pid");
+        let queued = supervisor
+            .queue_reply(&job.id, "follow up")
+            .expect("reply queued");
+        assert_eq!(queued.pending_prompt.as_deref(), Some("follow up"));
+        assert_eq!(queued.status.as_deref(), Some("reply_queued"));
+        assert_eq!(queued.state, AgentJobState::Working);
         supervisor.append_log(&job.id, "hello\n").expect("log");
         let done = supervisor
             .finish_job(&job.id, 0, Some("hello\n"))
             .expect("done");
         assert_eq!(done.state, AgentJobState::Done);
+        assert_eq!(done.pending_prompt, None);
         assert_eq!(supervisor.read_logs(&job.id).expect("logs"), "hello\n");
         assert!(supervisor
             .list_jobs(&AgentListFilter::default())
