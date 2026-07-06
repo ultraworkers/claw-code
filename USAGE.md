@@ -572,6 +572,23 @@ Agent view follows the Claude Code background-session layout. `CLAUDE_CONFIG_DIR
 
 When stdout/stdin are attached to a terminal, `claw agents` opens a full-screen view. Type a prompt and press Enter to dispatch a new background session, use Up/Down to select rows, Space to peek at captured output, type while peek is open and press Enter to send a reply to a resumable session without a live worker, Enter or Right on an empty input to attach or fold a group header, `Ctrl+S` to group by directory/state, `Ctrl+T` to pin a row, `Ctrl+R` to rename it, `Shift+Up`/`Shift+Down` to reorder within a group, `Ctrl+X` to stop and press `Ctrl+X` again to remove, `s`/`k` to stop or kill, `r` to respawn, and `d` twice to remove a row. In JSON mode or non-TTY automation it keeps the structured list behavior.
 
+## Run workflows
+
+`claw` supports Claude Code-style dynamic workflow entry points for local orchestration. Saved workflow scripts are discovered from `.claude/workflows/`, `.claw/workflows/`, `~/.claude/workflows/`, and `~/.claw/workflows/`. Inline scripts, `scriptPath`, saved workflow names, and the bundled `deep-research` workflow all route through the `Workflow` tool and record run manifests in `.clawd-workflows/` by default.
+
+```bash
+./target/debug/claw workflows
+./target/debug/claw workflows show <workflow-run-id>
+./target/debug/claw deep-research "what changed in Node.js permission model?"
+./target/debug/claw /deep-research "compare these APIs"
+```
+
+In the REPL, `/workflows` lists recorded runs and `/deep-research <question>` launches the bundled research workflow in the background. `/effort ultracode` is session-scoped: it sets API reasoning to `xhigh` and enables workflow orchestration for substantive prompts until you change effort again or start a new session. The `ultracode` keyword in a normal prompt also triggers workflow orchestration when `workflowKeywordTriggerEnabled` is true.
+
+Workflow feature switches follow Claude Code-compatible settings: `disableWorkflows`, `enableWorkflows`, `workflowKeywordTriggerEnabled`, and `CLAUDE_CODE_DISABLE_WORKFLOWS=1`. When workflows are disabled, `/workflows`, `/deep-research`, and `ultracode` orchestration return a disabled workflow payload instead of starting agents.
+
+Current local parity is intentionally bounded: the runner executes scripts with static `agent(...)` calls, stores run state, and spawns background agents. It does not yet embed a full isolated JavaScript workflow VM for arbitrary `workflow`, `parallel`, `pipeline`, `Date`, or `Math.random` behavior.
+
 ## Session management
 
 REPL turns are persisted under `.claw/sessions/` in the current workspace.

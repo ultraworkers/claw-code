@@ -158,6 +158,7 @@ pub struct RuntimeFeatureConfig {
     plugins: RuntimePluginConfig,
     mcp: McpConfigCollection,
     oauth: Option<OAuthConfig>,
+    workflows: RuntimeWorkflowConfig,
     model: Option<String>,
     aliases: BTreeMap<String, String>,
     permission_mode: Option<ResolvedPermissionMode>,
@@ -168,6 +169,24 @@ pub struct RuntimeFeatureConfig {
     api_timeout: ApiTimeoutConfig,
     rules_import: RulesImportConfig,
     provider: RuntimeProviderConfig,
+}
+
+/// Dynamic workflow feature switches from Claude Code-compatible settings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeWorkflowConfig {
+    disable_workflows: bool,
+    enable_workflows: Option<bool>,
+    workflow_keyword_trigger_enabled: bool,
+}
+
+impl Default for RuntimeWorkflowConfig {
+    fn default() -> Self {
+        Self {
+            disable_workflows: false,
+            enable_workflows: None,
+            workflow_keyword_trigger_enabled: true,
+        }
+    }
 }
 
 /// Controls which external AI coding framework rules are imported into the system prompt.
@@ -796,6 +815,7 @@ fn build_runtime_config(
         plugins: parse_optional_plugin_config(&merged_value)?,
         mcp,
         oauth: parse_optional_oauth_config(&merged_value, "merged settings.oauth")?,
+        workflows: parse_optional_workflow_config(&merged_value)?,
         model: parse_optional_model(&merged_value),
         aliases: parse_optional_aliases(&merged_value)?,
         permission_mode: parse_optional_permission_mode(&merged_value)?,
@@ -878,6 +898,21 @@ impl RuntimeConfig {
     #[must_use]
     pub fn oauth(&self) -> Option<&OAuthConfig> {
         self.feature_config.oauth.as_ref()
+    }
+
+    #[must_use]
+    pub fn workflows(&self) -> &RuntimeWorkflowConfig {
+        &self.feature_config.workflows
+    }
+
+    #[must_use]
+    pub fn workflows_enabled(&self) -> bool {
+        self.feature_config.workflows_enabled()
+    }
+
+    #[must_use]
+    pub fn workflow_keyword_trigger_enabled(&self) -> bool {
+        self.feature_config.workflow_keyword_trigger_enabled()
     }
 
     #[must_use]
@@ -978,6 +1013,21 @@ impl RuntimeFeatureConfig {
     }
 
     #[must_use]
+    pub fn workflows(&self) -> &RuntimeWorkflowConfig {
+        &self.workflows
+    }
+
+    #[must_use]
+    pub fn workflows_enabled(&self) -> bool {
+        self.workflows.enabled()
+    }
+
+    #[must_use]
+    pub fn workflow_keyword_trigger_enabled(&self) -> bool {
+        self.workflows.keyword_trigger_enabled() && self.workflows_enabled()
+    }
+
+    #[must_use]
     pub fn model(&self) -> Option<&str> {
         self.model.as_deref()
     }
@@ -1024,6 +1074,34 @@ impl RuntimeFeatureConfig {
     }
 }
 
+impl RuntimeWorkflowConfig {
+    #[must_use]
+    pub fn disable_workflows(&self) -> bool {
+        self.disable_workflows
+    }
+
+    #[must_use]
+    pub fn enable_workflows(&self) -> Option<bool> {
+        self.enable_workflows
+    }
+
+    #[must_use]
+    pub fn keyword_trigger_enabled(&self) -> bool {
+        self.workflow_keyword_trigger_enabled
+    }
+
+    #[must_use]
+    pub fn enabled(&self) -> bool {
+        if env_flag_enabled("CLAUDE_CODE_DISABLE_WORKFLOWS") {
+            return false;
+        }
+        if self.disable_workflows {
+            return false;
+        }
+        self.enable_workflows.unwrap_or(true)
+    }
+}
+
 fn merge_trusted_roots(config_roots: &[String], per_call_roots: &[String]) -> Vec<String> {
     let mut merged = Vec::with_capacity(config_roots.len() + per_call_roots.len());
     for root in config_roots.iter().chain(per_call_roots.iter()) {
@@ -1032,6 +1110,15 @@ fn merge_trusted_roots(config_roots: &[String], per_call_roots: &[String]) -> Ve
         }
     }
     merged
+}
+
+fn env_flag_enabled(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
 }
 
 impl ProviderFallbackConfig {
@@ -1747,6 +1834,24 @@ fn parse_optional_aliases(root: &JsonValue) -> Result<BTreeMap<String, String>, 
         return Ok(BTreeMap::new());
     };
     Ok(optional_string_map(object, "aliases", "merged settings")?.unwrap_or_default())
+}
+
+fn parse_optional_workflow_config(root: &JsonValue) -> Result<RuntimeWorkflowConfig, ConfigError> {
+    let Some(object) = root.as_object() else {
+        return Ok(RuntimeWorkflowConfig::default());
+    };
+
+    Ok(RuntimeWorkflowConfig {
+        disable_workflows: optional_bool(object, "disableWorkflows", "merged settings")?
+            .unwrap_or(false),
+        enable_workflows: optional_bool(object, "enableWorkflows", "merged settings")?,
+        workflow_keyword_trigger_enabled: optional_bool(
+            object,
+            "workflowKeywordTriggerEnabled",
+            "merged settings",
+        )?
+        .unwrap_or(true),
+    })
 }
 
 fn parse_optional_hooks_config(root: &JsonValue) -> Result<RuntimeHookConfig, ConfigError> {
@@ -3941,6 +4046,35 @@ mod tests {
             rendered.contains("model"),
             "warning should suggest the closest known key, got: {rendered}"
         );
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn parses_workflow_feature_switches_and_env_disable() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&cwd).expect("project dir");
+        fs::write(
+            home.join("settings.json"),
+            r#"{"enableWorkflows": true, "workflowKeywordTriggerEnabled": false}"#,
+        )
+        .expect("write settings");
+
+        std::env::remove_var("CLAUDE_CODE_DISABLE_WORKFLOWS");
+        let loaded = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("workflow settings should load");
+        assert!(loaded.workflows_enabled());
+        assert!(!loaded.workflow_keyword_trigger_enabled());
+        assert_eq!(loaded.workflows().enable_workflows(), Some(true));
+
+        std::env::set_var("CLAUDE_CODE_DISABLE_WORKFLOWS", "1");
+        assert!(!loaded.workflows_enabled());
+        assert!(!loaded.workflow_keyword_trigger_enabled());
+        std::env::remove_var("CLAUDE_CODE_DISABLE_WORKFLOWS");
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }

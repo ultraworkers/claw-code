@@ -245,6 +245,20 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         resume_supported: true,
     },
     SlashCommandSpec {
+        name: "workflows",
+        aliases: &[],
+        summary: "List or inspect dynamic workflow runs",
+        argument_hint: Some("[show <run-id>]"),
+        resume_supported: true,
+    },
+    SlashCommandSpec {
+        name: "deep-research",
+        aliases: &[],
+        summary: "Run the bundled deep research workflow",
+        argument_hint: Some("<question>"),
+        resume_supported: false,
+    },
+    SlashCommandSpec {
         name: "skills",
         aliases: &["skill"],
         summary: "List, install, uninstall, or invoke available skills",
@@ -1119,6 +1133,12 @@ pub enum SlashCommand {
     Agents {
         args: Option<String>,
     },
+    Workflows {
+        args: Option<String>,
+    },
+    DeepResearch {
+        question: Option<String>,
+    },
     Skills {
         args: Option<String>,
     },
@@ -1266,6 +1286,10 @@ impl SlashCommand {
             Self::Permissions { .. } => "/permissions",
             Self::Session { .. } => "/session",
             Self::Plugins { .. } => "/plugins",
+            Self::Agents { .. } => "/agents",
+            Self::Workflows { .. } => "/workflows",
+            Self::DeepResearch { .. } => "/deep-research",
+            Self::Skills { .. } => "/skills",
             Self::Login => "/login",
             Self::Logout => "/logout",
             Self::Vim => "/vim",
@@ -1407,6 +1431,10 @@ pub fn validate_slash_command_input(
         "plugin" | "plugins" | "marketplace" => parse_plugin_command(&args)?,
         "agents" => SlashCommand::Agents {
             args: parse_list_or_help_args(command, remainder)?,
+        },
+        "workflows" => SlashCommand::Workflows { args: remainder },
+        "deep-research" => SlashCommand::DeepResearch {
+            question: Some(require_remainder(command, remainder, "<question>")?),
         },
         "skills" | "skill" => SlashCommand::Skills {
             args: parse_skills_args(remainder.as_deref())?,
@@ -5805,6 +5833,8 @@ pub fn handle_slash_command(
         | SlashCommand::Session { .. }
         | SlashCommand::Plugins { .. }
         | SlashCommand::Agents { .. }
+        | SlashCommand::Workflows { .. }
+        | SlashCommand::DeepResearch { .. }
         | SlashCommand::Skills { .. }
         | SlashCommand::Doctor
         | SlashCommand::Login
@@ -6014,6 +6044,26 @@ mod tests {
             Ok(Some(SlashCommand::Ultraplan {
                 task: Some("ship both features".to_string())
             }))
+        );
+        assert_eq!(
+            SlashCommand::parse("/workflows show workflow-123"),
+            Ok(Some(SlashCommand::Workflows {
+                args: Some("show workflow-123".to_string())
+            }))
+        );
+        assert_eq!(
+            SlashCommand::parse("/deep-research Node.js permission model changes"),
+            Ok(Some(SlashCommand::DeepResearch {
+                question: Some("Node.js permission model changes".to_string())
+            }))
+        );
+        assert_eq!(
+            SlashCommand::parse("/ultracode implement login"),
+            Ok(Some(SlashCommand::Unknown("ultracode".to_string())))
+        );
+        assert!(
+            super::find_slash_command_spec("ultracode").is_none(),
+            "ultracode is a workflow keyword and /effort mode, not a slash command"
         );
         assert_eq!(
             SlashCommand::parse("/teleport conversation.rs"),
@@ -6470,6 +6520,8 @@ mod tests {
         ));
         assert!(help.contains("aliases: /plugins, /marketplace"));
         assert!(help.contains("/agents [list|show <name>|create <name>|help]"));
+        assert!(help.contains("/workflows [show <run-id>]"));
+        assert!(help.contains("/deep-research <question>"));
         assert!(help.contains(
             "/skills [list|show <name>|install <path>|uninstall <name>|help|<skill> [args]]"
         ));
@@ -6477,7 +6529,7 @@ mod tests {
         assert!(!help.contains("/login"));
         assert!(!help.contains("/logout"));
         assert!(help.contains("/setup"));
-        assert_eq!(slash_command_specs().len(), 142);
+        assert_eq!(slash_command_specs().len(), 144);
         assert!(resume_supported_slash_commands().len() >= 39);
     }
 

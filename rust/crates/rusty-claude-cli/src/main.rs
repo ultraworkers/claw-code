@@ -74,11 +74,16 @@ use runtime::{
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use tools::{
-    canonical_allowed_tool_name, execute_tool, mvp_tool_specs, GlobalToolRegistry,
-    RuntimeToolDefinition, ToolSearchOutput,
+    canonical_allowed_tool_name, execute_tool, mvp_tool_specs, render_workflows_report,
+    workflows_report_json, GlobalToolRegistry, RuntimeToolDefinition, ToolSearchOutput,
 };
 
 const DEFAULT_MODEL: &str = "anthropic/claude-sonnet-5";
+const API_REASONING_EFFORT_VALUES: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+const SESSION_EFFORT_VALUES: &[&str] =
+    &["auto", "low", "medium", "high", "xhigh", "max", "ultracode"];
+const REASONING_EFFORT_FLAG_USAGE: &str = "--reasoning-effort low|medium|high|xhigh|max";
+const SESSION_EFFORT_USAGE: &str = "/effort auto|low|medium|high|xhigh|max|ultracode";
 
 /// #148: Model provenance for `claw status` JSON/text output. Records where
 /// the resolved model string came from so claws don't have to re-read argv
@@ -1037,6 +1042,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             reasoning_effort: reasoning_effort.as_deref(),
             agent: agent.as_deref(),
         })?,
+        CliAction::Workflows {
+            args,
+            output_format,
+        } => LiveCli::print_workflows(args.as_deref(), output_format)?,
+        CliAction::DeepResearch {
+            question,
+            output_format,
+        } => LiveCli::run_deep_research_command(&question, output_format)?,
         CliAction::Background {
             prompt,
             exec,
@@ -1238,6 +1251,14 @@ enum CliAction {
         permission_mode: PermissionMode,
         reasoning_effort: Option<String>,
         agent: Option<String>,
+    },
+    Workflows {
+        args: Option<String>,
+        output_format: CliOutputFormat,
+    },
+    DeepResearch {
+        question: String,
+        output_format: CliOutputFormat,
     },
     Background {
         prompt: Option<String>,
@@ -1795,22 +1816,14 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             "--reasoning-effort" => {
                 let value = args
                     .get(index + 1)
-                    .ok_or_else(|| "missing_flag_value: missing value for --reasoning-effort.\nUsage: --reasoning-effort low|medium|high".to_string())?;
-                if !matches!(value.as_str(), "low" | "medium" | "high") {
-                    return Err(format!(
-                        "invalid_flag_value: invalid value for --reasoning-effort: '{value}'.\nUsage: --reasoning-effort low|medium|high"
-                    ));
-                }
+                    .ok_or_else(|| format!("missing_flag_value: missing value for --reasoning-effort.\nUsage: {REASONING_EFFORT_FLAG_USAGE}"))?;
+                validate_reasoning_effort_flag(value)?;
                 reasoning_effort = Some(value.clone());
                 index += 2;
             }
             flag if flag.starts_with("--reasoning-effort=") => {
                 let value = &flag[19..];
-                if !matches!(value, "low" | "medium" | "high") {
-                    return Err(format!(
-                        "invalid_flag_value: invalid value for --reasoning-effort: '{value}'.\nUsage: --reasoning-effort low|medium|high"
-                    ));
-                }
+                validate_reasoning_effort_flag(value)?;
                 reasoning_effort = Some(value.to_string());
                 index += 1;
             }
@@ -2188,6 +2201,22 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             reasoning_effort: reasoning_effort.clone(),
             agent: background_agent.clone(),
         }),
+        "workflows" => Ok(CliAction::Workflows {
+            args: join_optional_args(&rest[1..]),
+            output_format,
+        }),
+        "deep-research" => {
+            let Some(question) = join_optional_args(&rest[1..]) else {
+                return Err(
+                    "missing_argument: deep-research requires a question.\nUsage: claw deep-research <question>"
+                        .to_string(),
+                );
+            };
+            Ok(CliAction::DeepResearch {
+                question,
+                output_format,
+            })
+        }
         "mcp" => Ok(CliAction::Mcp {
             args: join_optional_args(&rest[1..]),
             output_format,
@@ -2732,6 +2761,8 @@ fn bare_slash_command_guidance(command_name: &str) -> Option<String> {
             | "remove"
             | "daemon"
             | "agents"
+            | "workflows"
+            | "deep-research"
             | "mcp"
             | "plugin"
             | "plugins"
@@ -2970,6 +3001,28 @@ fn join_optional_args(args: &[String]) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
+fn is_api_reasoning_effort(value: &str) -> bool {
+    API_REASONING_EFFORT_VALUES.contains(&value)
+}
+
+fn is_session_effort(value: &str) -> bool {
+    SESSION_EFFORT_VALUES.contains(&value)
+}
+
+fn validate_reasoning_effort_flag(value: &str) -> Result<(), String> {
+    if is_api_reasoning_effort(value) {
+        return Ok(());
+    }
+    if value == "ultracode" {
+        return Err(format!(
+            "invalid_flag_value: ultracode is session-scoped; use /effort ultracode inside the REPL.\nUsage: {REASONING_EFFORT_FLAG_USAGE}"
+        ));
+    }
+    Err(format!(
+        "invalid_flag_value: invalid value for --reasoning-effort: '{value}'.\nUsage: {REASONING_EFFORT_FLAG_USAGE}"
+    ))
+}
+
 #[allow(clippy::too_many_arguments, clippy::needless_pass_by_value)]
 fn parse_direct_slash_cli_action(
     rest: &[String],
@@ -3007,6 +3060,17 @@ fn parse_direct_slash_cli_action(
             reasoning_effort,
             agent: None,
         }),
+        Ok(Some(SlashCommand::Workflows { args })) => Ok(CliAction::Workflows {
+            args,
+            output_format,
+        }),
+        Ok(Some(SlashCommand::DeepResearch { question })) => Ok(CliAction::DeepResearch {
+            question: question.unwrap_or_default(),
+            output_format,
+        }),
+        Ok(Some(SlashCommand::Effort { .. })) => Err(format!(
+            "interactive_only: /effort is session-scoped.\nStart `claw` and run `{SESSION_EFFORT_USAGE}` inside the REPL."
+        )),
         Ok(Some(SlashCommand::Mcp { action, target })) => Ok(CliAction::Mcp {
             args: match (action, target) {
                 (None, None) => None,
@@ -3172,6 +3236,8 @@ fn suggest_similar_subcommand(input: &str) -> Option<Vec<String>> {
         "dump-manifests",
         "bootstrap-plan",
         "agents",
+        "workflows",
+        "deep-research",
         "mcp",
         "skills",
         "system-prompt",
@@ -3217,6 +3283,8 @@ fn is_known_top_level_subcommand(value: &str) -> bool {
             | "bootstrap-plan"
             | "agents"
             | "agent"
+            | "workflows"
+            | "deep-research"
             | "mcp"
             | "skills"
             | "skill"
@@ -7115,6 +7183,33 @@ fn run_resume_command(
                 ),
             })
         }
+        SlashCommand::Workflows { args } => Ok(ResumeCommandOutcome {
+            session: session.clone(),
+            message: Some(render_workflows_report(args.as_deref())?),
+            json: Some(workflows_report_json(args.as_deref())?),
+        }),
+        SlashCommand::DeepResearch { question } => {
+            let question = question.as_deref().unwrap_or_default();
+            let output = execute_tool(
+                "Workflow",
+                &json!({
+                    "name": "deep-research",
+                    "args": question,
+                }),
+            )?;
+            let value = serde_json::from_str::<Value>(&output).unwrap_or_else(|_| {
+                json!({
+                    "kind": "workflow",
+                    "status": "error",
+                    "message": output,
+                })
+            });
+            Ok(ResumeCommandOutcome {
+                session: session.clone(),
+                message: Some(format_workflow_tool_result(&value)),
+                json: Some(value),
+            })
+        }
         SlashCommand::Skills { args } => {
             if let SkillSlashDispatch::Invoke(_) = classify_skills_slash_command(args.as_deref()) {
                 // #779: use interactive_only: prefix + \n hint so #776 classify/split emits
@@ -7518,7 +7613,7 @@ fn run_live_cli_loop(cli: &mut LiveCli) -> Result<(), Box<dyn std::error::Error>
                 }
                 editor.push_history(input);
                 cli.record_prompt_history(&trimmed);
-                cli.run_turn(&trimmed)?;
+                cli.run_user_input(&trimmed)?;
             }
             input::ReadOutcome::Cancel => {}
             input::ReadOutcome::Exit => {
@@ -7550,10 +7645,137 @@ struct ManagedSessionSummary {
     lifecycle: SessionLifecycleSummary,
 }
 
+fn workflow_runtime_config_for_current_dir() -> runtime::RuntimeConfig {
+    let Ok(cwd) = env::current_dir() else {
+        return runtime::RuntimeConfig::empty();
+    };
+    ConfigLoader::default_for(&cwd)
+        .load()
+        .unwrap_or_else(|_| runtime::RuntimeConfig::empty())
+}
+
+fn workflows_enabled_for_current_dir() -> bool {
+    workflow_runtime_config_for_current_dir().workflows_enabled()
+}
+
+fn workflow_keyword_trigger_enabled_for_current_dir() -> bool {
+    workflow_runtime_config_for_current_dir().workflow_keyword_trigger_enabled()
+}
+
+fn workflow_disabled_value() -> Value {
+    json!({
+        "kind": "workflow",
+        "status": "disabled",
+        "message": "Dynamic workflows are disabled by settings or CLAUDE_CODE_DISABLE_WORKFLOWS.",
+    })
+}
+
+fn contains_ultracode_keyword(input: &str) -> bool {
+    input
+        .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_' && ch != '-')
+        .any(|token| token.eq_ignore_ascii_case("ultracode"))
+}
+
+fn strip_ultracode_keyword(input: &str) -> String {
+    let stripped = input
+        .split_whitespace()
+        .filter(|token| {
+            !token
+                .trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_' && ch != '-')
+                .eq_ignore_ascii_case("ultracode")
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    if stripped.trim().is_empty() {
+        input.trim().to_string()
+    } else {
+        stripped
+    }
+}
+
+fn looks_like_substantive_workflow_task(input: &str) -> bool {
+    let lower = input.to_ascii_lowercase();
+    let substantive_verbs = [
+        "implement",
+        "fix",
+        "debug",
+        "migrate",
+        "upgrade",
+        "refactor",
+        "build",
+        "create",
+        "design",
+        "analyze",
+        "review",
+        "test",
+        "investigate",
+        "research",
+        "port",
+        "integrate",
+    ];
+    input.chars().count() >= 80
+        || substantive_verbs
+            .iter()
+            .any(|verb| lower.split_whitespace().any(|token| token == *verb))
+}
+
+fn escape_workflow_template_text(input: &str) -> String {
+    input
+        .replace('\\', "\\\\")
+        .replace('`', "\\`")
+        .replace("${", "\\${")
+}
+
+fn ultracode_workflow_script(task: &str, trigger: &str) -> String {
+    let task = escape_workflow_template_text(task);
+    format!(
+        "export const meta = {{ name: 'ultracode', description: 'Session-scoped ultracode workflow orchestration.' }}\n\nconst result = await agent(`Use ultracode workflow orchestration for this substantive coding task. Inspect the workspace, plan the implementation, make the necessary changes, and report verification status. Trigger: {trigger}.\\n\\nTask:\\n{task}`, {{ label: 'ultracode', agentType: 'Explore', effort: 'xhigh' }})\n\nreturn result\n"
+    )
+}
+
+fn format_workflow_tool_result(value: &Value) -> String {
+    let mut lines = vec![String::from("Workflow")];
+    if let Some(status) = value.get("status").and_then(Value::as_str) {
+        lines.push(format!("  Status          {status}"));
+    }
+    if let Some(run_id) = value.get("runId").and_then(Value::as_str) {
+        lines.push(format!("  Run             {run_id}"));
+    }
+    if let Some(name) = value.get("name").and_then(Value::as_str) {
+        lines.push(format!("  Name            {name}"));
+    }
+    if let Some(source) = value.get("source").and_then(Value::as_str) {
+        lines.push(format!("  Source          {source}"));
+    }
+    if let Some(script_path) = value.get("scriptPath").and_then(Value::as_str) {
+        lines.push(format!("  Script          {script_path}"));
+    }
+    if let Some(agents) = value.get("agents").and_then(Value::as_array) {
+        lines.push(format!("  Agents          {}", agents.len()));
+        for agent in agents.iter().take(5) {
+            let label = agent
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("workflow-agent");
+            let status = agent
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("queued");
+            lines.push(format!("  - {label} ({status})"));
+        }
+    }
+    if let Some(message) = value.get("message").and_then(Value::as_str) {
+        lines.push(format!("  Message         {message}"));
+    }
+    lines.join("\n")
+}
+
 struct LiveCli {
     model: String,
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
+    effort_mode: String,
+    reasoning_effort: Option<String>,
     system_prompt: Vec<String>,
     runtime: BuiltRuntime,
     session: SessionHandle,
@@ -8960,6 +9182,8 @@ impl LiveCli {
             model,
             allowed_tools,
             permission_mode,
+            effort_mode: "auto".to_string(),
+            reasoning_effort: None,
             system_prompt,
             runtime,
             session,
@@ -8970,9 +9194,9 @@ impl LiveCli {
     }
 
     fn set_reasoning_effort(&mut self, effort: Option<String>) {
-        if let Some(rt) = self.runtime.runtime.as_mut() {
-            rt.api_client_mut().set_reasoning_effort(effort);
-        }
+        self.effort_mode = effort.clone().unwrap_or_else(|| "auto".to_string());
+        self.reasoning_effort = effort;
+        Self::apply_reasoning_effort(&mut self.runtime, self.reasoning_effort.clone());
     }
 
     fn startup_banner(&self) -> String {
@@ -9035,7 +9259,7 @@ impl LiveCli {
         emit_output: bool,
     ) -> Result<(BuiltRuntime, HookAbortMonitor), Box<dyn std::error::Error>> {
         let hook_abort_signal = runtime::HookAbortSignal::new();
-        let runtime = build_runtime(
+        let mut runtime = build_runtime(
             self.runtime.session().clone(),
             &self.session.id,
             self.model.clone(),
@@ -9047,15 +9271,26 @@ impl LiveCli {
             None,
         )?
         .with_hook_abort_signal(hook_abort_signal.clone());
+        Self::apply_reasoning_effort(&mut runtime, self.reasoning_effort.clone());
         let hook_abort_monitor = HookAbortMonitor::spawn(hook_abort_signal);
 
         Ok((runtime, hook_abort_monitor))
     }
 
-    fn replace_runtime(&mut self, runtime: BuiltRuntime) -> Result<(), Box<dyn std::error::Error>> {
+    fn replace_runtime(
+        &mut self,
+        mut runtime: BuiltRuntime,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        Self::apply_reasoning_effort(&mut runtime, self.reasoning_effort.clone());
         self.runtime.shutdown_plugins()?;
         self.runtime = runtime;
         Ok(())
+    }
+
+    fn apply_reasoning_effort(runtime: &mut BuiltRuntime, effort: Option<String>) {
+        if let Some(rt) = runtime.runtime.as_mut() {
+            rt.api_client_mut().set_reasoning_effort(effort);
+        }
     }
 
     fn run_turn(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
@@ -9290,12 +9525,62 @@ impl LiveCli {
         output_format: CliOutputFormat,
         compact: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(trigger) = self.workflow_trigger_for_input(input) {
+            return self.run_ultracode_workflow_with_output(input, trigger, output_format);
+        }
         match output_format {
             CliOutputFormat::Json if compact => self.run_prompt_compact_json(input),
             CliOutputFormat::Text if compact => self.run_prompt_compact(input),
             CliOutputFormat::Text => self.run_turn(input),
             CliOutputFormat::Json => self.run_prompt_json(input),
         }
+    }
+
+    fn run_user_input(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(trigger) = self.workflow_trigger_for_input(input) {
+            return self.run_ultracode_workflow_with_output(input, trigger, CliOutputFormat::Text);
+        }
+        self.run_turn(input)
+    }
+
+    fn workflow_trigger_for_input(&self, input: &str) -> Option<&'static str> {
+        let trimmed = input.trim();
+        if trimmed.is_empty() || trimmed.starts_with('/') || !workflows_enabled_for_current_dir() {
+            return None;
+        }
+        if contains_ultracode_keyword(trimmed) {
+            return workflow_keyword_trigger_enabled_for_current_dir().then_some("keyword");
+        }
+        if self.effort_mode == "ultracode" && looks_like_substantive_workflow_task(trimmed) {
+            return Some("effort");
+        }
+        None
+    }
+
+    fn run_ultracode_workflow_with_output(
+        &mut self,
+        input: &str,
+        trigger: &'static str,
+        output_format: CliOutputFormat,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let task = if trigger == "keyword" {
+            strip_ultracode_keyword(input)
+        } else {
+            input.trim().to_string()
+        };
+        let script = ultracode_workflow_script(&task, trigger);
+        let value = Self::execute_workflow_tool_json(&json!({
+            "script": script,
+            "args": {
+                "prompt": task,
+                "trigger": trigger,
+            },
+        }))?;
+        match output_format {
+            CliOutputFormat::Text => println!("{}", format_workflow_tool_result(&value)),
+            CliOutputFormat::Json => println!("{}", serde_json::to_string_pretty(&value)?),
+        }
+        Ok(())
     }
 
     fn run_prompt_compact(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
@@ -9485,6 +9770,24 @@ impl LiveCli {
                 }
                 false
             }
+            SlashCommand::Workflows { args } => {
+                if let Err(error) = Self::print_workflows(args.as_deref(), CliOutputFormat::Text) {
+                    eprintln!("{error}");
+                }
+                false
+            }
+            SlashCommand::DeepResearch { question } => {
+                if let Some(question) = question {
+                    if let Err(error) =
+                        Self::run_deep_research_command(&question, CliOutputFormat::Text)
+                    {
+                        eprintln!("{error}");
+                    }
+                } else {
+                    eprintln!("Usage: /deep-research <question>");
+                }
+                false
+            }
             SlashCommand::Skills { args } => {
                 match classify_skills_slash_command(args.as_deref()) {
                     SkillSlashDispatch::Invoke(prompt) => self.run_turn(&prompt)?,
@@ -9524,6 +9827,7 @@ impl LiveCli {
                 println!("{}", format_cost_report(usage));
                 false
             }
+            SlashCommand::Effort { level } => self.handle_effort_command(level.as_deref())?,
             SlashCommand::Review { scope } => {
                 let scope = scope.unwrap_or_else(|| "medium".to_string());
                 self.run_turn(&format!("$code-review {scope}"))?;
@@ -9559,7 +9863,6 @@ impl LiveCli {
             | SlashCommand::Hooks { .. }
             | SlashCommand::Context { .. }
             | SlashCommand::Color { .. }
-            | SlashCommand::Effort { .. }
             | SlashCommand::Branch { .. }
             | SlashCommand::Rewind { .. }
             | SlashCommand::Ide { .. }
@@ -9882,6 +10185,59 @@ impl LiveCli {
         Ok(())
     }
 
+    fn print_workflows(
+        args: Option<&str>,
+        output_format: CliOutputFormat,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if !workflows_enabled_for_current_dir() {
+            let value = workflow_disabled_value();
+            match output_format {
+                CliOutputFormat::Text => println!("{}", format_workflow_tool_result(&value)),
+                CliOutputFormat::Json => println!("{}", serde_json::to_string_pretty(&value)?),
+            }
+            return Ok(());
+        }
+        match output_format {
+            CliOutputFormat::Text => {
+                println!(
+                    "{}",
+                    render_workflows_report(args).map_err(io::Error::other)?
+                )
+            }
+            CliOutputFormat::Json => {
+                let value = workflows_report_json(args).map_err(io::Error::other)?;
+                println!("{}", serde_json::to_string_pretty(&value)?);
+            }
+        }
+        Ok(())
+    }
+
+    fn run_deep_research_command(
+        question: &str,
+        output_format: CliOutputFormat,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let value = Self::execute_workflow_tool_json(&json!({
+            "name": "deep-research",
+            "args": question,
+        }))?;
+        match output_format {
+            CliOutputFormat::Text => println!("{}", format_workflow_tool_result(&value)),
+            CliOutputFormat::Json => println!("{}", serde_json::to_string_pretty(&value)?),
+        }
+        Ok(())
+    }
+
+    fn execute_workflow_tool_json(input: &Value) -> Result<Value, Box<dyn std::error::Error>> {
+        let output = execute_tool("Workflow", input).map_err(io::Error::other)?;
+        Ok(serde_json::from_str(&output).unwrap_or_else(|_| {
+            json!({
+                "kind": "workflow",
+                "status": "error",
+                "message": output,
+            })
+        }))
+    }
+
     fn print_mcp(
         args: Option<&str>,
         output_format: CliOutputFormat,
@@ -9934,6 +10290,57 @@ impl LiveCli {
             }
         }
         Ok(())
+    }
+
+    fn handle_effort_command(
+        &mut self,
+        level: Option<&str>,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        let Some(raw_level) = level.map(str::trim).filter(|value| !value.is_empty()) else {
+            println!(
+                "Effort\n  Current mode     {}\n  API reasoning    {}\n  Usage            {}",
+                self.effort_mode,
+                self.reasoning_effort.as_deref().unwrap_or("auto"),
+                SESSION_EFFORT_USAGE
+            );
+            return Ok(false);
+        };
+        let normalized = raw_level.to_ascii_lowercase();
+        if !is_session_effort(&normalized) {
+            println!(
+                "Effort\n  Status          error\n  Message         unsupported effort level '{}'\n  Usage           {}",
+                raw_level, SESSION_EFFORT_USAGE
+            );
+            return Ok(false);
+        }
+        if normalized == "ultracode" && !workflows_enabled_for_current_dir() {
+            println!(
+                "{}",
+                format_workflow_tool_result(&workflow_disabled_value())
+            );
+            return Ok(false);
+        }
+
+        let previous = self.effort_mode.clone();
+        self.effort_mode = normalized.clone();
+        self.reasoning_effort = match normalized.as_str() {
+            "auto" => None,
+            "ultracode" => Some("xhigh".to_string()),
+            other => Some(other.to_string()),
+        };
+        Self::apply_reasoning_effort(&mut self.runtime, self.reasoning_effort.clone());
+        println!(
+            "Effort\n  Previous mode    {}\n  Current mode     {}\n  API reasoning    {}\n  Workflow mode    {}",
+            previous,
+            self.effort_mode,
+            self.reasoning_effort.as_deref().unwrap_or("auto"),
+            if self.effort_mode == "ultracode" {
+                "enabled"
+            } else {
+                "off"
+            }
+        );
+        Ok(false)
     }
 
     fn print_plugins(
@@ -10955,6 +11362,8 @@ fn run_attached_agent_session(
         model,
         allowed_tools: None,
         permission_mode,
+        effort_mode: "auto".to_string(),
+        reasoning_effort: None,
         system_prompt,
         runtime,
         session: SessionHandle {
@@ -15217,7 +15626,6 @@ const STUB_COMMANDS: &[&str] = &[
     "hooks",
     "context",
     "color",
-    "effort",
     "branch",
     "rewind",
     "ide",
@@ -15325,6 +15733,9 @@ fn slash_command_completion_candidates_with_sessions(
         "/config hooks",
         "/config model",
         "/config plugins",
+        "/deep-research ",
+        "/effort ",
+        "/effort ultracode",
         "/mcp ",
         "/mcp list",
         "/mcp show ",
@@ -15352,6 +15763,8 @@ fn slash_command_completion_candidates_with_sessions(
         "/session fork ",
         "/teleport ",
         "/ultraplan ",
+        "/workflows ",
+        "/workflows show ",
         "/agents help",
         "/mcp help",
         "/skills help",
@@ -19113,6 +19526,31 @@ mod tests {
                 output_format: CliOutputFormat::Json,
             }
         );
+        assert_eq!(
+            parse_args(&[
+                "--output-format=json".to_string(),
+                "/workflows".to_string(),
+                "show".to_string(),
+                "workflow-123".to_string(),
+            ])
+            .expect("json /workflows show should parse"),
+            CliAction::Workflows {
+                args: Some("show workflow-123".to_string()),
+                output_format: CliOutputFormat::Json,
+            }
+        );
+        assert_eq!(
+            parse_args(&[
+                "--output-format=json".to_string(),
+                "/deep-research".to_string(),
+                "workflow docs".to_string(),
+            ])
+            .expect("json /deep-research should parse"),
+            CliAction::DeepResearch {
+                question: "workflow docs".to_string(),
+                output_format: CliOutputFormat::Json,
+            }
+        );
     }
 
     #[test]
@@ -19693,6 +20131,9 @@ mod tests {
         assert!(completions.contains(&"/resume session-old".to_string()));
         assert!(completions.contains(&"/mcp list".to_string()));
         assert!(completions.contains(&"/ultraplan ".to_string()));
+        assert!(completions.contains(&"/workflows ".to_string()));
+        assert!(completions.contains(&"/deep-research ".to_string()));
+        assert!(completions.contains(&"/effort ultracode".to_string()));
     }
 
     #[test]
@@ -21778,7 +22219,7 @@ UU conflicted.rs",
 
     #[test]
     fn accepts_valid_reasoning_effort_values() {
-        for value in ["low", "medium", "high"] {
+        for value in ["low", "medium", "high", "xhigh", "max"] {
             let result = parse_args(&[
                 "--reasoning-effort".to_string(),
                 value.to_string(),
@@ -21796,6 +22237,19 @@ UU conflicted.rs",
                 assert_eq!(reasoning_effort.as_deref(), Some(value));
             }
         }
+    }
+
+    #[test]
+    fn rejects_ultracode_as_persistent_reasoning_effort_flag() {
+        let err = parse_args(&[
+            "--reasoning-effort".to_string(),
+            "ultracode".to_string(),
+            "prompt".to_string(),
+            "hello".to_string(),
+        ])
+        .unwrap_err();
+        assert!(err.contains("session-scoped"), "unexpected error: {err}");
+        assert!(err.contains("/effort ultracode"), "unexpected error: {err}");
     }
 
     #[test]

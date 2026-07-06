@@ -86,7 +86,7 @@ Hashes below come from `git log --oneline`. Merge line counts come from `git sho
 | **StructuredOutput** | `tools` | passthrough JSON — **good parity** |
 | **REPL** | `tools` | subprocess code execution — **moderate parity** |
 | **PowerShell** | `tools` | Windows PowerShell execution — **moderate parity** |
-| **Workflow / Monitor** | `tools` | v2.1.201 compatibility contracts with stable unsupported payloads; local workflow JS and live monitor scheduling are not implemented |
+| **Workflow / Monitor** | `tools` | Workflow supports saved/inline/scriptPath lookup, bundled `deep-research`, static `agent(...)` orchestration, run manifests, `/workflows`, `ultracode` keyword, and `/effort ultracode`; full JS VM and live Monitor scheduling are not implemented |
 | **ScheduleWakeup / PushNotification / ReportFindings / Artifact / Projects / ClaudeDesign / ShowOnboardingRolePicker** | `tools` | host-facing v2.1.201 contract payloads — **contract parity** |
 
 ### Stubs Only (surface parity, no behavior)

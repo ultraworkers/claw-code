@@ -1254,7 +1254,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "Workflow",
-            description: "Run a deterministic multi-agent workflow script. v2.1.201 contract surface; local execution is reported as unsupported unless a workflow runner is configured.",
+            description: "Run a deterministic multi-agent workflow script by resolving inline script, saved workflow name, or scriptPath and spawning workflow agents in the background.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -2255,16 +2255,685 @@ fn run_remote_trigger(input: RemoteTriggerInput) -> Result<String, String> {
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_workflow(input: WorkflowInput) -> Result<String, String> {
-    to_pretty_json(json!({
-        "status": "unsupported",
-        "kind": "workflow",
-        "message": "Workflow tool contract is registered for Claude Code v2.1.201 compatibility, but this local runtime does not execute workflow JavaScript yet.",
-        "name": input.name,
-        "has_script": input.script.as_ref().is_some_and(|script| !script.trim().is_empty()),
-        "scriptPath": input.script_path,
-        "resumeFromRunId": input.resume_from_run_id,
-        "args": input.args,
+    run_workflow_with_spawn(input, spawn_agent_job)
+}
+
+fn run_workflow_with_spawn<F>(input: WorkflowInput, spawn_fn: F) -> Result<String, String>
+where
+    F: Fn(AgentJob) -> Result<(), String> + Copy,
+{
+    if !workflow_feature_enabled() {
+        return to_pretty_json(json!({
+            "status": "disabled",
+            "kind": "workflow",
+            "message": "Dynamic workflows are disabled by settings or CLAUDE_CODE_DISABLE_WORKFLOWS.",
+            "name": input.name,
+            "scriptPath": input.script_path,
+            "resumeFromRunId": input.resume_from_run_id,
+            "args": input.args,
+        }));
+    }
+
+    if input.resume_from_run_id.is_some() {
+        return to_pretty_json(json!({
+            "status": "resume_requested",
+            "kind": "workflow",
+            "message": "This local workflow runner records run state, but resumeFromRunId replay is not implemented yet. Relaunching requires the original scriptPath.",
+            "resumeFromRunId": input.resume_from_run_id,
+            "scriptPath": input.script_path,
+            "name": input.name,
+            "args": input.args,
+        }));
+    }
+
+    let resolved = resolve_workflow_script(input)?;
+    let run = start_workflow_run(resolved, spawn_fn)?;
+    to_pretty_json(serde_json::to_value(run).map_err(|error| error.to_string())?)
+}
+
+fn workflow_feature_enabled() -> bool {
+    if workflow_env_disabled() {
+        return false;
+    }
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    ConfigLoader::default_for(cwd)
+        .load()
+        .map_or(true, |config| config.workflows_enabled())
+}
+
+fn workflow_env_disabled() -> bool {
+    std::env::var("CLAUDE_CODE_DISABLE_WORKFLOWS").is_ok_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
+fn resolve_workflow_script(input: WorkflowInput) -> Result<ResolvedWorkflowScript, String> {
+    let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
+    let args = input.args;
+    let requested_name = input
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(ToOwned::to_owned);
+
+    if let Some(script) = input
+        .script
+        .as_deref()
+        .map(str::trim)
+        .filter(|script| !script.is_empty())
+    {
+        let name = requested_name
+            .or_else(|| parse_workflow_meta_string(script, "name"))
+            .unwrap_or_else(|| String::from("inline-workflow"));
+        return Ok(ResolvedWorkflowScript {
+            name,
+            description: parse_workflow_meta_string(script, "description"),
+            script: script.to_string(),
+            script_path: None,
+            source: String::from("inline"),
+            args,
+        });
+    }
+
+    if let Some(script_path) = input
+        .script_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+    {
+        let path = resolve_workflow_script_path(script_path, &cwd)?;
+        let script = read_workflow_script_file(&path)?;
+        let name = requested_name
+            .or_else(|| parse_workflow_meta_string(&script, "name"))
+            .or_else(|| {
+                path.file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .map(ToOwned::to_owned)
+            })
+            .unwrap_or_else(|| String::from("workflow"));
+        return Ok(ResolvedWorkflowScript {
+            name,
+            description: parse_workflow_meta_string(&script, "description"),
+            script,
+            script_path: Some(path),
+            source: String::from("scriptPath"),
+            args,
+        });
+    }
+
+    let Some(name) = requested_name else {
+        return Err(String::from("Must provide script, name, or scriptPath"));
+    };
+
+    if name == "deep-research" {
+        let script = builtin_deep_research_script(args.as_ref());
+        return Ok(ResolvedWorkflowScript {
+            name,
+            description: Some(String::from(
+                "Deep research harness that fans out source discovery and verification.",
+            )),
+            script,
+            script_path: None,
+            source: String::from("built-in"),
+            args,
+        });
+    }
+
+    let path = find_saved_workflow_script(&name, &cwd)?;
+    let script = read_workflow_script_file(&path)?;
+    Ok(ResolvedWorkflowScript {
+        name: parse_workflow_meta_string(&script, "name").unwrap_or(name),
+        description: parse_workflow_meta_string(&script, "description"),
+        script,
+        script_path: Some(path),
+        source: String::from("saved"),
+        args,
+    })
+}
+
+fn start_workflow_run<F>(
+    workflow: ResolvedWorkflowScript,
+    spawn_fn: F,
+) -> Result<WorkflowRunOutput, String>
+where
+    F: Fn(AgentJob) -> Result<(), String> + Copy,
+{
+    let run_id = make_workflow_run_id();
+    let created_at = iso8601_now();
+    let store_dir = workflow_store_dir()?;
+    std::fs::create_dir_all(&store_dir).map_err(|error| error.to_string())?;
+    let script_path = persist_workflow_script_for_run(&store_dir, &run_id, &workflow)?;
+    let manifest_file = store_dir.join(format!("{run_id}.json"));
+    let calls = parse_workflow_agent_calls(&workflow.script);
+
+    let mut agents = Vec::new();
+    for (index, call) in calls.into_iter().enumerate() {
+        let description = call
+            .label
+            .clone()
+            .unwrap_or_else(|| format!("{} phase {}", workflow.name, index + 1));
+        let manifest = execute_agent_with_spawn(
+            AgentInput {
+                description: description.clone(),
+                prompt: workflow_agent_prompt(&workflow, &call),
+                subagent_type: call
+                    .agent_type
+                    .or_else(|| Some(String::from("general-purpose"))),
+                name: Some(format!("{}-{}", workflow.name, index + 1)),
+                model: call.model,
+                effort: call.effort,
+                run_in_background: Some(true),
+                isolation: call.isolation,
+            },
+            spawn_fn,
+        )?;
+        agents.push(WorkflowAgentRecord {
+            agent_id: manifest.agent_id,
+            name: manifest.name,
+            description,
+            status: manifest.status,
+            prompt_preview: preview_text(&call.prompt, 160),
+            manifest_file: manifest.manifest_file,
+        });
+    }
+
+    let (status, message) = if agents.is_empty() {
+        (
+            String::from("script_error"),
+            String::from(
+                "Workflow script did not contain a static agent(...) call this local runner can execute.",
+            ),
+        )
+    } else {
+        (
+            String::from("running"),
+            format!(
+                "Running in background: {} agent(s). Use /workflows to monitor and save.",
+                agents.len()
+            ),
+        )
+    };
+
+    let run = WorkflowRunOutput {
+        run_id,
+        kind: String::from("workflow"),
+        status,
+        name: workflow.name,
+        description: workflow.description,
+        source: workflow.source,
+        script_path: script_path.display().to_string(),
+        manifest_file: manifest_file.display().to_string(),
+        created_at,
+        agents,
+        args: workflow.args,
+        message,
+    };
+    write_workflow_run_manifest(&run)?;
+    Ok(run)
+}
+
+fn workflow_agent_prompt(workflow: &ResolvedWorkflowScript, call: &WorkflowAgentCall) -> String {
+    let args = workflow
+        .args
+        .as_ref()
+        .map(|value| format!("\n\nWorkflow args:\n{value}"))
+        .unwrap_or_default();
+    format!(
+        "You are a subagent spawned by workflow `{}`. Complete this workflow step and return a concise result.\n\n{}{}",
+        workflow.name, call.prompt, args
+    )
+}
+
+fn resolve_workflow_script_path(raw: &str, cwd: &Path) -> Result<PathBuf, String> {
+    if raw.starts_with("\\\\") {
+        return Err(format!(
+            "UNC paths are not allowed for workflow scriptPath: {raw}"
+        ));
+    }
+    let path = PathBuf::from(raw);
+    if path.is_absolute() {
+        Ok(path)
+    } else {
+        Ok(cwd.join(path))
+    }
+}
+
+const WORKFLOW_SCRIPT_MAX_BYTES: u64 = 1024 * 1024;
+
+fn read_workflow_script_file(path: &Path) -> Result<String, String> {
+    let metadata = std::fs::metadata(path)
+        .map_err(|_| format!("Workflow script file not found: {}", path.display()))?;
+    if metadata.len() > WORKFLOW_SCRIPT_MAX_BYTES {
+        return Err(format!(
+            "Workflow script file {} exceeds {} bytes",
+            path.display(),
+            WORKFLOW_SCRIPT_MAX_BYTES
+        ));
+    }
+    let bytes = std::fs::read(path).map_err(|error| {
+        format!(
+            "Failed to read workflow script file {}: {error}",
+            path.display()
+        )
+    })?;
+    String::from_utf8(bytes).map_err(|error| {
+        format!(
+            "Workflow script file {} is not utf-8: {error}",
+            path.display()
+        )
+    })
+}
+
+fn persist_workflow_script_for_run(
+    store_dir: &Path,
+    run_id: &str,
+    workflow: &ResolvedWorkflowScript,
+) -> Result<PathBuf, String> {
+    if let Some(path) = &workflow.script_path {
+        return Ok(path.clone());
+    }
+    let script_dir = store_dir.join("scripts");
+    std::fs::create_dir_all(&script_dir).map_err(|error| error.to_string())?;
+    let path = script_dir.join(format!("{run_id}.js"));
+    std::fs::write(&path, &workflow.script).map_err(|error| {
+        format!(
+            "Failed to persist workflow script to {}: {error}",
+            path.display()
+        )
+    })?;
+    Ok(path)
+}
+
+fn write_workflow_run_manifest(run: &WorkflowRunOutput) -> Result<(), String> {
+    std::fs::write(
+        &run.manifest_file,
+        serde_json::to_string_pretty(run).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())
+}
+
+fn make_workflow_run_id() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!("workflow-{nanos}")
+}
+
+fn workflow_store_dir() -> Result<PathBuf, String> {
+    if let Ok(path) = std::env::var("CLAWD_WORKFLOW_STORE") {
+        return Ok(PathBuf::from(path));
+    }
+    let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
+    if let Some(workspace_root) = cwd.ancestors().nth(2) {
+        return Ok(workspace_root.join(".clawd-workflows"));
+    }
+    Ok(cwd.join(".clawd-workflows"))
+}
+
+fn parse_workflow_agent_calls(script: &str) -> Vec<WorkflowAgentCall> {
+    let mut calls = Vec::new();
+    let mut offset = 0;
+    while let Some(relative) = script[offset..].find("agent(") {
+        let start = offset + relative + "agent(".len();
+        let Some((prompt, consumed)) = extract_js_string_literal(&script[start..]) else {
+            offset = start;
+            continue;
+        };
+        let options = &script[start + consumed..script.len().min(start + consumed + 1024)];
+        calls.push(WorkflowAgentCall {
+            prompt,
+            label: parse_workflow_option_string(options, "label"),
+            model: parse_workflow_option_string(options, "model"),
+            effort: parse_workflow_option_string(options, "effort"),
+            agent_type: parse_workflow_option_string(options, "agentType")
+                .or_else(|| parse_workflow_option_string(options, "subagent_type")),
+            isolation: parse_workflow_option_string(options, "isolation"),
+        });
+        offset = start + consumed;
+    }
+    calls
+}
+
+fn extract_js_string_literal(input: &str) -> Option<(String, usize)> {
+    let trimmed_start = input.len() - input.trim_start().len();
+    let mut chars = input[trimmed_start..].char_indices();
+    let (_, quote) = chars.next()?;
+    if !matches!(quote, '\'' | '"' | '`') {
+        return None;
+    }
+
+    let mut escaped = false;
+    let mut value = String::new();
+    for (index, ch) in chars {
+        if escaped {
+            value.push(ch);
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if ch == quote {
+            let consumed = trimmed_start + index + ch.len_utf8();
+            return Some((normalize_workflow_template_literal(&value), consumed));
+        }
+        value.push(ch);
+    }
+    None
+}
+
+fn normalize_workflow_template_literal(value: &str) -> String {
+    value.replace("${", "{")
+}
+
+fn parse_workflow_option_string(input: &str, key: &str) -> Option<String> {
+    let mut offset = 0;
+    while let Some(relative) = input[offset..].find(key) {
+        let key_start = offset + relative;
+        let key_end = key_start + key.len();
+        let before_ok = key_start == 0
+            || !input[..key_start]
+                .chars()
+                .next_back()
+                .is_some_and(|ch| ch.is_ascii_alphanumeric() || ch == '_');
+        let after_ok = input[key_end..]
+            .chars()
+            .next()
+            .is_none_or(|ch| !(ch.is_ascii_alphanumeric() || ch == '_'));
+        if before_ok && after_ok {
+            let after_key = &input[key_end..];
+            let colon_index = after_key.find(':')?;
+            let after_colon = &after_key[colon_index + 1..];
+            return extract_js_string_literal(after_colon).map(|(value, _)| value);
+        }
+        offset = key_end;
+    }
+    None
+}
+
+fn parse_workflow_meta_string(script: &str, key: &str) -> Option<String> {
+    parse_workflow_option_string(script, key)
+}
+
+fn builtin_deep_research_script(args: Option<&Value>) -> String {
+    let question =
+        workflow_args_to_prompt(args).unwrap_or_else(|| String::from("the requested topic"));
+    let question = escape_workflow_template_text(&question);
+    format!(
+        "export const meta = {{ name: 'deep-research', description: 'Deep research harness - fan out source discovery, verification, and synthesis.' }}\n\nconst report = await agent(`Research this question deeply using available search and fetch tools, cross-check claims, and return a cited report: {question}`, {{ label: 'deep-research', agentType: 'Explore', effort: 'high' }})\n\nreturn report\n"
+    )
+}
+
+fn workflow_args_to_prompt(args: Option<&Value>) -> Option<String> {
+    match args {
+        Some(Value::String(value)) if !value.trim().is_empty() => Some(value.trim().to_string()),
+        Some(value) if !value.is_null() => Some(value.to_string()),
+        _ => None,
+    }
+}
+
+fn escape_workflow_template_text(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('`', "\\`")
+        .replace("${", "\\${")
+}
+
+fn find_saved_workflow_script(name: &str, cwd: &Path) -> Result<PathBuf, String> {
+    for root in workflow_lookup_roots(cwd) {
+        if let Some(path) = find_workflow_in_root(&root, name) {
+            return Ok(path);
+        }
+    }
+    let available = list_saved_workflow_names(cwd);
+    let available = if available.is_empty() {
+        String::from("(none)")
+    } else {
+        available.join(", ")
+    };
+    Err(format!(
+        "Workflow \"{name}\" not found. Available: {available}"
+    ))
+}
+
+fn workflow_lookup_roots(cwd: &Path) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    for ancestor in cwd.ancestors() {
+        roots.push(ancestor.join(".claude").join("workflows"));
+        roots.push(ancestor.join(".claw").join("workflows"));
+    }
+    if let Ok(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
+        let home = PathBuf::from(home);
+        roots.push(home.join(".claude").join("workflows"));
+        roots.push(home.join(".claw").join("workflows"));
+    }
+    roots
+}
+
+fn find_workflow_in_root(root: &Path, requested: &str) -> Option<PathBuf> {
+    let candidates = [
+        root.join(format!("{requested}.js")),
+        root.join(format!("{requested}.mjs")),
+        root.join(requested),
+    ];
+    for candidate in candidates {
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+
+    for entry in std::fs::read_dir(root).ok()?.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let extension_ok = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| matches!(ext, "js" | "mjs"));
+        if !extension_ok {
+            continue;
+        }
+        let matches_stem = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .is_some_and(|stem| stem.eq_ignore_ascii_case(requested));
+        if matches_stem {
+            return Some(path);
+        }
+        if read_workflow_script_file(&path)
+            .ok()
+            .and_then(|script| parse_workflow_meta_string(&script, "name"))
+            .is_some_and(|name| name.eq_ignore_ascii_case(requested))
+        {
+            return Some(path);
+        }
+    }
+    None
+}
+
+fn list_saved_workflow_names(cwd: &Path) -> Vec<String> {
+    let mut names = BTreeSet::from([String::from("deep-research")]);
+    for root in workflow_lookup_roots(cwd) {
+        let Ok(entries) = std::fs::read_dir(root) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let extension_ok = path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| matches!(ext, "js" | "mjs"));
+            if !extension_ok {
+                continue;
+            }
+            if let Some(name) = read_workflow_script_file(&path)
+                .ok()
+                .and_then(|script| parse_workflow_meta_string(&script, "name"))
+                .or_else(|| {
+                    path.file_stem()
+                        .and_then(|stem| stem.to_str())
+                        .map(ToOwned::to_owned)
+                })
+            {
+                names.insert(name);
+            }
+        }
+    }
+    names.into_iter().collect()
+}
+
+pub fn render_workflows_report(args: Option<&str>) -> Result<String, String> {
+    let value = workflows_report_json(args)?;
+    if value["status"] == "empty" {
+        return Ok(String::from(
+            "Workflows\n  Status          no workflow runs found\n  Hint            run /deep-research <question> or ask with the ultracode keyword",
+        ));
+    }
+    if value["action"] == "show" {
+        return Ok(format_workflow_detail_report(&value));
+    }
+    Ok(format_workflow_list_report(&value))
+}
+
+pub fn workflows_report_json(args: Option<&str>) -> Result<Value, String> {
+    let requested = args.map(str::trim).filter(|value| !value.is_empty());
+    let runs = load_workflow_run_manifests()?;
+    if let Some(requested) = requested {
+        let requested = requested
+            .strip_prefix("show ")
+            .or_else(|| requested.strip_prefix("open "))
+            .unwrap_or(requested)
+            .trim();
+        let Some(run) = runs.iter().find(|run| run.run_id == requested) else {
+            return Ok(json!({
+                "kind": "workflows",
+                "action": "show",
+                "status": "not_found",
+                "runId": requested,
+                "available": runs.iter().map(|run| run.run_id.clone()).collect::<Vec<_>>(),
+            }));
+        };
+        return Ok(json!({
+            "kind": "workflows",
+            "action": "show",
+            "status": "ok",
+            "run": run,
+        }));
+    }
+    if runs.is_empty() {
+        return Ok(json!({
+            "kind": "workflows",
+            "action": "list",
+            "status": "empty",
+            "runs": [],
+        }));
+    }
+    Ok(json!({
+        "kind": "workflows",
+        "action": "list",
+        "status": "ok",
+        "count": runs.len(),
+        "runs": runs,
     }))
+}
+
+fn load_workflow_run_manifests() -> Result<Vec<WorkflowRunOutput>, String> {
+    let store_dir = workflow_store_dir()?;
+    let Ok(entries) = std::fs::read_dir(store_dir) else {
+        return Ok(Vec::new());
+    };
+    let mut runs = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        if let Ok(contents) = std::fs::read_to_string(&path) {
+            if let Ok(run) = serde_json::from_str::<WorkflowRunOutput>(&contents) {
+                runs.push(run);
+            }
+        }
+    }
+    runs.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+    Ok(runs)
+}
+
+fn format_workflow_list_report(value: &Value) -> String {
+    let mut lines = vec![format!(
+        "Workflows\n  Count           {}",
+        value["count"].as_u64().unwrap_or(0)
+    )];
+    if let Some(runs) = value["runs"].as_array() {
+        for run in runs {
+            lines.push(format!(
+                "  {}  {}  {}  {} agent(s)",
+                run["runId"].as_str().unwrap_or("<unknown>"),
+                run["status"].as_str().unwrap_or("unknown"),
+                run["name"].as_str().unwrap_or("workflow"),
+                run["agents"].as_array().map_or(0, Vec::len)
+            ));
+        }
+    }
+    lines.join("\n")
+}
+
+fn format_workflow_detail_report(value: &Value) -> String {
+    if value["status"] == "not_found" {
+        return format!(
+            "Workflows\n  Status          not found\n  Run             {}",
+            value["runId"].as_str().unwrap_or("<unknown>")
+        );
+    }
+    let run = &value["run"];
+    let mut lines = vec![
+        String::from("Workflow"),
+        format!(
+            "  Run             {}",
+            run["runId"].as_str().unwrap_or("<unknown>")
+        ),
+        format!(
+            "  Name            {}",
+            run["name"].as_str().unwrap_or("workflow")
+        ),
+        format!(
+            "  Status          {}",
+            run["status"].as_str().unwrap_or("unknown")
+        ),
+        format!(
+            "  Source          {}",
+            run["source"].as_str().unwrap_or("unknown")
+        ),
+        format!(
+            "  Script          {}",
+            run["scriptPath"].as_str().unwrap_or("<unknown>")
+        ),
+        format!(
+            "  Message         {}",
+            run["message"].as_str().unwrap_or("")
+        ),
+    ];
+    if let Some(agents) = run["agents"].as_array() {
+        lines.push(format!("  Agents          {}", agents.len()));
+        for agent in agents {
+            lines.push(format!(
+                "    {}  {}  {}",
+                agent["agentId"].as_str().unwrap_or("<unknown>"),
+                agent["status"].as_str().unwrap_or("unknown"),
+                agent["description"].as_str().unwrap_or("")
+            ));
+        }
+    }
+    lines.join("\n")
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -3485,6 +4154,62 @@ struct WorkflowInput {
     #[serde(rename = "resumeFromRunId")]
     resume_from_run_id: Option<String>,
     args: Option<Value>,
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedWorkflowScript {
+    name: String,
+    description: Option<String>,
+    script: String,
+    script_path: Option<PathBuf>,
+    source: String,
+    args: Option<Value>,
+}
+
+#[derive(Debug, Clone)]
+struct WorkflowAgentCall {
+    prompt: String,
+    label: Option<String>,
+    model: Option<String>,
+    effort: Option<String>,
+    agent_type: Option<String>,
+    isolation: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WorkflowRunOutput {
+    #[serde(rename = "runId")]
+    run_id: String,
+    kind: String,
+    status: String,
+    name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+    source: String,
+    #[serde(rename = "scriptPath")]
+    script_path: String,
+    #[serde(rename = "manifestFile")]
+    manifest_file: String,
+    #[serde(rename = "createdAt")]
+    created_at: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    agents: Vec<WorkflowAgentRecord>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    args: Option<Value>,
+    message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WorkflowAgentRecord {
+    #[serde(rename = "agentId")]
+    agent_id: String,
+    name: String,
+    description: String,
+    status: String,
+    #[serde(rename = "promptPreview")]
+    prompt_preview: String,
+    #[serde(rename = "manifestFile")]
+    manifest_file: String,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -7382,9 +8107,9 @@ mod tests {
         classify_lane_failure, derive_agent_state, execute_agent_with_spawn, execute_tool,
         extract_recovery_outcome, final_assistant_text, global_cron_registry, global_mcp_registry,
         maybe_commit_provenance, mvp_tool_specs, permission_mode_from_plugin,
-        persist_agent_terminal_state, push_output_block, run_task_packet, AgentInput, AgentJob,
-        GlobalToolRegistry, LaneEventName, LaneFailureClass, ProviderRuntimeClient,
-        SubagentToolExecutor,
+        persist_agent_terminal_state, push_output_block, run_task_packet, run_workflow_with_spawn,
+        AgentInput, AgentJob, GlobalToolRegistry, LaneEventName, LaneFailureClass,
+        ProviderRuntimeClient, SubagentToolExecutor, WorkflowInput,
     };
     use api::OutputContentBlock;
     use runtime::mcp_tool_bridge::{McpConnectionStatus, McpResourceInfo, McpToolInfo};
@@ -7550,6 +8275,13 @@ mod tests {
 
     #[test]
     fn v201_host_contract_tools_return_stable_payloads() {
+        let _guard = env_guard();
+        let workflow_store = temp_path("workflow-contract-store");
+        let original_workflow_store = std::env::var("CLAWD_WORKFLOW_STORE").ok();
+        let original_disable_workflows = std::env::var("CLAUDE_CODE_DISABLE_WORKFLOWS").ok();
+        std::env::set_var("CLAWD_WORKFLOW_STORE", &workflow_store);
+        std::env::remove_var("CLAUDE_CODE_DISABLE_WORKFLOWS");
+
         let workflow = execute_tool(
             "Workflow",
             &json!({
@@ -7560,9 +8292,13 @@ mod tests {
         )
         .expect("Workflow contract should be registered");
         let workflow: serde_json::Value = serde_json::from_str(&workflow).expect("workflow json");
-        assert_eq!(workflow["status"], "unsupported");
+        assert_eq!(workflow["status"], "script_error");
         assert_eq!(workflow["kind"], "workflow");
-        assert_eq!(workflow["has_script"], true);
+        assert_eq!(workflow["name"], "release-check");
+        assert_eq!(workflow["source"], "inline");
+        let script_path = Path::new(workflow["scriptPath"].as_str().expect("script path"));
+        assert!(script_path.exists());
+        assert!(script_path.starts_with(&workflow_store));
 
         let monitor = execute_tool(
             "Monitor",
@@ -7643,6 +8379,105 @@ mod tests {
             .as_array()
             .expect("roles")
             .contains(&json!("coding")));
+
+        match original_workflow_store {
+            Some(value) => std::env::set_var("CLAWD_WORKFLOW_STORE", value),
+            None => std::env::remove_var("CLAWD_WORKFLOW_STORE"),
+        }
+        match original_disable_workflows {
+            Some(value) => std::env::set_var("CLAUDE_CODE_DISABLE_WORKFLOWS", value),
+            None => std::env::remove_var("CLAUDE_CODE_DISABLE_WORKFLOWS"),
+        }
+        let _ = fs::remove_dir_all(workflow_store);
+    }
+
+    #[test]
+    fn workflow_static_agent_runner_records_run_and_agents() {
+        fn ok_spawn(_: AgentJob) -> Result<(), String> {
+            Ok(())
+        }
+
+        let _guard = env_guard();
+        let root = temp_path("workflow-static-agent");
+        let workflow_store = root.join("workflows");
+        let agent_store = root.join("agents");
+        let original_workflow_store = std::env::var("CLAWD_WORKFLOW_STORE").ok();
+        let original_agent_store = std::env::var("CLAWD_AGENT_STORE").ok();
+        let original_disable_workflows = std::env::var("CLAUDE_CODE_DISABLE_WORKFLOWS").ok();
+        std::env::set_var("CLAWD_WORKFLOW_STORE", &workflow_store);
+        std::env::set_var("CLAWD_AGENT_STORE", &agent_store);
+        std::env::remove_var("CLAUDE_CODE_DISABLE_WORKFLOWS");
+
+        let output = run_workflow_with_spawn(
+            WorkflowInput {
+                script: Some(
+                    "export const meta = { name: 'release-check', description: 'Check release readiness' }\nconst result = await agent(`Check release readiness`, { label: 'research', agentType: 'Explore', effort: 'xhigh' })\nreturn result\n"
+                        .to_string(),
+                ),
+                args: Some(json!({"target": "tools"})),
+                ..WorkflowInput::default()
+            },
+            ok_spawn,
+        )
+        .expect("static agent workflow should run");
+        let output: serde_json::Value = serde_json::from_str(&output).expect("workflow json");
+        assert_eq!(output["status"], "running");
+        assert_eq!(output["kind"], "workflow");
+        assert_eq!(output["name"], "release-check");
+        assert_eq!(output["description"], "Check release readiness");
+        assert_eq!(output["source"], "inline");
+        assert_eq!(output["agents"].as_array().expect("agents").len(), 1);
+        assert_eq!(output["agents"][0]["description"], "research");
+        assert_eq!(output["agents"][0]["status"], "running");
+        assert!(output["message"]
+            .as_str()
+            .expect("message")
+            .contains("/workflows"));
+        assert!(Path::new(output["scriptPath"].as_str().expect("script path")).exists());
+
+        let report = super::workflows_report_json(None).expect("workflow report");
+        assert_eq!(report["status"], "ok");
+        assert_eq!(report["count"], 1);
+        assert_eq!(report["runs"][0]["name"], "release-check");
+
+        match original_workflow_store {
+            Some(value) => std::env::set_var("CLAWD_WORKFLOW_STORE", value),
+            None => std::env::remove_var("CLAWD_WORKFLOW_STORE"),
+        }
+        match original_agent_store {
+            Some(value) => std::env::set_var("CLAWD_AGENT_STORE", value),
+            None => std::env::remove_var("CLAWD_AGENT_STORE"),
+        }
+        match original_disable_workflows {
+            Some(value) => std::env::set_var("CLAUDE_CODE_DISABLE_WORKFLOWS", value),
+            None => std::env::remove_var("CLAUDE_CODE_DISABLE_WORKFLOWS"),
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn workflow_tool_respects_disable_env() {
+        let _guard = env_guard();
+        let original_disable_workflows = std::env::var("CLAUDE_CODE_DISABLE_WORKFLOWS").ok();
+        std::env::set_var("CLAUDE_CODE_DISABLE_WORKFLOWS", "1");
+
+        let output = execute_tool(
+            "Workflow",
+            &json!({
+                "name": "deep-research",
+                "args": "workflow docs"
+            }),
+        )
+        .expect("disabled workflow should return structured payload");
+        let output: serde_json::Value = serde_json::from_str(&output).expect("workflow json");
+        assert_eq!(output["status"], "disabled");
+        assert_eq!(output["kind"], "workflow");
+        assert_eq!(output["name"], "deep-research");
+
+        match original_disable_workflows {
+            Some(value) => std::env::set_var("CLAUDE_CODE_DISABLE_WORKFLOWS", value),
+            None => std::env::remove_var("CLAUDE_CODE_DISABLE_WORKFLOWS"),
+        }
     }
 
     #[test]
