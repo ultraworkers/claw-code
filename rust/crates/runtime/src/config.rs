@@ -163,6 +163,10 @@ pub struct RuntimeFeatureConfig {
     api_timeout: ApiTimeoutConfig,
     rules_import: RulesImportConfig,
     provider: RuntimeProviderConfig,
+    /// Model override used when spawning sub-agents via the Agent tool.
+    /// Read from `subagentModel` (or `subagent_model`) in settings; falls
+    /// back to the default model when unset.
+    subagent_model: Option<String>,
 }
 
 /// Controls which external AI coding framework rules are imported into the system prompt.
@@ -801,6 +805,7 @@ fn build_runtime_config(
         api_timeout: parse_optional_api_timeout_config(&merged_value)?,
         rules_import: parse_optional_rules_import(&merged_value)?,
         provider: parse_optional_provider_config(&merged_value)?,
+        subagent_model: parse_optional_subagent_model(&merged_value),
     };
 
     Ok(RuntimeConfig {
@@ -878,6 +883,13 @@ impl RuntimeConfig {
     #[must_use]
     pub fn model(&self) -> Option<&str> {
         self.feature_config.model.as_deref()
+    }
+
+    /// Model override used when spawning sub-agents via the Agent tool.
+    /// Read from `subagentModel` in settings; `None` means "use default model".
+    #[must_use]
+    pub fn subagent_model(&self) -> Option<&str> {
+        self.feature_config.subagent_model.as_deref()
     }
 
     #[must_use]
@@ -1715,6 +1727,21 @@ fn parse_optional_model(root: &JsonValue) -> Option<String> {
         .and_then(|object| object.get("model"))
         .and_then(JsonValue::as_str)
         .map(ToOwned::to_owned)
+}
+
+/// Reads `subagentModel` (or the snake_case `subagent_model` alias) from
+/// merged settings. Returns `None` when absent or blank so the Agent tool
+/// falls back to the default model.
+fn parse_optional_subagent_model(root: &JsonValue) -> Option<String> {
+    root.as_object()
+        .and_then(|object| {
+            object
+                .get("subagentModel")
+                .or_else(|| object.get("subagent_model"))
+        })
+        .and_then(JsonValue::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.trim().to_string())
 }
 
 fn parse_optional_aliases(root: &JsonValue) -> Result<BTreeMap<String, String>, ConfigError> {
@@ -2577,6 +2604,49 @@ fn deep_merge_objects(
             _ => {
                 target.insert(key.clone(), value.clone());
             }
+        }
+    }
+}
+
+/// Read the provider config saved by `/setup` and inject its credentials
+/// into the environment so `ProviderClient::from_model()` can find them via
+/// the env-var-based provider dispatch. Only sets vars that aren't already
+/// present (preserves explicit env). Idempotent.
+///
+/// Called by the main CLI at startup and by sub-agent threads in the tools
+/// crate so that custom/ exotic providers work for spawned agents too.
+pub fn inject_config_as_env_fallbacks() {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let Ok(config) = ConfigLoader::default_for(&cwd).load() else {
+        return;
+    };
+    let provider = config.provider();
+
+    // Map provider kind to the expected env var names
+    let (api_key_env, base_url_env) = match provider.kind().unwrap_or("anthropic") {
+        "anthropic" => ("ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL"),
+        "xai" => ("XAI_API_KEY", "XAI_BASE_URL"),
+        "openai" => ("OPENAI_API_KEY", "OPENAI_BASE_URL"),
+        "dashscope" => ("DASHSCOPE_API_KEY", "DASHSCOPE_BASE_URL"),
+        "custom-openai" => ("CLAWCUSTOMOPENAI_API_KEY", "CLAWCUSTOMOPENAI_BASE_URL"),
+        _ => return, // unknown provider kind — don't inject
+    };
+
+    // Only set env vars that aren't already set (preserve user's explicit env)
+    if let Some(api_key) = provider.api_key() {
+        if std::env::var(api_key_env).is_err() {
+            std::env::set_var(api_key_env, api_key);
+        }
+    }
+    if let Some(base_url) = provider.base_url() {
+        if std::env::var(base_url_env).is_err() {
+            std::env::set_var(base_url_env, base_url);
+        }
+    }
+    // Also inject the saved model so resolve_model_alias sees it
+    if let Some(model) = provider.model() {
+        if std::env::var("CLAWD_PROVIDER_MODEL").is_err() {
+            std::env::set_var("CLAWD_PROVIDER_MODEL", model);
         }
     }
 }

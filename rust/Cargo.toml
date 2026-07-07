@@ -12,7 +12,9 @@ publish = false
 serde_json = "1"
 
 [workspace.lints.rust]
-unsafe_code = "forbid"
+# rusty-claude-cli needs unsafe for TUI stdout suppression (dup/dup2),
+# all other crates should avoid it — override per-crate if needed.
+unsafe_code = "warn"
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }

@@ -13,8 +13,13 @@ path = "src/main.rs"
 api = { path = "../api" }
 commands = { path = "../commands" }
 crossterm = "0.28"
+crossbeam-channel = "0.5"
+gag = "1"
 pulldown-cmark = "0.13"
+once_cell = "1"
+ratatui = "0.29"
 rustyline = "15"
+tui-textarea = "0.7"
 runtime = { path = "../runtime" }
 plugins = { path = "../plugins" }
 serde = { version = "1", features = ["derive"] }
@@ -23,10 +28,19 @@ syntect = "5"
 tokio = { version = "1", features = ["rt-multi-thread", "signal", "time"] }
 tools = { path = "../tools" }
 log = "0.4"
+libc = "0.2"
+unicode-width = "0.2"
 
 
-[lints]
-workspace = true
+[lints.rust]
+unsafe_code = "allow"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "allow", priority = -1 }
+module_name_repetitions = "allow"
+missing_panics_doc = "allow"
+missing_errors_doc = "allow"
 
 [dev-dependencies]
 mock-anthropic-service = { path = "../mock-anthropic-service" }

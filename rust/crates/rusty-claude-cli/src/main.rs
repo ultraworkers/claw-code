@@ -14,8 +14,10 @@
     clippy::unnecessary_wraps,
     clippy::unused_self
 )]
+
 mod init;
 mod input;
+
 mod render;
 mod setup_wizard;
 
@@ -1009,7 +1011,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // vars are preserved — resolution order remains: env var > .env file >
     // stored config. This only runs in the real binary (run() is not called by
     // unit tests) to avoid leaking user config into the test suite.
-    inject_config_as_env_fallbacks();
+    runtime::inject_config_as_env_fallbacks();
     match parse_args(&args)? {
         CliAction::DumpManifests {
             output_format,
@@ -6953,6 +6955,7 @@ fn run_resume_command(
         | SlashCommand::Tag { .. }
         | SlashCommand::OutputStyle { .. }
         | SlashCommand::AddDir { .. }
+        | SlashCommand::Lsp { .. }
         | SlashCommand::Team { .. }
         | SlashCommand::Setup => Err("unsupported resumed slash command".into()),
     }
@@ -7089,7 +7092,6 @@ fn run_repl(
         input::LineEditor::new("> ", cli.repl_completion_candidates().unwrap_or_default());
     println!("{}", cli.startup_banner());
     println!("{}", format_connected_line(&cli.model));
-
     loop {
         editor.set_completions(cli.repl_completion_candidates().unwrap_or_default());
         match editor.read_line()? {
@@ -7129,10 +7131,108 @@ fn run_repl(
                 cli.record_prompt_history(&trimmed);
                 cli.run_turn(&trimmed)?;
             }
+            input::ReadOutcome::TeamToggle => {
+                // Ctrl+T toggles agent teams mode
+                let current = std::env::var("CLAWD_AGENT_TEAMS").unwrap_or_default();
+                if current == "1" {
+                    std::env::set_var("CLAWD_AGENT_TEAMS", "0");
+                    eprintln!("[team] Agent teams disabled");
+                } else {
+                    std::env::set_var("CLAWD_AGENT_TEAMS", "1");
+                    eprintln!("[team] Agent teams enabled (TeamCreate now available)");
+                }
+            }
             input::ReadOutcome::Cancel => {}
             input::ReadOutcome::Exit => {
                 cli.persist_session()?;
                 break;
+            }
+            input::ReadOutcome::ProviderSwap => {
+                let _ = setup_wizard::run_setup_wizard();
+                let cwd = std::env::current_dir().unwrap_or_default();
+                let config = runtime::ConfigLoader::default_for(&cwd).load().ok();
+                if let Some(new_model) = config
+                    .as_ref()
+                    .and_then(|c| c.provider().model().map(str::to_string))
+                {
+                    let _ = cli.set_model(Some(new_model));
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Run the plain REPL starting from an existing LiveCli.
+/// This is the same loop as `run_repl` but takes ownership
+/// of a pre-existing `LiveCli` instead of creating one from CLI args.
+fn run_repl_from_cli(mut cli: LiveCli) -> Result<(), Box<dyn std::error::Error>> {
+    let mut editor =
+        input::LineEditor::new("> ", cli.repl_completion_candidates().unwrap_or_default());
+    println!();
+    println!("{}", format_connected_line(&cli.model));
+    loop {
+        editor.set_completions(cli.repl_completion_candidates().unwrap_or_default());
+        match editor.read_line()? {
+            input::ReadOutcome::Submit(input) => {
+                let trimmed = input.trim().to_string();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if matches!(trimmed.as_str(), "/exit" | "/quit") {
+                    cli.persist_session()?;
+                    break;
+                }
+                match SlashCommand::parse(&trimmed) {
+                    Ok(Some(command)) => {
+                        if cli.handle_repl_command(command)? {
+                            cli.persist_session()?;
+                        }
+                        continue;
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        eprintln!("{error}");
+                        continue;
+                    }
+                }
+                let cwd = std::env::current_dir().unwrap_or_default();
+                if let Some(prompt) = try_resolve_bare_skill_prompt(&cwd, &trimmed) {
+                    editor.push_history(input);
+                    cli.record_prompt_history(&trimmed);
+                    cli.run_turn(&prompt)?;
+                    continue;
+                }
+                editor.push_history(input);
+                cli.record_prompt_history(&trimmed);
+                cli.run_turn(&trimmed)?;
+            }
+            input::ReadOutcome::Cancel => {}
+            input::ReadOutcome::Exit => {
+                cli.persist_session()?;
+                break;
+            }
+            input::ReadOutcome::ProviderSwap => {
+                let _ = setup_wizard::run_setup_wizard();
+                let cwd = std::env::current_dir().unwrap_or_default();
+                let config = runtime::ConfigLoader::default_for(&cwd).load().ok();
+                if let Some(new_model) = config
+                    .as_ref()
+                    .and_then(|c| c.provider().model().map(str::to_string))
+                {
+                    let _ = cli.set_model(Some(new_model));
+                }
+            }
+            input::ReadOutcome::TeamToggle => {
+                let current = std::env::var("CLAWD_AGENT_TEAMS").unwrap_or_default();
+                if current == "1" {
+                    std::env::set_var("CLAWD_AGENT_TEAMS", "0");
+                    eprintln!("[team] Agent teams disabled");
+                } else {
+                    std::env::set_var("CLAWD_AGENT_TEAMS", "1");
+                    eprintln!("[team] Agent teams enabled");
+                }
             }
         }
     }
@@ -7776,35 +7876,38 @@ impl LiveCli {
     }
 
     fn run_turn(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
-        let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(true)?;
+        self.run_turn_to(input, &mut io::stdout(), true)
+    }
+
+    /// Core turn execution with a custom output writer.
+    /// In the plain REPL, `out` is `io::stdout()`.
+    fn run_turn_to<W: io::Write>(
+        &mut self,
+        input: &str,
+        out: &mut W,
+        emit_output: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(emit_output)?;
         let mut spinner = Spinner::new();
-        let mut stdout = io::stdout();
-        spinner.tick(
-            "🦀 Thinking...",
-            TerminalRenderer::new().color_theme(),
-            &mut stdout,
-        )?;
+        spinner.tick("🦀 Thinking...", TerminalRenderer::new().color_theme(), out)?;
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
         let result = runtime.run_turn(input, Some(&mut permission_prompter));
         hook_abort_monitor.stop();
         match result {
             Ok(summary) => {
                 self.replace_runtime(runtime)?;
-                spinner.finish(
-                    "✨ Done",
-                    TerminalRenderer::new().color_theme(),
-                    &mut stdout,
-                )?;
+                spinner.finish("✨ Done", TerminalRenderer::new().color_theme(), out)?;
                 let final_text = final_assistant_text(&summary);
                 if !final_text.is_empty() {
-                    println!("{final_text}");
+                    writeln!(out, "{final_text}")?;
                 }
-                println!();
+                writeln!(out)?;
                 if let Some(event) = summary.auto_compaction {
-                    println!(
+                    writeln!(
+                        out,
                         "{}",
                         format_auto_compaction_notice(event.removed_message_count)
-                    );
+                    )?;
                 }
                 self.persist_session()?;
                 Ok(())
@@ -7814,34 +7917,14 @@ impl LiveCli {
                 spinner.fail(
                     "❌ Request failed",
                     TerminalRenderer::new().color_theme(),
-                    &mut stdout,
+                    out,
                 )?;
 
                 // ============================================================================
                 // Auto-compact retry on context window errors
                 // ============================================================================
-                // When the model API returns a context_window_blocked error (because the request
-                // exceeds the model's context window), we automatically:
-                // 1. Compact the session (remove old messages to free up space)
-                // 2. Retry the original request with the compacted session
-                // 3. Report results to the user
-                //
-                // This eliminates the need for users to manually run /compact when they
-                // hit context limits - the recovery happens automatically.
-                //
-                // Detection: We look for "context_window" or "Context window" in the error
-                // message, which covers error types like:
-                // - "context_window_blocked"
-                // - "Context window blocked"
-                // - "This model's maximum context length is X tokens..."
-                // ============================================================================
 
                 let error_str = error.to_string();
-                // Detect context window overflow. Some providers (e.g. OpenAI-compat backends)
-                // return 400 with "no parseable body" instead of a proper context_length_exceeded
-                // error when the request is too large to even parse — treat that as context overflow too.
-                // Also detect model-specific context error markers (e.g. llama.cpp returns
-                // "Context size has been exceeded." / "exceed_context_size_error" / "exceeds the available context size").
                 let is_context_window = error_str.contains("context_window")
                     || error_str.contains("Context window")
                     || error_str.contains("no parseable body")
@@ -7851,44 +7934,33 @@ impl LiveCli {
                         .to_ascii_lowercase()
                         .contains("context size has been exceeded");
 
-                // Also treat "assistant stream produced no content" and reqwest decode failures
-                // as recoverable errors that may benefit from auto-compaction. Some backends (e.g.
-                // llama.cpp) return a non-SSE HTTP 500 body when context overflows, causing
-                // reqwest to fail with "error decoding response body" — treat that as context overflow too.
                 let is_no_content = error_str.contains("assistant stream produced no content")
                     || error_str.contains("Failed to parse input at pos")
                     || error_str.contains("error decoding response body");
 
                 if is_context_window || is_no_content {
-                    // If the error tells us the server's actual context window, adapt our
-                    // auto-compaction threshold so future auto-compact-trigger checks are accurate.
                     if let Some(window) = extract_context_window_tokens_from_error(&error_str) {
-                        // Set threshold at 70% of the reported window to leave headroom.
                         let threshold: u32 = (window as f64 * 0.7).round() as u32;
-                        println!(
+                        writeln!(
+                            out,
                             "  Server context window: {} tokens — setting auto-compaction threshold to {}",
                             window, threshold
-                        );
+                        )?;
                         runtime.set_auto_compaction_input_tokens_threshold(threshold);
                     }
 
-                    // A single compaction pass may not free enough context space.
-                    // Progressive retry: each round preserves fewer recent messages (4→2→1→0),
-                    // trading conversation continuity for a smaller payload until it fits.
-                    // Max 4 rounds before giving up and surfacing the error to the user.
                     let max_compact_rounds = 4;
                     let preserve_schedule = [4, 2, 1, 0];
 
                     for round in 0..max_compact_rounds {
                         let preserve = preserve_schedule[round];
-                        println!(
+                        writeln!(
+                            out,
                             "  Auto-compacting session (round {}/{}, preserving {} recent messages)...",
                             round + 1,
                             max_compact_rounds,
                             preserve
-                        );
-
-                        // Run Trident pipeline then summary-based compaction
+                        )?;
                         let result = runtime::trident::trident_compact_session(
                             runtime.session(),
                             CompactionConfig {
@@ -7901,19 +7973,20 @@ impl LiveCli {
 
                         if removed == 0 && round > 0 {
                             // No more messages to compact — further rounds won't help
-                            println!("  No further compaction possible.");
+                            writeln!(out, "  No further compaction possible.")?;
                             break;
                         }
 
                         if removed > 0 {
-                            println!(
+                            writeln!(
+                                out,
                                 "{}",
                                 format_compact_report(
                                     removed,
                                     result.compacted_session.messages.len(),
                                     false
                                 )
-                            );
+                            )?;
                         }
 
                         // Without this, prepare_turn_runtime() reads from self.runtime.session()
@@ -7923,7 +7996,7 @@ impl LiveCli {
 
                         // Build a new runtime with the compacted session and retry
                         let (mut new_runtime, hook_abort_monitor) =
-                            self.prepare_turn_runtime(true)?;
+                            self.prepare_turn_runtime(emit_output)?;
                         drop(hook_abort_monitor);
 
                         let mut rp = CliPermissionPrompter::new(self.permission_mode);
@@ -7937,14 +8010,15 @@ impl LiveCli {
                                         "✨ Done (after aggressive auto-compact)"
                                     },
                                     TerminalRenderer::new().color_theme(),
-                                    &mut stdout,
+                                    out,
                                 )?;
-                                println!();
+                                writeln!(out)?;
                                 if let Some(event) = summary.auto_compaction {
-                                    println!(
+                                    writeln!(
+                                        out,
                                         "{}",
                                         format_auto_compaction_notice(event.removed_message_count)
-                                    );
+                                    )?;
                                 }
                                 self.persist_session()?;
                                 return Ok(());
@@ -8167,6 +8241,56 @@ impl LiveCli {
                 run_init(CliOutputFormat::Text)?;
                 false
             }
+            SlashCommand::Team { action } => {
+                match action.as_deref().unwrap_or("") {
+                    "on" | "enable" => {
+                        std::env::set_var("CLAWD_AGENT_TEAMS", "1");
+                        eprintln!("[team] Agent teams enabled (TeamCreate now available)");
+                    }
+                    "off" | "disable" => {
+                        std::env::set_var("CLAWD_AGENT_TEAMS", "0");
+                        eprintln!("[team] Agent teams disabled");
+                    }
+                    "status" => {
+                        let current = std::env::var("CLAWD_AGENT_TEAMS").unwrap_or_default();
+                        if current == "1" {
+                            eprintln!("[team] Agent teams: ENABLED");
+                        } else {
+                            eprintln!(
+                                "[team] Agent teams: DISABLED (use /team on or Ctrl+T to enable)"
+                            );
+                        }
+                    }
+                    "" => {
+                        // Toggle
+                        let current = std::env::var("CLAWD_AGENT_TEAMS").unwrap_or_default();
+                        if current == "1" {
+                            std::env::set_var("CLAWD_AGENT_TEAMS", "0");
+                            eprintln!("[team] Agent teams disabled");
+                        } else {
+                            std::env::set_var("CLAWD_AGENT_TEAMS", "1");
+                            eprintln!("[team] Agent teams enabled (TeamCreate now available)");
+                        }
+                    }
+                    other => {
+                        eprintln!("[team] unknown action: {other}. Use: /team [on|off|status]")
+                    }
+                }
+                false
+            }
+            SlashCommand::Setup => {
+                setup_wizard::run_setup_wizard()?;
+                // Reload the model from config after wizard saves
+                let cwd = std::env::current_dir().unwrap_or_default();
+                let config = runtime::ConfigLoader::default_for(&cwd).load().ok();
+                if let Some(new_model) = config
+                    .as_ref()
+                    .and_then(|c| c.provider().model().map(str::to_string))
+                {
+                    self.set_model(Some(new_model))?;
+                }
+                false
+            }
             SlashCommand::Diff => {
                 Self::print_diff()?;
                 false
@@ -8213,12 +8337,6 @@ impl LiveCli {
                     )?
                     .render()
                 );
-                false
-            }
-            SlashCommand::Setup => {
-                if let Err(e) = setup_wizard::run_setup_wizard() {
-                    eprintln!("Setup wizard failed: {e}");
-                }
                 false
             }
             SlashCommand::History { count } => {
@@ -8268,7 +8386,7 @@ impl LiveCli {
             | SlashCommand::Tag { .. }
             | SlashCommand::OutputStyle { .. }
             | SlashCommand::AddDir { .. }
-            | SlashCommand::Team { .. } => {
+            | SlashCommand::Lsp { .. } => {
                 let cmd_name = command.slash_name();
                 eprintln!("{cmd_name} is not yet implemented in this build.");
                 false
@@ -12651,44 +12769,7 @@ fn resolve_cli_auth_source_for_cwd() -> Result<AuthSource, api::ApiError> {
     resolve_startup_auth_source(|| Ok(None))
 }
 
-/// Inject provider settings from `~/.claw/settings.json` as environment
-/// variable fallbacks so the API client constructors (which only read env
-/// vars) can find them.
-///
-/// This bridges the gap between `/setup` (which saves apiKey/baseUrl to
-/// the config file) and the API crate (which reads env vars only).
-/// Already-set env vars are never overwritten — the 3-tier resolution
-/// order is preserved: env var > .env file > stored config.
-fn inject_config_as_env_fallbacks() {
-    let cwd = std::env::current_dir().unwrap_or_default();
-    let Ok(config) = runtime::ConfigLoader::default_for(&cwd).load() else {
-        return;
-    };
-    let provider = config.provider();
 
-    // Map provider kind to the expected env var names
-    let (api_key_env, base_url_env) = match provider.kind().unwrap_or("anthropic") {
-        "anthropic" => ("ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL"),
-        "xai" => ("XAI_API_KEY", "XAI_BASE_URL"),
-        "openai" => ("OPENAI_API_KEY", "OPENAI_BASE_URL"),
-        "dashscope" => ("DASHSCOPE_API_KEY", "DASHSCOPE_BASE_URL"),
-        "custom-openai" => ("CLAWCUSTOMOPENAI_API_KEY", "CLAWCUSTOMOPENAI_BASE_URL"),
-        _ => return, // unknown provider kind — don't inject
-    };
-
-    // Only set env vars that aren't already set (preserve user's explicit env)
-    if let Some(api_key) = provider.api_key() {
-        if !api_key.is_empty() && std::env::var(api_key_env).is_err() {
-            std::env::set_var(api_key_env, api_key);
-        }
-    }
-
-    if let Some(base_url) = provider.base_url() {
-        if !base_url.is_empty() && std::env::var(base_url_env).is_err() {
-            std::env::set_var(base_url_env, base_url);
-        }
-    }
-}
 
 impl ApiClient for AnthropicRuntimeClient {
     #[allow(clippy::too_many_lines)]
@@ -14048,6 +14129,153 @@ impl ToolExecutor for CliToolExecutor {
             }
         }
     }
+
+    fn execute_batch(&mut self, calls: Vec<runtime::ToolCall>) -> Vec<runtime::ToolResult> {
+        if calls.len() <= 1 {
+            return calls
+                .into_iter()
+                .map(|call| {
+                    let result = self.execute(&call.tool_name, &call.input);
+                    runtime::ToolResult {
+                        tool_use_id: call.tool_use_id,
+                        tool_name: call.tool_name,
+                        result,
+                    }
+                })
+                .collect();
+        }
+
+        /// Tools that are safe to run in parallel because they only read
+        /// state and dispatch through the stateless tool registry.
+        const PARALLEL_SAFE_TOOLS: &[&str] = &[
+            "read_file",
+            "glob_search",
+            "grep_search",
+            "WebFetch",
+            "WebSearch",
+            "ToolSearch",
+            "Skill",
+            "LSP",
+            "Agent",
+            "AgentMessage",
+            "TeamStatus",
+            "TaskClaim",
+            "AgentSuggestion",
+            "ContextRequest",
+            "TaskGet",
+            "TaskList",
+            "TaskOutput",
+            "GitStatus",
+            "GitDiff",
+            "GitLog",
+            "GitShow",
+            "GitBlame",
+        ];
+
+        let emit_output = self.emit_output;
+        let mut results: Vec<Option<runtime::ToolResult>> = vec![None; calls.len()];
+        let mut parallel_calls: Vec<(usize, String, String, String)> = Vec::new();
+        let mut sequential_indices: Vec<usize> = Vec::new();
+
+        // Classify calls as parallel-safe or sequential
+        for (i, call) in calls.iter().enumerate() {
+            if self.allowed_tools.as_ref().is_some_and(|allowed| {
+                !allowed.contains(&canonical_allowed_tool_name(&call.tool_name))
+            }) {
+                results[i] = Some(runtime::ToolResult {
+                    tool_use_id: call.tool_use_id.clone(),
+                    tool_name: call.tool_name.clone(),
+                    result: Err(ToolError::new(format!(
+                        "tool `{}` is not enabled by the current --allowedTools setting",
+                        call.tool_name
+                    ))),
+                });
+            } else if PARALLEL_SAFE_TOOLS.contains(&call.tool_name.as_str())
+                && !self.tool_registry.has_runtime_tool(&call.tool_name)
+            {
+                parallel_calls.push((
+                    i,
+                    call.tool_use_id.clone(),
+                    call.tool_name.clone(),
+                    call.input.clone(),
+                ));
+            } else {
+                sequential_indices.push(i);
+            }
+        }
+
+        // Execute parallel-safe tools concurrently
+        if !parallel_calls.is_empty() {
+            let registry = self.tool_registry.clone();
+            let parallel_results: Vec<(usize, String, String, Result<String, ToolError>)> =
+                std::thread::scope(|s| {
+                    let mut handles = Vec::new();
+                    for (idx, tool_use_id, tool_name, input) in &parallel_calls {
+                        let registry = &registry;
+                        let tool_use_id = tool_use_id.clone();
+                        let tool_name = tool_name.clone();
+                        let input = input.clone();
+                        let idx = *idx;
+                        handles.push(s.spawn(move || {
+                            let value = serde_json::from_str(&input).map_err(|error| {
+                                ToolError::new(format!("invalid tool input JSON: {error}"))
+                            });
+                            let result = match value {
+                                Ok(v) => registry.execute(&tool_name, &v).map_err(ToolError::new),
+                                Err(e) => Err(e),
+                            };
+                            (idx, tool_use_id, tool_name, result)
+                        }));
+                    }
+                    handles
+                        .into_iter()
+                        .map(|h| {
+                            h.join().unwrap_or_else(|_| {
+                                (
+                                    0,
+                                    String::new(),
+                                    String::new(),
+                                    Err(ToolError::new("parallel thread panicked")),
+                                )
+                            })
+                        })
+                        .collect()
+                });
+
+            for (idx, tool_use_id, tool_name, result) in parallel_results {
+                if emit_output {
+                    let output_str = match &result {
+                        Ok(o) => o.clone(),
+                        Err(e) => e.to_string(),
+                    };
+                    let is_error = result.is_err();
+                    let markdown = format_tool_result(&tool_name, &output_str, is_error);
+                    self.renderer
+                        .stream_markdown(&markdown, &mut io::stdout())
+                        .map_err(|error| ToolError::new(error.to_string()))
+                        .ok();
+                }
+                results[idx] = Some(runtime::ToolResult {
+                    tool_use_id,
+                    tool_name,
+                    result,
+                });
+            }
+        }
+
+        // Execute sequential tools one at a time
+        for idx in sequential_indices {
+            let call = &calls[idx];
+            let result = self.execute(&call.tool_name, &call.input);
+            results[idx] = Some(runtime::ToolResult {
+                tool_use_id: call.tool_use_id.clone(),
+                tool_name: call.tool_name.clone(),
+                result,
+            });
+        }
+
+        results.into_iter().map(|r| r.unwrap()).collect()
+    }
 }
 
 fn permission_policy(
@@ -14809,7 +15037,7 @@ mod tests {
         std::env::remove_var("OPENAI_API_KEY");
         std::env::remove_var("OPENAI_BASE_URL");
 
-        with_current_dir(&cwd, super::inject_config_as_env_fallbacks);
+        with_current_dir(&cwd, runtime::inject_config_as_env_fallbacks);
 
         let api_key = std::env::var("OPENAI_API_KEY").ok();
         let base_url = std::env::var("OPENAI_BASE_URL").ok();
@@ -14860,7 +15088,7 @@ mod tests {
         std::env::remove_var("CLAWCUSTOMOPENAI_API_KEY");
         std::env::remove_var("CLAWCUSTOMOPENAI_BASE_URL");
 
-        with_current_dir(&cwd, super::inject_config_as_env_fallbacks);
+        with_current_dir(&cwd, runtime::inject_config_as_env_fallbacks);
 
         let api_key = std::env::var("CLAWCUSTOMOPENAI_API_KEY").ok();
         let base_url = std::env::var("CLAWCUSTOMOPENAI_BASE_URL").ok();
