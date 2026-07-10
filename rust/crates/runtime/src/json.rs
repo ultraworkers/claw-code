@@ -330,7 +330,7 @@ impl<'a> Parser<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{render_string, JsonValue};
+    use super::{render_string, JsonError, JsonValue};
     use std::collections::BTreeMap;
 
     #[test]
@@ -354,5 +354,144 @@ mod tests {
     #[test]
     fn escapes_control_characters() {
         assert_eq!(render_string("a\n\t\"b"), "\"a\\n\\t\\\"b\"");
+    }
+
+    #[test]
+    fn renders_primitive_values() {
+        assert_eq!(JsonValue::Null.render(), "null");
+        assert_eq!(JsonValue::Bool(true).render(), "true");
+        assert_eq!(JsonValue::Bool(false).render(), "false");
+        assert_eq!(JsonValue::Number(42).render(), "42");
+        assert_eq!(JsonValue::Number(-7).render(), "-7");
+        assert_eq!(JsonValue::String("hi".to_string()).render(), "\"hi\"");
+    }
+
+    #[test]
+    fn renders_arrays_and_objects_with_sorted_keys() {
+        assert_eq!(JsonValue::Array(Vec::new()).render(), "[]");
+        assert_eq!(
+            JsonValue::Array(vec![JsonValue::Number(1), JsonValue::Number(2)]).render(),
+            "[1,2]"
+        );
+        assert_eq!(JsonValue::Object(BTreeMap::new()).render(), "{}");
+
+        let mut object = BTreeMap::new();
+        object.insert("b".to_string(), JsonValue::Bool(false));
+        object.insert("a".to_string(), JsonValue::Number(1));
+        // A BTreeMap iterates keys in sorted order, so object rendering is
+        // deterministic regardless of insertion order.
+        assert_eq!(JsonValue::Object(object).render(), "{\"a\":1,\"b\":false}");
+    }
+
+    #[test]
+    fn render_string_escapes_quotes_backslashes_and_other_controls() {
+        // Backslash and double-quote are backslash-escaped.
+        assert_eq!(render_string("\"\\"), "\"\\\"\\\\\"");
+        // Carriage return has a dedicated short escape.
+        assert_eq!(render_string("\r"), "\"\\r\"");
+        // Other control characters fall back to the \uXXXX form (U+0001 here).
+        assert_eq!(render_string("\u{1}"), "\"\\u0001\"");
+    }
+
+    #[test]
+    fn parses_primitive_values() {
+        assert_eq!(
+            JsonValue::parse("null").expect("null parses"),
+            JsonValue::Null
+        );
+        assert_eq!(
+            JsonValue::parse("true").expect("true parses"),
+            JsonValue::Bool(true)
+        );
+        assert_eq!(
+            JsonValue::parse("false").expect("false parses"),
+            JsonValue::Bool(false)
+        );
+        assert_eq!(
+            JsonValue::parse("\"hello\"").expect("string parses"),
+            JsonValue::String("hello".to_string())
+        );
+    }
+
+    #[test]
+    fn parses_signed_integers_and_ignores_surrounding_whitespace() {
+        assert_eq!(
+            JsonValue::parse("-42").expect("negative parses").as_i64(),
+            Some(-42)
+        );
+        assert_eq!(
+            JsonValue::parse("  123  ")
+                .expect("padded parses")
+                .as_i64(),
+            Some(123)
+        );
+    }
+
+    #[test]
+    fn parses_nested_arrays_and_objects() {
+        let value =
+            JsonValue::parse("{\"nums\": [1, 2], \"flag\": true}").expect("nested json parses");
+        let object = value.as_object().expect("top level is an object");
+
+        assert_eq!(object.len(), 2);
+
+        let nums = object
+            .get("nums")
+            .and_then(JsonValue::as_array)
+            .expect("nums is an array");
+        assert_eq!(nums.len(), 2);
+        assert_eq!(nums[0].as_i64(), Some(1));
+
+        assert_eq!(object.get("flag").and_then(JsonValue::as_bool), Some(true));
+    }
+
+    #[test]
+    fn round_trips_rendered_values_through_the_parser() {
+        let mut object = BTreeMap::new();
+        object.insert("name".to_string(), JsonValue::String("clawi".to_string()));
+        object.insert("count".to_string(), JsonValue::Number(-3));
+        object.insert(
+            "tags".to_string(),
+            JsonValue::Array(vec![JsonValue::Bool(true), JsonValue::Null]),
+        );
+        let original = JsonValue::Object(object);
+
+        let reparsed =
+            JsonValue::parse(&original.render()).expect("rendered json should re-parse");
+
+        assert_eq!(reparsed, original);
+    }
+
+    #[test]
+    fn parse_rejects_malformed_input() {
+        assert!(JsonValue::parse("").is_err(), "empty input");
+        assert!(JsonValue::parse("nul").is_err(), "truncated literal");
+        assert!(JsonValue::parse("true false").is_err(), "trailing content");
+        assert!(
+            JsonValue::parse("\"unterminated").is_err(),
+            "unterminated string"
+        );
+        assert!(JsonValue::parse("[1, 2").is_err(), "unterminated array");
+    }
+
+    #[test]
+    fn parse_rejects_integers_outside_the_i64_range() {
+        // Far beyond i64::MAX (~9.2e18): the parser must reject rather than
+        // silently truncate the value.
+        assert!(JsonValue::parse("9999999999999999999999999").is_err());
+    }
+
+    #[test]
+    fn accessors_return_none_for_mismatched_variants() {
+        assert_eq!(JsonValue::Null.as_bool(), None);
+        assert_eq!(JsonValue::Bool(true).as_i64(), None);
+        assert!(JsonValue::Number(1).as_str().is_none());
+        assert!(JsonValue::Number(1).as_array().is_none());
+        assert!(JsonValue::String("x".to_string()).as_object().is_none());
+    }
+
+    #[test]
+    fn json_error_displays_its_message() {
+        assert_eq!(JsonError::new("boom").to_string(), "boom");
     }
 }
