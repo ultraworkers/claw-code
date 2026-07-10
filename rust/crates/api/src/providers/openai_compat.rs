@@ -1027,7 +1027,12 @@ fn url_host(url: &str) -> &str {
     host_port.split(':').next().unwrap_or("")
 }
 
-fn is_local_openai_compatible_base_url(url: &str) -> bool {
+/// Returns true when `url`'s host is loopback or a private-network address
+/// (`localhost`, `127.0.0.1`, `10.x`, `192.168.x`, `172.16-31.x`). Used to
+/// waive auth requirements for local OpenAI-compatible servers (Ollama, LM
+/// Studio, llama.cpp, vLLM) that don't expect a real API key.
+#[must_use]
+pub fn is_local_openai_compatible_base_url(url: &str) -> bool {
     let host = url_host(url.trim());
     if host.eq_ignore_ascii_case("localhost") || host == "::1" {
         return true;
