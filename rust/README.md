@@ -221,7 +221,7 @@ rust/
 ## Stats
 
 - **~20K lines** of Rust
-- **9 crates** in workspace
+- **11 crates** in workspace
 - **Binary name:** `claw`
 - **Default model:** `claude-opus-4-7`
 - **Default permissions:** `workspace-write`
