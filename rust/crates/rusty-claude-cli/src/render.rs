@@ -249,6 +249,16 @@ impl TerminalRenderer {
 
     #[must_use]
     pub fn render_markdown(&self, markdown: &str) -> String {
+        self.render_markdown_raw(markdown).trim_end().to_string()
+    }
+
+    /// Render markdown to ANSI without trimming trailing whitespace.
+    ///
+    /// Block-level events (paragraphs, headings, lists, code blocks) emit their
+    /// trailing newline separators here. `render_markdown` trims them for
+    /// one-shot output, while streaming keeps them so that successive chunks
+    /// stay on their own lines instead of running together.
+    fn render_markdown_raw(&self, markdown: &str) -> String {
         let normalized = normalize_nested_fences(markdown);
         let mut output = String::new();
         let mut state = RenderState::default();
@@ -267,12 +277,24 @@ impl TerminalRenderer {
             );
         }
 
-        output.trim_end().to_string()
+        output
     }
 
     #[must_use]
     pub fn markdown_to_ansi(&self, markdown: &str) -> String {
         self.render_markdown(markdown)
+    }
+
+    /// Stream-friendly variant of `markdown_to_ansi` that preserves trailing
+    /// block separators (such as a paragraph's closing newlines).
+    ///
+    /// `MarkdownStreamState::push` writes each rendered chunk directly to the
+    /// terminal with no separator of its own, so the trailing newlines must
+    /// survive here to keep a paragraph from sticking to the block that follows
+    /// it. The final `flush` still uses `markdown_to_ansi` to trim the tail.
+    #[must_use]
+    pub fn markdown_to_ansi_stream(&self, markdown: &str) -> String {
+        self.render_markdown_raw(markdown)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -609,7 +631,7 @@ impl MarkdownStreamState {
         let split = find_stream_safe_boundary(&self.pending)?;
         let ready = self.pending[..split].to_string();
         self.pending.drain(..split);
-        Some(renderer.markdown_to_ansi(&ready))
+        Some(renderer.markdown_to_ansi_stream(&ready))
     }
 
     #[must_use]
@@ -1050,6 +1072,32 @@ mod tests {
         assert!(plain_text.contains("╭─ markdown"));
         assert!(plain_text.contains("```rust"));
         assert!(plain_text.contains("fn nested()"));
+    }
+
+    #[test]
+    fn stream_rendering_preserves_block_separators() {
+        let renderer = TerminalRenderer::new();
+
+        // The stream variant keeps the paragraph-ending newlines that the
+        // one-shot variant trims, so consecutive streamed chunks do not run
+        // into each other when written back-to-back to the terminal.
+        let streamed = renderer.markdown_to_ansi_stream("Intro paragraph.\n\n");
+        assert!(streamed.ends_with('\n'));
+        assert!(!renderer.markdown_to_ansi("Intro paragraph.\n\n").ends_with('\n'));
+
+        let mut state = MarkdownStreamState::default();
+        let first = state
+            .push(&renderer, "Intro paragraph.\n\n")
+            .expect("blank line closes the paragraph block");
+        let second = state
+            .push(&renderer, "1. first item\n\n")
+            .expect("blank line closes the list block");
+
+        let combined = strip_ansi(&format!("{first}{second}"));
+        assert!(combined.contains("Intro paragraph."));
+        assert!(combined.contains("1. first item"));
+        // The two blocks stay on separate lines instead of sticking together.
+        assert!(!combined.contains("Intro paragraph.1."));
     }
 
     #[test]
