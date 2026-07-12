@@ -7005,6 +7005,7 @@ mod tests {
                 agent: None,
                 permission_mode: None,
                 reasoning_effort: None,
+                json_schema: None,
             })
             .expect("old job");
         supervisor
@@ -7021,6 +7022,7 @@ mod tests {
                 agent: Some("Explore".to_string()),
                 permission_mode: Some("manual".to_string()),
                 reasoning_effort: Some("medium".to_string()),
+                json_schema: None,
             })
             .expect("new job");
         supervisor

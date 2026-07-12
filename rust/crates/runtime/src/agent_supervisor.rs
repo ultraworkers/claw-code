@@ -70,6 +70,7 @@ pub struct AgentJobCreate {
     pub agent: Option<String>,
     pub permission_mode: Option<String>,
     pub reasoning_effort: Option<String>,
+    pub json_schema: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -127,6 +128,8 @@ pub struct AgentJobRecord {
     pub permission_mode: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub json_schema: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_tail: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -268,6 +271,7 @@ impl AgentSupervisor {
             agent: request.agent,
             permission_mode: request.permission_mode,
             reasoning_effort: request.reasoning_effort,
+            json_schema: request.json_schema,
             output_tail: None,
             exit_code: None,
             stopped_at: None,
@@ -634,6 +638,11 @@ mod tests {
                 agent: None,
                 permission_mode: Some("manual".to_string()),
                 reasoning_effort: Some("medium".to_string()),
+                json_schema: Some(serde_json::json!({
+                    "type": "object",
+                    "properties": {"name": {"type": "string"}},
+                    "required": ["name"]
+                })),
             })
             .expect("job");
 
@@ -647,6 +656,14 @@ mod tests {
             .expect("list");
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].name.as_deref(), Some("parser-fix"));
+        assert_eq!(
+            listed[0].json_schema.as_ref(),
+            Some(&serde_json::json!({
+                "type": "object",
+                "properties": {"name": {"type": "string"}},
+                "required": ["name"]
+            }))
+        );
         assert!(!listed[0].pinned);
 
         let pinned = supervisor.set_pinned(&job.id, true).expect("pin");
@@ -683,6 +700,7 @@ mod tests {
                 agent: None,
                 permission_mode: None,
                 reasoning_effort: None,
+                json_schema: None,
             })
             .expect("job");
 

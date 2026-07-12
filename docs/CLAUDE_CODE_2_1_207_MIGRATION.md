@@ -21,6 +21,7 @@ This document records implemented behavior separately from compatibility surface
 | 2.1.206 | Per-server MCP `request_timeout_ms` is honored, with camelCase and legacy timeout aliases | `McpStdioServerConfig.tool_call_timeout_ms`, bootstrap/manager path, config tests |
 | 2.1.207 | Shell-form hooks and MCP `headersHelper` reject `${user_config.*}` interpolation | partial config validation records unsafe entries without executing them |
 | 2.1.207 | Safe `cd <workspace> && <read command> >/dev/null` is no longer classified as unrestricted shell access | bash permission classifier regression tests |
+| 2.1.207 | `--json-schema` accepts inline object schemas, installs the requested `StructuredOutput.input_schema`, retries validation failures, ignores `format` semantics, and emits `structured_output` | runtime retry/format tests, mock-provider request capture, CLI foreground/background contract tests |
 
 The former v2.1.201 host-only surfaces also moved forward:
 
@@ -42,7 +43,6 @@ The following upstream areas remain unproven or incomplete and must stay on the 
 
 - full background daemon upgrade/recovery, cold-resume, cross-agent TaskStop/TaskOutput, and remote-control synchronization;
 - additional working directories in MCP `roots/list` plus `roots/list_changed` notifications;
-- `--json-schema` request/output enforcement, including accepted JSON Schema `format` keywords and invalid-schema failures;
 - complete auto-mode classifier behavior, provider entitlement/default handling, transcript tamper protection, and unresolved-variable `rm -rf` prompting;
 - Bedrock, Vertex AI, Foundry, Claude Platform on AWS, gateway login, SSO refresh, and provider-specific model picker behavior;
 - updater/installer streaming, launcher/symlink ownership detection, retry behavior, and Homebrew channel diagnostics;

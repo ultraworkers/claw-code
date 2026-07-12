@@ -306,6 +306,7 @@ const CLI_OPTION_SUGGESTIONS: &[&str] = &[
     "-V",
     "--model",
     "--output-format",
+    "--json-schema",
     "--permission-mode",
     "--cwd",
     "--directory",
@@ -502,6 +503,8 @@ fn classify_error_kind(message: &str) -> &'static str {
         "missing_flag_value"
     } else if message.starts_with("invalid_permission_mode:") {
         "invalid_permission_mode"
+    } else if message.starts_with("invalid_json_schema:") {
+        "invalid_json_schema"
     } else if message.starts_with("invalid_flag_value:") {
         "invalid_flag_value"
     } else if message.starts_with("invalid_model:") {
@@ -862,6 +865,7 @@ fn global_flag_takes_value(flag: &str) -> bool {
             | "--permission-mode"
             | "--base-commit"
             | "--reasoning-effort"
+            | "--json-schema"
             | "--allowedTools"
             | "--allowed-tools"
     )
@@ -873,6 +877,7 @@ fn global_flag_is_value_inline(flag: &str) -> bool {
         || flag.starts_with("--permission-mode=")
         || flag.starts_with("--base-commit=")
         || flag.starts_with("--reasoning-effort=")
+        || flag.starts_with("--json-schema=")
         || flag.starts_with("--allowedTools=")
         || flag.starts_with("--allowed-tools=")
 }
@@ -1059,6 +1064,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             output_format,
             permission_mode,
             reasoning_effort,
+            json_schema,
         } => run_background_agent(BackgroundAgentRequest {
             prompt: prompt.as_deref(),
             exec: exec.as_deref(),
@@ -1068,6 +1074,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             output_format,
             permission_mode,
             reasoning_effort: reasoning_effort.as_deref(),
+            json_schema: json_schema.as_ref(),
         })?,
         CliAction::AgentAttach { id, output_format } => run_agent_attach(&id, output_format)?,
         CliAction::AgentLogs { id, output_format } => run_agent_logs(&id, output_format)?,
@@ -1141,6 +1148,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             compact,
             base_commit,
             reasoning_effort,
+            json_schema,
             allow_broad_cwd,
         } => {
             enforce_broad_cwd_policy(allow_broad_cwd, output_format)?;
@@ -1159,7 +1167,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let resolved_model = resolve_repl_model(model)?;
             let mut cli = LiveCli::new(resolved_model, true, allowed_tools, permission_mode)?;
             cli.set_reasoning_effort(reasoning_effort);
-            cli.run_turn_with_output(&effective_prompt, output_format, compact)?;
+            cli.run_turn_with_output(&effective_prompt, output_format, compact, json_schema)?;
         }
         CliAction::Doctor {
             output_format,
@@ -1269,6 +1277,7 @@ enum CliAction {
         output_format: CliOutputFormat,
         permission_mode: PermissionMode,
         reasoning_effort: Option<String>,
+        json_schema: Option<Value>,
     },
     AgentAttach {
         id: String,
@@ -1356,6 +1365,7 @@ enum CliAction {
         compact: bool,
         base_commit: Option<String>,
         reasoning_effort: Option<String>,
+        json_schema: Option<Value>,
         allow_broad_cwd: bool,
     },
     Doctor {
@@ -1632,6 +1642,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
     let mut compact = false;
     let mut base_commit: Option<String> = None;
     let mut reasoning_effort: Option<String> = None;
+    let mut json_schema: Option<Value> = None;
     let mut allow_broad_cwd = false;
     let mut background = false;
     let mut background_exec: Option<String> = None;
@@ -1713,6 +1724,17 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 output_format = apply_output_format_flag(&mut output_format_selection, value)?;
                 index += 2;
             }
+            "--json-schema" => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    "missing_flag_value: missing value for --json-schema.\nUsage: --json-schema '<inline JSON object>'"
+                        .to_string()
+                })?;
+                if json_schema.is_some() {
+                    push_duplicate_flag("--json-schema (overwriting previous value)");
+                }
+                json_schema = Some(parse_json_schema_flag(value)?);
+                index += 2;
+            }
             "--permission-mode" => {
                 let value = args
                     .get(index + 1)
@@ -1728,6 +1750,13 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             flag if flag.starts_with("--output-format=") => {
                 output_format =
                     apply_output_format_flag(&mut output_format_selection, &flag[16..])?;
+                index += 1;
+            }
+            flag if flag.starts_with("--json-schema=") => {
+                if json_schema.is_some() {
+                    push_duplicate_flag("--json-schema (overwriting previous value)");
+                }
+                json_schema = Some(parse_json_schema_flag(&flag["--json-schema=".len()..])?);
                 index += 1;
             }
             flag if flag.starts_with("--permission-mode=") => {
@@ -2020,6 +2049,12 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                     .to_string(),
             );
         }
+        if background_exec.is_some() && json_schema.is_some() {
+            return Err(
+                "invalid_flag_value: --json-schema cannot be combined with --bg --exec.\nUsage: claw --bg '<prompt>' --json-schema '<schema>'"
+                    .to_string(),
+            );
+        }
         let prompt = if background_exec.is_none() {
             let prompt = positional_prompt.trim().to_string();
             if prompt.is_empty() {
@@ -2041,6 +2076,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             output_format,
             permission_mode: permission_mode_override.unwrap_or_else(default_permission_mode),
             reasoning_effort,
+            json_schema,
         });
     }
 
@@ -2055,6 +2091,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             compact,
             base_commit,
             reasoning_effort,
+            json_schema,
             allow_broad_cwd,
         });
     }
@@ -2070,6 +2107,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             compact,
             base_commit,
             reasoning_effort: reasoning_effort.clone(),
+            json_schema: json_schema.clone(),
             allow_broad_cwd,
         });
     }
@@ -2098,6 +2136,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                     compact,
                     base_commit,
                     reasoning_effort,
+                    json_schema,
                     allow_broad_cwd,
                 });
             }
@@ -2112,6 +2151,12 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             // #746: newline before remediation so split_error_hint populates hint field
             return Err("interactive_only: claw requires an interactive terminal.\nStdin is not a TTY and no prompt was provided — pipe a prompt with `echo 'task' | claw` or run `claw` in an interactive terminal.".into());
         }
+        if json_schema.is_some() {
+            return Err(
+                "invalid_flag_value: --json-schema requires non-interactive prompt mode.\nUsage: claw -p <prompt> --json-schema '<schema>'"
+                    .to_string(),
+            );
+        }
         return Ok(CliAction::Repl {
             model,
             allowed_tools,
@@ -2120,6 +2165,18 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             reasoning_effort: reasoning_effort.clone(),
             allow_broad_cwd,
         });
+    }
+    if json_schema.is_some()
+        && rest.first().is_some_and(|first| {
+            (is_known_top_level_subcommand(first)
+                && !matches!(first.as_str(), "prompt" | "skills" | "skill"))
+                || (first.starts_with('/') && !matches!(first.as_str(), "/skills" | "/skill"))
+        })
+    {
+        return Err(
+            "invalid_flag_value: --json-schema requires non-interactive prompt mode.\nUsage: claw -p <prompt> --json-schema '<schema>'"
+                .to_string(),
+        );
     }
     if let Some(action) = parse_local_help_action(&rest, output_format) {
         return action;
@@ -2376,12 +2433,14 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                     compact,
                     base_commit,
                     reasoning_effort: reasoning_effort.clone(),
+                    json_schema: json_schema.clone(),
                     allow_broad_cwd,
                 }),
-                SkillSlashDispatch::Local => Ok(CliAction::Skills {
-                    args,
-                    output_format,
-                }),
+                SkillSlashDispatch::Local if json_schema.is_some() => Err(
+                    "invalid_flag_value: --json-schema requires a skill invocation, not a local skills command.\nUsage: claw skills <skill> [args] --json-schema '<schema>'"
+                        .to_string(),
+                ),
+                SkillSlashDispatch::Local => Ok(CliAction::Skills { args, output_format }),
             }
         }
         "settings" => {
@@ -2468,6 +2527,7 @@ Usage: claw prompt <text>  or  echo '<text>' | claw prompt".to_string());
                 compact,
                 base_commit: base_commit.clone(),
                 reasoning_effort: reasoning_effort.clone(),
+                json_schema: json_schema.clone(),
                 allow_broad_cwd,
             })
         }
@@ -2480,6 +2540,7 @@ Usage: claw prompt <text>  or  echo '<text>' | claw prompt".to_string());
             compact,
             base_commit,
             reasoning_effort,
+            json_schema.clone(),
             allow_broad_cwd,
         ),
         other => {
@@ -2529,6 +2590,7 @@ Usage: claw prompt <text>  or  echo '<text>' | claw prompt".to_string());
                 compact,
                 base_commit,
                 reasoning_effort: reasoning_effort.clone(),
+                json_schema,
                 allow_broad_cwd,
             })
         }
@@ -3023,6 +3085,38 @@ fn validate_reasoning_effort_flag(value: &str) -> Result<(), String> {
     ))
 }
 
+fn parse_json_schema_flag(value: &str) -> Result<Value, String> {
+    let schema = serde_json::from_str::<Value>(value).map_err(|error| {
+        format!(
+            "invalid_json_schema: --json-schema is not valid JSON: {error}\nHint: Pass an inline JSON object, for example {{\"type\":\"object\"}}."
+        )
+    })?;
+    if !schema.is_object() {
+        return Err(
+            "invalid_json_schema: --json-schema must be a JSON object.\nHint: Pass an inline JSON Schema object."
+                .to_string(),
+        );
+    }
+    runtime::validate_structured_output_schema(&schema).map_err(|error| {
+        let message = error.to_string();
+        let detail = message
+            .strip_prefix("Invalid JSON schema: ")
+            .unwrap_or(&message);
+        format!(
+            "invalid_json_schema: --json-schema is not a valid JSON Schema: {detail}\nHint: Fix the schema before retrying; format keywords are accepted as annotations."
+        )
+    })?;
+    Ok(schema)
+}
+
+fn structured_output_max_attempts() -> usize {
+    env::var("MAX_STRUCTURED_OUTPUT_RETRIES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(runtime::DEFAULT_MAX_STRUCTURED_OUTPUT_ATTEMPTS)
+}
+
 #[allow(clippy::too_many_arguments, clippy::needless_pass_by_value)]
 fn parse_direct_slash_cli_action(
     rest: &[String],
@@ -3033,6 +3127,7 @@ fn parse_direct_slash_cli_action(
     compact: bool,
     base_commit: Option<String>,
     reasoning_effort: Option<String>,
+    json_schema: Option<Value>,
     allow_broad_cwd: bool,
 ) -> Result<CliAction, String> {
     let raw = rest.join(" ");
@@ -3091,12 +3186,14 @@ fn parse_direct_slash_cli_action(
                     compact,
                     base_commit,
                     reasoning_effort: reasoning_effort.clone(),
+                    json_schema,
                     allow_broad_cwd,
                 }),
-                SkillSlashDispatch::Local => Ok(CliAction::Skills {
-                    args,
-                    output_format,
-                }),
+                SkillSlashDispatch::Local if json_schema.is_some() => Err(
+                    "invalid_flag_value: --json-schema requires a skill invocation, not a local skills command.\nUsage: claw /skills <skill> [args] --json-schema '<schema>'"
+                        .to_string(),
+                ),
+                SkillSlashDispatch::Local => Ok(CliAction::Skills { args, output_format }),
             }
         }
         Ok(Some(SlashCommand::Unknown(name))) => {
@@ -3651,6 +3748,22 @@ fn filter_tool_specs(
     allowed_tools: Option<&AllowedToolSet>,
 ) -> Vec<ToolDefinition> {
     tool_registry.definitions(allowed_tools)
+}
+
+fn upsert_structured_output_tool(tools: &mut Vec<ToolDefinition>, schema: Value) {
+    let definition = ToolDefinition {
+        name: "StructuredOutput".to_string(),
+        description: Some(
+            "Use this tool exactly once at the end of your response to return the requested structured output."
+                .to_string(),
+        ),
+        input_schema: schema,
+    };
+    if let Some(existing) = tools.iter_mut().find(|tool| tool.name == definition.name) {
+        *existing = definition;
+    } else {
+        tools.push(definition);
+    }
 }
 
 fn parse_system_prompt_args(
@@ -8302,6 +8415,7 @@ fn start_agent_view_dispatch(
         output_format: request.output_format,
         permission_mode: request.permission_mode,
         reasoning_effort: request.reasoning_effort,
+        json_schema: None,
     })?;
     state.status = Some(format!("started background session {}", job.id));
     state.selected = 0;
@@ -9526,7 +9640,11 @@ impl LiveCli {
         input: &str,
         output_format: CliOutputFormat,
         compact: bool,
+        json_schema: Option<Value>,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(schema) = json_schema {
+            return self.run_prompt_structured(input, output_format, compact, schema);
+        }
         if let Some(trigger) = self.workflow_trigger_for_input(input) {
             return self.run_ultracode_workflow_with_output(input, trigger, output_format);
         }
@@ -9536,6 +9654,66 @@ impl LiveCli {
             CliOutputFormat::Text => self.run_turn(input),
             CliOutputFormat::Json => self.run_prompt_json(input),
         }
+    }
+
+    fn run_prompt_structured(
+        &mut self,
+        input: &str,
+        output_format: CliOutputFormat,
+        compact: bool,
+        schema: Value,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(false)?;
+        let conversation = runtime
+            .runtime
+            .take()
+            .ok_or_else(|| io::Error::other("conversation runtime is unavailable"))?
+            .with_structured_output_schema(schema, structured_output_max_attempts())?;
+        runtime.runtime = Some(conversation);
+        let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
+        let result = runtime.run_turn(input, Some(&mut permission_prompter));
+        hook_abort_monitor.stop();
+        let summary = result?;
+        let structured_output = summary.structured_output.clone().ok_or_else(|| {
+            io::Error::other("structured output completed without a validated value")
+        })?;
+        let message = serde_json::to_string(&structured_output)?;
+        self.replace_runtime(runtime)?;
+        self.persist_session()?;
+
+        match output_format {
+            CliOutputFormat::Text => println!("{message}"),
+            CliOutputFormat::Json => println!(
+                "{}",
+                json!({
+                    "message": message,
+                    "structured_output": structured_output,
+                    "compact": compact,
+                    "model": self.model,
+                    "iterations": summary.iterations,
+                    "auto_compaction": summary.auto_compaction.map(|event| json!({
+                        "removed_messages": event.removed_message_count,
+                        "notice": format_auto_compaction_notice(event.removed_message_count),
+                    })),
+                    "tool_uses": collect_tool_uses(&summary),
+                    "tool_results": collect_tool_results(&summary),
+                    "prompt_cache_events": collect_prompt_cache_events(&summary),
+                    "usage": {
+                        "input_tokens": summary.usage.input_tokens,
+                        "output_tokens": summary.usage.output_tokens,
+                        "cache_creation_input_tokens": summary.usage.cache_creation_input_tokens,
+                        "cache_read_input_tokens": summary.usage.cache_read_input_tokens,
+                    },
+                    "estimated_cost": format_usd(
+                        summary.usage.estimate_cost_usd_with_pricing(
+                            pricing_for_model(&self.model)
+                                .unwrap_or_else(runtime::ModelPricing::default_sonnet_tier)
+                        ).total_cost_usd()
+                    )
+                })
+            ),
+        }
+        Ok(())
     }
 
     fn run_user_input(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
@@ -11183,6 +11361,7 @@ struct BackgroundAgentRequest<'a> {
     output_format: CliOutputFormat,
     permission_mode: PermissionMode,
     reasoning_effort: Option<&'a str>,
+    json_schema: Option<&'a Value>,
 }
 
 fn run_background_agent(
@@ -11213,6 +11392,7 @@ fn start_background_agent_job(
         agent: request.agent.map(ToOwned::to_owned),
         permission_mode: Some(request.permission_mode.as_str().to_string()),
         reasoning_effort: request.reasoning_effort.map(ToOwned::to_owned),
+        json_schema: request.json_schema.cloned(),
     })?;
     let child = spawn_agent_worker(&job.id, Path::new(&job.cwd))?;
     let job = supervisor.set_process(&job.id, child.id())?;
@@ -11684,22 +11864,33 @@ fn run_agent_prompt_worker(
     }
     let executable = env::current_exe()?;
     let mut command = Command::new(executable);
-    if let Some(model) = &job.model {
-        command.arg("--model").arg(model);
-    }
-    if let Some(permission_mode) = &job.permission_mode {
-        command.arg("--permission-mode").arg(permission_mode);
-    }
-    if let Some(reasoning_effort) = &job.reasoning_effort {
-        command.arg("--reasoning-effort").arg(reasoning_effort);
-    }
+    command.args(agent_prompt_worker_args(job, prompt)?);
     command
-        .arg("prompt")
-        .arg(prompt)
         .current_dir(&job.cwd)
         .env("CLAW_AGENT_JOB_ID", &job.id);
     let output = command.output()?;
     Ok(command_output_to_worker_output(output))
+}
+
+fn agent_prompt_worker_args(
+    job: &runtime::AgentJobRecord,
+    prompt: &str,
+) -> Result<Vec<String>, serde_json::Error> {
+    let mut args = Vec::new();
+    if let Some(model) = &job.model {
+        args.extend(["--model".to_string(), model.clone()]);
+    }
+    if let Some(permission_mode) = &job.permission_mode {
+        args.extend(["--permission-mode".to_string(), permission_mode.clone()]);
+    }
+    if let Some(reasoning_effort) = &job.reasoning_effort {
+        args.extend(["--reasoning-effort".to_string(), reasoning_effort.clone()]);
+    }
+    if let Some(schema) = &job.json_schema {
+        args.extend(["--json-schema".to_string(), serde_json::to_string(schema)?]);
+    }
+    args.extend(["prompt".to_string(), prompt.to_string()]);
+    Ok(args)
 }
 
 fn run_agent_follow_up_worker(
@@ -11734,6 +11925,14 @@ fn run_agent_follow_up_worker(
         permission_mode,
         None,
     )?;
+    if let Some(schema) = &job.json_schema {
+        let conversation = runtime
+            .runtime
+            .take()
+            .ok_or_else(|| io::Error::other("conversation runtime is unavailable"))?
+            .with_structured_output_schema(schema.clone(), structured_output_max_attempts())?;
+        runtime.runtime = Some(conversation);
+    }
     let mut permission_prompter = CliPermissionPrompter::new(permission_mode);
     let summary = runtime.run_turn(prompt, Some(&mut permission_prompter))?;
     runtime.session().save_to_path(&handle.path)?;
@@ -11741,7 +11940,11 @@ fn run_agent_follow_up_worker(
     text.push_str("User reply:\n");
     text.push_str(prompt);
     text.push_str("\n\nAssistant:\n");
-    text.push_str(&final_assistant_text(&summary));
+    if let Some(structured_output) = &summary.structured_output {
+        text.push_str(&serde_json::to_string(structured_output)?);
+    } else {
+        text.push_str(&final_assistant_text(&summary));
+    }
     text.push('\n');
     Ok(AgentWorkerOutput { exit_code: 0, text })
 }
@@ -15030,15 +15233,22 @@ impl ApiClient for AnthropicRuntimeClient {
             progress_reporter.mark_model_phase();
         }
         let is_post_tool = request_ends_with_tool_result(&request);
+        let mut tools = if self.enable_tools {
+            filter_tool_specs(&self.tool_registry, self.allowed_tools.as_ref())
+        } else {
+            Vec::new()
+        };
+        if let Some(schema) = request.structured_output_schema.clone() {
+            upsert_structured_output_tool(&mut tools, schema);
+        }
+        let has_tools = !tools.is_empty();
         let message_request = MessageRequest {
             model: self.model.clone(),
             max_tokens: max_tokens_for_model(&self.model),
             messages: convert_messages(&request.messages),
             system: (!request.system_prompt.is_empty()).then(|| request.system_prompt.join("\n\n")),
-            tools: self
-                .enable_tools
-                .then(|| filter_tool_specs(&self.tool_registry, self.allowed_tools.as_ref())),
-            tool_choice: self.enable_tools.then_some(ToolChoice::Auto),
+            tools: has_tools.then_some(tools),
+            tool_choice: has_tools.then_some(ToolChoice::Auto),
             stream: true,
             reasoning_effort: self.reasoning_effort.clone(),
             ..Default::default()
@@ -16557,7 +16767,7 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(out, "      Start the interactive REPL")?;
     writeln!(
         out,
-        "  claw [--model MODEL] [--output-format text|json] prompt [--stdin] [TEXT]"
+        "  claw [--model MODEL] [--output-format text|json] [--json-schema JSON] prompt [--stdin] [TEXT]"
     )?;
     writeln!(
         out,
@@ -16609,7 +16819,7 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(out, "  claw dump-manifests [--manifests-dir PATH]")?;
     writeln!(out, "  claw bootstrap-plan")?;
     writeln!(out, "  claw agents [--json] [--all] [--cwd PATH]")?;
-    writeln!(out, "  claw --bg \"prompt\"")?;
+    writeln!(out, "  claw --bg \"prompt\" [--json-schema JSON]")?;
     writeln!(out, "  claw --bg --exec \"command\"")?;
     writeln!(out, "  claw attach|logs|stop|kill|respawn|rm <agent-id>")?;
     writeln!(out, "  claw daemon status")?;
@@ -16650,6 +16860,14 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(
         out,
         "  --compact                  Strip tool call details; print only the final assistant text (text mode only; useful for piping)"
+    )?;
+    writeln!(
+        out,
+        "  --json-schema JSON         Validate the final response against an inline JSON Schema object"
+    )?;
+    writeln!(
+        out,
+        "                              Adds structured_output in JSON mode; MAX_STRUCTURED_OUTPUT_RETRIES defaults to 5"
     )?;
     writeln!(
         out,
@@ -16713,6 +16931,10 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(
         out,
         "  claw --output-format json prompt \"explain src/main.rs\""
+    )?;
+    writeln!(
+        out,
+        "  claw --output-format json --json-schema '{{\"type\":\"object\"}}' prompt \"summarize src/main.rs\""
     )?;
     writeln!(out, "  claw --compact \"summarize Cargo.toml\" | wc -l")?;
     writeln!(
@@ -16778,8 +17000,9 @@ fn print_help(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::
 #[cfg(test)]
 mod tests {
     use super::{
-        acp_status_json, build_runtime_plugin_state_with_loader, build_runtime_with_plugin_state,
-        classify_error_kind, classify_session_lifecycle_from_panes, collect_session_prompt_history,
+        acp_status_json, agent_prompt_worker_args, build_runtime_plugin_state_with_loader,
+        build_runtime_with_plugin_state, classify_error_kind,
+        classify_session_lifecycle_from_panes, collect_session_prompt_history,
         create_managed_session_handle, describe_tool_progress, filter_tool_specs,
         format_bughunter_report, format_commit_preflight_report, format_commit_skipped_report,
         format_compact_report, format_connected_line, format_cost_report, format_history_timestamp,
@@ -16798,13 +17021,14 @@ mod tests {
         resolve_repl_model, resolve_session_reference, response_to_events,
         resume_supported_slash_commands, run_resume_command, short_tool_id,
         slash_command_completion_candidates_with_sessions, split_error_hint, status_context,
-        status_json_value, summarize_tool_payload_for_markdown, try_resolve_bare_skill_prompt,
-        validate_no_args, write_mcp_server_fixture, AgentStopSignal, AgentViewTuiOptions,
-        AgentViewTuiState, CliAction, CliOutputFormat, CliToolExecutor, GitOperation,
-        GitWorkspaceSummary, InternalPromptProgressEvent, InternalPromptProgressState, LiveCli,
-        LocalHelpTopic, PermissionModeProvenance, PromptHistoryEntry, SessionHandle,
-        SessionLifecycleKind, SessionLifecycleSummary, SlashCommand, StatusUsage, TmuxPaneSnapshot,
-        DEFAULT_MODEL, LATEST_SESSION_REFERENCE, STUB_COMMANDS,
+        status_json_value, structured_output_max_attempts, summarize_tool_payload_for_markdown,
+        try_resolve_bare_skill_prompt, validate_no_args, write_mcp_server_fixture, AgentStopSignal,
+        AgentViewTuiOptions, AgentViewTuiState, CliAction, CliOutputFormat, CliToolExecutor,
+        GitOperation, GitWorkspaceSummary, InternalPromptProgressEvent,
+        InternalPromptProgressState, LiveCli, LocalHelpTopic, PermissionModeProvenance,
+        PromptHistoryEntry, SessionHandle, SessionLifecycleKind, SessionLifecycleSummary,
+        SlashCommand, StatusUsage, TmuxPaneSnapshot, DEFAULT_MODEL, LATEST_SESSION_REFERENCE,
+        STUB_COMMANDS,
     };
     use api::{ApiError, MessageResponse, OutputContentBlock, Usage};
     use plugins::{
@@ -17287,9 +17511,81 @@ mod tests {
                 compact: false,
                 base_commit: None,
                 reasoning_effort: None,
+                json_schema: None,
                 allow_broad_cwd: false,
             }
         );
+    }
+
+    #[test]
+    fn parses_inline_json_schema_forms_and_rejects_invalid_schemas_before_dispatch() {
+        let _guard = env_lock();
+        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+        let schema = json!({
+            "type": "object",
+            "properties": {"email": {"type": "string", "format": "email"}},
+            "required": ["email"]
+        });
+
+        for args in [
+            vec![
+                "--json-schema".to_string(),
+                schema.to_string(),
+                "prompt".to_string(),
+                "return email".to_string(),
+            ],
+            vec![
+                format!("--json-schema={schema}"),
+                "prompt".to_string(),
+                "return email".to_string(),
+            ],
+        ] {
+            let action = parse_args(&args).expect("valid inline schema should parse");
+            let CliAction::Prompt { json_schema, .. } = action else {
+                panic!("expected prompt action")
+            };
+            assert_eq!(json_schema, Some(schema.clone()));
+        }
+
+        for (value, expected) in [
+            ("{", "is not valid JSON"),
+            ("[]", "must be a JSON object"),
+            (
+                r#"{"type":"definitely-not-a-json-schema-type"}"#,
+                "is not a valid JSON Schema",
+            ),
+        ] {
+            let error = parse_args(&[
+                "--json-schema".to_string(),
+                value.to_string(),
+                "prompt".to_string(),
+                "return data".to_string(),
+            ])
+            .expect_err("invalid schema should fail before dispatch");
+            assert!(error.starts_with("invalid_json_schema:"), "{error}");
+            assert!(error.contains(expected), "{error}");
+            assert_eq!(classify_error_kind(&error), "invalid_json_schema");
+        }
+    }
+
+    #[test]
+    fn structured_output_retry_cap_uses_positive_environment_override() {
+        let _guard = env_lock();
+        let previous = std::env::var_os("MAX_STRUCTURED_OUTPUT_RETRIES");
+
+        std::env::set_var("MAX_STRUCTURED_OUTPUT_RETRIES", "2");
+        assert_eq!(structured_output_max_attempts(), 2);
+
+        std::env::set_var("MAX_STRUCTURED_OUTPUT_RETRIES", "0");
+        assert_eq!(
+            structured_output_max_attempts(),
+            runtime::DEFAULT_MAX_STRUCTURED_OUTPUT_ATTEMPTS
+        );
+
+        match previous {
+            Some(value) => std::env::set_var("MAX_STRUCTURED_OUTPUT_RETRIES", value),
+            None => std::env::remove_var("MAX_STRUCTURED_OUTPUT_RETRIES"),
+        }
     }
 
     #[test]
@@ -17378,6 +17674,7 @@ mod tests {
                 compact: false,
                 base_commit: None,
                 reasoning_effort: None,
+                json_schema: None,
                 allow_broad_cwd: false,
             }
         );
@@ -17400,6 +17697,7 @@ mod tests {
                 compact: false,
                 base_commit: None,
                 reasoning_effort: None,
+                json_schema: None,
                 allow_broad_cwd: false,
             }
         );
@@ -17416,6 +17714,7 @@ mod tests {
                 compact: false,
                 base_commit: None,
                 reasoning_effort: None,
+                json_schema: None,
                 allow_broad_cwd: false,
             }
         );
@@ -17432,6 +17731,7 @@ mod tests {
                 compact: false,
                 base_commit: None,
                 reasoning_effort: None,
+                json_schema: None,
                 allow_broad_cwd: false,
             }
         );
@@ -17470,6 +17770,7 @@ mod tests {
                 compact: true,
                 base_commit: None,
                 reasoning_effort: None,
+                json_schema: None,
                 allow_broad_cwd: false,
             }
         );
@@ -17485,6 +17786,7 @@ mod tests {
                 compact: true,
                 base_commit: None,
                 reasoning_effort: None,
+                json_schema: None,
                 allow_broad_cwd: false,
             }
         );
@@ -17528,6 +17830,7 @@ mod tests {
                 compact: false,
                 base_commit: None,
                 reasoning_effort: None,
+                json_schema: None,
                 allow_broad_cwd: false,
             }
         );
@@ -17667,6 +17970,7 @@ mod tests {
                 compact: false,
                 base_commit: None,
                 reasoning_effort: None,
+                json_schema: None,
                 allow_broad_cwd: false,
             }
         );
@@ -17881,6 +18185,7 @@ mod tests {
                 compact: false,
                 base_commit: None,
                 reasoning_effort: None,
+                json_schema: None,
                 allow_broad_cwd: false,
             }
         );
@@ -18145,6 +18450,8 @@ mod tests {
             "Explore".to_string(),
             "--reasoning-effort".to_string(),
             "medium".to_string(),
+            "--json-schema".to_string(),
+            r#"{"type":"object","properties":{"name":{"type":"string"}}}"#.to_string(),
             "fix parser".to_string(),
         ])
         .expect("--bg prompt should parse")
@@ -18155,6 +18462,7 @@ mod tests {
                 name,
                 agent,
                 reasoning_effort,
+                json_schema,
                 ..
             } => {
                 assert_eq!(prompt.as_deref(), Some("fix parser"));
@@ -18162,6 +18470,13 @@ mod tests {
                 assert_eq!(name.as_deref(), Some("parser-fix"));
                 assert_eq!(agent.as_deref(), Some("Explore"));
                 assert_eq!(reasoning_effort.as_deref(), Some("medium"));
+                assert_eq!(
+                    json_schema,
+                    Some(json!({
+                        "type": "object",
+                        "properties": {"name": {"type": "string"}}
+                    }))
+                );
             }
             other => panic!("expected background prompt action, got {other:?}"),
         }
@@ -18190,6 +18505,15 @@ mod tests {
                 .expect_err("--bg --print should reject")
                 .contains("--bg cannot be combined")
         );
+        assert!(parse_args(&[
+            "--bg".to_string(),
+            "--exec".to_string(),
+            "echo hi".to_string(),
+            "--json-schema".to_string(),
+            r#"{"type":"object"}"#.to_string(),
+        ])
+        .expect_err("background exec cannot produce model structured output")
+        .contains("--json-schema cannot be combined with --bg --exec"));
 
         assert_eq!(
             parse_args(&["attach".to_string(), "abc123".to_string()]).expect("attach"),
@@ -18295,6 +18619,7 @@ mod tests {
             agent: Some("Explore".to_string()),
             permission_mode: Some("manual".to_string()),
             reasoning_effort: Some("medium".to_string()),
+            json_schema: Some(json!({"type": "object"})),
             output_tail: Some("latest output".to_string()),
             exit_code: None,
             stopped_at: None,
@@ -18333,6 +18658,7 @@ mod tests {
                 agent: None,
                 permission_mode: Some("manual".to_string()),
                 reasoning_effort: None,
+                json_schema: None,
             })
             .expect("job should create");
         let previous_config = std::env::var("CLAUDE_CONFIG_DIR").ok();
@@ -18356,6 +18682,53 @@ mod tests {
             Some(value) => std::env::set_var("CLAW_AGENT_JOB_ID", value),
             None => std::env::remove_var("CLAW_AGENT_JOB_ID"),
         }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn background_prompt_worker_forwards_persisted_json_schema_as_one_inline_argument() {
+        let root = temp_dir();
+        let config = root.join("claude-config");
+        let workspace = root.join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace should exist");
+        let schema = json!({
+            "type": "object",
+            "properties": {"name": {"type": "string"}},
+            "required": ["name"]
+        });
+        let supervisor = runtime::AgentSupervisor::from_config_dir(&config);
+        let job = supervisor
+            .create_job(runtime::AgentJobCreate {
+                cwd: workspace,
+                kind: runtime::AgentJobKind::Claude,
+                prompt: Some("return a name".to_string()),
+                command: None,
+                name: None,
+                model: Some(DEFAULT_MODEL.to_string()),
+                agent: None,
+                permission_mode: Some("manual".to_string()),
+                reasoning_effort: Some("high".to_string()),
+                json_schema: Some(schema.clone()),
+            })
+            .expect("job should create");
+
+        let args = agent_prompt_worker_args(&job, "return a name")
+            .expect("worker arguments should serialize");
+        let schema_index = args
+            .iter()
+            .position(|arg| arg == "--json-schema")
+            .expect("json schema flag should be forwarded");
+
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&args[schema_index + 1])
+                .expect("schema argument should be inline JSON"),
+            schema
+        );
+        assert_eq!(
+            &args[args.len() - 2..],
+            &["prompt".to_string(), "return a name".to_string()]
+        );
+
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -19602,6 +19975,7 @@ mod tests {
                 compact: false,
                 base_commit: None,
                 reasoning_effort: None,
+                json_schema: None,
                 allow_broad_cwd: false,
             }
         );
@@ -19677,6 +20051,7 @@ mod tests {
                 compact: false,
                 base_commit: None,
                 reasoning_effort: None,
+                json_schema: None,
                 allow_broad_cwd: false,
             }
         );
@@ -19704,6 +20079,7 @@ mod tests {
                 compact: false,
                 base_commit: None,
                 reasoning_effort: None,
+                json_schema: None,
                 allow_broad_cwd: false,
             }
         );
@@ -19839,6 +20215,7 @@ mod tests {
                 compact: false,
                 base_commit: None,
                 reasoning_effort: None,
+                json_schema: None,
                 allow_broad_cwd: false,
             }
         );
@@ -19858,6 +20235,7 @@ mod tests {
                 compact: false,
                 base_commit: None,
                 reasoning_effort: None,
+                json_schema: None,
                 allow_broad_cwd: false,
             }
         );
@@ -19887,6 +20265,7 @@ mod tests {
                 compact: false,
                 base_commit: None,
                 reasoning_effort: None,
+                json_schema: None,
                 allow_broad_cwd: false,
             }
         );

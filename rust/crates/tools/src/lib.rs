@@ -6799,7 +6799,7 @@ fn load_provider_fallback_config() -> ProviderFallbackConfig {
 
 impl ApiClient for ProviderRuntimeClient {
     fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
-        let tools = tool_specs_for_allowed_tools(Some(&self.allowed_tools))
+        let mut tools = tool_specs_for_allowed_tools(Some(&self.allowed_tools))
             .into_iter()
             .map(|spec| ToolDefinition {
                 name: spec.name.to_string(),
@@ -6807,10 +6807,13 @@ impl ApiClient for ProviderRuntimeClient {
                 input_schema: spec.input_schema,
             })
             .collect::<Vec<_>>();
+        if let Some(schema) = request.structured_output_schema.clone() {
+            upsert_structured_output_tool(&mut tools, schema);
+        }
         let messages = convert_messages(&request.messages);
         let system =
             (!request.system_prompt.is_empty()).then(|| request.system_prompt.join("\n\n"));
-        let tool_choice = (!self.allowed_tools.is_empty()).then_some(ToolChoice::Auto);
+        let tool_choice = (!tools.is_empty()).then_some(ToolChoice::Auto);
 
         let runtime = &self.runtime;
         let chain = &self.chain;
@@ -6845,6 +6848,22 @@ impl ApiClient for ProviderRuntimeClient {
             || String::from("provider chain exhausted with no attempts"),
             |error| error.to_string(),
         )))
+    }
+}
+
+fn upsert_structured_output_tool(tools: &mut Vec<ToolDefinition>, schema: Value) {
+    let definition = ToolDefinition {
+        name: "StructuredOutput".to_string(),
+        description: Some(
+            "Use this tool exactly once at the end of your response to return the requested structured output."
+                .to_string(),
+        ),
+        input_schema: schema,
+    };
+    if let Some(existing) = tools.iter_mut().find(|tool| tool.name == definition.name) {
+        *existing = definition;
+    } else {
+        tools.push(definition);
     }
 }
 
@@ -8477,10 +8496,10 @@ mod tests {
         final_assistant_text, global_cron_registry, global_mcp_registry, maybe_commit_provenance,
         mvp_tool_specs, parse_workflow_agent_calls, permission_mode_from_plugin,
         persist_agent_terminal_state, push_output_block, run_task_packet, run_workflow_with_spawn,
-        AgentInput, AgentJob, GlobalToolRegistry, LaneEventName, LaneFailureClass,
-        ProviderRuntimeClient, SubagentToolExecutor, WorkflowInput,
+        upsert_structured_output_tool, AgentInput, AgentJob, GlobalToolRegistry, LaneEventName,
+        LaneFailureClass, ProviderRuntimeClient, SubagentToolExecutor, WorkflowInput,
     };
-    use api::OutputContentBlock;
+    use api::{OutputContentBlock, ToolDefinition};
     use runtime::mcp_tool_bridge::{McpConnectionStatus, McpResourceInfo, McpToolInfo};
     use runtime::ProviderFallbackConfig;
     use runtime::{
@@ -12695,6 +12714,39 @@ printf 'pwsh:%s' "$1"
             Some(value) => std::env::set_var("ANTHROPIC_API_KEY", value),
             None => std::env::remove_var("ANTHROPIC_API_KEY"),
         }
+    }
+
+    #[test]
+    fn structured_output_schema_replaces_builtin_tool_contract_without_duplicates() {
+        let schema = json!({
+            "type": "object",
+            "properties": {"name": {"type": "string"}},
+            "required": ["name"]
+        });
+        let mut tools = vec![ToolDefinition {
+            name: "StructuredOutput".to_string(),
+            description: Some("old contract".to_string()),
+            input_schema: json!({"type": "string"}),
+        }];
+
+        upsert_structured_output_tool(&mut tools, schema.clone());
+
+        assert_eq!(
+            tools
+                .iter()
+                .filter(|tool| tool.name == "StructuredOutput")
+                .count(),
+            1
+        );
+        let tool = tools
+            .iter()
+            .find(|tool| tool.name == "StructuredOutput")
+            .expect("structured output tool");
+        assert_eq!(tool.input_schema, schema);
+        assert!(tool
+            .description
+            .as_deref()
+            .is_some_and(|description| description.contains("exactly once")));
     }
 
     #[test]

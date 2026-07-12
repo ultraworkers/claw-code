@@ -100,6 +100,7 @@ enum Scenario {
     PluginToolRoundtrip,
     AutoCompactTriggered,
     TokenCostReporting,
+    StructuredOutputRetry,
 }
 
 impl Scenario {
@@ -117,6 +118,7 @@ impl Scenario {
             "plugin_tool_roundtrip" => Some(Self::PluginToolRoundtrip),
             "auto_compact_triggered" => Some(Self::AutoCompactTriggered),
             "token_cost_reporting" => Some(Self::TokenCostReporting),
+            "structured_output_retry" => Some(Self::StructuredOutputRetry),
             _ => None,
         }
     }
@@ -135,6 +137,7 @@ impl Scenario {
             Self::PluginToolRoundtrip => "plugin_tool_roundtrip",
             Self::AutoCompactTriggered => "auto_compact_triggered",
             Self::TokenCostReporting => "token_cost_reporting",
+            Self::StructuredOutputRetry => "structured_output_retry",
         }
     }
 }
@@ -464,6 +467,19 @@ fn build_stream_body(request: &MessageRequest, scenario: Scenario) -> String {
         Scenario::TokenCostReporting => {
             final_text_sse_with_usage("token cost reporting parity complete.", 1_000, 500)
         }
+        Scenario::StructuredOutputRetry => match latest_tool_result(request) {
+            Some((_tool_output, true)) => tool_use_sse(
+                "toolu_structured_valid",
+                "StructuredOutput",
+                &[r#"{"name":"Ada"}"#],
+            ),
+            Some((_tool_output, false)) => final_text_sse("structured output was already accepted"),
+            None => tool_use_sse(
+                "toolu_structured_invalid",
+                "StructuredOutput",
+                &[r#"{"name":42}"#],
+            ),
+        },
     }
 }
 
@@ -634,6 +650,24 @@ fn build_message_response(request: &MessageRequest, scenario: Scenario) -> Messa
             1_000,
             500,
         ),
+        Scenario::StructuredOutputRetry => match latest_tool_result(request) {
+            Some((_tool_output, true)) => tool_message_response(
+                "msg_structured_valid",
+                "toolu_structured_valid",
+                "StructuredOutput",
+                json!({"name": "Ada"}),
+            ),
+            Some((_tool_output, false)) => text_message_response(
+                "msg_structured_already_accepted",
+                "structured output was already accepted",
+            ),
+            None => tool_message_response(
+                "msg_structured_invalid",
+                "toolu_structured_invalid",
+                "StructuredOutput",
+                json!({"name": 42}),
+            ),
+        },
     }
 }
 
@@ -651,6 +685,7 @@ fn request_id_for(scenario: Scenario) -> &'static str {
         Scenario::PluginToolRoundtrip => "req_plugin_tool_roundtrip",
         Scenario::AutoCompactTriggered => "req_auto_compact_triggered",
         Scenario::TokenCostReporting => "req_token_cost_reporting",
+        Scenario::StructuredOutputRetry => "req_structured_output_retry",
     }
 }
 

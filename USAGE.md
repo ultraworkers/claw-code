@@ -113,6 +113,29 @@ cd rust
 ./target/debug/claw --output-format json prompt "status"
 ```
 
+### Structured output with `--json-schema`
+
+Pass an inline JSON Schema object to require the model to finish with a validated `StructuredOutput` tool call:
+
+```bash
+./target/debug/claw \
+  --output-format json \
+  --json-schema '{"type":"object","properties":{"summary":{"type":"string"}},"required":["summary"]}' \
+  prompt "summarize this repository"
+```
+
+JSON mode includes both the JSON-stringified `message` and the independent `structured_output` value. Text mode prints the compact JSON value directly. Schema `format` keywords are accepted as annotations, matching Claude Code's `validateFormats: false` behavior. Invalid JSON, non-object values, and invalid JSON Schemas fail before credentials or provider startup.
+
+The runtime retries schema mismatches up to five attempts by default. Set `MAX_STRUCTURED_OUTPUT_RETRIES` to a positive integer to change the cap. Background model sessions preserve and forward the schema as well:
+
+```bash
+./target/debug/claw --bg \
+  --json-schema '{"type":"object","properties":{"result":{"type":"string"}},"required":["result"]}' \
+  "analyze the parser regression"
+```
+
+`--json-schema` cannot be combined with `--bg --exec`, because shell-command jobs do not produce model tool calls.
+
 ### Inspect worker state
 
 The `claw state` command reads `.claw/worker-state.json`, which is written by the interactive REPL or a one-shot prompt when a worker executes a task. This file contains the worker ID, session reference, model, and permission mode.

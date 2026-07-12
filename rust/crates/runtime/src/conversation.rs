@@ -17,12 +17,95 @@ use crate::usage::{TokenUsage, UsageTracker};
 
 const DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD: u32 = 100_000;
 const AUTO_COMPACTION_THRESHOLD_ENV_VAR: &str = "CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS";
+pub const DEFAULT_MAX_STRUCTURED_OUTPUT_ATTEMPTS: usize = 5;
+const MAX_STRUCTURED_OUTPUT_SCHEMA_NODES: usize = 100_000;
+const MAX_STRUCTURED_OUTPUT_SCHEMA_DEPTH: usize = 10_000;
+const STRUCTURED_OUTPUT_TOOL_NAME: &str = "StructuredOutput";
+const STRUCTURED_OUTPUT_INSTRUCTION: &str = "Use the StructuredOutput tool to return your final response in the requested structured format. You MUST call this tool exactly once at the end of your response.";
 
 /// Fully assembled request payload sent to the upstream model client.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApiRequest {
     pub system_prompt: Vec<String>,
     pub messages: Vec<ConversationMessage>,
+    pub structured_output_schema: Option<Value>,
+}
+
+struct StructuredOutputState {
+    schema: Value,
+    validator: jsonschema::Validator,
+    max_attempts: usize,
+}
+
+impl StructuredOutputState {
+    fn new(schema: Value, max_attempts: usize) -> Result<Self, RuntimeError> {
+        if !schema.is_object() {
+            return Err(RuntimeError::new(
+                "Invalid JSON schema: --json-schema must be a JSON object",
+            ));
+        }
+        validate_structured_output_schema_complexity(&schema)?;
+        let validator = jsonschema::options()
+            .should_validate_formats(false)
+            .build(&schema)
+            .map_err(|error| RuntimeError::new(format!("Invalid JSON schema: {error}")))?;
+        Ok(Self {
+            schema,
+            validator,
+            max_attempts: max_attempts.max(1),
+        })
+    }
+
+    fn validate(&self, value: &Value) -> Result<(), String> {
+        let errors = self
+            .validator
+            .iter_errors(value)
+            .map(|error| {
+                let path = error.instance_path().to_string();
+                let path = if path.is_empty() {
+                    "root"
+                } else {
+                    path.as_str()
+                };
+                format!("{path}: {error}")
+            })
+            .collect::<Vec<_>>();
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join(", "))
+        }
+    }
+}
+
+pub fn validate_structured_output_schema(schema: &Value) -> Result<(), RuntimeError> {
+    StructuredOutputState::new(schema.clone(), DEFAULT_MAX_STRUCTURED_OUTPUT_ATTEMPTS).map(|_| ())
+}
+
+fn validate_structured_output_schema_complexity(schema: &Value) -> Result<(), RuntimeError> {
+    let mut stack = vec![(schema, 0_usize)];
+    let mut nodes = 0_usize;
+    while let Some((value, depth)) = stack.pop() {
+        nodes = nodes.saturating_add(1);
+        if nodes > MAX_STRUCTURED_OUTPUT_SCHEMA_NODES || depth > MAX_STRUCTURED_OUTPUT_SCHEMA_DEPTH
+        {
+            return Err(RuntimeError::new("Invalid JSON schema: schema too large"));
+        }
+        match value {
+            Value::Array(values) => {
+                stack.extend(values.iter().map(|value| (value, depth.saturating_add(1))));
+            }
+            Value::Object(values) => {
+                stack.extend(
+                    values
+                        .values()
+                        .map(|value| (value, depth.saturating_add(1))),
+                );
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 /// Streamed events emitted while processing a single assistant turn.
@@ -117,6 +200,7 @@ impl std::error::Error for RuntimeError {}
 pub struct TurnSummary {
     pub assistant_messages: Vec<ConversationMessage>,
     pub tool_results: Vec<ConversationMessage>,
+    pub structured_output: Option<Value>,
     pub prompt_cache_events: Vec<PromptCacheEvent>,
     pub iterations: usize,
     pub usage: TokenUsage,
@@ -143,6 +227,7 @@ pub struct ConversationRuntime<C, T> {
     hook_abort_signal: HookAbortSignal,
     hook_progress_reporter: Option<Box<dyn HookProgressReporter>>,
     session_tracer: Option<SessionTracer>,
+    structured_output: Option<StructuredOutputState>,
 }
 
 impl<C, T> ConversationRuntime<C, T>
@@ -192,6 +277,7 @@ where
             hook_abort_signal: HookAbortSignal::default(),
             hook_progress_reporter: None,
             session_tracer: None,
+            structured_output: None,
         }
     }
 
@@ -199,6 +285,17 @@ where
     pub fn with_max_iterations(mut self, max_iterations: usize) -> Self {
         self.max_iterations = max_iterations;
         self
+    }
+
+    pub fn with_structured_output_schema(
+        mut self,
+        schema: Value,
+        max_attempts: usize,
+    ) -> Result<Self, RuntimeError> {
+        self.structured_output = Some(StructuredOutputState::new(schema, max_attempts)?);
+        self.system_prompt
+            .push(STRUCTURED_OUTPUT_INSTRUCTION.to_string());
+        Ok(self)
     }
 
     #[must_use]
@@ -353,8 +450,10 @@ where
         let mut prompt_cache_events = Vec::new();
         let mut iterations = 0;
         let mut auto_compaction = None;
+        let mut structured_output = None;
+        let mut structured_output_attempts = 0_usize;
 
-        loop {
+        'conversation: loop {
             iterations += 1;
             if iterations > self.max_iterations {
                 let error = RuntimeError::new(
@@ -367,6 +466,10 @@ where
             let request = ApiRequest {
                 system_prompt: self.system_prompt.clone(),
                 messages: self.session.messages.clone(),
+                structured_output_schema: self
+                    .structured_output
+                    .as_ref()
+                    .map(|state| state.schema.clone()),
             };
             let events = match self.api_client.stream(request) {
                 Ok(events) => events,
@@ -415,10 +518,83 @@ where
             }
 
             if pending_tool_uses.is_empty() {
+                if let Some(state) = self.structured_output.as_ref() {
+                    structured_output_attempts = structured_output_attempts.saturating_add(1);
+                    if structured_output_attempts >= state.max_attempts {
+                        let error = RuntimeError::new(format!(
+                            "Failed to provide valid structured output after {} attempts",
+                            state.max_attempts
+                        ));
+                        self.record_turn_failed(iterations, &error);
+                        return Err(error);
+                    }
+                    self.session
+                        .push_user_text(
+                            "Your previous response did not call StructuredOutput. Call StructuredOutput exactly once with a value matching the requested JSON Schema.",
+                        )
+                        .map_err(|error| RuntimeError::new(error.to_string()))?;
+                    continue;
+                }
                 break;
             }
 
             for (tool_use_id, tool_name, input) in pending_tool_uses {
+                if tool_name == STRUCTURED_OUTPUT_TOOL_NAME {
+                    if let Some(state) = self.structured_output.as_ref() {
+                        structured_output_attempts = structured_output_attempts.saturating_add(1);
+                        self.record_tool_started(iterations, &tool_name);
+                        let validation = serde_json::from_str::<Value>(&input)
+                            .map_err(|error| format!("invalid tool input JSON: {error}"))
+                            .and_then(|value| state.validate(&value).map(|()| value));
+                        let (result_message, valid_output) = match validation {
+                            Ok(value) => {
+                                let output = serde_json::to_string_pretty(&serde_json::json!({
+                                    "data": "Structured output provided successfully",
+                                    "structured_output": value,
+                                }))
+                                .map_err(|error| RuntimeError::new(error.to_string()))?;
+                                (
+                                    ConversationMessage::tool_result(
+                                        tool_use_id,
+                                        tool_name,
+                                        output,
+                                        false,
+                                    ),
+                                    Some(value),
+                                )
+                            }
+                            Err(error) => (
+                                ConversationMessage::tool_result(
+                                    tool_use_id,
+                                    tool_name,
+                                    format!("Output does not match required schema: {error}"),
+                                    true,
+                                ),
+                                None,
+                            ),
+                        };
+                        self.session
+                            .push_message(result_message.clone())
+                            .map_err(|error| RuntimeError::new(error.to_string()))?;
+                        self.record_tool_finished(iterations, &result_message);
+                        tool_results.push(result_message);
+
+                        if let Some(value) = valid_output {
+                            structured_output = Some(value);
+                            break 'conversation;
+                        }
+                        if structured_output_attempts >= state.max_attempts {
+                            let error = RuntimeError::new(format!(
+                                "Failed to provide valid structured output after {} attempts",
+                                state.max_attempts
+                            ));
+                            self.record_turn_failed(iterations, &error);
+                            return Err(error);
+                        }
+                        continue;
+                    }
+                }
+
                 let pre_hook_result = self.run_pre_tool_use_hook(&tool_name, &input);
                 let effective_input = pre_hook_result
                     .updated_input()
@@ -523,6 +699,7 @@ where
         let summary = TurnSummary {
             assistant_messages,
             tool_results,
+            structured_output,
             prompt_cache_events,
             iterations,
             usage: self.usage_tracker.cumulative_usage(),
@@ -867,8 +1044,10 @@ mod tests {
     use crate::session::{ContentBlock, MessageRole, Session};
     use crate::usage::TokenUsage;
     use crate::ToolError;
+    use serde_json::json;
     use std::fs;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
     use telemetry::{MemoryTelemetrySink, SessionTracer, TelemetryEvent};
@@ -940,6 +1119,152 @@ mod tests {
             assert_eq!(request.tool_name, "add");
             PermissionPromptDecision::Allow
         }
+    }
+
+    #[test]
+    fn structured_output_retries_schema_mismatch_and_preserves_format_as_annotation() {
+        struct StructuredOutputApi {
+            calls: usize,
+        }
+
+        impl ApiClient for StructuredOutputApi {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                self.calls += 1;
+                let expected_schema = json!({
+                    "type": "object",
+                    "properties": {
+                        "email": {"type": "string", "format": "email"}
+                    },
+                    "required": ["email"],
+                    "additionalProperties": false
+                });
+                assert_eq!(
+                    request.structured_output_schema.as_ref(),
+                    Some(&expected_schema)
+                );
+                assert!(request.system_prompt.iter().any(|section| {
+                    section.contains("StructuredOutput") && section.contains("exactly once")
+                }));
+
+                match self.calls {
+                    1 => Ok(vec![
+                        AssistantEvent::ToolUse {
+                            id: "structured-invalid".to_string(),
+                            name: "StructuredOutput".to_string(),
+                            input: r#"{"email":42}"#.to_string(),
+                        },
+                        AssistantEvent::MessageStop,
+                    ]),
+                    2 => {
+                        let last_message = request.messages.last().expect("retry tool result");
+                        let ContentBlock::ToolResult {
+                            is_error, output, ..
+                        } = &last_message.blocks[0]
+                        else {
+                            panic!("expected structured output validation result")
+                        };
+                        assert!(*is_error);
+                        assert!(output.starts_with("Output does not match required schema:"));
+                        Ok(vec![
+                            AssistantEvent::ToolUse {
+                                id: "structured-valid".to_string(),
+                                name: "StructuredOutput".to_string(),
+                                // AJV is configured with validateFormats=false upstream. A
+                                // non-email string must therefore remain valid here too.
+                                input: r#"{"email":"not-an-email"}"#.to_string(),
+                            },
+                            AssistantEvent::MessageStop,
+                        ])
+                    }
+                    _ => unreachable!("extra structured output request"),
+                }
+            }
+        }
+
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "email": {"type": "string", "format": "email"}
+            },
+            "required": ["email"],
+            "additionalProperties": false
+        });
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            StructuredOutputApi { calls: 0 },
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_structured_output_schema(schema, 5)
+        .expect("schema should compile");
+
+        let summary = runtime
+            .run_turn("return an email object", None)
+            .expect("second structured output should validate");
+
+        assert_eq!(summary.iterations, 2);
+        assert_eq!(
+            summary.structured_output,
+            Some(json!({"email": "not-an-email"}))
+        );
+        assert_eq!(summary.tool_results.len(), 2);
+        let ContentBlock::ToolResult { is_error, .. } = &summary.tool_results[1].blocks[0] else {
+            panic!("expected successful structured output result")
+        };
+        assert!(!is_error);
+    }
+
+    #[test]
+    fn structured_output_stops_after_configured_attempt_cap() {
+        struct AlwaysInvalidStructuredOutputApi {
+            calls: Arc<AtomicUsize>,
+        }
+
+        impl ApiClient for AlwaysInvalidStructuredOutputApi {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+                assert!(request.structured_output_schema.is_some());
+                Ok(vec![
+                    AssistantEvent::ToolUse {
+                        id: format!("structured-invalid-{call}"),
+                        name: "StructuredOutput".to_string(),
+                        input: r#"{"name":42}"#.to_string(),
+                    },
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            AlwaysInvalidStructuredOutputApi {
+                calls: Arc::clone(&calls),
+            },
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_structured_output_schema(
+            json!({
+                "type": "object",
+                "properties": {"name": {"type": "string"}},
+                "required": ["name"]
+            }),
+            2,
+        )
+        .expect("schema should compile");
+
+        let error = runtime
+            .run_turn("return a name", None)
+            .expect_err("two invalid attempts should exhaust the cap");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            error.to_string(),
+            "Failed to provide valid structured output after 2 attempts"
+        );
     }
 
     #[test]
