@@ -1953,7 +1953,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             let topic = match rest[0].as_str() {
                 "status" => Some(LocalHelpTopic::Status),
                 "sandbox" => Some(LocalHelpTopic::Sandbox),
-                "doctor" => Some(LocalHelpTopic::Doctor),
+                "doctor" | "checkup" => Some(LocalHelpTopic::Doctor),
                 "acp" => Some(LocalHelpTopic::Acp),
                 "init" => Some(LocalHelpTopic::Init),
                 "setup" => Some(LocalHelpTopic::Setup),
@@ -2549,7 +2549,7 @@ fn parse_local_help_action(
     let topic = match rest[0].as_str() {
         "status" => LocalHelpTopic::Status,
         "sandbox" => LocalHelpTopic::Sandbox,
-        "doctor" => LocalHelpTopic::Doctor,
+        "doctor" | "checkup" => LocalHelpTopic::Doctor,
         "acp" => LocalHelpTopic::Acp,
         "init" => LocalHelpTopic::Init,
         "setup" => LocalHelpTopic::Setup,
@@ -2598,7 +2598,7 @@ fn parse_single_word_command_alias(
     let verb = &rest[0];
     let is_diagnostic = matches!(
         verb.as_str(),
-        "help" | "version" | "status" | "sandbox" | "doctor" | "setup" | "state"
+        "help" | "version" | "status" | "sandbox" | "doctor" | "checkup" | "setup" | "state"
     );
 
     if is_diagnostic && rest.len() > 1 {
@@ -2615,7 +2615,7 @@ fn parse_single_word_command_alias(
             let topic = match topic_name {
                 "status" => Some(LocalHelpTopic::Status),
                 "sandbox" => Some(LocalHelpTopic::Sandbox),
-                "doctor" => Some(LocalHelpTopic::Doctor),
+                "doctor" | "checkup" => Some(LocalHelpTopic::Doctor),
                 "acp" => Some(LocalHelpTopic::Acp),
                 "init" => Some(LocalHelpTopic::Init),
                 "setup" => Some(LocalHelpTopic::Setup),
@@ -2670,7 +2670,7 @@ fn parse_single_word_command_alias(
         let topic = match topic_name {
             "status" => Some(LocalHelpTopic::Status),
             "sandbox" => Some(LocalHelpTopic::Sandbox),
-            "doctor" => Some(LocalHelpTopic::Doctor),
+            "doctor" | "checkup" => Some(LocalHelpTopic::Doctor),
             "acp" => Some(LocalHelpTopic::Acp),
             "init" => Some(LocalHelpTopic::Init),
             "setup" => Some(LocalHelpTopic::Setup),
@@ -2711,7 +2711,7 @@ fn parse_single_word_command_alias(
     }
     // Known CLI subcommands that don't accept additional arguments
     const CLI_SUBCOMMANDS: &[&str] = &[
-        "help", "version", "status", "sandbox", "doctor", "state", "config", "diff",
+        "help", "version", "status", "sandbox", "doctor", "checkup", "state", "config", "diff",
     ];
     if rest.len() > 1 && !CLI_SUBCOMMANDS.contains(&rest[0].as_str()) {
         return None;
@@ -2730,7 +2730,7 @@ fn parse_single_word_command_alias(
             allowed_tools,
         })),
         "sandbox" => Some(Ok(CliAction::Sandbox { output_format })),
-        "doctor" => Some(Ok(CliAction::Doctor {
+        "doctor" | "checkup" => Some(Ok(CliAction::Doctor {
             output_format,
             permission_mode: permission_mode_override
                 .map(PermissionModeProvenance::from_flag)
@@ -3231,6 +3231,7 @@ fn suggest_similar_subcommand(input: &str) -> Option<Vec<String>> {
         "status",
         "sandbox",
         "doctor",
+        "checkup",
         "setup",
         "state",
         "dump-manifests",
@@ -3278,6 +3279,7 @@ fn is_known_top_level_subcommand(value: &str) -> bool {
             | "status"
             | "sandbox"
             | "doctor"
+            | "checkup"
             | "state"
             | "dump-manifests"
             | "bootstrap-plan"
@@ -17809,6 +17811,13 @@ mod tests {
             }
         );
         assert_eq!(
+            parse_args(&["checkup".to_string()]).expect("checkup should parse"),
+            CliAction::Doctor {
+                output_format: CliOutputFormat::Text,
+                permission_mode: PermissionModeProvenance::default_fallback(),
+            }
+        );
+        assert_eq!(
             parse_args(&["state".to_string()]).expect("state should parse"),
             CliAction::State {
                 output_format: CliOutputFormat::Text,
@@ -18458,6 +18467,14 @@ mod tests {
         assert_eq!(
             parse_args(&["doctor".to_string(), "--help".to_string()])
                 .expect("doctor help should parse"),
+            CliAction::HelpTopic {
+                topic: LocalHelpTopic::Doctor,
+                output_format: CliOutputFormat::Text,
+            }
+        );
+        assert_eq!(
+            parse_args(&["checkup".to_string(), "--help".to_string()])
+                .expect("checkup help should parse"),
             CliAction::HelpTopic {
                 topic: LocalHelpTopic::Doctor,
                 output_format: CliOutputFormat::Text,

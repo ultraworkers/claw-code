@@ -119,6 +119,7 @@ mod tests {
             lane_events: vec![],
             derived_state: "working".to_string(),
             current_blocker: None,
+            telemetry_attributes: std::collections::BTreeMap::new(),
             error: None,
         }
     }

@@ -1,6 +1,6 @@
 # Parity Status — claw-code Rust Port
 
-Last updated: 2026-04-03
+Last updated: 2026-07-13
 
 ## Summary
 
@@ -9,7 +9,7 @@ Last updated: 2026-04-03
 - Current `main` HEAD: `ee31e00` (stub implementations replaced with real AskUserQuestion + RemoteTrigger).
 - Repository stats at this checkpoint: **292 commits on `main` / 293 across all branches**, **9 crates**, **48,599 tracked Rust LOC**, **2,568 test LOC**, **3 authors**, date range **2026-03-31 → 2026-04-03**.
 - Mock parity harness stats: **12 scripted scenarios**, **21 captured `/v1/messages` requests** in `rust/crates/rusty-claude-cli/tests/mock_parity_harness.rs`.
-- Claude Code v2.1.201 migration branch note: `TaskCreate`/`TaskUpdate` accept the structured `subject`/`activeForm`/`metadata` contract, `McpAuth` exposes login/logout host-flow payloads, workflows add `/workflows`, `/deep-research`, `ultracode` keyword, and `/effort ultracode` entry points, and the remaining host-facing contracts (`Monitor`, `ScheduleWakeup`, `PushNotification`, `ReportFindings`, `ReadMcpResourceDir`, `Artifact`, `Projects`, `ClaudeDesign`, `ShowOnboardingRolePicker`) are registered with stable JSON responses.
+- Claude Code latest baseline is now v2.1.207. The migration adds `dynamicWorkflowSize`, workflow run/name telemetry metadata, real bounded Monitor polling, persistent ScheduleWakeup queue records, `/checkup`, MCP `request_timeout_ms`, reserved Claude Browser/Preview MCP names, safe `cd ... >/dev/null` classification, and `${user_config.*}` shell-interpolation rejection. See `docs/CLAUDE_CODE_2_1_207_MIGRATION.md` for the requirement-by-requirement status and remaining upstream gaps.
 
 ## Mock parity harness — milestone 1
 
@@ -147,12 +147,12 @@ Canonical scenario map: `rust/mock_parity_scenarios.json`
 
 ## Tool Surface
 
-- `mvp_tool_specs()` in `rust/crates/tools/src/lib.rs` exposes the core tool set plus Claude Code v2.1.201 compatibility contracts.
+- `mvp_tool_specs()` in `rust/crates/tools/src/lib.rs` exposes the core tool set plus Claude Code v2.1.207 migration contracts.
 - Core execution is present for `bash`, `read_file`, `write_file`, `edit_file`, `glob_search`, and `grep_search`.
 - Existing product tools in `mvp_tool_specs()` include `WebFetch`, `WebSearch`, `TodoWrite`, `Skill`, `Agent`, `ToolSearch`, `NotebookEdit`, `Sleep`, `SendUserMessage`, `Config`, `EnterPlanMode`, `ExitPlanMode`, `StructuredOutput`, `REPL`, and `PowerShell`.
 - Agent view now uses the Claude Code v2.1.201 background-session layout: `CLAUDE_CONFIG_DIR` or `~/.claude`, `jobs/<id>/state.json`, `jobs/<id>/tmp/`, `daemon/roster.json`, and `daemon.log`. `claw agents`, `claw agents --json [--all] [--cwd <path>]`, `claw --bg`, `claw --bg --exec`, `claw attach/logs/stop/kill/respawn/rm <id>`, and `claw daemon status/stop --any` are wired through `runtime::AgentSupervisor`; TTY `claw agents` opens a full-screen crossterm view with grouped rows, peek, dispatch, and lifecycle shortcuts.
 - The 9-lane push replaced pure fixed-payload stubs for `Task*`, `Team*`, `Cron*`, `LSP`, and MCP tools with registry-backed handlers on `main`; the v2.1.201 migration extends `TaskCreate`/`TaskUpdate` to the structured task-list payload shape.
-- The v2.1.201 host-facing contracts include `Workflow`, `Monitor`, `ScheduleWakeup`, `PushNotification`, `ReportFindings`, `ReadMcpResourceDir`, `Artifact`, `Projects`, `ClaudeDesign`, and `ShowOnboardingRolePicker`.
+- The migrated host-facing surfaces include `Workflow`, `Monitor`, `ScheduleWakeup`, `PushNotification`, `ReportFindings`, `ReadMcpResourceDir`, `Artifact`, `Projects`, `ClaudeDesign`, and `ShowOnboardingRolePicker`.
 - `Workflow` now resolves inline scripts, `scriptPath`, saved scripts under `.claude/workflows` and `.claw/workflows`, user-level workflow roots, and the bundled `deep-research` workflow. Static `agent(...)` calls spawn background agents and write run manifests; `/workflows`, `claw workflows`, `/deep-research`, `claw deep-research`, `ultracode` keyword trigger, and session-only `/effort ultracode` are wired through the CLI.
 - `Brief` is handled as an execution alias in `execute_tool()`, but it is not a separately exposed tool spec in `mvp_tool_specs()`.
 
@@ -160,7 +160,7 @@ Canonical scenario map: `rust/mock_parity_scenarios.json`
 
 - `AskUserQuestion` supports local stdin/stdout question flow, but it is not wired to an async host UI prompt surface.
 - `McpAuth` reports structured login/logout contract state and host-flow requirements, but it does not open a browser or complete OAuth by itself.
-- `Workflow` does not yet embed a full isolated JavaScript workflow VM. The current runner is a local parity layer for static `agent(...)` orchestration, saved workflow lookup, run registry, and disable switches; arbitrary `workflow`, `parallel`, `pipeline`, `Date`, and `Math.random` script behavior remains incomplete. `Monitor` still exposes only compatibility payloads and does not schedule live monitor loops.
+- `Workflow` does not yet embed a full isolated JavaScript workflow VM. The current runner is a local parity layer for static `agent(...)` orchestration, sized deep-research fan-out, saved workflow lookup, run registry, telemetry metadata, and disable switches; arbitrary `workflow`, `parallel`, `pipeline`, `Date`, and `Math.random` script behavior remains incomplete. `Monitor` performs synchronous bounded polling, while detached host-managed monitors remain open.
 - `RemoteTrigger` performs direct HTTP requests, but it has not been validated against every upstream host-trigger edge case.
 - Agent view has a local supervisor, official state files, shell lifecycle commands, raw `agents --json` arrays, background worker spawning, a basic full-screen TUI, queued peek replies into resumable prompt sessions without live workers, row pin/rename/reorder/collapse shortcuts, directory/state grouping, and terminal attach once workers record their managed session id. Remaining gaps are live in-process peek reply routing, generated row summaries/PR status, notification hooks for background completion/needs-input, `/bg` or left-arrow handoff from an already-running foreground session, and a real supervisor socket/pre-warmed worker pool.
 - `TestingPermission` remains test-only.

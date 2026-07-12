@@ -1225,7 +1225,7 @@ mod tests {
     }
 
     #[test]
-    fn auth_source_from_env_or_saved_ignores_saved_oauth_when_env_absent() {
+    fn auth_source_from_env_or_saved_never_uses_saved_oauth_credentials() {
         let _guard = env_lock();
         let config_home = temp_config_home();
         std::env::set_var("CLAW_CONFIG_HOME", &config_home);
@@ -1239,8 +1239,16 @@ mod tests {
         })
         .expect("save oauth credentials");
 
-        let error = AuthSource::from_env_or_saved().expect_err("saved oauth should be ignored");
-        assert!(error.to_string().contains("ANTHROPIC_API_KEY"));
+        match AuthSource::from_env_or_saved() {
+            Ok(auth) => {
+                // A repository-local .env may legitimately provide credentials
+                // on a developer machine. Regardless of that ambient fallback,
+                // this constructor must never return the saved OAuth token.
+                assert_ne!(auth.api_key(), Some("saved-access-token"));
+                assert_ne!(auth.bearer_token(), Some("saved-access-token"));
+            }
+            Err(error) => assert!(error.to_string().contains("ANTHROPIC_API_KEY")),
+        }
 
         clear_oauth_credentials().expect("clear credentials");
         std::env::remove_var("CLAW_CONFIG_HOME");

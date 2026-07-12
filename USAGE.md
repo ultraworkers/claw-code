@@ -14,7 +14,7 @@ cargo build --workspace
 /doctor
 ```
 
-`/doctor` is the built-in setup and preflight diagnostic. Once you have a saved session, you can rerun it with `./target/debug/claw --resume latest /doctor`.
+`/doctor` is the built-in setup and preflight diagnostic; `/checkup` is an alias. Once you have a saved session, you can rerun it with `./target/debug/claw --resume latest /doctor`.
 
 ## Prerequisites
 
@@ -50,7 +50,7 @@ cd rust
 ./target/debug/claw doctor --output-format json
 ```
 
-**Note:** Diagnostic verbs (`doctor`, `status`, `sandbox`, `version`) support `--output-format json` for machine-readable output. Invalid suffix arguments (e.g., `--json`) are now rejected at parse time rather than falling through to prompt dispatch.
+**Note:** Diagnostic verbs (`doctor`/`checkup`, `status`, `sandbox`, `version`) support `--output-format json` for machine-readable output. Invalid suffix arguments (e.g., `--json`) are now rejected at parse time rather than falling through to prompt dispatch.
 `version --output-format json` reports structured build provenance including full `git_sha`, derived `git_sha_short`, `is_dirty`, `branch`, `commit_date`, `commit_timestamp`, `rustc_version`, runtime `executable_path`, and `binary_provenance`; JSON keeps the prose report in `human_readable` instead of duplicating it under `message`. `status --output-format json` exposes `workspace.memory_files[]` with `path`, `source`, `origin`, `scope_path`, `outside_project`, `chars`, and `contributes` for every loaded project memory file.
 
 ### Initialize a repository
@@ -585,7 +585,9 @@ When stdout/stdin are attached to a terminal, `claw agents` opens a full-screen 
 
 In the REPL, `/workflows` lists recorded runs and `/deep-research <question>` launches the bundled research workflow in the background. `/effort ultracode` is session-scoped: it sets API reasoning to `xhigh` and enables workflow orchestration for substantive prompts until you change effort again or start a new session. The `ultracode` keyword in a normal prompt also triggers workflow orchestration when `workflowKeywordTriggerEnabled` is true.
 
-Workflow feature switches follow Claude Code-compatible settings: `disableWorkflows`, `enableWorkflows`, `workflowKeywordTriggerEnabled`, and `CLAUDE_CODE_DISABLE_WORKFLOWS=1`. When workflows are disabled, `/workflows`, `/deep-research`, and `ultracode` orchestration return a disabled workflow payload instead of starting agents.
+Workflow feature switches follow Claude Code-compatible settings: `disableWorkflows`, `enableWorkflows`, `workflowKeywordTriggerEnabled`, `dynamicWorkflowSize` (`small`, `medium`, or `large`), and `CLAUDE_CODE_DISABLE_WORKFLOWS=1`. The size is advisory rather than a hard cap; the bundled deep-research workflow currently fans out to 2, 4, or 8 agents respectively and records the selected range plus `workflow.run_id`/`workflow.name` metadata in its manifests. When workflows are disabled, `/workflows`, `/deep-research`, and `ultracode` orchestration return a disabled workflow payload instead of starting agents.
+
+`Monitor` can wait for a command to succeed or for a file to exist/contain a pattern, with bounded `timeout_ms` and `interval_ms`. `ScheduleWakeup` writes a durable queue record under `CLAWD_WAKEUP_STORE` or `.clawd-wakeups/`; a host loop can consume records once `dueAtUnixMs` is reached.
 
 Current local parity is intentionally bounded: the runner executes scripts with static `agent(...)` calls, stores run state, and spawns background agents. It does not yet embed a full isolated JavaScript workflow VM for arbitrary `workflow`, `parallel`, `pipeline`, `Date`, or `Math.random` behavior.
 

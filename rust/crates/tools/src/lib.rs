@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -27,10 +28,10 @@ use runtime::{
     worker_boot::{WorkerReadySnapshot, WorkerRegistry, WorkerTaskReceipt},
     write_file_in_workspace, ApiClient, ApiRequest, AssistantEvent, BashCommandInput,
     BashCommandOutput, BranchFreshness, ConfigLoader, ContentBlock, ConversationMessage,
-    ConversationRuntime, GrepSearchInput, LaneCommitProvenance, LaneEvent, LaneEventBlocker,
-    LaneEventName, LaneEventStatus, LaneFailureClass, McpDegradedReport, MessageRole,
-    PermissionMode, PermissionPolicy, PromptCacheEvent, ProviderFallbackConfig, RuntimeError,
-    Session, TaskPacket, ToolError, ToolExecutor,
+    ConversationRuntime, DynamicWorkflowSize, GrepSearchInput, LaneCommitProvenance, LaneEvent,
+    LaneEventBlocker, LaneEventName, LaneEventStatus, LaneFailureClass, McpDegradedReport,
+    MessageRole, PermissionMode, PermissionPolicy, PromptCacheEvent, ProviderFallbackConfig,
+    RuntimeError, Session, TaskPacket, ToolError, ToolExecutor,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -1277,7 +1278,8 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                     "command": { "type": "string" },
                     "path": { "type": "string" },
                     "pattern": { "type": "string" },
-                    "timeout_ms": { "type": "integer", "minimum": 1 }
+                    "timeout_ms": { "type": "integer", "minimum": 1 },
+                    "interval_ms": { "type": "integer", "minimum": 10 }
                 },
                 "additionalProperties": false
             }),
@@ -2370,7 +2372,7 @@ fn resolve_workflow_script(input: WorkflowInput) -> Result<ResolvedWorkflowScrip
     };
 
     if name == "deep-research" {
-        let script = builtin_deep_research_script(args.as_ref());
+        let script = builtin_deep_research_script(args.as_ref(), workflow_size_for_current_dir());
         return Ok(ResolvedWorkflowScript {
             name,
             description: Some(String::from(
@@ -2409,6 +2411,8 @@ where
     let script_path = persist_workflow_script_for_run(&store_dir, &run_id, &workflow)?;
     let manifest_file = store_dir.join(format!("{run_id}.json"));
     let calls = parse_workflow_agent_calls(&workflow.script);
+    let workflow_size = workflow_size_for_current_dir();
+    let (recommended_min, recommended_max) = workflow_size.recommended_agent_range();
 
     let mut agents = Vec::new();
     for (index, call) in calls.into_iter().enumerate() {
@@ -2419,7 +2423,7 @@ where
         let manifest = execute_agent_with_spawn(
             AgentInput {
                 description: description.clone(),
-                prompt: workflow_agent_prompt(&workflow, &call),
+                prompt: workflow_agent_prompt(&workflow, &call, workflow_size),
                 subagent_type: call
                     .agent_type
                     .or_else(|| Some(String::from("general-purpose"))),
@@ -2428,6 +2432,8 @@ where
                 effort: call.effort,
                 run_in_background: Some(true),
                 isolation: call.isolation,
+                workflow_run_id: Some(run_id.clone()),
+                workflow_name: Some(workflow.name.clone()),
             },
             spawn_fn,
         )?;
@@ -2458,6 +2464,13 @@ where
         )
     };
 
+    let telemetry_attributes = BTreeMap::from([
+        ("workflow.run_id".to_string(), Value::String(run_id.clone())),
+        (
+            "workflow.name".to_string(),
+            Value::String(workflow.name.clone()),
+        ),
+    ]);
     let run = WorkflowRunOutput {
         run_id,
         kind: String::from("workflow"),
@@ -2470,22 +2483,43 @@ where
         created_at,
         agents,
         args: workflow.args,
+        workflow_size: workflow_size.as_str().to_string(),
+        recommended_agent_range: [recommended_min, recommended_max],
+        telemetry_attributes,
         message,
     };
     write_workflow_run_manifest(&run)?;
     Ok(run)
 }
 
-fn workflow_agent_prompt(workflow: &ResolvedWorkflowScript, call: &WorkflowAgentCall) -> String {
+fn workflow_agent_prompt(
+    workflow: &ResolvedWorkflowScript,
+    call: &WorkflowAgentCall,
+    workflow_size: DynamicWorkflowSize,
+) -> String {
     let args = workflow
         .args
         .as_ref()
         .map(|value| format!("\n\nWorkflow args:\n{value}"))
         .unwrap_or_default();
     format!(
-        "You are a subagent spawned by workflow `{}`. Complete this workflow step and return a concise result.\n\n{}{}",
-        workflow.name, call.prompt, args
+        "You are a subagent spawned by workflow `{}`. Dynamic workflow size is `{}` (advisory agent range {}-{}). Complete this workflow step and return a concise result.\n\n{}{}",
+        workflow.name,
+        workflow_size.as_str(),
+        workflow_size.recommended_agent_range().0,
+        workflow_size.recommended_agent_range().1,
+        call.prompt,
+        args
     )
+}
+
+fn workflow_size_for_current_dir() -> DynamicWorkflowSize {
+    std::env::current_dir()
+        .ok()
+        .and_then(|cwd| ConfigLoader::default_for(cwd).load().ok())
+        .map_or(DynamicWorkflowSize::Medium, |config| {
+            config.workflows().dynamic_workflow_size()
+        })
 }
 
 fn resolve_workflow_script_path(raw: &str, cwd: &Path) -> Result<PathBuf, String> {
@@ -2661,13 +2695,64 @@ fn parse_workflow_meta_string(script: &str, key: &str) -> Option<String> {
     parse_workflow_option_string(script, key)
 }
 
-fn builtin_deep_research_script(args: Option<&Value>) -> String {
+fn builtin_deep_research_script(
+    args: Option<&Value>,
+    workflow_size: DynamicWorkflowSize,
+) -> String {
     let question =
         workflow_args_to_prompt(args).unwrap_or_else(|| String::from("the requested topic"));
     let question = escape_workflow_template_text(&question);
-    format!(
-        "export const meta = {{ name: 'deep-research', description: 'Deep research harness - fan out source discovery, verification, and synthesis.' }}\n\nconst report = await agent(`Research this question deeply using available search and fetch tools, cross-check claims, and return a cited report: {question}`, {{ label: 'deep-research', agentType: 'Explore', effort: 'high' }})\n\nreturn report\n"
-    )
+    let phase_count = match workflow_size {
+        DynamicWorkflowSize::Small => 2,
+        DynamicWorkflowSize::Medium => 4,
+        DynamicWorkflowSize::Large => 8,
+    };
+    let phases = [
+        (
+            "primary-sources",
+            "Find authoritative primary sources and extract concrete claims.",
+        ),
+        (
+            "independent-check",
+            "Independently research the question and challenge likely assumptions.",
+        ),
+        (
+            "implementation-evidence",
+            "Look for implementation details, changelogs, and behavioral evidence.",
+        ),
+        (
+            "verification",
+            "Cross-check the strongest claims and identify contradictions or uncertainty.",
+        ),
+        (
+            "edge-cases",
+            "Investigate edge cases, regressions, and platform-specific behavior.",
+        ),
+        (
+            "security",
+            "Assess security, permissions, trust boundaries, and unsafe defaults.",
+        ),
+        (
+            "performance",
+            "Assess performance, scalability, and resource-usage implications.",
+        ),
+        (
+            "synthesis-review",
+            "Review the accumulated evidence and propose a cited final synthesis.",
+        ),
+    ];
+    let mut script = String::from(
+        "export const meta = { name: 'deep-research', description: 'Deep research harness - fan out source discovery, verification, and synthesis.' }\n\n",
+    );
+    for (index, (label, instruction)) in phases.iter().take(phase_count).enumerate() {
+        script.push_str(&format!(
+            "const phase{index} = await agent(`{instruction} Question: {question}`, {{ label: '{label}', agentType: 'Explore', effort: 'high' }})\n"
+        ));
+    }
+    script.push_str(
+        "\nreturn { status: 'running', note: 'Agent results are collected by the workflow run manifest.' }\n",
+    );
+    script
 }
 
 fn workflow_args_to_prompt(args: Option<&Value>) -> Option<String> {
@@ -2938,28 +3023,240 @@ fn format_workflow_detail_report(value: &Value) -> String {
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_monitor(input: MonitorInput) -> Result<String, String> {
-    to_pretty_json(json!({
-        "status": "unsupported",
-        "kind": "monitor",
-        "message": "Monitor contract is registered for Claude Code v2.1.201 compatibility; live monitor execution is not available in this runtime.",
-        "command": input.command,
-        "path": input.path,
-        "pattern": input.pattern,
-        "timeout_ms": input.timeout_ms,
-    }))
+    if input.command.as_deref().is_none_or(str::is_empty)
+        && input.path.as_deref().is_none_or(str::is_empty)
+    {
+        return Err("Monitor requires command or path".to_string());
+    }
+
+    let timeout_ms = input.timeout_ms.unwrap_or(30_000).clamp(1, 600_000);
+    let interval_ms = input.interval_ms.unwrap_or(250).clamp(10, 5_000);
+    let started = Instant::now();
+    let mut attempts = 0_u64;
+    let mut last_output = String::new();
+    let mut last_error: Option<String> = None;
+
+    loop {
+        attempts += 1;
+
+        if let Some(path) = input.path.as_deref().filter(|path| !path.trim().is_empty()) {
+            match std::fs::read_to_string(path) {
+                Ok(contents) => {
+                    last_output = preview_text(&contents, 4_000);
+                    let matched = input
+                        .pattern
+                        .as_deref()
+                        .is_none_or(|pattern| contents.contains(pattern));
+                    if matched {
+                        return to_pretty_json(json!({
+                            "status": "matched",
+                            "kind": "monitor",
+                            "source": "path",
+                            "path": path,
+                            "pattern": input.pattern,
+                            "attempts": attempts,
+                            "elapsed_ms": started.elapsed().as_millis(),
+                            "output": last_output,
+                        }));
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    last_error = Some(format!("path not found: {path}"));
+                }
+                Err(error) => last_error = Some(error.to_string()),
+            }
+        }
+
+        if let Some(command) = input
+            .command
+            .as_deref()
+            .filter(|command| !command.trim().is_empty())
+        {
+            let elapsed_ms = started.elapsed().as_millis() as u64;
+            let remaining_ms = timeout_ms.saturating_sub(elapsed_ms).max(1);
+            match run_monitor_command(command, Duration::from_millis(remaining_ms)) {
+                Ok((success, output)) => {
+                    last_output = preview_text(&output, 4_000);
+                    let matched = success
+                        && input
+                            .pattern
+                            .as_deref()
+                            .is_none_or(|pattern| output.contains(pattern));
+                    if matched {
+                        return to_pretty_json(json!({
+                            "status": "matched",
+                            "kind": "monitor",
+                            "source": "command",
+                            "command": command,
+                            "pattern": input.pattern,
+                            "attempts": attempts,
+                            "elapsed_ms": started.elapsed().as_millis(),
+                            "output": last_output,
+                        }));
+                    }
+                    if !success {
+                        last_error = Some("monitor command exited unsuccessfully".to_string());
+                    }
+                }
+                Err(error) => last_error = Some(error),
+            }
+        }
+
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        if elapsed_ms >= timeout_ms {
+            return to_pretty_json(json!({
+                "status": "timeout",
+                "kind": "monitor",
+                "command": input.command,
+                "path": input.path,
+                "pattern": input.pattern,
+                "timeout_ms": timeout_ms,
+                "attempts": attempts,
+                "elapsed_ms": elapsed_ms,
+                "last_output": last_output,
+                "last_error": last_error,
+            }));
+        }
+        std::thread::sleep(Duration::from_millis(
+            interval_ms.min(timeout_ms.saturating_sub(elapsed_ms)),
+        ));
+    }
+}
+
+fn run_monitor_command(command: &str, timeout: Duration) -> Result<(bool, String), String> {
+    #[cfg(windows)]
+    let mut process = {
+        let mut process = Command::new("powershell");
+        process.args(["-NoProfile", "-Command", command]);
+        process
+    };
+    #[cfg(not(windows))]
+    let mut process = {
+        let mut process = Command::new("sh");
+        process.args(["-lc", command]);
+        process
+    };
+
+    process
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = process.spawn().map_err(|error| error.to_string())?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "monitor command stdout was not captured".to_string())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "monitor command stderr was not captured".to_string())?;
+    let stdout_reader = std::thread::spawn(move || read_monitor_stream(stdout));
+    let stderr_reader = std::thread::spawn(move || read_monitor_stream(stderr));
+    let started = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
+            break Some(status);
+        }
+        if started.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        std::thread::sleep(
+            Duration::from_millis(10).min(timeout.saturating_sub(started.elapsed())),
+        );
+    };
+
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| "monitor command stdout reader panicked".to_string())??;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| "monitor command stderr reader panicked".to_string())??;
+    let mut combined = String::from_utf8_lossy(&stdout).into_owned();
+    if !stderr.is_empty() {
+        if !combined.is_empty() && !combined.ends_with('\n') {
+            combined.push('\n');
+        }
+        combined.push_str(&String::from_utf8_lossy(&stderr));
+    }
+    let Some(status) = status else {
+        return Err(format!(
+            "monitor command exceeded timeout of {} ms",
+            timeout.as_millis()
+        ));
+    };
+    Ok((status.success(), combined))
+}
+
+fn read_monitor_stream(mut stream: impl Read) -> Result<Vec<u8>, String> {
+    let mut contents = Vec::new();
+    stream
+        .read_to_end(&mut contents)
+        .map_err(|error| error.to_string())?;
+    Ok(contents)
 }
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_schedule_wakeup(input: ScheduleWakeupInput) -> Result<String, String> {
+    if input.reason.trim().is_empty() || input.prompt.trim().is_empty() {
+        return Err("ScheduleWakeup requires non-empty reason and prompt".to_string());
+    }
     let clamped = input.delay_seconds.clamp(60, 3600);
-    to_pretty_json(json!({
-        "status": "scheduled_contract_only",
+    let wakeup_id = make_wakeup_id();
+    let store_dir = wakeup_store_dir()?;
+    std::fs::create_dir_all(&store_dir).map_err(|error| error.to_string())?;
+    let queue_file = store_dir.join(format!("{wakeup_id}.json"));
+    let now_ms = unix_timestamp_ms();
+    let due_at_ms = now_ms.saturating_add(clamped.saturating_mul(1_000));
+    let record = json!({
+        "id": wakeup_id,
+        "status": "scheduled",
         "kind": "schedule_wakeup",
         "delaySeconds": clamped,
         "reason": input.reason,
         "prompt": input.prompt,
-        "message": "ScheduleWakeup contract captured; this local runtime does not yet enqueue dynamic-loop wakeups."
-    }))
+        "createdAtUnixMs": now_ms,
+        "dueAtUnixMs": due_at_ms,
+        "queueFile": queue_file.display().to_string(),
+        "message": "Wakeup persisted to the local dynamic-loop queue."
+    });
+    std::fs::write(
+        &queue_file,
+        serde_json::to_vec_pretty(&record).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+    to_pretty_json(record)
+}
+
+fn wakeup_store_dir() -> Result<PathBuf, String> {
+    if let Ok(path) = std::env::var("CLAWD_WAKEUP_STORE") {
+        return Ok(PathBuf::from(path));
+    }
+    Ok(std::env::current_dir()
+        .map_err(|error| error.to_string())?
+        .join(".clawd-wakeups"))
+}
+
+fn make_wakeup_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    format!("wakeup-{nanos}-{}-{sequence}", std::process::id())
+}
+
+fn unix_timestamp_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -3257,6 +3554,20 @@ fn classify_bash_permission(command: &str) -> PermissionMode {
         "pwd", "echo", "printf",
     ];
 
+    // A leading `cd <workspace-path> &&` only changes the directory used by
+    // the command that follows. Classify the actual command while still
+    // rejecting absolute, variable-based, or otherwise unsafe cd targets.
+    let command = if let Some((prefix, remainder)) = command.split_once("&&") {
+        let prefix = prefix.trim();
+        if prefix.starts_with("cd ") && !has_dangerous_paths(prefix) {
+            remainder.trim()
+        } else {
+            command
+        }
+    } else {
+        command
+    };
+
     // Get the base command (first word before any args or pipes)
     let base_cmd = command.split_whitespace().next().unwrap_or("");
     let base_cmd = base_cmd.split('|').next().unwrap_or("").trim();
@@ -3301,6 +3612,10 @@ fn has_dangerous_paths(command: &str) -> bool {
             continue;
         }
 
+        let Some(token) = token_without_dev_null_redirection(token) else {
+            continue;
+        };
+
         if token.contains('$') {
             return true;
         }
@@ -3344,6 +3659,23 @@ fn has_dangerous_paths(command: &str) -> bool {
     }
 
     false
+}
+
+fn token_without_dev_null_redirection(token: &str) -> Option<&str> {
+    if token == "/dev/null" {
+        return None;
+    }
+    if !token.ends_with("/dev/null") {
+        return Some(token);
+    }
+
+    let redirect_index = token.find(['>', '<'])?;
+    let prefix = &token[..redirect_index];
+    if prefix.is_empty() || prefix.chars().all(|ch| ch.is_ascii_digit() || ch == '&') {
+        None
+    } else {
+        Some(prefix)
+    }
 }
 
 fn looks_like_windows_absolute_path(token: &str) -> bool {
@@ -3900,6 +4232,10 @@ struct AgentInput {
     effort: Option<String>,
     run_in_background: Option<bool>,
     isolation: Option<String>,
+    #[serde(skip)]
+    workflow_run_id: Option<String>,
+    #[serde(skip)]
+    workflow_name: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -4196,7 +4532,21 @@ struct WorkflowRunOutput {
     agents: Vec<WorkflowAgentRecord>,
     #[serde(skip_serializing_if = "Option::is_none")]
     args: Option<Value>,
+    #[serde(rename = "workflowSize", default = "default_workflow_size_label")]
+    workflow_size: String,
+    #[serde(rename = "recommendedAgentRange", default)]
+    recommended_agent_range: [usize; 2],
+    #[serde(
+        rename = "telemetryAttributes",
+        default,
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    telemetry_attributes: BTreeMap<String, Value>,
     message: String,
+}
+
+fn default_workflow_size_label() -> String {
+    DynamicWorkflowSize::Medium.as_str().to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -4219,6 +4569,7 @@ struct MonitorInput {
     path: Option<String>,
     pattern: Option<String>,
     timeout_ms: Option<u64>,
+    interval_ms: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -4442,6 +4793,12 @@ struct AgentOutput {
     current_blocker: Option<LaneEventBlocker>,
     #[serde(rename = "derivedState")]
     derived_state: String,
+    #[serde(
+        rename = "telemetryAttributes",
+        default,
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    telemetry_attributes: BTreeMap<String, Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
 }
@@ -5366,6 +5723,16 @@ where
     let created_at = iso8601_now();
     let system_prompt = build_agent_system_prompt(&normalized_subagent_type, &model)?;
     let allowed_tools = allowed_tools_for_subagent(&normalized_subagent_type);
+    let mut telemetry_attributes = BTreeMap::new();
+    if let Some(run_id) = input.workflow_run_id.as_ref() {
+        telemetry_attributes.insert("workflow.run_id".to_string(), Value::String(run_id.clone()));
+    }
+    if let Some(workflow_name) = input.workflow_name.as_ref() {
+        telemetry_attributes.insert(
+            "workflow.name".to_string(),
+            Value::String(workflow_name.clone()),
+        );
+    }
 
     let output_contents = format!(
         "# Agent Task
@@ -5402,6 +5769,7 @@ where
         lane_events: vec![LaneEvent::started(iso8601_now())],
         current_blocker: None,
         derived_state: String::from("working"),
+        telemetry_attributes,
         error: None,
     };
     write_agent_manifest(&manifest)?;
@@ -8104,9 +8472,10 @@ mod tests {
 
     use super::{
         agent_permission_policy, allowed_tools_for_subagent, build_agent_system_prompt,
-        classify_lane_failure, derive_agent_state, execute_agent_with_spawn, execute_tool,
-        extract_recovery_outcome, final_assistant_text, global_cron_registry, global_mcp_registry,
-        maybe_commit_provenance, mvp_tool_specs, permission_mode_from_plugin,
+        builtin_deep_research_script, classify_bash_permission, classify_lane_failure,
+        derive_agent_state, execute_agent_with_spawn, execute_tool, extract_recovery_outcome,
+        final_assistant_text, global_cron_registry, global_mcp_registry, maybe_commit_provenance,
+        mvp_tool_specs, parse_workflow_agent_calls, permission_mode_from_plugin,
         persist_agent_terminal_state, push_output_block, run_task_packet, run_workflow_with_spawn,
         AgentInput, AgentJob, GlobalToolRegistry, LaneEventName, LaneFailureClass,
         ProviderRuntimeClient, SubagentToolExecutor, WorkflowInput,
@@ -8116,7 +8485,8 @@ mod tests {
     use runtime::ProviderFallbackConfig;
     use runtime::{
         permission_enforcer::PermissionEnforcer, ApiRequest, AssistantEvent, ConversationRuntime,
-        PermissionMode, PermissionPolicy, RuntimeError, Session, TaskPacket, ToolExecutor,
+        DynamicWorkflowSize, PermissionMode, PermissionPolicy, RuntimeError, Session, TaskPacket,
+        ToolExecutor,
     };
     use serde_json::json;
 
@@ -8277,9 +8647,12 @@ mod tests {
     fn v201_host_contract_tools_return_stable_payloads() {
         let _guard = env_guard();
         let workflow_store = temp_path("workflow-contract-store");
+        let wakeup_store = temp_path("wakeup-contract-store");
         let original_workflow_store = std::env::var("CLAWD_WORKFLOW_STORE").ok();
+        let original_wakeup_store = std::env::var("CLAWD_WAKEUP_STORE").ok();
         let original_disable_workflows = std::env::var("CLAUDE_CODE_DISABLE_WORKFLOWS").ok();
         std::env::set_var("CLAWD_WORKFLOW_STORE", &workflow_store);
+        std::env::set_var("CLAWD_WAKEUP_STORE", &wakeup_store);
         std::env::remove_var("CLAUDE_CODE_DISABLE_WORKFLOWS");
 
         let workflow = execute_tool(
@@ -8300,15 +8673,18 @@ mod tests {
         assert!(script_path.exists());
         assert!(script_path.starts_with(&workflow_store));
 
+        let monitor_path = temp_path("monitor-finished.txt");
+        fs::write(&monitor_path, "build finished\n").expect("write monitor fixture");
         let monitor = execute_tool(
             "Monitor",
-            &json!({"command": "cargo test", "pattern": "finished", "timeout_ms": 250}),
+            &json!({"path": monitor_path, "pattern": "finished", "timeout_ms": 250}),
         )
-        .expect("Monitor contract should be registered");
+        .expect("Monitor should evaluate a live file condition");
         let monitor: serde_json::Value = serde_json::from_str(&monitor).expect("monitor json");
-        assert_eq!(monitor["status"], "unsupported");
+        assert_eq!(monitor["status"], "matched");
         assert_eq!(monitor["kind"], "monitor");
-        assert_eq!(monitor["timeout_ms"], 250);
+        assert_eq!(monitor["source"], "path");
+        let _ = fs::remove_file(monitor_path);
 
         let wakeup = execute_tool(
             "ScheduleWakeup",
@@ -8316,8 +8692,11 @@ mod tests {
         )
         .expect("ScheduleWakeup contract should be captured");
         let wakeup: serde_json::Value = serde_json::from_str(&wakeup).expect("wakeup json");
-        assert_eq!(wakeup["status"], "scheduled_contract_only");
+        assert_eq!(wakeup["status"], "scheduled");
         assert_eq!(wakeup["delaySeconds"], 60);
+        let queue_file = Path::new(wakeup["queueFile"].as_str().expect("queue file"));
+        assert!(queue_file.exists());
+        assert!(queue_file.starts_with(&wakeup_store));
 
         let notification = execute_tool(
             "PushNotification",
@@ -8384,11 +8763,16 @@ mod tests {
             Some(value) => std::env::set_var("CLAWD_WORKFLOW_STORE", value),
             None => std::env::remove_var("CLAWD_WORKFLOW_STORE"),
         }
+        match original_wakeup_store {
+            Some(value) => std::env::set_var("CLAWD_WAKEUP_STORE", value),
+            None => std::env::remove_var("CLAWD_WAKEUP_STORE"),
+        }
         match original_disable_workflows {
             Some(value) => std::env::set_var("CLAUDE_CODE_DISABLE_WORKFLOWS", value),
             None => std::env::remove_var("CLAUDE_CODE_DISABLE_WORKFLOWS"),
         }
         let _ = fs::remove_dir_all(workflow_store);
+        let _ = fs::remove_dir_all(wakeup_store);
     }
 
     #[test]
@@ -8399,11 +8783,15 @@ mod tests {
 
         let _guard = env_guard();
         let root = temp_path("workflow-static-agent");
+        let project = root.join("project");
         let workflow_store = root.join("workflows");
         let agent_store = root.join("agents");
+        fs::create_dir_all(&project).expect("project dir");
+        let original_cwd = std::env::current_dir().expect("current dir");
         let original_workflow_store = std::env::var("CLAWD_WORKFLOW_STORE").ok();
         let original_agent_store = std::env::var("CLAWD_AGENT_STORE").ok();
         let original_disable_workflows = std::env::var("CLAUDE_CODE_DISABLE_WORKFLOWS").ok();
+        std::env::set_current_dir(&project).expect("enter project dir");
         std::env::set_var("CLAWD_WORKFLOW_STORE", &workflow_store);
         std::env::set_var("CLAWD_AGENT_STORE", &agent_store);
         std::env::remove_var("CLAUDE_CODE_DISABLE_WORKFLOWS");
@@ -8426,9 +8814,32 @@ mod tests {
         assert_eq!(output["name"], "release-check");
         assert_eq!(output["description"], "Check release readiness");
         assert_eq!(output["source"], "inline");
+        assert_eq!(output["workflowSize"], "medium");
+        assert_eq!(output["recommendedAgentRange"], json!([4, 6]));
+        assert_eq!(
+            output["telemetryAttributes"]["workflow.name"],
+            "release-check"
+        );
         assert_eq!(output["agents"].as_array().expect("agents").len(), 1);
         assert_eq!(output["agents"][0]["description"], "research");
         assert_eq!(output["agents"][0]["status"], "running");
+        let agent_manifest_path = Path::new(
+            output["agents"][0]["manifestFile"]
+                .as_str()
+                .expect("agent manifest"),
+        );
+        let agent_manifest: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(agent_manifest_path).expect("read agent manifest"),
+        )
+        .expect("agent manifest json");
+        assert_eq!(
+            agent_manifest["telemetryAttributes"]["workflow.name"],
+            "release-check"
+        );
+        assert_eq!(
+            agent_manifest["telemetryAttributes"]["workflow.run_id"],
+            output["runId"]
+        );
         assert!(output["message"]
             .as_str()
             .expect("message")
@@ -8452,7 +8863,78 @@ mod tests {
             Some(value) => std::env::set_var("CLAUDE_CODE_DISABLE_WORKFLOWS", value),
             None => std::env::remove_var("CLAUDE_CODE_DISABLE_WORKFLOWS"),
         }
+        std::env::set_current_dir(original_cwd).expect("restore cwd");
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn dynamic_workflow_size_changes_builtin_deep_research_fanout() {
+        for (size, expected) in [
+            (DynamicWorkflowSize::Small, 2),
+            (DynamicWorkflowSize::Medium, 4),
+            (DynamicWorkflowSize::Large, 8),
+        ] {
+            let script = builtin_deep_research_script(Some(&json!("latest migration")), size);
+            assert_eq!(parse_workflow_agent_calls(&script).len(), expected);
+        }
+    }
+
+    #[test]
+    fn bash_permission_allows_safe_cd_with_dev_null_redirect() {
+        assert_eq!(
+            classify_bash_permission("cd src && ls -la >/dev/null"),
+            PermissionMode::WorkspaceWrite
+        );
+        assert_eq!(
+            classify_bash_permission("cd src && ls -la 2>/dev/null"),
+            PermissionMode::WorkspaceWrite
+        );
+        assert_eq!(
+            classify_bash_permission("cd src && rm -rf generated >/dev/null"),
+            PermissionMode::DangerFullAccess
+        );
+        assert_eq!(
+            classify_bash_permission("cd /tmp && ls >/dev/null"),
+            PermissionMode::DangerFullAccess
+        );
+        assert_eq!(
+            classify_bash_permission("cat /etc/passwd>/dev/null"),
+            PermissionMode::DangerFullAccess
+        );
+        assert_eq!(
+            classify_bash_permission("cat ../../outside>/dev/null"),
+            PermissionMode::DangerFullAccess
+        );
+    }
+
+    #[test]
+    fn monitor_command_respects_overall_timeout() {
+        let command = if cfg!(windows) {
+            "Start-Sleep -Seconds 5"
+        } else {
+            "sleep 5"
+        };
+        let started = std::time::Instant::now();
+        let output = execute_tool(
+            "Monitor",
+            &json!({"command": command, "timeout_ms": 100, "interval_ms": 10}),
+        )
+        .expect("Monitor timeout should return a structured result");
+        let output: serde_json::Value = serde_json::from_str(&output).expect("monitor json");
+        assert_eq!(output["status"], "timeout");
+        assert!(output["last_error"]
+            .as_str()
+            .expect("timeout error")
+            .contains("exceeded timeout"));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "monitor command exceeded its bounded deadline"
+        );
+    }
+
+    #[test]
+    fn wakeup_ids_are_unique_for_back_to_back_records() {
+        assert_ne!(super::make_wakeup_id(), super::make_wakeup_id());
     }
 
     #[test]

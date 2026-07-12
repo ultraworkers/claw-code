@@ -228,6 +228,22 @@ const TOP_LEVEL_FIELDS: &[FieldSpec] = &[
         name: "subagentModel",
         expected: FieldType::String,
     },
+    FieldSpec {
+        name: "enableWorkflows",
+        expected: FieldType::Bool,
+    },
+    FieldSpec {
+        name: "disableWorkflows",
+        expected: FieldType::Bool,
+    },
+    FieldSpec {
+        name: "workflowKeywordTriggerEnabled",
+        expected: FieldType::Bool,
+    },
+    FieldSpec {
+        name: "dynamicWorkflowSize",
+        expected: FieldType::String,
+    },
 ];
 
 const HOOKS_FIELDS: &[FieldSpec] = &[

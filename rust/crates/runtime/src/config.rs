@@ -172,11 +172,42 @@ pub struct RuntimeFeatureConfig {
 }
 
 /// Dynamic workflow feature switches from Claude Code-compatible settings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DynamicWorkflowSize {
+    Small,
+    #[default]
+    Medium,
+    Large,
+}
+
+impl DynamicWorkflowSize {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Small => "small",
+            Self::Medium => "medium",
+            Self::Large => "large",
+        }
+    }
+
+    /// Advisory range used by local workflow builders. Claude Code documents
+    /// this setting as guidance rather than a hard concurrency cap.
+    #[must_use]
+    pub const fn recommended_agent_range(self) -> (usize, usize) {
+        match self {
+            Self::Small => (1, 3),
+            Self::Medium => (4, 6),
+            Self::Large => (7, 12),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeWorkflowConfig {
     disable_workflows: bool,
     enable_workflows: Option<bool>,
     workflow_keyword_trigger_enabled: bool,
+    dynamic_workflow_size: DynamicWorkflowSize,
 }
 
 impl Default for RuntimeWorkflowConfig {
@@ -185,6 +216,7 @@ impl Default for RuntimeWorkflowConfig {
             disable_workflows: false,
             enable_workflows: None,
             workflow_keyword_trigger_enabled: true,
+            dynamic_workflow_size: DynamicWorkflowSize::Medium,
         }
     }
 }
@@ -1091,6 +1123,11 @@ impl RuntimeWorkflowConfig {
     }
 
     #[must_use]
+    pub const fn dynamic_workflow_size(&self) -> DynamicWorkflowSize {
+        self.dynamic_workflow_size
+    }
+
+    #[must_use]
     pub fn enabled(&self) -> bool {
         if env_flag_enabled("CLAUDE_CODE_DISABLE_WORKFLOWS") {
             return false;
@@ -1683,6 +1720,19 @@ fn merge_mcp_servers(
     target.total_configured += servers.len();
     for (name, value) in servers {
         let context = format!("{}: mcpServers.{name}", path.display());
+        if is_reserved_mcp_server_name(name) {
+            target.servers.remove(name);
+            target.invalid_servers.push(McpInvalidServerConfig {
+                name: name.clone(),
+                scope: source,
+                path: path.to_path_buf(),
+                error_field: "name".to_string(),
+                reason: format!(
+                    "{context}: reserved MCP server name; choose a name other than Claude Browser or Claude Preview"
+                ),
+            });
+            continue;
+        }
         let Ok(object) = expect_object(value, &context) else {
             let error = expect_object(value, &context).expect_err("object parse must fail");
             target.servers.remove(name);
@@ -1728,6 +1778,13 @@ fn merge_mcp_servers(
         );
     }
     Ok(())
+}
+
+fn is_reserved_mcp_server_name(name: &str) -> bool {
+    matches!(
+        name.trim().to_ascii_lowercase().as_str(),
+        "claude browser" | "claude preview"
+    )
 }
 
 fn mcp_invalid_server(
@@ -1795,6 +1852,8 @@ fn validate_mcp_server_keys(
             "args",
             "env",
             "toolCallTimeoutMs",
+            "requestTimeoutMs",
+            "request_timeout_ms",
             "required",
         ][..],
         "sse" | "http" => &[
@@ -1851,7 +1910,28 @@ fn parse_optional_workflow_config(root: &JsonValue) -> Result<RuntimeWorkflowCon
             "merged settings",
         )?
         .unwrap_or(true),
+        dynamic_workflow_size: parse_dynamic_workflow_size(optional_string(
+            object,
+            "dynamicWorkflowSize",
+            "merged settings",
+        )?)?,
     })
+}
+
+fn parse_dynamic_workflow_size(value: Option<&str>) -> Result<DynamicWorkflowSize, ConfigError> {
+    match value
+        .unwrap_or("medium")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "small" => Ok(DynamicWorkflowSize::Small),
+        "medium" => Ok(DynamicWorkflowSize::Medium),
+        "large" => Ok(DynamicWorkflowSize::Large),
+        other => Err(ConfigError::Parse(format!(
+            "merged settings.dynamicWorkflowSize: expected small, medium, or large; got {other}"
+        ))),
+    }
 }
 
 fn parse_optional_hooks_config(root: &JsonValue) -> Result<RuntimeHookConfig, ConfigError> {
@@ -1953,6 +2033,17 @@ fn parse_hook_event_partial(
                     kind: "invalid_hooks_config".to_string(),
                     error_field: "command".to_string(),
                     reason: format!("{context}: field {event}[{index}] must be a non-empty string"),
+                });
+            } else if contains_unsafe_user_config_expansion(command) {
+                config.push_invalid_hook(RuntimeInvalidHookConfig {
+                    event: event.to_string(),
+                    index: Some(index),
+                    hook_index: None,
+                    kind: "invalid_hooks_config".to_string(),
+                    error_field: "command".to_string(),
+                    reason: format!(
+                        "{context}: field {event}[{index}] must not interpolate ${{user_config.*}} in a shell command; use an exec-form args array or CLAUDE_PLUGIN_OPTION_* environment variable"
+                    ),
                 });
             } else {
                 push_command(config, RuntimeHookCommand::new(command.to_string()));
@@ -2057,12 +2148,29 @@ fn parse_hook_event_partial(
                 });
                 continue;
             };
+            if contains_unsafe_user_config_expansion(command) {
+                config.push_invalid_hook(RuntimeInvalidHookConfig {
+                    event: event.to_string(),
+                    index: Some(index),
+                    hook_index: Some(hook_index),
+                    kind: "invalid_hooks_config".to_string(),
+                    error_field: "command".to_string(),
+                    reason: format!(
+                        "{context}: field {event}[{index}].hooks[{hook_index}].command must not interpolate ${{user_config.*}} in a shell command; use an exec-form args array or CLAUDE_PLUGIN_OPTION_* environment variable"
+                    ),
+                });
+                continue;
+            }
             push_command(
                 config,
                 RuntimeHookCommand::with_matcher(command.to_string(), matcher.clone()),
             );
         }
     }
+}
+
+fn contains_unsafe_user_config_expansion(command: &str) -> bool {
+    command.contains("${user_config.")
 }
 
 fn runtime_invalid_hook(
@@ -2404,7 +2512,7 @@ fn parse_mcp_server_config(
                 .map(|a| expand_config_value(a))
                 .collect(),
             env: optional_string_map(object, "env", context)?.unwrap_or_default(),
-            tool_call_timeout_ms: optional_u64(object, "toolCallTimeoutMs", context)?,
+            tool_call_timeout_ms: parse_mcp_request_timeout_ms(object, context)?,
         })),
         "sse" => Ok(McpServerConfig::Sse(parse_mcp_remote_server_config(
             object, context,
@@ -2416,7 +2524,7 @@ fn parse_mcp_server_config(
             // #92: expand ${VAR} and ~/ in URL
             url: expand_config_value(expect_string(object, "url", context)?),
             headers: optional_string_map(object, "headers", context)?.unwrap_or_default(),
-            headers_helper: optional_string(object, "headersHelper", context)?.map(str::to_string),
+            headers_helper: parse_safe_headers_helper(object, context)?,
         })),
         "sdk" => Ok(McpServerConfig::Sdk(McpSdkServerConfig {
             name: expect_string(object, "name", context)?.to_string(),
@@ -2430,6 +2538,22 @@ fn parse_mcp_server_config(
             "{context}: unsupported MCP server type for {server_name}: {other}"
         ))),
     }
+}
+
+fn parse_mcp_request_timeout_ms(
+    object: &BTreeMap<String, JsonValue>,
+    context: &str,
+) -> Result<Option<u64>, ConfigError> {
+    for key in [
+        "request_timeout_ms",
+        "requestTimeoutMs",
+        "toolCallTimeoutMs",
+    ] {
+        if object.contains_key(key) {
+            return optional_u64(object, key, context);
+        }
+    }
+    Ok(None)
 }
 
 fn infer_mcp_server_type(object: &BTreeMap<String, JsonValue>) -> &'static str {
@@ -2448,9 +2572,25 @@ fn parse_mcp_remote_server_config(
         // #92: expand ${VAR} and ~/ in URL
         url: expand_config_value(expect_string(object, "url", context)?),
         headers: optional_string_map(object, "headers", context)?.unwrap_or_default(),
-        headers_helper: optional_string(object, "headersHelper", context)?.map(str::to_string),
+        headers_helper: parse_safe_headers_helper(object, context)?,
         oauth: parse_optional_mcp_oauth_config(object, context)?,
     })
+}
+
+fn parse_safe_headers_helper(
+    object: &BTreeMap<String, JsonValue>,
+    context: &str,
+) -> Result<Option<String>, ConfigError> {
+    let helper = optional_string(object, "headersHelper", context)?.map(str::to_string);
+    if helper
+        .as_deref()
+        .is_some_and(contains_unsafe_user_config_expansion)
+    {
+        return Err(ConfigError::Parse(format!(
+            "{context}: headersHelper must not interpolate ${{user_config.*}} in a shell command; read plugin options from the helper process environment instead"
+        )));
+    }
+    Ok(helper)
 }
 
 fn parse_optional_mcp_oauth_config(
@@ -2724,8 +2864,9 @@ fn deep_merge_objects(
 mod tests {
     use super::{
         deep_merge_objects, parse_permission_mode_label, ConfigFileStatus, ConfigLoader,
-        ConfigSource, McpServerConfig, McpTransport, ResolvedPermissionMode, RuntimeFeatureConfig,
-        RuntimeHookCommand, RuntimeHookConfig, RuntimePluginConfig, CLAW_SETTINGS_SCHEMA_NAME,
+        ConfigSource, DynamicWorkflowSize, McpServerConfig, McpTransport, ResolvedPermissionMode,
+        RuntimeFeatureConfig, RuntimeHookCommand, RuntimeHookConfig, RuntimePluginConfig,
+        CLAW_SETTINGS_SCHEMA_NAME,
     };
     use crate::json::JsonValue;
     use crate::sandbox::FilesystemIsolationMode;
@@ -3276,6 +3417,7 @@ mod tests {
                   "command": "uvx",
                   "args": ["mcp-server"],
                   "env": {"TOKEN": "secret"},
+                  "request_timeout_ms": 12345,
                   "required": true
                 },
                 "remote-server": {
@@ -3327,6 +3469,12 @@ mod tests {
         assert_eq!(stdio_server.scope, ConfigSource::User);
         assert!(stdio_server.required);
         assert_eq!(stdio_server.transport(), McpTransport::Stdio);
+        match &stdio_server.config {
+            McpServerConfig::Stdio(config) => {
+                assert_eq!(config.tool_call_timeout_ms, Some(12_345));
+            }
+            other => panic!("expected stdio config, got {other:?}"),
+        }
 
         let remote_server = loaded
             .mcp()
@@ -3575,6 +3723,50 @@ mod tests {
     }
 
     #[test]
+    fn rejects_reserved_mcp_names_and_unsafe_headers_helpers() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&cwd).expect("project dir");
+        fs::write(
+            home.join("settings.json"),
+            r#"{
+              "mcpServers": {
+                "Claude Browser": {"command": "/bin/echo"},
+                "claude preview": {"command": "/bin/echo"},
+                "unsafe-helper": {
+                  "type": "http",
+                  "url": "https://example.test/mcp",
+                  "headersHelper": "printf '${user_config.token}'"
+                },
+                "safe": {"command": "/bin/echo", "requestTimeoutMs": 2222}
+              }
+            }"#,
+        )
+        .expect("write settings");
+
+        let loaded = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("invalid MCP entries should be isolated");
+
+        assert_eq!(loaded.mcp().valid_count(), 1);
+        assert_eq!(loaded.mcp().invalid_count(), 3);
+        assert!(loaded.mcp().get("safe").is_some());
+        let reasons = loaded
+            .mcp()
+            .invalid_servers()
+            .iter()
+            .map(|server| server.reason.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(reasons.contains("reserved MCP server name"));
+        assert!(reasons.contains("must not interpolate ${user_config.*}"));
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
     fn parses_user_defined_model_aliases_from_settings() {
         // given
         let root = temp_dir();
@@ -3713,6 +3905,32 @@ mod tests {
         assert!(loaded.hooks().invalid_hooks()[0]
             .reason
             .contains("must be a string or hook object"));
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn rejects_user_config_interpolation_in_shell_hooks() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&cwd).expect("project dir");
+        fs::write(
+            home.join("settings.json"),
+            r#"{"hooks":{"PreToolUse":["printf '${user_config.token}'","printf safe"]}}"#,
+        )
+        .expect("write settings");
+
+        let loaded = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("unsafe hook should be recorded instead of executed");
+
+        assert_eq!(loaded.hooks().pre_tool_use(), &["printf safe".to_string()]);
+        assert_eq!(loaded.hooks().invalid_count(), 1);
+        assert!(loaded.hooks().invalid_hooks()[0]
+            .reason
+            .contains("CLAUDE_PLUGIN_OPTION_*"));
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
@@ -4059,7 +4277,7 @@ mod tests {
         fs::create_dir_all(&cwd).expect("project dir");
         fs::write(
             home.join("settings.json"),
-            r#"{"enableWorkflows": true, "workflowKeywordTriggerEnabled": false}"#,
+            r#"{"enableWorkflows": true, "workflowKeywordTriggerEnabled": false, "dynamicWorkflowSize": "large"}"#,
         )
         .expect("write settings");
 
@@ -4070,6 +4288,17 @@ mod tests {
         assert!(loaded.workflows_enabled());
         assert!(!loaded.workflow_keyword_trigger_enabled());
         assert_eq!(loaded.workflows().enable_workflows(), Some(true));
+        assert_eq!(
+            loaded.workflows().dynamic_workflow_size(),
+            DynamicWorkflowSize::Large
+        );
+        assert_eq!(
+            loaded
+                .workflows()
+                .dynamic_workflow_size()
+                .recommended_agent_range(),
+            (7, 12)
+        );
 
         std::env::set_var("CLAUDE_CODE_DISABLE_WORKFLOWS", "1");
         assert!(!loaded.workflows_enabled());

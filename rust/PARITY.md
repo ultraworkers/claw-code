@@ -1,6 +1,6 @@
 # Parity Status — claw-code Rust Port
 
-Last updated: 2026-04-03
+Last updated: 2026-07-13
 
 ## Mock parity harness — milestone 1
 
@@ -42,7 +42,7 @@ Hashes below come from `git log --oneline`. Merge line counts come from `git sho
 | LSP client | ✅ complete | `2d66503` | `d7f0dc6` | `461 insertions, 9 deletions` |
 | Permission enforcement | ✅ complete | `66283f4` | `336f820` | `357 insertions` |
 
-## Tool Surface (spec parity plus v2.1.201 host contracts)
+## Tool Surface (spec parity plus Claude Code v2.1.207 migration contracts)
 
 ### Real Implementations (behavioral parity — varying depth)
 
@@ -86,8 +86,9 @@ Hashes below come from `git log --oneline`. Merge line counts come from `git sho
 | **StructuredOutput** | `tools` | passthrough JSON — **good parity** |
 | **REPL** | `tools` | subprocess code execution — **moderate parity** |
 | **PowerShell** | `tools` | Windows PowerShell execution — **moderate parity** |
-| **Workflow / Monitor** | `tools` | Workflow supports saved/inline/scriptPath lookup, bundled `deep-research`, static `agent(...)` orchestration, run manifests, `/workflows`, `ultracode` keyword, and `/effort ultracode`; full JS VM and live Monitor scheduling are not implemented |
-| **ScheduleWakeup / PushNotification / ReportFindings / Artifact / Projects / ClaudeDesign / ShowOnboardingRolePicker** | `tools` | host-facing v2.1.201 contract payloads — **contract parity** |
+| **Workflow / Monitor** | `tools` | Workflow supports saved/inline/scriptPath lookup, `dynamicWorkflowSize`, sized bundled `deep-research` fan-out, workflow telemetry metadata, static `agent(...)` orchestration, run manifests, `/workflows`, `ultracode`, and `/effort ultracode`; Monitor now performs bounded command/file polling. A full isolated JS VM remains open |
+| **ScheduleWakeup** | `tools` | persists durable wakeup queue records with due timestamps — **moderate parity**; a long-lived dispatcher is still open |
+| **PushNotification / ReportFindings / Artifact / Projects / ClaudeDesign / ShowOnboardingRolePicker** | `tools` | host-facing compatibility payloads — **contract parity** |
 
 ### Stubs Only (surface parity, no behavior)
 

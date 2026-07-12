@@ -267,7 +267,7 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
     },
     SlashCommandSpec {
         name: "doctor",
-        aliases: &[],
+        aliases: &["checkup"],
         summary: "Diagnose setup issues and environment health",
         argument_hint: None,
         resume_supported: true,
@@ -1451,7 +1451,7 @@ pub fn validate_slash_command_input(
                 None => "dataviz".to_string(),
             }),
         },
-        "doctor" | "providers" => {
+        "doctor" | "checkup" | "providers" => {
             validate_no_args(command, &args)?;
             SlashCommand::Doctor
         }
@@ -6177,6 +6177,10 @@ mod tests {
         assert_eq!(
             SlashCommand::parse("/version"),
             Ok(Some(SlashCommand::Version))
+        );
+        assert_eq!(
+            SlashCommand::parse("/checkup"),
+            Ok(Some(SlashCommand::Doctor))
         );
         assert_eq!(
             SlashCommand::parse("/export notes.txt"),
