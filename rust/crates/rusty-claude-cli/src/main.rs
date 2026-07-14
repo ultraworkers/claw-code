@@ -7908,6 +7908,9 @@ impl LiveCli {
                         match new_runtime.run_turn(input, Some(&mut rp)) {
                             Ok(summary) => {
                                 self.replace_runtime(new_runtime)?;
+                                if !final_assistant_text(&summary).is_empty() {
+                                    println!();
+                                }
                                 spinner.finish(
                                     if round == 0 {
                                         "✨ Done (after auto-compact)"
