@@ -2,7 +2,7 @@
 
 <p align="center">
   <a href="https://github.com/code-yeongyu/lazycodex">
-    <img src="https://img.shields.io/badge/LazyCodex-codex%20for%20no--brainers-111111?style=for-the-badge&logo=github&logoColor=white" alt="LazyCodex banner" />
+    <img src="https://img.shields.io/badge/LazyCodex-codex%20for%20no--brainrs-111111?style=for-the-badge&logo=github&logoColor=white" alt="LazyCodex banner" />
   </a>
   <a href="https://github.com/Yeachan-Heo/gajae-code">
     <img src="https://img.shields.io/badge/Gajae--Code-red--claw%20agent%20harness-B22222?style=for-the-badge&logo=github&logoColor=white" alt="Gajae-Code banner" />
