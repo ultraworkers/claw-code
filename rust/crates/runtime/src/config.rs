@@ -3961,4 +3961,79 @@ mod tests {
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
+
+    #[test]
+    fn subagent_model_reads_camel_case_config_key() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&cwd).expect("project dir");
+        fs::write(
+            home.join("settings.json"),
+            "{\n  \"subagentModel\": \"custom/openclaw\"\n}\n",
+        )
+        .expect("write settings");
+
+        let config = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("config should load");
+        assert_eq!(
+            config.subagent_model(),
+            Some("custom/openclaw"),
+            "subagentModel camelCase key should be read end-to-end"
+        );
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn subagent_model_reads_snake_case_config_key() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&cwd).expect("project dir");
+        fs::write(
+            home.join("settings.json"),
+            "{\n  \"subagent_model\": \"qwen3.6-35b-fast\"\n}\n",
+        )
+        .expect("write settings");
+
+        let config = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("config should load");
+        assert_eq!(
+            config.subagent_model(),
+            Some("qwen3.6-35b-fast"),
+            "subagent_model snake_case key should be read end-to-end"
+        );
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn subagent_model_blank_value_returns_none() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&cwd).expect("project dir");
+        fs::write(
+            home.join("settings.json"),
+            "{\n  \"subagentModel\": \"  \"\n}\n",
+        )
+        .expect("write settings");
+
+        let config = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("config should load");
+        assert_eq!(
+            config.subagent_model(),
+            None,
+            "blank subagentModel should fall back to None"
+        );
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
 }
