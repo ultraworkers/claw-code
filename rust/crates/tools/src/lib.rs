@@ -2797,9 +2797,6 @@ fn claim_task(task_id: &str, agent_id: &str, team_id: &str) -> Result<bool, Stri
     let dir = claims_dir();
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let lock_path = dir.join(format!("{task_id}.lock"));
-    if lock_path.exists() {
-        return Ok(false);
-    }
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -2810,20 +2807,22 @@ fn claim_task(task_id: &str, agent_id: &str, team_id: &str) -> Result<bool, Stri
         "team_id": team_id,
         "claimed_at": ts,
     });
-    // Atomic claim: write to temp file then rename
-    let tmp_path = dir.join(format!("{task_id}.lock.tmp.{agent_id}"));
-    std::fs::write(
-        &tmp_path,
-        serde_json::to_string_pretty(&entry).map_err(|e| e.to_string())?,
-    )
-    .map_err(|e| e.to_string())?;
-    match std::fs::rename(&tmp_path, &lock_path) {
-        Ok(()) => Ok(true),
-        Err(_) => {
-            // Another agent claimed it first
-            let _ = std::fs::remove_file(&tmp_path);
-            Ok(false)
+    // Atomic claim: create_new fails atomically if the file already exists,
+    // eliminating the TOCTOU race between exists() and write().
+    let content = serde_json::to_string_pretty(&entry).map_err(|e| e.to_string())?;
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&lock_path)
+    {
+        Ok(mut file) => {
+            use std::io::Write;
+            file.write_all(content.as_bytes())
+                .map_err(|e| e.to_string())?;
+            Ok(true)
         }
+        Err(ref e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(e) => Err(e.to_string()),
     }
 }
 
@@ -12316,9 +12315,12 @@ printf 'pwsh:%s' "$1"
         .expect("chain with primary override should construct");
 
         // then
-        assert_eq!(client.chain.len(), 2);
-        assert_eq!(client.chain[0].model, "grok-3");
-        assert_eq!(client.chain[1].model, "claude-sonnet-4-6");
+        // The caller's model is now the primary; fallbacks are appended
+        // as recovery entries, deduped.
+        assert_eq!(client.chain.len(), 3);
+        assert_eq!(client.chain[0].model, "claude-haiku-4-5-20251213");
+        assert_eq!(client.chain[1].model, "grok-3");
+        assert_eq!(client.chain[2].model, "claude-sonnet-4-6");
 
         match original_anthropic {
             Some(value) => std::env::set_var("ANTHROPIC_API_KEY", value),
