@@ -597,7 +597,8 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                 "type": "object",
                 "properties": {
                     "url": { "type": "string", "format": "uri" },
-                    "prompt": { "type": "string" }
+                    "prompt": { "type": "string" },
+                    "timeout_ms": { "type": "integer", "minimum": 1 }
                 },
                 "required": ["url", "prompt"],
                 "additionalProperties": false
@@ -2792,6 +2793,7 @@ struct GlobSearchInputValue {
 struct WebFetchInput {
     url: String,
     prompt: String,
+    timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3354,12 +3356,16 @@ struct SearchHit {
 
 fn execute_web_fetch(input: &WebFetchInput) -> Result<WebFetchOutput, String> {
     let started = Instant::now();
-    let client = build_http_client()?;
+    let timeout_ms = input.timeout_ms.unwrap_or(DEFAULT_HTTP_TIMEOUT_MS);
+    let client = build_http_client_with_timeout(Some(Duration::from_millis(timeout_ms)))?;
     let request_url = normalize_fetch_url(&input.url)?;
-    let response = client
-        .get(request_url.clone())
-        .send()
-        .map_err(|error| error.to_string())?;
+    let response = client.get(request_url.clone()).send().map_err(|error| {
+        if error.is_timeout() {
+            format!("web fetch request timed out after {timeout_ms} ms")
+        } else {
+            error.to_string()
+        }
+    })?;
 
     let status = response.status();
     let final_url = response.url().to_string();
@@ -3441,8 +3447,14 @@ fn execute_web_search(input: &WebSearchInput) -> Result<WebSearchOutput, String>
 }
 
 fn build_http_client() -> Result<Client, String> {
+    build_http_client_with_timeout(None)
+}
+const DEFAULT_HTTP_TIMEOUT_MS: u64 = 20_000;
+
+fn build_http_client_with_timeout(timeout: Option<Duration>) -> Result<Client, String> {
+    let timeout = timeout.unwrap_or(Duration::from_millis(DEFAULT_HTTP_TIMEOUT_MS));
     Client::builder()
-        .timeout(Duration::from_secs(20))
+        .timeout(timeout)
         .redirect(reqwest::redirect::Policy::limited(10))
         .user_agent("clawd-rust-tools/0.1")
         .build()
@@ -7894,6 +7906,32 @@ mod tests {
         assert!(error.contains("relative URL without a base") || error.contains("invalid"));
     }
 
+    #[test]
+    fn web_fetch_respects_timeout_ms() {
+        let server = TestServer::spawn(Arc::new(|request_line: &str| {
+            assert!(request_line.starts_with("GET /slow "));
+            thread::sleep(Duration::from_millis(75));
+            HttpResponse::text(200, "OK", "slow response")
+        }));
+
+        let error = execute_tool(
+            "WebFetch",
+            &json!({
+                "url": format!("http://{}/slow", server.addr()),
+                "prompt": "Summarize",
+                "timeout_ms": 10
+            }),
+        )
+        .expect_err("WebFetch should time out");
+
+        let lower = error.to_ascii_lowercase();
+        assert!(
+            lower.contains("timed out")
+                || lower.contains("deadline has elapsed")
+                || lower.contains("timeout"),
+            "unexpected timeout error: {error}"
+        );
+    }
     #[test]
     fn web_search_extracts_and_filters_results() {
         // Serialize env-var mutation so this test cannot race with the sibling
