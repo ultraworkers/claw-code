@@ -270,6 +270,16 @@ pub fn metadata_for_model(model: &str) -> Option<ProviderMetadata> {
             default_base_url: openai_compat::DEFAULT_OPENAI_BASE_URL,
         });
     }
+    // Groq compound systems and Groq-namespaced model ids are served through
+    // the OpenAI-compatible transport selected by OPENAI_BASE_URL.
+    if canonical.starts_with("groq/") {
+        return Some(ProviderMetadata {
+            provider: ProviderKind::OpenAi,
+            auth_env: "OPENAI_API_KEY",
+            base_url_env: "OPENAI_BASE_URL",
+            default_base_url: openai_compat::DEFAULT_OPENAI_BASE_URL,
+        });
+    }
     // Alibaba DashScope compatible-mode endpoint. Routes qwen/* and bare
     // qwen-* model names (qwen-max, qwen-plus, qwen-turbo, qwen-qwq, etc.)
     // to the OpenAI-compat client pointed at DashScope's /compatible-mode/v1.
@@ -666,11 +676,26 @@ pub fn model_token_limit(model: &str) -> Option<ModelTokenLimit> {
             max_output_tokens: 16_384,
             context_window_tokens: 256_000,
         }),
+        // Groq Llama 4 models accept tool calling but cap completions below
+        // Claw's 64k fallback heuristic. Encode the provider limit so prompts
+        // fit inside Groq's request validation and TPM budget.
+        "llama-4-scout-17b-16e-instruct" => Some(ModelTokenLimit {
+            max_output_tokens: 8_192,
+            context_window_tokens: 131_072,
+        }),
         "qwen-max" => Some(ModelTokenLimit {
             max_output_tokens: 8_192,
             context_window_tokens: 131_072,
         }),
         "qwen-plus" => Some(ModelTokenLimit {
+            max_output_tokens: 8_192,
+            context_window_tokens: 131_072,
+        }),
+        // Groq compound systems are exposed through an OpenAI-compatible API
+        // but cap completions at 8,192 output tokens. Without this metadata
+        // Claw uses its 64k fallback heuristic and the provider rejects the
+        // request before generation starts.
+        "compound" | "compound-mini" => Some(ModelTokenLimit {
             max_output_tokens: 8_192,
             context_window_tokens: 131_072,
         }),
@@ -1081,6 +1106,18 @@ mod tests {
     }
 
     #[test]
+    fn groq_prefix_routes_to_openai_not_anthropic() {
+        let meta = super::metadata_for_model("groq/compound")
+            .expect("groq/ prefix must resolve to OpenAI-compatible metadata");
+        assert_eq!(meta.provider, ProviderKind::OpenAi);
+        assert_eq!(meta.auth_env, "OPENAI_API_KEY");
+        assert_eq!(meta.base_url_env, "OPENAI_BASE_URL");
+
+        let kind = detect_provider_kind("groq/compound");
+        assert_eq!(kind, ProviderKind::OpenAi);
+    }
+
+    #[test]
     fn qwen_prefix_routes_to_dashscope_not_anthropic() {
         // User request from Discord #clawcode-get-help: web3g wants to use
         // Qwen 3.6 Plus via native Alibaba DashScope API (not OpenRouter,
@@ -1377,6 +1414,27 @@ mod tests {
             alias_limit.context_window_tokens,
             direct_limit.context_window_tokens
         );
+    }
+
+    #[test]
+    fn returns_context_window_metadata_for_groq_compound_models() {
+        let compound =
+            model_token_limit("groq/compound").expect("groq/compound should have token limits");
+        assert_eq!(compound.max_output_tokens, 8_192);
+        assert_eq!(compound.context_window_tokens, 131_072);
+
+        let compound_mini = model_token_limit("groq/compound-mini")
+            .expect("groq/compound-mini should have token limits");
+        assert_eq!(compound_mini.max_output_tokens, 8_192);
+        assert_eq!(compound_mini.context_window_tokens, 131_072);
+    }
+
+    #[test]
+    fn returns_context_window_metadata_for_groq_llama4_scout() {
+        let scout = model_token_limit("groq/meta-llama/llama-4-scout-17b-16e-instruct")
+            .expect("groq llama 4 scout should have token limits");
+        assert_eq!(scout.max_output_tokens, 8_192);
+        assert_eq!(scout.context_window_tokens, 131_072);
     }
 
     #[test]
