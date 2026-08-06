@@ -1,4 +1,4 @@
-//! Scratch probe: dump GitHub runner unshare semantics (temporary, PR will be closed).
+//! Scratch probe: dump GitHub runner unshare semantics (temporary, PRs will be closed).
 #![cfg(target_os = "linux")]
 
 use std::process::Command;
@@ -15,11 +15,18 @@ fn run(args: &[&str]) -> (i32, String, String) {
     }
 }
 
+fn sh(cmd: &str) -> String {
+    Command::new("sh")
+        .args(["-lc", cmd])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default()
+}
+
 #[test]
 fn dump_unshare_semantics() {
-    let uid = unsafe { libc::getuid() };
     let mut report = String::new();
-    report.push_str(&format!("uid={uid} euid={}\n", unsafe { libc::geteuid() }));
+    report.push_str(&format!("uid line: {}\n", sh("id")));
     for f in ["/etc/subuid", "/etc/subgid"] {
         report.push_str(&format!("--- {f} ---\n"));
         if let Ok(s) = std::fs::read_to_string(f) {
@@ -41,6 +48,10 @@ fn dump_unshare_semantics() {
         (
             "auto-full",
             &["--user", "--map-root-user", "--map-auto", "--mount", "--ipc", "--pid", "--uts", "--fork", "sh", "-lc", "echo alpha"][..],
+        ),
+        (
+            "auto-full-echo-multi",
+            &["--user", "--map-root-user", "--map-auto", "--mount", "--ipc", "--pid", "--uts", "--fork", "sh", "-lc", "echo alpha from bash"][..],
         ),
     ] {
         let (rc, so, se) = run(args);
