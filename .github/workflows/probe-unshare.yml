@@ -1,0 +1,28 @@
+name: probe-unshare
+on:
+  workflow_dispatch:
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Probe unshare semantics
+        run: |
+          echo "=== sysctls ==="
+          cat /proc/sys/kernel/unprivileged_userns_clone 2>/dev/null || echo "no unprivileged_userns_clone"
+          cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo "no apparmor_restrict_unprivileged_userns"
+          echo "=== identity ==="
+          id
+          echo "=== subuids ==="
+          getent passwd "$(id -un)" | head -1
+          grep -E "$(id -un)|^$(id -u):" /etc/subuid /etc/subgid 2>/dev/null || echo "no subuid/subgid entries"
+          echo "=== helpers ==="
+          which unshare newuidmap newgidmap
+          echo "=== plain ==="
+          unshare --user --map-root-user true; echo "plain rc=$?"
+          echo "=== map-auto ==="
+          unshare --user --map-root-user --map-auto true; echo "auto rc=$?"
+          echo "=== full launch shape (map-auto) ==="
+          unshare --user --map-root-user --map-auto --mount --ipc --pid --uts --fork sh -lc "echo alpha"; echo "full rc=$?"
+          echo "=== full launch shape (plain) ==="
+          unshare --user --map-root-user --mount --ipc --pid --uts --fork sh -lc "echo alpha"; echo "plain full rc=$?"
