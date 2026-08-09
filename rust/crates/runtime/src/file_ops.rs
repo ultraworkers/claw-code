@@ -40,7 +40,9 @@ fn is_binary_file(path: &Path) -> io::Result<bool> {
 /// the workspace boundary (e.g. via `../` traversal or symlink).
 #[allow(dead_code)]
 fn validate_workspace_boundary(resolved: &Path, workspace_root: &Path) -> io::Result<()> {
-    if !resolved.starts_with(workspace_root) {
+    let resolved = normalize_for_comparison(resolved);
+    let workspace_root = normalize_for_comparison(workspace_root);
+    if !resolved.starts_with(&workspace_root) {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!(
@@ -527,9 +529,29 @@ fn build_grep_content_output(
 }
 
 fn canonicalize_workspace_root(workspace_root: &Path) -> PathBuf {
-    workspace_root
+    let canonical = workspace_root
         .canonicalize()
-        .unwrap_or_else(|_| workspace_root.to_path_buf())
+        .unwrap_or_else(|_| workspace_root.to_path_buf());
+    normalize_for_comparison(&canonical)
+}
+
+/// Normalize Windows' extended-length path prefix before comparing paths.
+///
+/// `std::fs::canonicalize` returns paths with a `\\?\` prefix on Windows,
+/// while a workspace root may still be represented as a regular path when it
+/// cannot be canonicalized (for example, while a workspace is bootstrapping).
+/// These paths refer to the same location but do not compare equal with
+/// [`Path::starts_with`]. Keep the comparison representation stable without
+/// changing the paths returned to callers.
+fn normalize_for_comparison(path: &Path) -> PathBuf {
+    let raw = path.to_string_lossy();
+    if let Some(unc_path) = raw.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{unc_path}"));
+    }
+    if let Some(dos_path) = raw.strip_prefix(r"\\?\") {
+        return PathBuf::from(dos_path);
+    }
+    path.to_path_buf()
 }
 
 fn should_skip_glob_dir(entry: &DirEntry) -> bool {
@@ -777,8 +799,9 @@ mod tests {
 
     use super::{
         component_contains_glob, derive_glob_walk_root, edit_file, expand_braces, glob_search,
-        grep_search, is_symlink_escape, read_file, read_file_in_workspace, write_file,
-        write_file_in_workspace, GrepSearchInput, MAX_WRITE_SIZE,
+        grep_search, is_symlink_escape, normalize_for_comparison, read_file,
+        read_file_in_workspace, validate_workspace_boundary, write_file, write_file_in_workspace,
+        GrepSearchInput, MAX_WRITE_SIZE,
     };
 
     fn temp_path(name: &str) -> std::path::PathBuf {
@@ -904,6 +927,33 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&workspace);
         let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    fn normalizes_windows_extended_length_prefixes_for_boundary_checks() {
+        let dos_path = PathBuf::from(r"C:\workspace\file.txt");
+        let extended_dos_path = PathBuf::from(r"\\?\C:\workspace\file.txt");
+        assert_eq!(
+            normalize_for_comparison(&extended_dos_path),
+            dos_path,
+            "extended DOS paths should compare like their regular form"
+        );
+
+        let unc_path = PathBuf::from(r"\\server\share\workspace\file.txt");
+        let extended_unc_path = PathBuf::from(r"\\?\UNC\server\share\workspace\file.txt");
+        assert_eq!(
+            normalize_for_comparison(&extended_unc_path),
+            unc_path,
+            "extended UNC paths should compare like their regular form"
+        );
+    }
+
+    #[test]
+    fn accepts_equivalent_extended_path_at_workspace_boundary() {
+        let root = PathBuf::from(r"C:\workspace");
+        let resolved = PathBuf::from(r"\\?\C:\workspace\src\main.rs");
+        validate_workspace_boundary(&resolved, &root)
+            .expect("equivalent Windows path representations should be accepted");
     }
 
     #[test]
