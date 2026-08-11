@@ -420,11 +420,6 @@ pub fn detect_trust_prompt(screen_text: &str) -> bool {
         .any(|needle| lowered.contains(needle))
 }
 
-#[must_use]
-pub fn path_matches_trusted_root(cwd: &str, trusted_root: &str) -> bool {
-    path_matches(cwd, &normalize_path(Path::new(trusted_root)))
-}
-
 fn path_matches(candidate: &str, root: &Path) -> bool {
     let candidate = normalize_path(Path::new(candidate));
     let root = normalize_path(root);
@@ -432,30 +427,19 @@ fn path_matches(candidate: &str, root: &Path) -> bool {
 }
 
 fn normalize_path(path: &Path) -> PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+    dunce::simplified(&std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())).to_path_buf()
 }
 
 /// Extract repository name from a path for event context.
 fn extract_repo_name(cwd: &str) -> Option<String> {
     let path = Path::new(cwd);
-    // Ask git from the cwd itself. Walking ancestors manually can accidentally
-    // classify synthetic/nonexistent paths as an unrelated parent repo (for
-    // example `/tmp/.git`), which makes trust events point at the wrong repo.
-    if path.is_dir() {
-        if let Ok(output) = std::process::Command::new("git")
-            .args(["rev-parse", "--show-toplevel"])
-            .current_dir(path)
-            .output()
-        {
-            if output.status.success() {
-                let root = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                if !root.is_empty() {
-                    return Path::new(&root)
-                        .file_name()
-                        .map(|n| n.to_string_lossy().to_string());
-                }
-            }
+    // Try to find a .git directory to identify repo root
+    let mut current = Some(path);
+    while let Some(p) = current {
+        if p.join(".git").is_dir() {
+            return p.file_name().map(|n| n.to_string_lossy().to_string());
         }
+        current = p.parent();
     }
     // Fallback: use the last component of the path
     path.file_name().map(|n| n.to_string_lossy().to_string())
@@ -677,7 +661,7 @@ mod path_matching_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        detect_manual_approval, detect_trust_prompt, path_matches_trusted_root,
+        detect_manual_approval, detect_trust_prompt, path_matches,
         TrustAllowlistEntry, TrustConfig, TrustDecision, TrustEvent, TrustPolicy, TrustResolution,
         TrustResolver,
     };
@@ -856,11 +840,11 @@ mod tests {
     #[test]
     fn sibling_prefix_does_not_match_trusted_root() {
         // given
-        let trusted_root = "/tmp/worktrees";
+        let trusted_root = std::path::Path::new("/tmp/worktrees");
         let sibling_path = "/tmp/worktrees-other/repo-d";
 
         // when
-        let matched = path_matches_trusted_root(sibling_path, trusted_root);
+        let matched = path_matches(sibling_path, trusted_root);
 
         // then
         assert!(!matched);

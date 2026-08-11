@@ -359,12 +359,13 @@ pub fn validate_sed(command: &str, mode: PermissionMode) -> ValidationResult {
 #[must_use]
 pub fn validate_paths(command: &str, workspace: &Path) -> ValidationResult {
     // Check for directory traversal attempts.
-    if command.contains("../") {
+    if command.contains("../") || command.contains("..\\") {
         let workspace_str = workspace.to_string_lossy();
         // Allow traversal if it resolves within workspace (heuristic).
         if !command.contains(&*workspace_str) {
+            let pattern = if command.contains("../") { "../" } else { "..\\" };
             return ValidationResult::Warn {
-                message: "Command contains directory traversal pattern '../' — verify the target path resolves within the workspace".to_string(),
+                message: format!("Command contains directory traversal pattern '{pattern}' — verify the target path resolves within the workspace"),
             };
         }
     }

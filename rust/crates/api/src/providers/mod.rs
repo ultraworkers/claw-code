@@ -1,5 +1,4 @@
 #![allow(clippy::cast_possible_truncation)]
-#![allow(dead_code)]
 use std::future::Future;
 use std::pin::Pin;
 
@@ -29,10 +28,9 @@ pub trait Provider {
     ) -> ProviderFuture<'a, Self::Stream>;
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderKind {
     Anthropic,
-    Xai,
     OpenAi,
 }
 
@@ -48,74 +46,6 @@ pub struct ProviderMetadata {
 pub struct ModelTokenLimit {
     pub max_output_tokens: u32,
     pub context_window_tokens: u32,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ProviderWireProtocol {
-    AnthropicMessages,
-    OpenAiChatCompletions,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ProviderFeatureSupport {
-    Supported,
-    Unsupported,
-    PassthroughAsTool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct ProviderCapabilityReport {
-    pub provider: ProviderKind,
-    pub wire_protocol: ProviderWireProtocol,
-    pub auth_env: &'static str,
-    pub base_url_env: &'static str,
-    pub default_base_url: &'static str,
-    pub tool_calls: ProviderFeatureSupport,
-    pub streaming: ProviderFeatureSupport,
-    pub streaming_usage: ProviderFeatureSupport,
-    pub prompt_cache: ProviderFeatureSupport,
-    pub custom_parameters: ProviderFeatureSupport,
-    pub reasoning_effort: ProviderFeatureSupport,
-    pub reasoning_content_history: ProviderFeatureSupport,
-    pub fixed_sampling_reasoning_models: ProviderFeatureSupport,
-    pub web_search: ProviderFeatureSupport,
-    pub web_fetch: ProviderFeatureSupport,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ProviderDiagnosticSeverity {
-    Info,
-    Warning,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct ProviderDiagnostic {
-    pub code: &'static str,
-    pub severity: ProviderDiagnosticSeverity,
-    pub message: String,
-    pub action: String,
-}
-
-#[allow(clippy::struct_excessive_bools)]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct ProviderDiagnostics {
-    pub requested_model: String,
-    pub resolved_model: String,
-    pub provider: ProviderKind,
-    pub auth_env: &'static str,
-    pub base_url_env: &'static str,
-    pub default_base_url: &'static str,
-    pub openai_compatible: bool,
-    pub reasoning_model: bool,
-    pub preserves_reasoning_content_in_history: bool,
-    pub strips_tuning_params: bool,
-    pub supports_stream_usage: bool,
-    pub honors_proxy_env: bool,
-    pub supports_extra_body_params: bool,
-    pub preserves_slash_model_ids_on_custom_base_url: bool,
 }
 
 const MODEL_REGISTRY: &[(&str, ProviderMetadata)] = &[
@@ -146,60 +76,6 @@ const MODEL_REGISTRY: &[(&str, ProviderMetadata)] = &[
             default_base_url: anthropic::DEFAULT_BASE_URL,
         },
     ),
-    (
-        "grok",
-        ProviderMetadata {
-            provider: ProviderKind::Xai,
-            auth_env: "XAI_API_KEY",
-            base_url_env: "XAI_BASE_URL",
-            default_base_url: openai_compat::DEFAULT_XAI_BASE_URL,
-        },
-    ),
-    (
-        "grok-3",
-        ProviderMetadata {
-            provider: ProviderKind::Xai,
-            auth_env: "XAI_API_KEY",
-            base_url_env: "XAI_BASE_URL",
-            default_base_url: openai_compat::DEFAULT_XAI_BASE_URL,
-        },
-    ),
-    (
-        "grok-mini",
-        ProviderMetadata {
-            provider: ProviderKind::Xai,
-            auth_env: "XAI_API_KEY",
-            base_url_env: "XAI_BASE_URL",
-            default_base_url: openai_compat::DEFAULT_XAI_BASE_URL,
-        },
-    ),
-    (
-        "grok-3-mini",
-        ProviderMetadata {
-            provider: ProviderKind::Xai,
-            auth_env: "XAI_API_KEY",
-            base_url_env: "XAI_BASE_URL",
-            default_base_url: openai_compat::DEFAULT_XAI_BASE_URL,
-        },
-    ),
-    (
-        "grok-2",
-        ProviderMetadata {
-            provider: ProviderKind::Xai,
-            auth_env: "XAI_API_KEY",
-            base_url_env: "XAI_BASE_URL",
-            default_base_url: openai_compat::DEFAULT_XAI_BASE_URL,
-        },
-    ),
-    (
-        "kimi",
-        ProviderMetadata {
-            provider: ProviderKind::OpenAi,
-            auth_env: "DASHSCOPE_API_KEY",
-            base_url_env: "DASHSCOPE_BASE_URL",
-            default_base_url: openai_compat::DEFAULT_DASHSCOPE_BASE_URL,
-        },
-    ),
 ];
 
 #[must_use]
@@ -211,21 +87,12 @@ pub fn resolve_model_alias(model: &str) -> String {
         .find_map(|(alias, metadata)| {
             (*alias == lower).then_some(match metadata.provider {
                 ProviderKind::Anthropic => match *alias {
-                    "opus" => "claude-opus-4-7",
+                    "opus" => "claude-opus-4-6",
                     "sonnet" => "claude-sonnet-4-6",
                     "haiku" => "claude-haiku-4-5-20251213",
                     _ => trimmed,
                 },
-                ProviderKind::Xai => match *alias {
-                    "grok" | "grok-3" => "grok-3",
-                    "grok-mini" | "grok-3-mini" => "grok-3-mini",
-                    "grok-2" => "grok-2",
-                    _ => trimmed,
-                },
-                ProviderKind::OpenAi => match *alias {
-                    "kimi" => "kimi-k2.5",
-                    _ => trimmed,
-                },
+                ProviderKind::OpenAi => trimmed,
             })
         })
         .map_or_else(|| trimmed.to_string(), ToOwned::to_owned)
@@ -234,20 +101,12 @@ pub fn resolve_model_alias(model: &str) -> String {
 #[must_use]
 pub fn metadata_for_model(model: &str) -> Option<ProviderMetadata> {
     let canonical = resolve_model_alias(model);
-    if canonical.starts_with("claude") || canonical.starts_with("anthropic/") {
+    if canonical.starts_with("claude") {
         return Some(ProviderMetadata {
             provider: ProviderKind::Anthropic,
             auth_env: "ANTHROPIC_API_KEY",
             base_url_env: "ANTHROPIC_BASE_URL",
             default_base_url: anthropic::DEFAULT_BASE_URL,
-        });
-    }
-    if canonical.starts_with("grok") {
-        return Some(ProviderMetadata {
-            provider: ProviderKind::Xai,
-            auth_env: "XAI_API_KEY",
-            base_url_env: "XAI_BASE_URL",
-            default_base_url: openai_compat::DEFAULT_XAI_BASE_URL,
         });
     }
     // Explicit provider-namespaced models (e.g. "openai/gpt-4.1-mini") must
@@ -262,118 +121,20 @@ pub fn metadata_for_model(model: &str) -> Option<ProviderMetadata> {
             default_base_url: openai_compat::DEFAULT_OPENAI_BASE_URL,
         });
     }
-    if canonical.starts_with("local/") {
-        return Some(ProviderMetadata {
-            provider: ProviderKind::OpenAi,
-            auth_env: "OPENAI_API_KEY",
-            base_url_env: "OPENAI_BASE_URL",
-            default_base_url: openai_compat::DEFAULT_OPENAI_BASE_URL,
-        });
-    }
-    // Alibaba DashScope compatible-mode endpoint. Routes qwen/* and bare
-    // qwen-* model names (qwen-max, qwen-plus, qwen-turbo, qwen-qwq, etc.)
-    // to the OpenAI-compat client pointed at DashScope's /compatible-mode/v1.
-    // Uses the OpenAi provider kind because DashScope speaks the OpenAI REST
-    // shape — only the base URL and auth env var differ.
-    if canonical.starts_with("qwen/") || canonical.starts_with("qwen-") {
-        return Some(ProviderMetadata {
-            provider: ProviderKind::OpenAi,
-            auth_env: "DASHSCOPE_API_KEY",
-            base_url_env: "DASHSCOPE_BASE_URL",
-            default_base_url: openai_compat::DEFAULT_DASHSCOPE_BASE_URL,
-        });
-    }
-    // Kimi models (kimi-k2.5, kimi-k1.5, etc.) via DashScope compatible-mode.
-    // Routes kimi/* and kimi-* model names to DashScope endpoint.
-    if canonical.starts_with("kimi/") || canonical.starts_with("kimi-") {
-        return Some(ProviderMetadata {
-            provider: ProviderKind::OpenAi,
-            auth_env: "DASHSCOPE_API_KEY",
-            base_url_env: "DASHSCOPE_BASE_URL",
-            default_base_url: openai_compat::DEFAULT_DASHSCOPE_BASE_URL,
-        });
-    }
     None
 }
 
 #[must_use]
-pub fn strip_provider_prefix(canonical_model: &str) -> String {
-    if let Some(pos) = canonical_model.find('/') {
-        canonical_model[pos + 1..].to_string()
-    } else {
-        canonical_model.to_string()
-    }
-}
-
-#[must_use]
-pub fn provider_diagnostics_for_model(model: &str) -> ProviderDiagnostics {
-    let resolved_model = resolve_model_alias(model);
-    let metadata =
-        metadata_for_model(&resolved_model).unwrap_or_else(|| {
-            match detect_provider_kind(&resolved_model) {
-                ProviderKind::Anthropic => ProviderMetadata {
-                    provider: ProviderKind::Anthropic,
-                    auth_env: "ANTHROPIC_API_KEY",
-                    base_url_env: "ANTHROPIC_BASE_URL",
-                    default_base_url: anthropic::DEFAULT_BASE_URL,
-                },
-                ProviderKind::Xai => ProviderMetadata {
-                    provider: ProviderKind::Xai,
-                    auth_env: "XAI_API_KEY",
-                    base_url_env: "XAI_BASE_URL",
-                    default_base_url: openai_compat::DEFAULT_XAI_BASE_URL,
-                },
-                ProviderKind::OpenAi => ProviderMetadata {
-                    provider: ProviderKind::OpenAi,
-                    auth_env: "OPENAI_API_KEY",
-                    base_url_env: "OPENAI_BASE_URL",
-                    default_base_url: openai_compat::DEFAULT_OPENAI_BASE_URL,
-                },
-            }
-        });
-    let openai_compatible = matches!(metadata.provider, ProviderKind::OpenAi | ProviderKind::Xai);
-    let reasoning_model = openai_compatible && openai_compat::is_reasoning_model(&resolved_model);
-
-    ProviderDiagnostics {
-        requested_model: model.to_string(),
-        resolved_model: resolved_model.clone(),
-        provider: metadata.provider,
-        auth_env: metadata.auth_env,
-        base_url_env: metadata.base_url_env,
-        default_base_url: metadata.default_base_url,
-        openai_compatible,
-        reasoning_model,
-        preserves_reasoning_content_in_history: openai_compatible
-            && openai_compat::model_requires_reasoning_content_in_history(&resolved_model),
-        strips_tuning_params: reasoning_model,
-        supports_stream_usage: metadata.provider == ProviderKind::OpenAi
-            && metadata.default_base_url == openai_compat::DEFAULT_OPENAI_BASE_URL,
-        honors_proxy_env: true,
-        supports_extra_body_params: openai_compatible,
-        preserves_slash_model_ids_on_custom_base_url: metadata.provider == ProviderKind::OpenAi,
-    }
-}
-
-fn looks_like_local_openai_model(model: &str) -> bool {
-    model.contains(':') || model.contains('.')
-}
-
-#[must_use]
 pub fn detect_provider_kind(model: &str) -> ProviderKind {
-    // OLLAMA_HOST takes priority: if set, route all models through the local
-    // OpenAI-compatible endpoint regardless of model name or other env vars.
-    if std::env::var_os("OLLAMA_HOST").is_some() {
-        return ProviderKind::OpenAi;
-    }
-    let resolved_model = resolve_model_alias(model);
-    if let Some(metadata) = metadata_for_model(&resolved_model) {
+    if let Some(metadata) = metadata_for_model(model) {
         return metadata.provider;
     }
-    // When OPENAI_BASE_URL is set and the unknown model name looks like a
-    // local server tag (for example `llama3.2` or `qwen2.5-coder:7b`), prefer
-    // the OpenAI-compatible endpoint over ambient Anthropic credentials.
-    if std::env::var_os("OPENAI_BASE_URL").is_some()
-        && looks_like_local_openai_model(&resolved_model)
+    // When OPENAI_BASE_URL is set, the user explicitly configured an
+    // OpenAI-compatible endpoint. Prefer it over the Anthropic fallback
+    // even when the model name has no recognized prefix — this is the
+    // common case for local providers (Ollama, LM Studio, vLLM, etc.)
+    // where model names like "qwen2.5-coder:7b" don't match any prefix.
+    if std::env::var_os("OPENAI_BASE_URL").is_some() && openai_compat::has_api_key("OPENAI_API_KEY")
     {
         return ProviderKind::OpenAi;
     }
@@ -382,9 +143,6 @@ pub fn detect_provider_kind(model: &str) -> ProviderKind {
     }
     if openai_compat::has_api_key("OPENAI_API_KEY") {
         return ProviderKind::OpenAi;
-    }
-    if openai_compat::has_api_key("XAI_API_KEY") {
-        return ProviderKind::Xai;
     }
     // Last resort: if OPENAI_BASE_URL is set without OPENAI_API_KEY (some
     // local providers like Ollama don't require auth), still route there.
@@ -395,230 +153,18 @@ pub fn detect_provider_kind(model: &str) -> ProviderKind {
 }
 
 #[must_use]
-pub const fn model_family_identity_for_kind(kind: ProviderKind) -> runtime::ModelFamilyIdentity {
-    match kind {
-        ProviderKind::Anthropic => runtime::ModelFamilyIdentity::Claude,
-        ProviderKind::Xai | ProviderKind::OpenAi => runtime::ModelFamilyIdentity::Generic,
-    }
-}
-
-#[must_use]
-pub fn model_family_identity_for(model: &str) -> runtime::ModelFamilyIdentity {
-    model_family_identity_for_kind(detect_provider_kind(model))
-}
-
-#[must_use]
-pub fn provider_capabilities_for_model(model: &str) -> ProviderCapabilityReport {
-    let metadata = metadata_for_model(model).unwrap_or_else(|| {
-        let provider = detect_provider_kind(model);
-        metadata_for_provider_kind(provider)
-    });
-
-    let (
-        wire_protocol,
-        streaming_usage,
-        prompt_cache,
-        custom_parameters,
-        reasoning_effort,
-        reasoning_content_history,
-        fixed_sampling_reasoning_models,
-    ) = match metadata.provider {
-        ProviderKind::Anthropic => (
-            ProviderWireProtocol::AnthropicMessages,
-            ProviderFeatureSupport::Unsupported,
-            ProviderFeatureSupport::Supported,
-            ProviderFeatureSupport::Unsupported,
-            ProviderFeatureSupport::Unsupported,
-            ProviderFeatureSupport::Unsupported,
-            ProviderFeatureSupport::Unsupported,
-        ),
-        ProviderKind::Xai => (
-            ProviderWireProtocol::OpenAiChatCompletions,
-            ProviderFeatureSupport::Unsupported,
-            ProviderFeatureSupport::Unsupported,
-            ProviderFeatureSupport::Supported,
-            ProviderFeatureSupport::Unsupported,
-            ProviderFeatureSupport::Unsupported,
-            ProviderFeatureSupport::Supported,
-        ),
-        ProviderKind::OpenAi => (
-            ProviderWireProtocol::OpenAiChatCompletions,
-            ProviderFeatureSupport::Supported,
-            ProviderFeatureSupport::Unsupported,
-            ProviderFeatureSupport::Supported,
-            ProviderFeatureSupport::Supported,
-            if openai_compat::model_requires_reasoning_content_in_history(model) {
-                ProviderFeatureSupport::Supported
-            } else {
-                ProviderFeatureSupport::Unsupported
-            },
-            ProviderFeatureSupport::Supported,
-        ),
-    };
-
-    ProviderCapabilityReport {
-        provider: metadata.provider,
-        wire_protocol,
-        auth_env: metadata.auth_env,
-        base_url_env: metadata.base_url_env,
-        default_base_url: metadata.default_base_url,
-        tool_calls: ProviderFeatureSupport::Supported,
-        streaming: ProviderFeatureSupport::Supported,
-        streaming_usage,
-        prompt_cache,
-        custom_parameters,
-        reasoning_effort,
-        reasoning_content_history,
-        fixed_sampling_reasoning_models,
-        web_search: ProviderFeatureSupport::PassthroughAsTool,
-        web_fetch: ProviderFeatureSupport::PassthroughAsTool,
-    }
-}
-
-#[must_use]
-pub fn provider_diagnostics_for_request(request: &MessageRequest) -> Vec<ProviderDiagnostic> {
-    let capabilities = provider_capabilities_for_model(&request.model);
-    let mut diagnostics = Vec::new();
-
-    if request.reasoning_effort.is_some()
-        && capabilities.reasoning_effort == ProviderFeatureSupport::Unsupported
-    {
-        diagnostics.push(ProviderDiagnostic {
-            code: "reasoning_effort_unsupported",
-            severity: ProviderDiagnosticSeverity::Warning,
-            message: format!(
-                "{} does not map `reasoning_effort` for model `{}`.",
-                provider_label(capabilities.provider),
-                request.model
-            ),
-            action: "Remove `reasoning_effort` or route to an OpenAI-compatible reasoning model such as `openai/o4-mini`.".to_string(),
-        });
-    }
-
-    if openai_compat::is_reasoning_model(&request.model)
-        && has_openai_tuning_parameters(request)
-        && capabilities.fixed_sampling_reasoning_models == ProviderFeatureSupport::Supported
-    {
-        diagnostics.push(ProviderDiagnostic {
-            code: "reasoning_model_fixed_sampling",
-            severity: ProviderDiagnosticSeverity::Info,
-            message: format!(
-                "Model `{}` is treated as a fixed-sampling reasoning model; tuning parameters are omitted before the provider call.",
-                request.model
-            ),
-            action: "Leave temperature/top_p/frequency_penalty/presence_penalty unset for reasoning models to match provider validation rules.".to_string(),
-        });
-    }
-
-    if openai_compat::model_requires_reasoning_content_in_history(&request.model) {
-        diagnostics.push(ProviderDiagnostic {
-            code: "deepseek_v4_reasoning_history",
-            severity: ProviderDiagnosticSeverity::Info,
-            message: format!(
-                "Model `{}` requires assistant thinking history to be echoed as `reasoning_content`.",
-                request.model
-            ),
-            action: "Keep prior assistant Thinking blocks in history; the OpenAI-compatible serializer will emit `reasoning_content` for DeepSeek V4 models.".to_string(),
-        });
-    }
-
-    if declares_tool(request, "web_search") {
-        diagnostics.push(web_passthrough_diagnostic(
-            "web_search_passthrough_tool",
-            "web_search",
-            capabilities.provider,
-        ));
-    }
-    if declares_tool(request, "web_fetch") {
-        diagnostics.push(web_passthrough_diagnostic(
-            "web_fetch_passthrough_tool",
-            "web_fetch",
-            capabilities.provider,
-        ));
-    }
-
-    diagnostics
-}
-
-#[must_use]
-fn metadata_for_provider_kind(provider: ProviderKind) -> ProviderMetadata {
-    match provider {
-        ProviderKind::Anthropic => ProviderMetadata {
-            provider,
-            auth_env: "ANTHROPIC_API_KEY",
-            base_url_env: "ANTHROPIC_BASE_URL",
-            default_base_url: anthropic::DEFAULT_BASE_URL,
-        },
-        ProviderKind::Xai => ProviderMetadata {
-            provider,
-            auth_env: "XAI_API_KEY",
-            base_url_env: "XAI_BASE_URL",
-            default_base_url: openai_compat::DEFAULT_XAI_BASE_URL,
-        },
-        ProviderKind::OpenAi => ProviderMetadata {
-            provider,
-            auth_env: "OPENAI_API_KEY",
-            base_url_env: "OPENAI_BASE_URL",
-            default_base_url: openai_compat::DEFAULT_OPENAI_BASE_URL,
-        },
-    }
-}
-
-#[must_use]
-const fn provider_label(provider: ProviderKind) -> &'static str {
-    match provider {
-        ProviderKind::Anthropic => "Anthropic",
-        ProviderKind::Xai => "xAI",
-        ProviderKind::OpenAi => "OpenAI-compatible",
-    }
-}
-
-#[must_use]
-fn has_openai_tuning_parameters(request: &MessageRequest) -> bool {
-    request.temperature.is_some()
-        || request.top_p.is_some()
-        || request.frequency_penalty.is_some()
-        || request.presence_penalty.is_some()
-}
-
-#[must_use]
-fn declares_tool(request: &MessageRequest, tool_name: &str) -> bool {
-    request.tools.as_ref().is_some_and(|tools| {
-        tools
-            .iter()
-            .any(|tool| tool.name.eq_ignore_ascii_case(tool_name))
-    })
-}
-
-#[must_use]
-fn web_passthrough_diagnostic(
-    code: &'static str,
-    tool_name: &'static str,
-    provider: ProviderKind,
-) -> ProviderDiagnostic {
-    ProviderDiagnostic {
-        code,
-        severity: ProviderDiagnosticSeverity::Info,
-        message: format!(
-            "`{tool_name}` is exposed to {} as a normal function tool, not as a provider-native web capability.",
-            provider_label(provider)
-        ),
-        action: format!(
-            "Provide a local `{tool_name}` tool implementation or route through a provider adapter that explicitly supports native web tools."
-        ),
-    }
-}
-
-#[must_use]
 pub fn max_tokens_for_model(model: &str) -> u32 {
-    let canonical = resolve_model_alias(model);
-    let heuristic = if canonical.contains("opus") {
-        32_000
-    } else {
-        64_000
-    };
-
-    model_token_limit(model).map_or(heuristic, |limit| heuristic.min(limit.max_output_tokens))
+    model_token_limit(model).map_or_else(
+        || {
+            let canonical = resolve_model_alias(model);
+            if canonical.contains("opus") {
+                32_000
+            } else {
+                64_000
+            }
+        },
+        |limit| limit.max_output_tokens,
+    )
 }
 
 /// Returns the effective max output tokens for a model, preferring a plugin
@@ -632,9 +178,8 @@ pub fn max_tokens_for_model_with_override(model: &str, plugin_override: Option<u
 #[must_use]
 pub fn model_token_limit(model: &str) -> Option<ModelTokenLimit> {
     let canonical = resolve_model_alias(model);
-    let base_model = canonical.rsplit('/').next().unwrap_or(canonical.as_str());
-    match base_model {
-        "claude-opus-4-7" | "claude-opus-4-6" => Some(ModelTokenLimit {
+    match canonical.as_str() {
+        "claude-opus-4-6" => Some(ModelTokenLimit {
             max_output_tokens: 32_000,
             context_window_tokens: 200_000,
         }),
@@ -642,40 +187,59 @@ pub fn model_token_limit(model: &str) -> Option<ModelTokenLimit> {
             max_output_tokens: 64_000,
             context_window_tokens: 200_000,
         }),
-        "grok-3" | "grok-3-mini" => Some(ModelTokenLimit {
-            max_output_tokens: 64_000,
-            context_window_tokens: 131_072,
-        }),
-        // GPT-4.1 family via the OpenAI API.
-        "gpt-4.1" | "gpt-4.1-mini" | "gpt-4.1-nano" => Some(ModelTokenLimit {
-            max_output_tokens: 32_768,
-            context_window_tokens: 1_047_576,
-        }),
-        // GPT-5.4 family via the OpenAI API.
-        "gpt-5.4" => Some(ModelTokenLimit {
-            max_output_tokens: 128_000,
-            context_window_tokens: 1_000_000,
-        }),
-        "gpt-5.4-mini" | "gpt-5.4-nano" => Some(ModelTokenLimit {
-            max_output_tokens: 128_000,
-            context_window_tokens: 400_000,
-        }),
-        // Kimi models via DashScope (Moonshot AI)
-        // Source: https://platform.moonshot.cn/docs/intro
-        "kimi-k2.5" | "kimi-k1.5" => Some(ModelTokenLimit {
-            max_output_tokens: 16_384,
-            context_window_tokens: 256_000,
-        }),
-        "qwen-max" => Some(ModelTokenLimit {
-            max_output_tokens: 8_192,
-            context_window_tokens: 131_072,
-        }),
-        "qwen-plus" => Some(ModelTokenLimit {
-            max_output_tokens: 8_192,
-            context_window_tokens: 131_072,
-        }),
         _ => None,
     }
+}
+
+/// Detect whether the active provider is a local inference endpoint
+/// (llama.cpp, LM Studio, Ollama, vLLM, mock servers, etc.) where
+/// KV cache prefix stability is critical and tools-in-system-prompt
+/// is beneficial.
+///
+/// Detection heuristics:
+/// 1. Explicit opt-in via `CLAW_LOCAL_INFERENCE=true`
+/// 2. `OPENAI_BASE_URL` or `ANTHROPIC_BASE_URL` points to a loopback address
+/// 3. A base URL is set without its corresponding API key (no-auth local server)
+#[must_use]
+pub fn is_local_inference() -> bool {
+    if std::env::var_os("CLAW_LOCAL_INFERENCE")
+        .is_some_and(|v| v == "true" || v == "1")
+    {
+        return true;
+    }
+
+    let local_hosts = ["localhost", "127.0.0.1", "0.0.0.0"];
+
+    // Helper: check if a base URL env points to a loopback address.
+    let base_url_looks_local = |key: &str| -> bool {
+        std::env::var(key).is_ok_and(|url| {
+            if url.is_empty() {
+                return false;
+            }
+            local_hosts.iter().any(|h| url.contains(h))
+        })
+    };
+
+    if base_url_looks_local("OPENAI_BASE_URL") {
+        return true;
+    }
+    if base_url_looks_local("ANTHROPIC_BASE_URL") {
+        return true;
+    }
+
+    // Base URL set without its API key = likely a no-auth local server.
+    if std::env::var("OPENAI_BASE_URL").is_ok_and(|u| !u.is_empty())
+        && std::env::var("OPENAI_API_KEY").is_err()
+    {
+        return true;
+    }
+    if std::env::var("ANTHROPIC_BASE_URL").is_ok_and(|u| !u.is_empty())
+        && std::env::var("ANTHROPIC_API_KEY").is_err()
+    {
+        return true;
+    }
+
+    false
 }
 
 pub fn preflight_message_request(request: &MessageRequest) -> Result<(), ApiError> {
@@ -716,23 +280,11 @@ fn estimate_serialized_tokens<T: Serialize>(value: &T) -> u32 {
 /// resolution fails we sniff these so we can hint the user that their
 /// credentials probably belong to a different provider and suggest the
 /// model-prefix routing fix that would select it.
-const FOREIGN_PROVIDER_ENV_VARS: &[(&str, &str, &str)] = &[
-    (
-        "OPENAI_API_KEY",
-        "OpenAI-compat",
-        "prefix your model name with `openai/` (e.g. `--model openai/gpt-4.1-mini`) so prefix routing selects the OpenAI-compatible provider, and set `OPENAI_BASE_URL` if you are pointing at OpenRouter/Ollama/a local server",
-    ),
-    (
-        "XAI_API_KEY",
-        "xAI",
-        "use an xAI model alias (e.g. `--model grok` or `--model grok-mini`) so the prefix router selects the xAI backend",
-    ),
-    (
-        "DASHSCOPE_API_KEY",
-        "Alibaba DashScope",
-        "prefix your model name with `qwen/` or `qwen-` (e.g. `--model qwen-plus`) so prefix routing selects the DashScope backend",
-    ),
-];
+const FOREIGN_PROVIDER_ENV_VARS: &[(&str, &str, &str)] = &[(
+    "OPENAI_API_KEY",
+    "OpenAI-compat",
+    "prefix your model name with `openai/` (e.g. `--model openai/gpt-4.1-mini`) so prefix routing selects the OpenAI-compatible provider, and set `OPENAI_BASE_URL` if you are pointing at OpenRouter/Ollama/a local server",
+)];
 
 /// Check whether an env var is set to a non-empty value either in the real
 /// process environment or in the working-directory `.env` file. Mirrors the
@@ -772,7 +324,7 @@ pub(crate) fn anthropic_missing_credentials_hint() -> Option<String> {
 /// signal instead of a generic "missing Anthropic credentials" wall.
 pub(crate) fn anthropic_missing_credentials() -> ApiError {
     const PROVIDER: &str = "Anthropic";
-    const ENV_VARS: &[&str] = &["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"];
+    const ENV_VARS: &[&str] = &["ANTHROPIC_API_KEY"];
     match anthropic_missing_credentials_hint() {
         Some(hint) => ApiError::missing_credentials_with_hint(PROVIDER, ENV_VARS, hint),
         None => ApiError::missing_credentials(PROVIDER, ENV_VARS),
@@ -825,19 +377,60 @@ pub(crate) fn load_dotenv_file(
     Some(parse_dotenv(&content))
 }
 
-/// Look up `key` in a `.env` file located in the current working directory.
-/// Returns `None` when the file is missing, the key is absent, or the value
-/// is empty.
+/// Look up `key` in the first-found `.env` file.
+/// Priority: `cwd/.env` → `cwd/.claw/.env` → `~/.claw/.env`
+/// (`$CLAW_CONFIG_HOME/.env` overrides `~/.claw/.env`).
+/// Returns `None` when the key is absent or its value is empty.
 pub(crate) fn dotenv_value(key: &str) -> Option<String> {
-    let cwd = std::env::current_dir().ok()?;
-    let values = load_dotenv_file(&cwd.join(".env"))?;
+    let values = resolve_first_dotenv()?;
     values.get(key).filter(|value| !value.is_empty()).cloned()
+}
+
+/// Load the first-found `.env` file into the process environment.
+/// Priority: `cwd/.env` → `cwd/.claw/.env` → `~/.claw/.env`
+/// Existing vars are NOT overwritten. Call early in `main()` so ALL
+/// `std::env::var()` calls in any crate pick up `.env` values.
+pub fn load_env_file_to_process() {
+    runtime::text_only_models::reload();
+    let Some(values) = resolve_first_dotenv() else { return };
+    for (key, value) in values {
+        if std::env::var(&key).is_err() {
+            std::env::set_var(&key, &value);
+        }
+    }
+}
+
+/// Resolve the user config home: `$CLAW_CONFIG_HOME` or `~/.claw`.
+fn user_config_home() -> Option<std::path::PathBuf> {
+    if let Some(custom) = std::env::var_os("CLAW_CONFIG_HOME") {
+        return Some(std::path::PathBuf::from(custom));
+    }
+    #[cfg(windows)]
+    let home = std::env::var_os("USERPROFILE");
+    #[cfg(not(windows))]
+    let home = std::env::var_os("HOME");
+    home.map(|h| std::path::PathBuf::from(h).join(".claw"))
+}
+
+/// Try `.env` files in order: `cwd/.env` → `cwd/.claw/.env` → user home.
+/// Returns the contents of the first existing file, or `None`.
+fn resolve_first_dotenv() -> Option<std::collections::HashMap<String, String>> {
+    // Project-local candidates
+    if let Ok(cwd) = std::env::current_dir() {
+        for candidate in [cwd.join(".env"), cwd.join(".claw").join(".env")] {
+            if let Some(values) = load_dotenv_file(&candidate) {
+                return Some(values);
+            }
+        }
+    }
+    // User-level fallback
+    load_dotenv_file(&user_config_home()?.join(".env"))
 }
 
 #[cfg(test)]
 mod tests {
     use std::ffi::OsString;
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::{Arc, Mutex, OnceLock};
 
     use serde_json::json;
 
@@ -849,10 +442,7 @@ mod tests {
     use super::{
         anthropic_missing_credentials, anthropic_missing_credentials_hint, detect_provider_kind,
         load_dotenv_file, max_tokens_for_model, max_tokens_for_model_with_override,
-        model_family_identity_for, model_family_identity_for_kind, model_token_limit, parse_dotenv,
-        preflight_message_request, provider_capabilities_for_model,
-        provider_diagnostics_for_request, resolve_model_alias, ProviderFeatureSupport,
-        ProviderKind, ProviderWireProtocol,
+        model_token_limit, parse_dotenv, preflight_message_request, ProviderKind,
     };
 
     /// Serializes every test in this module that mutates process-wide
@@ -896,154 +486,11 @@ mod tests {
     }
 
     #[test]
-    fn resolves_grok_aliases() {
-        assert_eq!(resolve_model_alias("grok"), "grok-3");
-        assert_eq!(resolve_model_alias("grok-mini"), "grok-3-mini");
-        assert_eq!(resolve_model_alias("grok-2"), "grok-2");
-    }
-
-    #[test]
     fn detects_provider_from_model_name_first() {
-        assert_eq!(detect_provider_kind("grok"), ProviderKind::Xai);
         assert_eq!(
             detect_provider_kind("claude-sonnet-4-6"),
             ProviderKind::Anthropic
         );
-    }
-
-    #[test]
-    fn maps_provider_kind_to_model_family_identity() {
-        // given: each supported provider kind
-        let anthropic = ProviderKind::Anthropic;
-        let openai = ProviderKind::OpenAi;
-        let xai = ProviderKind::Xai;
-
-        // when: converting provider kinds to prompt model family identities
-        let anthropic_identity = model_family_identity_for_kind(anthropic);
-        let openai_identity = model_family_identity_for_kind(openai);
-        let xai_identity = model_family_identity_for_kind(xai);
-
-        // then: Anthropic stays Claude and OpenAI-compatible providers are generic
-        assert_eq!(anthropic_identity, runtime::ModelFamilyIdentity::Claude);
-        assert_eq!(openai_identity, runtime::ModelFamilyIdentity::Generic);
-        assert_eq!(xai_identity, runtime::ModelFamilyIdentity::Generic);
-    }
-
-    #[test]
-    fn maps_model_name_to_model_family_identity() {
-        // given: Anthropic, OpenAI-compatible, and xAI model names
-        let claude_model = "claude-opus-4-6";
-        let openai_model = "openai/gpt-4.1-mini";
-        let xai_model = "grok-3";
-
-        // when: detecting prompt model family identities from model names
-        let claude_identity = model_family_identity_for(claude_model);
-        let openai_identity = model_family_identity_for(openai_model);
-        let xai_identity = model_family_identity_for(xai_model);
-
-        // then: Anthropic stays Claude and OpenAI-compatible providers are generic
-        assert_eq!(claude_identity, runtime::ModelFamilyIdentity::Claude);
-        assert_eq!(openai_identity, runtime::ModelFamilyIdentity::Generic);
-        assert_eq!(xai_identity, runtime::ModelFamilyIdentity::Generic);
-    }
-
-    #[test]
-    fn provider_capability_matrix_snapshots_openai_compat_differences() {
-        let openai = provider_capabilities_for_model("openai/gpt-4.1-mini");
-        assert_eq!(openai.provider, ProviderKind::OpenAi);
-        assert_eq!(
-            openai.wire_protocol,
-            ProviderWireProtocol::OpenAiChatCompletions
-        );
-        assert_eq!(openai.auth_env, "OPENAI_API_KEY");
-        assert_eq!(openai.streaming_usage, ProviderFeatureSupport::Supported);
-        assert_eq!(openai.reasoning_effort, ProviderFeatureSupport::Supported);
-        assert_eq!(openai.web_search, ProviderFeatureSupport::PassthroughAsTool);
-        assert_eq!(openai.web_fetch, ProviderFeatureSupport::PassthroughAsTool);
-
-        let deepseek = provider_capabilities_for_model("openai/deepseek-v4-pro");
-        assert_eq!(
-            deepseek.reasoning_content_history,
-            ProviderFeatureSupport::Supported
-        );
-
-        let xai = provider_capabilities_for_model("grok-3");
-        assert_eq!(xai.provider, ProviderKind::Xai);
-        assert_eq!(xai.auth_env, "XAI_API_KEY");
-        assert_eq!(xai.reasoning_effort, ProviderFeatureSupport::Unsupported);
-        assert_eq!(xai.streaming_usage, ProviderFeatureSupport::Unsupported);
-
-        let anthropic = provider_capabilities_for_model("claude-sonnet-4-6");
-        assert_eq!(anthropic.provider, ProviderKind::Anthropic);
-        assert_eq!(
-            anthropic.wire_protocol,
-            ProviderWireProtocol::AnthropicMessages
-        );
-        assert_eq!(anthropic.prompt_cache, ProviderFeatureSupport::Supported);
-        assert_eq!(
-            anthropic.custom_parameters,
-            ProviderFeatureSupport::Unsupported
-        );
-    }
-
-    #[test]
-    fn provider_diagnostics_explain_deepseek_reasoning_and_web_tool_passthrough() {
-        let request = MessageRequest {
-            model: "openai/deepseek-v4-pro".to_string(),
-            max_tokens: 1024,
-            messages: vec![InputMessage::user_text("research this")],
-            tools: Some(vec![
-                ToolDefinition {
-                    name: "web_search".to_string(),
-                    description: Some("Search the web".to_string()),
-                    input_schema: json!({"type": "object"}),
-                },
-                ToolDefinition {
-                    name: "web_fetch".to_string(),
-                    description: Some("Fetch a URL".to_string()),
-                    input_schema: json!({"type": "object"}),
-                },
-            ]),
-            stream: true,
-            ..Default::default()
-        };
-
-        let diagnostics = provider_diagnostics_for_request(&request);
-        let codes = diagnostics
-            .iter()
-            .map(|diagnostic| diagnostic.code)
-            .collect::<Vec<_>>();
-
-        assert!(codes.contains(&"deepseek_v4_reasoning_history"));
-        assert!(codes.contains(&"web_search_passthrough_tool"));
-        assert!(codes.contains(&"web_fetch_passthrough_tool"));
-        assert!(diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.action.contains("provider adapter")));
-    }
-
-    #[test]
-    fn provider_diagnostics_warn_for_unsupported_reasoning_effort() {
-        let request = MessageRequest {
-            model: "grok-3-mini".to_string(),
-            max_tokens: 1024,
-            messages: vec![InputMessage::user_text("think")],
-            reasoning_effort: Some("high".to_string()),
-            temperature: Some(0.7),
-            ..Default::default()
-        };
-
-        let diagnostics = provider_diagnostics_for_request(&request);
-        let codes = diagnostics
-            .iter()
-            .map(|diagnostic| diagnostic.code)
-            .collect::<Vec<_>>();
-
-        assert!(codes.contains(&"reasoning_effort_unsupported"));
-        assert!(codes.contains(&"reasoning_model_fixed_sampling"));
-        assert!(diagnostics.iter().any(|diagnostic| diagnostic
-            .message
-            .contains("does not map `reasoning_effort`")));
     }
 
     #[test]
@@ -1069,101 +516,8 @@ mod tests {
     }
 
     #[test]
-    fn local_prefix_routes_to_openai_not_anthropic() {
-        let meta = super::metadata_for_model("local/Qwen/Qwen3.6-27B-FP8")
-            .expect("local/ prefix must resolve to OpenAI-compatible metadata");
-        assert_eq!(meta.provider, ProviderKind::OpenAi);
-        assert_eq!(meta.auth_env, "OPENAI_API_KEY");
-        assert_eq!(meta.base_url_env, "OPENAI_BASE_URL");
-
-        let kind = detect_provider_kind("local/Qwen/Qwen3.6-27B-FP8");
-        assert_eq!(kind, ProviderKind::OpenAi);
-    }
-
-    #[test]
-    fn qwen_prefix_routes_to_dashscope_not_anthropic() {
-        // User request from Discord #clawcode-get-help: web3g wants to use
-        // Qwen 3.6 Plus via native Alibaba DashScope API (not OpenRouter,
-        // which has lower rate limits). metadata_for_model must route
-        // qwen/* and bare qwen-* to the OpenAi provider kind pointed at
-        // the DashScope compatible-mode endpoint, regardless of whether
-        // ANTHROPIC_API_KEY is present in the environment.
-        let meta = super::metadata_for_model("qwen/qwen-max")
-            .expect("qwen/ prefix must resolve to DashScope metadata");
-        assert_eq!(meta.provider, ProviderKind::OpenAi);
-        assert_eq!(meta.auth_env, "DASHSCOPE_API_KEY");
-        assert_eq!(meta.base_url_env, "DASHSCOPE_BASE_URL");
-        assert!(meta.default_base_url.contains("dashscope.aliyuncs.com"));
-
-        // Bare qwen- prefix also routes
-        let meta2 = super::metadata_for_model("qwen-plus")
-            .expect("qwen- prefix must resolve to DashScope metadata");
-        assert_eq!(meta2.provider, ProviderKind::OpenAi);
-        assert_eq!(meta2.auth_env, "DASHSCOPE_API_KEY");
-
-        // detect_provider_kind must agree even if ANTHROPIC_API_KEY is set
-        let kind = detect_provider_kind("qwen/qwen3-coder");
-        assert_eq!(
-            kind,
-            ProviderKind::OpenAi,
-            "qwen/ prefix must win over auth-sniffer order"
-        );
-    }
-
-    #[test]
-    fn kimi_prefix_routes_to_dashscope() {
-        // Kimi models via DashScope (kimi-k2.5, kimi-k1.5, etc.)
-        let meta = super::metadata_for_model("kimi-k2.5")
-            .expect("kimi-k2.5 must resolve to DashScope metadata");
-        assert_eq!(meta.auth_env, "DASHSCOPE_API_KEY");
-        assert_eq!(meta.base_url_env, "DASHSCOPE_BASE_URL");
-        assert!(meta.default_base_url.contains("dashscope.aliyuncs.com"));
-        assert_eq!(meta.provider, ProviderKind::OpenAi);
-
-        // With provider prefix
-        let meta2 = super::metadata_for_model("kimi/kimi-k2.5")
-            .expect("kimi/kimi-k2.5 must resolve to DashScope metadata");
-        assert_eq!(meta2.auth_env, "DASHSCOPE_API_KEY");
-        assert_eq!(meta2.provider, ProviderKind::OpenAi);
-
-        // Different kimi variants
-        let meta3 = super::metadata_for_model("kimi-k1.5")
-            .expect("kimi-k1.5 must resolve to DashScope metadata");
-        assert_eq!(meta3.auth_env, "DASHSCOPE_API_KEY");
-    }
-
-    #[test]
-    fn kimi_alias_resolves_to_kimi_k2_5() {
-        assert_eq!(super::resolve_model_alias("kimi"), "kimi-k2.5");
-        assert_eq!(super::resolve_model_alias("KIMI"), "kimi-k2.5"); // case insensitive
-    }
-
-    #[test]
-    fn provider_diagnostics_explain_openai_compatible_capabilities() {
-        let diagnostics = super::provider_diagnostics_for_model("openai/deepseek-v4-pro");
-
-        assert_eq!(diagnostics.provider, ProviderKind::OpenAi);
-        assert_eq!(diagnostics.auth_env, "OPENAI_API_KEY");
-        assert!(diagnostics.openai_compatible);
-        assert!(diagnostics.preserves_reasoning_content_in_history);
-        assert!(diagnostics.supports_extra_body_params);
-        assert!(diagnostics.honors_proxy_env);
-        assert!(diagnostics.preserves_slash_model_ids_on_custom_base_url);
-    }
-
-    #[test]
     fn keeps_existing_max_token_heuristic() {
         assert_eq!(max_tokens_for_model("opus"), 32_000);
-        assert_eq!(max_tokens_for_model("grok-3"), 64_000);
-        assert_eq!(max_tokens_for_model("gpt-5.4"), 64_000);
-    }
-
-    #[test]
-    fn caps_default_max_tokens_to_openai_model_limits() {
-        assert_eq!(max_tokens_for_model("gpt-4.1-mini"), 32_768);
-        assert_eq!(max_tokens_for_model("openai/gpt-4.1-mini"), 32_768);
-        assert_eq!(max_tokens_for_model("gpt-5.4"), 64_000);
-        assert_eq!(max_tokens_for_model("openai/gpt-5.4"), 64_000);
     }
 
     #[test]
@@ -1224,24 +578,6 @@ mod tests {
                 .context_window_tokens,
             200_000
         );
-        assert_eq!(
-            model_token_limit("grok-mini")
-                .expect("grok-mini should resolve to a registered model")
-                .context_window_tokens,
-            131_072
-        );
-        assert_eq!(
-            model_token_limit("openai/gpt-4.1-mini")
-                .expect("openai/gpt-4.1-mini should be registered")
-                .context_window_tokens,
-            1_047_576
-        );
-        assert_eq!(
-            model_token_limit("gpt-5.4")
-                .expect("gpt-5.4 should be registered")
-                .context_window_tokens,
-            1_000_000
-        );
     }
 
     #[test]
@@ -1249,13 +585,13 @@ mod tests {
         let request = MessageRequest {
             model: "claude-sonnet-4-6".to_string(),
             max_tokens: 64_000,
-            messages: vec![InputMessage {
+            messages: Arc::new(vec![InputMessage {
                 role: "user".to_string(),
                 content: vec![InputContentBlock::Text {
-                    text: "x".repeat(600_000),
+                text: "x".repeat(600_000),
                 }],
-            }],
-            system: Some("Keep the answer short.".to_string()),
+            }]),
+            system: Some(Arc::from("Keep the answer short.")),
             tools: Some(vec![ToolDefinition {
                 name: "weather".to_string(),
                 description: Some("Fetches weather".to_string()),
@@ -1291,52 +627,16 @@ mod tests {
     }
 
     #[test]
-    fn preflight_blocks_oversized_requests_for_gpt_5_4() {
-        let request = MessageRequest {
-            model: "gpt-5.4".to_string(),
-            max_tokens: 64_000,
-            messages: vec![InputMessage {
-                role: "user".to_string(),
-                content: vec![InputContentBlock::Text {
-                    text: "x".repeat(3_900_000),
-                }],
-            }],
-            system: Some("Keep the answer short.".to_string()),
-            tools: None,
-            tool_choice: None,
-            stream: true,
-            ..Default::default()
-        };
-
-        let error = preflight_message_request(&request)
-            .expect_err("oversized gpt-5.4 request should be rejected before the provider call");
-
-        match error {
-            ApiError::ContextWindowExceeded {
-                model,
-                requested_output_tokens,
-                context_window_tokens,
-                ..
-            } => {
-                assert_eq!(model, "gpt-5.4");
-                assert_eq!(requested_output_tokens, 64_000);
-                assert_eq!(context_window_tokens, 1_000_000);
-            }
-            other => panic!("expected context-window preflight failure, got {other:?}"),
-        }
-    }
-
-    #[test]
     fn preflight_skips_unknown_models() {
         let request = MessageRequest {
             model: "unknown-model".to_string(),
             max_tokens: 64_000,
-            messages: vec![InputMessage {
+            messages: Arc::new(vec![InputMessage {
                 role: "user".to_string(),
                 content: vec![InputContentBlock::Text {
                     text: "x".repeat(600_000),
                 }],
-            }],
+            }]),
             system: None,
             tools: None,
             tool_choice: None,
@@ -1349,80 +649,13 @@ mod tests {
     }
 
     #[test]
-    fn returns_context_window_metadata_for_kimi_models() {
-        // kimi-k2.5
-        let k25_limit =
-            model_token_limit("kimi-k2.5").expect("kimi-k2.5 should have token limit metadata");
-        assert_eq!(k25_limit.max_output_tokens, 16_384);
-        assert_eq!(k25_limit.context_window_tokens, 256_000);
-
-        // kimi-k1.5
-        let k15_limit =
-            model_token_limit("kimi-k1.5").expect("kimi-k1.5 should have token limit metadata");
-        assert_eq!(k15_limit.max_output_tokens, 16_384);
-        assert_eq!(k15_limit.context_window_tokens, 256_000);
-    }
-
-    #[test]
-    fn kimi_alias_resolves_to_kimi_k25_token_limits() {
-        // The "kimi" alias resolves to "kimi-k2.5" via resolve_model_alias()
-        let alias_limit =
-            model_token_limit("kimi").expect("kimi alias should resolve to kimi-k2.5 limits");
-        let direct_limit = model_token_limit("kimi-k2.5").expect("kimi-k2.5 should have limits");
-        assert_eq!(
-            alias_limit.max_output_tokens,
-            direct_limit.max_output_tokens
-        );
-        assert_eq!(
-            alias_limit.context_window_tokens,
-            direct_limit.context_window_tokens
-        );
-    }
-
-    #[test]
-    fn preflight_blocks_oversized_requests_for_kimi_models() {
-        let request = MessageRequest {
-            model: "kimi-k2.5".to_string(),
-            max_tokens: 16_384,
-            messages: vec![InputMessage {
-                role: "user".to_string(),
-                content: vec![InputContentBlock::Text {
-                    text: "x".repeat(1_000_000), // Large input to exceed context window
-                }],
-            }],
-            system: Some("Keep the answer short.".to_string()),
-            tools: None,
-            tool_choice: None,
-            stream: true,
-            ..Default::default()
-        };
-
-        let error = preflight_message_request(&request)
-            .expect_err("oversized request should be rejected for kimi models");
-
-        match error {
-            ApiError::ContextWindowExceeded {
-                model,
-                context_window_tokens,
-                ..
-            } => {
-                assert_eq!(model, "kimi-k2.5");
-                assert_eq!(context_window_tokens, 256_000);
-            }
-            other => panic!("expected context-window preflight failure, got {other:?}"),
-        }
-    }
-
-    #[test]
     fn parse_dotenv_extracts_keys_handles_comments_quotes_and_export_prefix() {
         // given
         let body = "\
 # this is a comment
 
 ANTHROPIC_API_KEY=plain-value
-XAI_API_KEY=\"quoted-value\"
 OPENAI_API_KEY='single-quoted'
-export GROK_API_KEY=exported-value
    PADDED_KEY  =  padded-value  
 EMPTY_VALUE=
 NO_EQUALS_LINE
@@ -1437,16 +670,8 @@ NO_EQUALS_LINE
             Some("plain-value")
         );
         assert_eq!(
-            values.get("XAI_API_KEY").map(String::as_str),
-            Some("quoted-value")
-        );
-        assert_eq!(
             values.get("OPENAI_API_KEY").map(String::as_str),
             Some("single-quoted")
-        );
-        assert_eq!(
-            values.get("GROK_API_KEY").map(String::as_str),
-            Some("exported-value")
         );
         assert_eq!(
             values.get("PADDED_KEY").map(String::as_str),
@@ -1471,7 +696,7 @@ NO_EQUALS_LINE
         let env_path = temp_root.join(".env");
         std::fs::write(
             &env_path,
-            "ANTHROPIC_API_KEY=secret-from-file\n# comment\nXAI_API_KEY=\"xai-secret\"\n",
+            "ANTHROPIC_API_KEY=secret-from-file\n# comment\n",
         )
         .expect("write .env");
         let missing_path = temp_root.join("does-not-exist.env");
@@ -1485,10 +710,6 @@ NO_EQUALS_LINE
             loaded.get("ANTHROPIC_API_KEY").map(String::as_str),
             Some("secret-from-file")
         );
-        assert_eq!(
-            loaded.get("XAI_API_KEY").map(String::as_str),
-            Some("xai-secret")
-        );
         assert!(missing.is_none());
 
         let _ = std::fs::remove_dir_all(&temp_root);
@@ -1499,8 +720,6 @@ NO_EQUALS_LINE
         // given
         let _lock = env_lock();
         let _openai = EnvVarGuard::set("OPENAI_API_KEY", None);
-        let _xai = EnvVarGuard::set("XAI_API_KEY", None);
-        let _dashscope = EnvVarGuard::set("DASHSCOPE_API_KEY", None);
 
         // when
         let hint = anthropic_missing_credentials_hint();
@@ -1517,8 +736,6 @@ NO_EQUALS_LINE
         // given
         let _lock = env_lock();
         let _openai = EnvVarGuard::set("OPENAI_API_KEY", Some("sk-openrouter-varleg"));
-        let _xai = EnvVarGuard::set("XAI_API_KEY", None);
-        let _dashscope = EnvVarGuard::set("DASHSCOPE_API_KEY", None);
 
         // when
         let hint = anthropic_missing_credentials_hint()
@@ -1543,90 +760,13 @@ NO_EQUALS_LINE
         );
     }
 
-    #[test]
-    fn anthropic_missing_credentials_hint_detects_xai_api_key() {
-        // given
-        let _lock = env_lock();
-        let _openai = EnvVarGuard::set("OPENAI_API_KEY", None);
-        let _xai = EnvVarGuard::set("XAI_API_KEY", Some("xai-test-key"));
-        let _dashscope = EnvVarGuard::set("DASHSCOPE_API_KEY", None);
 
-        // when
-        let hint = anthropic_missing_credentials_hint()
-            .expect("XAI_API_KEY presence should produce a hint");
-
-        // then
-        assert!(
-            hint.contains("XAI_API_KEY is set"),
-            "hint should name XAI_API_KEY: {hint}"
-        );
-        assert!(
-            hint.contains("xAI"),
-            "hint should identify the xAI provider: {hint}"
-        );
-        assert!(
-            hint.contains("grok"),
-            "hint should suggest a grok-prefixed model alias: {hint}"
-        );
-    }
-
-    #[test]
-    fn anthropic_missing_credentials_hint_detects_dashscope_api_key() {
-        // given
-        let _lock = env_lock();
-        let _openai = EnvVarGuard::set("OPENAI_API_KEY", None);
-        let _xai = EnvVarGuard::set("XAI_API_KEY", None);
-        let _dashscope = EnvVarGuard::set("DASHSCOPE_API_KEY", Some("sk-dashscope-test"));
-
-        // when
-        let hint = anthropic_missing_credentials_hint()
-            .expect("DASHSCOPE_API_KEY presence should produce a hint");
-
-        // then
-        assert!(
-            hint.contains("DASHSCOPE_API_KEY is set"),
-            "hint should name DASHSCOPE_API_KEY: {hint}"
-        );
-        assert!(
-            hint.contains("DashScope"),
-            "hint should identify the DashScope provider: {hint}"
-        );
-        assert!(
-            hint.contains("qwen"),
-            "hint should suggest a qwen-prefixed model alias: {hint}"
-        );
-    }
-
-    #[test]
-    fn anthropic_missing_credentials_hint_prefers_openai_when_multiple_foreign_creds_set() {
-        // given
-        let _lock = env_lock();
-        let _openai = EnvVarGuard::set("OPENAI_API_KEY", Some("sk-openrouter-varleg"));
-        let _xai = EnvVarGuard::set("XAI_API_KEY", Some("xai-test-key"));
-        let _dashscope = EnvVarGuard::set("DASHSCOPE_API_KEY", Some("sk-dashscope-test"));
-
-        // when
-        let hint = anthropic_missing_credentials_hint()
-            .expect("multiple foreign creds should still produce a hint");
-
-        // then
-        assert!(
-            hint.contains("OPENAI_API_KEY"),
-            "OpenAI should be prioritized because it is the most common misrouting pattern (OpenRouter users), got: {hint}"
-        );
-        assert!(
-            !hint.contains("XAI_API_KEY"),
-            "only the first detected provider should be named to keep the hint focused, got: {hint}"
-        );
-    }
 
     #[test]
     fn anthropic_missing_credentials_builds_error_with_canonical_env_vars_and_no_hint_when_clean() {
         // given
         let _lock = env_lock();
         let _openai = EnvVarGuard::set("OPENAI_API_KEY", None);
-        let _xai = EnvVarGuard::set("XAI_API_KEY", None);
-        let _dashscope = EnvVarGuard::set("DASHSCOPE_API_KEY", None);
 
         // when
         let error = anthropic_missing_credentials();
@@ -1639,7 +779,7 @@ NO_EQUALS_LINE
                 hint,
             } => {
                 assert_eq!(*provider, "Anthropic");
-                assert_eq!(*env_vars, &["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"]);
+                assert_eq!(*env_vars, &["ANTHROPIC_API_KEY"]);
                 assert!(
                     hint.is_none(),
                     "clean environment should not generate a hint, got {hint:?}"
@@ -1659,8 +799,6 @@ NO_EQUALS_LINE
         // given
         let _lock = env_lock();
         let _openai = EnvVarGuard::set("OPENAI_API_KEY", Some("sk-openrouter-varleg"));
-        let _xai = EnvVarGuard::set("XAI_API_KEY", None);
-        let _dashscope = EnvVarGuard::set("DASHSCOPE_API_KEY", None);
 
         // when
         let error = anthropic_missing_credentials();
@@ -1673,7 +811,7 @@ NO_EQUALS_LINE
                 hint,
             } => {
                 assert_eq!(*provider, "Anthropic");
-                assert_eq!(*env_vars, &["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"]);
+                assert_eq!(*env_vars, &["ANTHROPIC_API_KEY"]);
                 let hint_value = hint.as_deref().expect("hint should be populated");
                 assert!(
                     hint_value.contains("OPENAI_API_KEY is set"),
@@ -1687,14 +825,9 @@ NO_EQUALS_LINE
             rendered.starts_with("missing Anthropic credentials;"),
             "canonical base message should still lead the rendered error: {rendered}"
         );
-        // #754: hint delimiter changed from " — hint: " to "\n" so split_error_hint works
         assert!(
-            rendered.contains("I see OPENAI_API_KEY is set"),
+            rendered.contains(" — hint: I see OPENAI_API_KEY is set"),
             "rendered error should carry the env-driven hint: {rendered}"
-        );
-        assert!(
-            rendered.contains('\n'),
-            "rendered error must use newline separator (#754): {rendered}"
         );
     }
 
@@ -1707,8 +840,6 @@ NO_EQUALS_LINE
         // to avoid false-positive hints for users who intentionally cleared
         // a stale export with `OPENAI_API_KEY=`.
         let _openai = EnvVarGuard::set("OPENAI_API_KEY", Some(""));
-        let _xai = EnvVarGuard::set("XAI_API_KEY", None);
-        let _dashscope = EnvVarGuard::set("DASHSCOPE_API_KEY", None);
 
         // when
         let hint = anthropic_missing_credentials_hint();
@@ -1728,7 +859,6 @@ NO_EQUALS_LINE
         let _base_url = EnvVarGuard::set("OPENAI_BASE_URL", Some("http://127.0.0.1:11434/v1"));
         let _api_key = EnvVarGuard::set("OPENAI_API_KEY", Some("dummy"));
         let _anthropic_key = EnvVarGuard::set("ANTHROPIC_API_KEY", None);
-        let _anthropic_token = EnvVarGuard::set("ANTHROPIC_AUTH_TOKEN", None);
 
         // when
         let provider = detect_provider_kind("qwen2.5-coder:7b");

@@ -117,7 +117,7 @@ pub fn scoped_mcp_config_hash(config: &ScopedMcpServerConfig) -> String {
             format!("claudeai-proxy|{}|{}", proxy.url, proxy.id)
         }
     };
-    stable_hex_hash(&format!("required:{}|{rendered}", config.required))
+    stable_hex_hash(&rendered)
 }
 
 fn render_command_signature(command: &[String]) -> String {
@@ -275,12 +275,10 @@ mod tests {
             oauth: None,
         });
         let user = ScopedMcpServerConfig {
-            required: false,
             scope: ConfigSource::User,
             config: base_config.clone(),
         };
         let local = ScopedMcpServerConfig {
-            required: false,
             scope: ConfigSource::Local,
             config: base_config,
         };
@@ -290,7 +288,6 @@ mod tests {
         );
 
         let changed = ScopedMcpServerConfig {
-            required: false,
             scope: ConfigSource::Local,
             config: McpServerConfig::Http(McpRemoteServerConfig {
                 url: "https://vendor.example/v2/mcp".to_string(),

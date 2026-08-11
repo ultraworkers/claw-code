@@ -14,13 +14,7 @@ const CONTEXT_WINDOW_ERROR_MARKERS: &[&str] = &[
     "too many tokens",
     "prompt is too long",
     "input is too long",
-    "input tokens exceed",
-    "configured limit",
-    "messages resulted in",
-    "completion tokens",
-    "prompt tokens",
     "request is too large",
-    "no parseable body",
 ];
 
 #[derive(Debug)]
@@ -61,9 +55,6 @@ pub enum ApiError {
         retryable: bool,
         /// Suggested user action based on error type (e.g., "Reduce prompt size" for 413)
         suggested_action: Option<String>,
-        /// Parsed Retry-After header value (seconds) for 429 responses.
-        /// When present, overrides the exponential backoff delay.
-        retry_after: Option<Duration>,
     },
     RetriesExhausted {
         attempts: u32,
@@ -132,21 +123,23 @@ impl ApiError {
     }
 
     #[must_use]
-    /// Return the `Retry-After` delay if this error came from a 429 response
-    /// that included a `retry-after` header. Callers should prefer this value
-    /// over the computed backoff delay when it exists.
-    pub fn retry_after(&self) -> Option<Duration> {
-        match self {
-            Self::Api { retry_after, .. } => *retry_after,
-            Self::RetriesExhausted { last_error, .. } => last_error.retry_after(),
-            _ => None,
-        }
-    }
-
     pub fn is_retryable(&self) -> bool {
         match self {
             Self::Http(error) => error.is_connect() || error.is_timeout() || error.is_request(),
-            Self::Api { retryable, .. } => *retryable,
+            Self::Api {
+                retryable,
+                error_type,
+                message,
+                body,
+                ..
+            } => {
+                *retryable
+                    && !looks_like_balance_error(
+                        error_type.as_deref(),
+                        message.as_deref(),
+                        body,
+                    )
+            }
             Self::RetriesExhausted { last_error, .. } => last_error.is_retryable(),
             Self::MissingCredentials { .. }
             | Self::ContextWindowExceeded { .. }
@@ -278,20 +271,17 @@ impl Display for ApiError {
                     if let Some(primary) = env_vars.first() {
                         write!(
                             f,
-                            " (on Windows, environment variables set in PowerShell only persist for the current session; use `setx {primary} <value>` to make it permanent, then open a new terminal, or place a `.env` file containing `{primary}=<value>` in the current working directory)"
+                            " (on Windows, environment variables set in PowerShell only persist for the current session; use `setx {primary} <value>` to make it permanent, then open a new terminal, or place a `.env` file containing `{primary}=<value>` in the Claw config directory (`~/.claw/.env` or `$CLAW_CONFIG_HOME/.env`))"
                         )?;
                     } else {
                         write!(
                             f,
-                            " (on Windows, environment variables set in PowerShell only persist for the current session; use `setx` to make them permanent, then open a new terminal, or place a `.env` file in the current working directory)"
+                            " (on Windows, environment variables set in PowerShell only persist for the current session; use `setx` to make them permanent, then open a new terminal, or place a `.env` file in the Claw config directory (`~/.claw/.env` or `$CLAW_CONFIG_HOME/.env`))"
                         )?;
                     }
                 }
                 if let Some(hint) = hint {
-                    // #754: newline-delimited so split_error_hint() can extract the hint
-                    // into the JSON envelope's `hint` field. The em-dash form was a
-                    // single-line string that left hint:null in --output-format json.
-                    write!(f, "\n{hint}")?;
+                    write!(f, " — hint: {hint}")?;
                 }
                 Ok(())
             }
@@ -326,36 +316,6 @@ impl Display for ApiError {
                 f,
                 "failed to parse {provider} response for model {model}: {source}; first 200 chars of body: {body_snippet}"
             ),
-            // #28: enhance 401/403 errors with actionable auth guidance
-            Self::Api {
-                status,
-                error_type,
-                message,
-                request_id,
-                body,
-                ..
-            } if matches!(status.as_u16(), 401 | 403) => {
-                if let (Some(error_type), Some(message)) = (error_type, message) {
-                    write!(f, "api returned {status} ({error_type})")?;
-                    if let Some(request_id) = request_id {
-                        write!(f, " [trace {request_id}]")?;
-                    }
-                    write!(f, ": {message}")?;
-                } else {
-                    write!(f, "api returned {status}")?;
-                    if let Some(request_id) = request_id {
-                        write!(f, " [trace {request_id}]")?;
-                    }
-                    write!(f, ": {body}")?;
-                }
-                write!(
-                    f,
-                    "\nhint: check that your API key is valid and matches the target provider. \
-                     For OpenAI-compatible providers set OPENAI_API_KEY or OPENAI_BASE_URL. \
-                     For Anthropic set ANTHROPIC_API_KEY. \
-                     Run `claw doctor` to verify your credential configuration."
-                )
-            }
             Self::Api {
                 status,
                 error_type,
@@ -443,6 +403,45 @@ fn looks_like_generic_fatal_wrapper(text: &str) -> bool {
 fn looks_like_context_window_error(text: &str) -> bool {
     let lowered = text.to_ascii_lowercase();
     CONTEXT_WINDOW_ERROR_MARKERS
+        .iter()
+        .any(|marker| lowered.contains(marker))
+}
+
+const BALANCE_ERROR_MARKERS: &[&str] = &[
+    "insufficient_quota",
+    "insufficient quota",
+    "insufficient balance",
+    "insufficient_balance",
+    "balance is insufficient",
+    "your account balance",
+    "account balance is",
+    "no credits",
+    "out of credits",
+    "credit balance",
+    "insufficient credits",
+    "balance is too low",
+    "余额不足",
+    "payment required",
+];
+
+/// Returns true when the provider error (error_type, message or raw body)
+/// indicates the account has run out of credits/balance. Such errors are
+/// deterministic: retrying cannot fix them, so they must never enter the
+/// retry/backoff loop (which would otherwise stall the CLI for minutes on a
+/// 429 rate-limit style response from a relay/gateway).
+fn looks_like_balance_error(error_type: Option<&str>, message: Option<&str>, body: &str) -> bool {
+    let mut haystack = String::new();
+    if let Some(error_type) = error_type {
+        haystack.push_str(error_type);
+        haystack.push(' ');
+    }
+    if let Some(message) = message {
+        haystack.push_str(message);
+        haystack.push(' ');
+    }
+    haystack.push_str(body);
+    let lowered = haystack.to_ascii_lowercase();
+    BALANCE_ERROR_MARKERS
         .iter()
         .any(|marker| lowered.contains(marker))
 }
@@ -544,7 +543,6 @@ mod tests {
             body: String::new(),
             retryable: true,
             suggested_action: None,
-        retry_after: None,
         };
 
         assert!(error.is_generic_fatal_wrapper());
@@ -568,7 +566,6 @@ mod tests {
                 body: String::new(),
                 retryable: true,
                 suggested_action: None,
-            retry_after: None,
             }),
         };
 
@@ -590,7 +587,6 @@ mod tests {
             body: String::new(),
             retryable: false,
             suggested_action: None,
-        retry_after: None,
         };
 
         assert!(error.is_context_window_failure());
@@ -599,32 +595,11 @@ mod tests {
     }
 
     #[test]
-    fn classifies_openai_configured_limit_errors_as_context_window_failures() {
-        let error = ApiError::Api {
-            status: reqwest::StatusCode::BAD_REQUEST,
-            error_type: Some("invalid_request_error".to_string()),
-            message: Some(
-                "Input tokens exceed the configured limit of 922000 tokens. Your messages resulted in 1860900 tokens. Please reduce the length of the messages."
-                    .to_string(),
-            ),
-            request_id: Some("req_ctx_openai_123".to_string()),
-            body: String::new(),
-            retryable: false,
-            suggested_action: None,
-            retry_after: None,
-        };
-
-        assert!(error.is_context_window_failure());
-        assert_eq!(error.safe_failure_class(), "context_window");
-        assert_eq!(error.request_id(), Some("req_ctx_openai_123"));
-    }
-
-    #[test]
     fn missing_credentials_without_hint_renders_the_canonical_message() {
         // given
         let error = ApiError::missing_credentials(
             "Anthropic",
-            &["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"],
+            &["ANTHROPIC_API_KEY"],
         );
 
         // when
@@ -633,7 +608,7 @@ mod tests {
         // then
         assert!(
             rendered.starts_with(
-                "missing Anthropic credentials; export ANTHROPIC_AUTH_TOKEN or ANTHROPIC_API_KEY before calling the Anthropic API"
+                "missing Anthropic credentials; export ANTHROPIC_API_KEY before calling the Anthropic API"
             ),
             "rendered error should lead with the canonical missing-credential message: {rendered}"
         );
@@ -644,11 +619,81 @@ mod tests {
     }
 
     #[test]
+    fn api_429_insufficient_quota_is_not_retryable() {
+        let error = ApiError::Api {
+            status: reqwest::StatusCode::TOO_MANY_REQUESTS,
+            error_type: Some("insufficient_quota".to_string()),
+            message: Some("Your account balance is insufficient. Please top up.".to_string()),
+            request_id: Some("req_balance_123".to_string()),
+            body: String::new(),
+            retryable: true,
+            suggested_action: None,
+        };
+        assert!(
+            !error.is_retryable(),
+            "insufficient_quota must not trigger retry backoff"
+        );
+    }
+
+    #[test]
+    fn api_429_chinese_balance_insufficient_is_not_retryable() {
+        let error = ApiError::Api {
+            status: reqwest::StatusCode::TOO_MANY_REQUESTS,
+            error_type: Some("rate_limit_error".to_string()),
+            message: Some("余额不足,请充值".to_string()),
+            request_id: Some("req_balance_456".to_string()),
+            body: String::new(),
+            retryable: true,
+            suggested_action: None,
+        };
+        assert!(
+            !error.is_retryable(),
+            "余额不足 must not trigger retry backoff"
+        );
+    }
+
+    #[test]
+    fn api_429_plain_rate_limit_slow_down_remains_retryable() {
+        let error = ApiError::Api {
+            status: reqwest::StatusCode::TOO_MANY_REQUESTS,
+            error_type: Some("rate_limit_error".to_string()),
+            message: Some("slow down".to_string()),
+            request_id: Some("req_rate_789".to_string()),
+            body: String::new(),
+            retryable: true,
+            suggested_action: None,
+        };
+        assert!(
+            error.is_retryable(),
+            "a plain rate-limit 'slow down' must remain retryable"
+        );
+    }
+
+    #[test]
+    fn api_429_billing_plan_wording_is_not_mistaken_for_balance_error() {
+        let error = ApiError::Api {
+            status: reqwest::StatusCode::TOO_MANY_REQUESTS,
+            error_type: Some("rate_limit_error".to_string()),
+            message: Some(
+                "Your current billing plan allows 100 requests per minute".to_string(),
+            ),
+            request_id: Some("req_billing_plan".to_string()),
+            body: String::new(),
+            retryable: true,
+            suggested_action: None,
+        };
+        assert!(
+            error.is_retryable(),
+            "billing-plan rate-limit wording must not be flagged as a balance error"
+        );
+    }
+
+    #[test]
     fn missing_credentials_with_hint_appends_the_hint_after_base_message() {
         // given
         let error = ApiError::missing_credentials_with_hint(
             "Anthropic",
-            &["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"],
+            &["ANTHROPIC_API_KEY"],
             "I see OPENAI_API_KEY is set — if you meant to use the OpenAI-compat provider, prefix your model name with `openai/` so prefix routing selects it.",
         );
 
@@ -660,15 +705,10 @@ mod tests {
             rendered.starts_with("missing Anthropic credentials;"),
             "hint should be appended, not replace the base message: {rendered}"
         );
-        // #754: hint is now newline-delimited so split_error_hint() can extract it
-        let hint_text = "I see OPENAI_API_KEY is set — if you meant to use the OpenAI-compat provider, prefix your model name with `openai/` so prefix routing selects it.";
+        let hint_marker = " — hint: I see OPENAI_API_KEY is set — if you meant to use the OpenAI-compat provider, prefix your model name with `openai/` so prefix routing selects it.";
         assert!(
-            rendered.ends_with(hint_text),
+            rendered.ends_with(hint_marker),
             "rendered error should end with the hint: {rendered}"
-        );
-        assert!(
-            rendered.contains('\n'),
-            "rendered error must contain newline separator so split_error_hint works: {rendered}"
         );
         // Classification semantics are unaffected by the presence of a hint.
         assert_eq!(error.safe_failure_class(), "provider_auth");

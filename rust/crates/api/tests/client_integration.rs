@@ -45,7 +45,6 @@ async fn send_message_posts_json_and_parses_response() {
     .await;
 
     let client = ApiClient::new("test-key")
-        .with_auth_token(Some("proxy-token".to_string()))
         .with_base_url(server.base_url());
     let response = client
         .send_message(&sample_request(false))
@@ -72,21 +71,19 @@ async fn send_message_posts_json_and_parses_response() {
         request.headers.get("x-api-key").map(String::as_str),
         Some("test-key")
     );
-    assert_eq!(
-        request.headers.get("authorization").map(String::as_str),
-        Some("Bearer proxy-token")
-    );
+    assert!(request.headers.get("authorization").is_none());
     assert_eq!(
         request.headers.get("anthropic-version").map(String::as_str),
         Some("2023-06-01")
     );
+    let expected_user_agent = format!("claude-code/{}", env!("CARGO_PKG_VERSION"));
     assert_eq!(
         request.headers.get("user-agent").map(String::as_str),
-        Some("claude-code/0.1.3")
+        Some(expected_user_agent.as_str())
     );
     assert_eq!(
         request.headers.get("anthropic-beta").map(String::as_str),
-        Some("claude-code-20250219,prompt-caching-scope-2026-01-05")
+        Some("claude-code-20250219,prompt-caching-scope-2026-01-05,effort-2025-11-24")
     );
     let body: serde_json::Value =
         serde_json::from_str(&request.body).expect("request body should be json");
@@ -104,58 +101,6 @@ async fn send_message_posts_json_and_parses_response() {
 }
 
 #[tokio::test]
-async fn send_message_strips_anthropic_routing_prefix_on_wire() {
-    let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
-    let server = spawn_server(
-        state.clone(),
-        vec![
-            http_response("200 OK", "application/json", "{\"input_tokens\":1}"),
-            http_response(
-                "200 OK",
-                "application/json",
-                concat!(
-                    "{",
-                    "\"id\":\"msg_prefixed\",",
-                    "\"type\":\"message\",",
-                    "\"role\":\"assistant\",",
-                    "\"content\":[{\"type\":\"text\",\"text\":\"ok\"}],",
-                    "\"model\":\"claude-opus-4-6\",",
-                    "\"stop_reason\":\"end_turn\",",
-                    "\"stop_sequence\":null,",
-                    "\"usage\":{\"input_tokens\":1,\"output_tokens\":1}",
-                    "}"
-                ),
-            ),
-        ],
-    )
-    .await;
-
-    let client = AnthropicClient::new("test-key").with_base_url(server.base_url());
-    client
-        .send_message(&MessageRequest {
-            model: "anthropic/claude-opus-4-6".to_string(),
-            ..sample_request(false)
-        })
-        .await
-        .expect("request should succeed");
-
-    let captured = state.lock().await;
-    assert_eq!(
-        captured.len(),
-        2,
-        "count_tokens and messages requests should be captured"
-    );
-    let count_tokens_body: serde_json::Value =
-        serde_json::from_str(&captured[0].body).expect("count_tokens body should be json");
-    let messages_body: serde_json::Value =
-        serde_json::from_str(&captured[1].body).expect("request body should be json");
-    assert_eq!(captured[0].path, "/v1/messages/count_tokens");
-    assert_eq!(captured[1].path, "/v1/messages");
-    assert_eq!(count_tokens_body["model"], json!("claude-opus-4-6"));
-    assert_eq!(messages_body["model"], json!("claude-opus-4-6"));
-}
-
-#[tokio::test]
 async fn send_message_blocks_oversized_requests_before_the_http_call() {
     let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
     let server = spawn_server(
@@ -169,13 +114,13 @@ async fn send_message_blocks_oversized_requests_before_the_http_call() {
         .send_message(&MessageRequest {
             model: "claude-sonnet-4-6".to_string(),
             max_tokens: 64_000,
-            messages: vec![InputMessage {
+            messages: Arc::new(vec![InputMessage {
                 role: "user".to_string(),
                 content: vec![InputContentBlock::Text {
                     text: "x".repeat(600_000),
                 }],
-            }],
-            system: Some("Keep the answer short.".to_string()),
+            }]),
+            system: Some(Arc::from("Keep the answer short.")),
             tools: None,
             tool_choice: None,
             stream: false,
@@ -235,7 +180,7 @@ async fn send_message_applies_request_profile_and_records_telemetry() {
     let request = captured.first().expect("server should capture request");
     assert_eq!(
         request.headers.get("anthropic-beta").map(String::as_str),
-        Some("claude-code-20250219,prompt-caching-scope-2026-01-05,tools-2026-04-01")
+        Some("claude-code-20250219,prompt-caching-scope-2026-01-05,effort-2025-11-24,tools-2026-04-01")
     );
     assert_eq!(
         request.headers.get("user-agent").map(String::as_str),
@@ -404,7 +349,6 @@ async fn stream_message_parses_sse_events_with_tool_use() {
     .await;
 
     let client = ApiClient::new("test-key")
-        .with_auth_token(Some("proxy-token".to_string()))
         .with_base_url(server.base_url())
         .with_prompt_cache(PromptCache::new("stream-session"));
     let mut stream = client
@@ -787,9 +731,9 @@ async fn live_stream_smoke_test() {
             model: std::env::var("ANTHROPIC_MODEL")
                 .unwrap_or_else(|_| "claude-3-7-sonnet-latest".to_string()),
             max_tokens: 32,
-            messages: vec![InputMessage::user_text(
+            messages: Arc::new(vec![InputMessage::user_text(
                 "Reply with exactly: hello from rust",
-            )],
+            )]),
             system: None,
             tools: None,
             tool_choice: None,
@@ -948,7 +892,7 @@ fn sample_request(stream: bool) -> MessageRequest {
     MessageRequest {
         model: "claude-3-7-sonnet-latest".to_string(),
         max_tokens: 64,
-        messages: vec![InputMessage {
+        messages: Arc::new(vec![InputMessage {
             role: "user".to_string(),
             content: vec![
                 InputContentBlock::Text {
@@ -960,10 +904,11 @@ fn sample_request(stream: bool) -> MessageRequest {
                         value: json!({"forecast": "sunny"}),
                     }],
                     is_error: false,
+                    cache_reference: None,
                 },
             ],
-        }],
-        system: Some("Use tools when needed".to_string()),
+        }]),
+        system: Some(Arc::from("Use tools when needed")),
         tools: Some(vec![ToolDefinition {
             name: "get_weather".to_string(),
             description: Some("Fetches the weather".to_string()),

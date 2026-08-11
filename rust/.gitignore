@@ -1,7 +1,1 @@
-target/
-.omx/
-.clawd-agents/
-# Claw Code local artifacts
-.claw/settings.local.json
-.claw/sessions/
-.clawhip/
+/target/

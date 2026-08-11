@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -13,6 +14,7 @@ const DEFAULT_BREAK_MIN_DROP: u32 = 2_000;
 const MAX_SANITIZED_LENGTH: usize = 80;
 const REQUEST_FINGERPRINT_VERSION: u32 = 1;
 const REQUEST_FINGERPRINT_PREFIX: &str = "v1";
+const PREVIOUS_WINDOW_SIZE: usize = 3;
 const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 
@@ -120,7 +122,13 @@ impl PromptCache {
     pub fn with_config(config: PromptCacheConfig) -> Self {
         let paths = PromptCachePaths::for_session(&config.session_id);
         let stats = read_json::<PromptCacheStats>(&paths.stats_path).unwrap_or_default();
-        let previous = read_json::<TrackedPromptState>(&paths.session_state_path);
+        let previous = read_json::<TrackedPromptState>(&paths.session_state_path)
+            .map(|state| {
+                let mut deque = VecDeque::with_capacity(PREVIOUS_WINDOW_SIZE);
+                deque.push_back(state);
+                deque
+            })
+            .unwrap_or_default();
         Self {
             inner: Arc::new(Mutex::new(PromptCacheInner {
                 config,
@@ -144,14 +152,10 @@ impl PromptCache {
     #[must_use]
     pub fn lookup_completion(&self, request: &MessageRequest) -> Option<MessageResponse> {
         let request_hash = request_hash_hex(request);
-        let (paths, ttl) = {
-            let inner = self.lock();
-            (inner.paths.clone(), inner.config.completion_ttl)
-        };
-        let entry_path = paths.completion_entry_path(&request_hash);
+        let mut inner = self.lock();
+        let entry_path = inner.paths.completion_entry_path(&request_hash);
         let entry = read_json::<CompletionCacheEntry>(&entry_path);
         let Some(entry) = entry else {
-            let mut inner = self.lock();
             inner.stats.completion_cache_misses += 1;
             inner.stats.last_completion_cache_key = Some(request_hash);
             persist_state(&inner);
@@ -159,20 +163,18 @@ impl PromptCache {
         };
 
         if entry.fingerprint_version != current_fingerprint_version() {
-            let mut inner = self.lock();
             inner.stats.completion_cache_misses += 1;
             inner.stats.last_completion_cache_key = Some(request_hash.clone());
-            let _ = fs::remove_file(entry_path);
+            let _ = fs::remove_file(&entry_path);
             persist_state(&inner);
             return None;
         }
 
-        let expired = now_unix_secs().saturating_sub(entry.cached_at_unix_secs) >= ttl.as_secs();
-        let mut inner = self.lock();
-        inner.stats.last_completion_cache_key = Some(request_hash.clone());
+        let expired = now_unix_secs().saturating_sub(entry.cached_at_unix_secs)
+            >= inner.config.completion_ttl.as_secs();
         if expired {
             inner.stats.completion_cache_misses += 1;
-            let _ = fs::remove_file(entry_path);
+            let _ = fs::remove_file(&entry_path);
             persist_state(&inner);
             return None;
         }
@@ -184,10 +186,12 @@ impl PromptCache {
             &request_hash,
             "completion-cache",
         );
-        inner.previous = Some(TrackedPromptState::from_usage(
-            request,
-            &entry.response.usage,
-        ));
+        inner
+            .previous
+            .push_back(TrackedPromptState::from_usage(request, &entry.response.usage));
+        if inner.previous.len() > PREVIOUS_WINDOW_SIZE {
+            inner.previous.pop_front();
+        }
         persist_state(&inner);
         Some(entry.response)
     }
@@ -214,7 +218,7 @@ impl PromptCache {
     ) -> PromptCacheRecord {
         let request_hash = request_hash_hex(request);
         let mut inner = self.lock();
-        let previous = inner.previous.clone();
+        let previous = inner.previous.back().cloned();
         let current = TrackedPromptState::from_usage(request, usage);
         let cache_break = detect_cache_break(&inner.config, previous.as_ref(), &current);
 
@@ -229,7 +233,10 @@ impl PromptCache {
             inner.stats.last_break_reason = Some(event.reason.clone());
         }
 
-        inner.previous = Some(current);
+        inner.previous.push_back(current);
+        if inner.previous.len() > PREVIOUS_WINDOW_SIZE {
+            inner.previous.pop_front();
+        }
         if let Some(response) = response {
             write_completion_entry(&inner.paths, &request_hash, response);
             inner.stats.completion_cache_writes += 1;
@@ -254,7 +261,7 @@ struct PromptCacheInner {
     config: PromptCacheConfig,
     paths: PromptCachePaths,
     stats: PromptCacheStats,
-    previous: Option<TrackedPromptState>,
+    previous: VecDeque<TrackedPromptState>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -398,7 +405,7 @@ fn apply_usage_to_stats(
 fn persist_state(inner: &PromptCacheInner) {
     let _ = ensure_cache_dirs(&inner.paths);
     let _ = write_json(&inner.paths.stats_path, &inner.stats);
-    if let Some(previous) = &inner.previous {
+    if let Some(previous) = inner.previous.back() {
         let _ = write_json(&inner.paths.session_state_path, previous);
     }
 }
@@ -440,7 +447,7 @@ fn request_hash_hex(request: &MessageRequest) -> String {
 }
 
 fn hash_serializable<T: Serialize>(value: &T) -> u64 {
-    let json = serde_json::to_vec(value).unwrap_or_default();
+    let json = serde_json::to_vec(value).expect("hash_serializable: serialization failed");
     stable_hash_bytes(&json)
 }
 
@@ -500,7 +507,7 @@ fn stable_hash_bytes(bytes: &[u8]) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::{Arc, Mutex, OnceLock};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use super::{
@@ -699,8 +706,8 @@ mod tests {
         MessageRequest {
             model: "claude-3-7-sonnet-latest".to_string(),
             max_tokens: 64,
-            messages: vec![InputMessage::user_text(text)],
-            system: Some("system".to_string()),
+            messages: Arc::new(vec![InputMessage::user_text(text)]),
+            system: Some(Arc::from("system")),
             tools: None,
             tool_choice: None,
             stream: false,

@@ -4,21 +4,28 @@
 //! MCP plumbing, tool-facing file operations, and the core conversation loop
 //! that drives interactive and one-shot turns.
 
-mod approval_tokens;
 mod bash;
+pub use bash::resolve_shell;
+mod bash_dangerous_env;
+mod bash_job_object_ffi;
 pub mod bash_validation;
+pub mod boundary;
 mod bootstrap;
 pub mod branch_lock;
 mod compact;
+pub mod compression_config;
 mod config;
 pub mod config_validate;
+mod context;
 mod conversation;
 mod file_ops;
-pub mod g004_conformance;
 mod git_context;
 pub mod green_contract;
 mod hooks;
-mod json;
+pub mod image_cache;
+pub mod image_compressor;
+pub mod image_store;
+pub mod json;
 mod lane_events;
 pub mod lsp_client;
 mod mcp;
@@ -26,69 +33,66 @@ mod mcp_client;
 pub mod mcp_lifecycle_hardened;
 pub mod mcp_server;
 mod mcp_stdio;
-pub mod mcp_tool_bridge;
 mod oauth;
 pub mod permission_enforcer;
 mod permissions;
-pub mod plugin_lifecycle;
 mod policy_engine;
 mod prompt;
 pub mod recovery_recipes;
 mod remote;
-mod report_schema;
 pub mod sandbox;
 mod session;
 pub mod session_control;
-pub mod trident;
 pub use session_control::SessionStore;
 mod sse;
 pub mod stale_base;
 pub mod stale_branch;
 pub mod summary_compression;
 pub mod task_packet;
-pub mod task_registry;
 pub mod team_cron_registry;
-#[cfg(test)]
+pub mod text_only_models;
+pub mod thinking;
+pub mod tool_registry;
 mod trust_resolver;
 mod usage;
-pub mod worker_boot;
 
-pub use approval_tokens::{
-    ApprovalDelegationHop, ApprovalScope, ApprovalTokenAudit, ApprovalTokenError,
-    ApprovalTokenGrant, ApprovalTokenLedger, ApprovalTokenStatus,
-};
 pub use bash::{execute_bash, BashCommandInput, BashCommandOutput};
+pub use boundary::{
+    ApprovedRoot, ApprovedRootsFile, BoundaryCheck, BoundaryDecision, PolicyOutcome, Prompter,
+    PrompterError, BoundaryPolicy, BoundaryPolicyKind,
+};
 pub use bootstrap::{BootstrapPhase, BootstrapPlan};
 pub use branch_lock::{detect_branch_lock_collisions, BranchLockCollision, BranchLockIntent};
 pub use compact::{
-    compact_session, estimate_session_tokens, format_compact_summary,
-    get_compact_continuation_message, should_compact, CompactionConfig, CompactionResult,
+    compact_session, estimate_image_block_tokens, estimate_session_tokens, estimate_text_tokens,
+    format_compact_summary, get_compact_continuation_message, should_compact, CompactionConfig,
+    CompactionResult,
 };
+pub use compression_config::CompressionConfig;
 pub use config::{
-    clear_user_provider_settings, default_config_home, save_user_provider_settings,
-    suppress_config_warnings_for_json_mode, ApiTimeoutConfig, ConfigEntry, ConfigError,
-    ConfigFileReport, ConfigFileStatus, ConfigInspection, ConfigLoader, ConfigSource,
-    McpConfigCollection, McpInvalidServerConfig, McpManagedProxyServerConfig, McpOAuthConfig,
-    McpRemoteServerConfig, McpSdkServerConfig, McpServerConfig, McpStdioServerConfig, McpTransport,
-    McpWebSocketServerConfig, OAuthConfig, ProviderFallbackConfig, ResolvedPermissionMode,
-    RulesImportConfig, RuntimeConfig, RuntimeFeatureConfig, RuntimeHookCommand, RuntimeHookConfig,
-    RuntimeInvalidHookConfig, RuntimePermissionRuleConfig, RuntimePluginConfig,
-    RuntimeProviderConfig, ScopedMcpServerConfig, CLAW_SETTINGS_SCHEMA_NAME,
+    default_config_home, parse_mcp_server_config, strip_verbatim_prefix, user_home_dir, ConfigEntry,
+    ConfigError, ConfigLoader, ConfigSource, McpConfigCollection, McpManagedProxyServerConfig,
+    McpOAuthConfig, McpRemoteServerConfig, McpSdkServerConfig, McpServerConfig, McpStdioServerConfig,
+    McpTransport, McpWebSocketServerConfig, OAuthConfig, ProviderFallbackConfig,
+    ResolvedPermissionMode, RuntimeConfig, RuntimeFeatureConfig, RuntimeHookConfig,
+    RuntimePermissionRuleConfig, RuntimePluginConfig, ScopedMcpServerConfig,
+    CLAW_SETTINGS_SCHEMA_NAME,
 };
 pub use config_validate::{
     check_unsupported_format, format_diagnostics, validate_config_file, ConfigDiagnostic,
     DiagnosticKind, ValidationResult,
 };
 pub use conversation::{
-    auto_compaction_threshold_from_env, ApiClient, ApiRequest, AssistantEvent, AutoCompactionEvent,
-    ConversationRuntime, PromptCacheEvent, RuntimeError, StaticToolExecutor, ToolError,
-    ToolExecutor, TurnSummary,
+    auto_compaction_threshold_from_env, extract_embedded_tools, ApiClient, ApiRequest,
+    AssistantEvent, AutoCompactionEvent, ConversationRuntime, PromptCacheEvent, RuntimeError,
+    StaticToolExecutor, ToolError, ToolExecutor, TurnSummary,
 };
+pub use context::{estimate_message_tokens, filter_for_api, filter_for_api_with_config};
 pub use file_ops::{
-    edit_file, edit_file_in_workspace, glob_search, glob_search_in_workspace, grep_search,
-    grep_search_in_workspace, read_file, read_file_in_workspace, write_file,
-    write_file_in_workspace, EditFileOutput, GlobSearchOutput, GrepSearchInput, GrepSearchOutput,
-    ReadFileOutput, StructuredPatchHunk, TextFilePayload, WriteFileOutput,
+    edit_file, edit_file_with_policy, glob_search, grep_search, new_file, new_file_with_policy,
+    normalize_path_for_output, read_file, read_file_with_policy, EditFileOutput, GlobSearchOutput,
+    GrepSearchInput, GrepSearchOutput, ReadFileOutput, StructuredPatchHunk, TextFilePayload,
+    WriteFileOutput,
 };
 pub use git_context::{GitCommitEntry, GitContext};
 pub use hooks::{
@@ -134,36 +138,22 @@ pub use permissions::{
     PermissionContext, PermissionMode, PermissionOutcome, PermissionOverride, PermissionPolicy,
     PermissionPromptDecision, PermissionPrompter, PermissionRequest,
 };
-pub use plugin_lifecycle::{
-    DegradedMode, DiscoveryResult, PluginHealthcheck, PluginLifecycle, PluginLifecycleEvent,
-    PluginState, ResourceInfo, ServerHealth, ServerStatus, ToolInfo,
-};
 pub use policy_engine::{
-    evaluate, evaluate_with_events, ApprovalToken, DiffScope, GreenLevel, LaneBlocker, LaneContext,
-    PolicyAction, PolicyCondition, PolicyDecisionEvent, PolicyDecisionKind, PolicyEngine,
-    PolicyEvaluation, PolicyRule, ReconcileReason, ReviewStatus,
+    evaluate, DiffScope, GreenLevel, LaneBlocker, LaneContext, PolicyAction, PolicyCondition,
+    PolicyEngine, PolicyRule, ReconcileReason, ReviewStatus,
 };
 pub use prompt::{
-    load_system_prompt, load_system_prompt_with_context, prepend_bullets, ContextFile,
-    ModelFamilyIdentity, ProjectContext, PromptBuildError, SystemPromptBuilder,
-    FRONTIER_MODEL_NAME, SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
+    load_system_prompt, prepend_bullets, ContextFile, ProjectContext, PromptBuildError,
+    SystemPromptBuilder, FRONTIER_MODEL_NAME, SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
 };
 pub use recovery_recipes::{
-    attempt_recovery, recipe_for, EscalationPolicy, FailureScenario, RecoveryAttemptState,
-    RecoveryAttemptType, RecoveryCommandResult, RecoveryContext, RecoveryEvent,
-    RecoveryLedgerEntry, RecoveryRecipe, RecoveryResult, RecoveryStatusReport, RecoveryStep,
+    attempt_recovery, recipe_for, EscalationPolicy, FailureScenario, RecoveryContext,
+    RecoveryEvent, RecoveryRecipe, RecoveryResult, RecoveryStep, WorkerFailureKind,
 };
 pub use remote::{
     inherited_upstream_proxy_env, no_proxy_list, read_token, upstream_proxy_ws_url,
     RemoteSessionContext, UpstreamProxyBootstrap, UpstreamProxyState, DEFAULT_REMOTE_BASE_URL,
     DEFAULT_SESSION_TOKEN_PATH, DEFAULT_SYSTEM_CA_BUNDLE, NO_PROXY_HOSTS, UPSTREAM_PROXY_ENV_KEYS,
-};
-pub use report_schema::{
-    canonicalize_report, project_report, report_content_hash, report_schema_v1_registry,
-    CanonicalReportV1, ClaimKind, ConsumerCapabilities, FieldDelta, FieldDeltaState,
-    NegativeEvidence, NegativeFindingStatus, ProjectionProvenance, RedactionProvenance,
-    ReportClaim, ReportConfidence, ReportIdentity, ReportProjectionV1, ReportSchemaField,
-    ReportSchemaRegistry, SensitivityClass, DEFAULT_PROJECTION_POLICY_V1, REPORT_SCHEMA_V1,
 };
 pub use sandbox::{
     build_linux_sandbox_command, detect_container_environment, detect_container_environment_from,
@@ -173,9 +163,10 @@ pub use sandbox::{
 };
 pub use session::{
     ContentBlock, ConversationMessage, MessageRole, Session, SessionCompaction, SessionError,
-    SessionFork, SessionHeartbeat, SessionLiveness, SessionPromptEntry,
+    SessionFork, SessionPromptEntry,
 };
 pub use sse::{IncrementalSseParser, SseEvent};
+pub use thinking::{render_reasoning, ReasoningTheme, ThinkParser};
 pub use stale_base::{
     check_base_commit, format_stale_base_warning, read_claw_base_file, resolve_expected_base,
     BaseCommitSource, BaseCommitState,
@@ -184,19 +175,12 @@ pub use stale_branch::{
     apply_policy, check_freshness, BranchFreshness, StaleBranchAction, StaleBranchEvent,
     StaleBranchPolicy,
 };
-pub use task_packet::{
-    validate_packet, TaskPacket, TaskPacketValidationError, TaskResource, ValidatedPacket,
-};
-pub use task_registry::{LaneBoard, LaneBoardEntry, LaneFreshness, LaneHeartbeat};
-#[cfg(test)]
+pub use task_packet::{validate_packet, TaskPacket, TaskPacketValidationError, ValidatedPacket};
 pub use trust_resolver::{TrustConfig, TrustDecision, TrustEvent, TrustPolicy, TrustResolver};
 pub use usage::{
     format_usd, pricing_for_model, ModelPricing, TokenUsage, UsageCostEstimate, UsageTracker,
 };
-pub use worker_boot::{
-    Worker, WorkerEvent, WorkerEventKind, WorkerEventPayload, WorkerFailure, WorkerFailureKind,
-    WorkerPromptTarget, WorkerReadySnapshot, WorkerRegistry, WorkerStatus, WorkerTrustResolution,
-};
+
 
 #[cfg(test)]
 pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {

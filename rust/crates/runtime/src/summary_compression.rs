@@ -1,8 +1,6 @@
 use std::collections::BTreeSet;
 
-const DEFAULT_MAX_CHARS: usize = 1_200;
-const DEFAULT_MAX_LINES: usize = 24;
-const DEFAULT_MAX_LINE_CHARS: usize = 160;
+use crate::compression_config::CompressionConfig;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SummaryCompressionBudget {
@@ -13,10 +11,16 @@ pub struct SummaryCompressionBudget {
 
 impl Default for SummaryCompressionBudget {
     fn default() -> Self {
+        Self::from_config(&CompressionConfig::default())
+    }
+}
+
+impl SummaryCompressionBudget {
+    pub fn from_config(config: &CompressionConfig) -> Self {
         Self {
-            max_chars: DEFAULT_MAX_CHARS,
-            max_lines: DEFAULT_MAX_LINES,
-            max_line_chars: DEFAULT_MAX_LINE_CHARS,
+            max_chars: config.summary_max_chars,
+            max_lines: config.summary_max_lines,
+            max_line_chars: config.summary_max_line_chars,
         }
     }
 }
@@ -89,7 +93,11 @@ pub fn compress_summary(
 
 #[must_use]
 pub fn compress_summary_text(summary: &str) -> String {
-    compress_summary(summary, SummaryCompressionBudget::default()).summary
+    compress_summary_with_budget(summary, &CompressionConfig::global())
+}
+
+pub fn compress_summary_with_budget(summary: &str, config: &CompressionConfig) -> String {
+    compress_summary(summary, SummaryCompressionBudget::from_config(config)).summary
 }
 
 #[derive(Debug, Default)]

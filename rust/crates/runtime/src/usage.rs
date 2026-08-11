@@ -218,6 +218,8 @@ impl UsageTracker {
 mod tests {
     use super::{format_usd, pricing_for_model, TokenUsage, UsageTracker};
     use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
+    use std::sync::OnceLock;
+    use std::time::Instant;
 
     #[test]
     fn tracks_true_cumulative_usage() {
@@ -304,6 +306,9 @@ mod tests {
                 cache_creation_input_tokens: 1,
                 cache_read_input_tokens: 0,
             }),
+            created_at: Instant::now(),
+            cached_tokens: OnceLock::new(),
+            cached_input_message: OnceLock::new(),
         }];
 
         let tracker = UsageTracker::from_session(&session);

@@ -122,9 +122,47 @@ pub(crate) fn parse_frame_with_provider(
         return Ok(None);
     }
 
-    serde_json::from_str::<StreamEvent>(&payload)
-        .map(Some)
-        .map_err(|error| ApiError::json_deserialize(provider, model, &payload, error))
+    match serde_json::from_str::<StreamEvent>(&payload) {
+        Ok(event) => Ok(Some(event)),
+        Err(error) => {
+            // Unknown event type (e.g. "server_error", "error") - try to
+            // extract diagnostic info and return an ApiError, so the caller
+            // can handle it instead of crashing.
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&payload) {
+                if let Some(typ) = val.get("type").and_then(|v| v.as_str()) {
+                    if typ == "error" || typ.ends_with("_error") {
+                        let status = val
+                            .get("code")
+                            .and_then(|v| v.as_u64())
+                            .map(|c| reqwest::StatusCode::try_from(c as u16).ok())
+                            .flatten()
+                            .unwrap_or(reqwest::StatusCode::INTERNAL_SERVER_ERROR);
+                        let msg = val
+                            .get("message")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown streaming error")
+                            .to_string();
+                        return Err(ApiError::Api {
+                            status,
+                            error_type: Some(typ.to_string()),
+                            message: Some(msg),
+                            request_id: None,
+                            body: payload,
+                            retryable: true,
+                            suggested_action: None,
+                        });
+                    }
+                }
+            }
+            // Unrecognisable payload — skip the frame rather than failing
+            // the entire stream. A future API extension may have introduced
+            // a new event type we don't understand.
+            eprintln!(
+                "[sse] skipping unparseable event from {provider}/{model}: {error}"
+            );
+            Ok(None)
+        }
+    }
 }
 
 #[cfg(test)]

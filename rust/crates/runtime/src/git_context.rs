@@ -194,6 +194,7 @@ mod tests {
         let root = temp_dir("branch-commits");
         fs::create_dir_all(&root).expect("create dir");
         git(&root, &["init", "--quiet", "--initial-branch=main"]);
+        git(&root, &["config", "core.autocrlf", "false"]);
         git(&root, &["config", "user.email", "tests@example.com"]);
         git(&root, &["config", "user.name", "Git Context Tests"]);
         fs::write(root.join("a.txt"), "a\n").expect("write a");
@@ -223,6 +224,7 @@ mod tests {
         let root = temp_dir("staged");
         fs::create_dir_all(&root).expect("create dir");
         git(&root, &["init", "--quiet", "--initial-branch=main"]);
+        git(&root, &["config", "core.autocrlf", "false"]);
         git(&root, &["config", "user.email", "tests@example.com"]);
         git(&root, &["config", "user.name", "Git Context Tests"]);
         fs::write(root.join("init.txt"), "init\n").expect("write init");
@@ -293,6 +295,7 @@ mod tests {
         let root = temp_dir("five-commits");
         fs::create_dir_all(&root).expect("create dir");
         git(&root, &["init", "--quiet", "--initial-branch=main"]);
+        git(&root, &["config", "core.autocrlf", "false"]);
         git(&root, &["config", "user.email", "tests@example.com"]);
         git(&root, &["config", "user.name", "Git Context Tests"]);
         for i in 1..=8 {

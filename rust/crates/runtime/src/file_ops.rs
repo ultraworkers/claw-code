@@ -1,29 +1,21 @@
 use std::cmp::Reverse;
-use std::collections::HashSet;
 use std::fs;
-use std::io;
+use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use glob::Pattern;
-use regex::RegexBuilder;
 use serde::{Deserialize, Serialize};
-use walkdir::{DirEntry, WalkDir};
+use xxhash_rust::xxh3::xxh3_64;
+
+use crate::boundary::{
+    canonicalize_maybe_missing, classify_boundary, BoundaryCheck, BoundaryPolicy, PolicyOutcome,
+};
 
 /// Maximum file size that can be read (10 MB).
 const MAX_READ_SIZE: u64 = 10 * 1024 * 1024;
 
 /// Maximum file size that can be written (10 MB).
 const MAX_WRITE_SIZE: usize = 10 * 1024 * 1024;
-
-const GLOB_SEARCH_IGNORED_DIRS: &[&str] = &[
-    ".git",
-    "node_modules",
-    ".build",
-    "target",
-    "dist",
-    "coverage",
-];
 
 /// Check whether a file appears to contain binary content by examining
 /// the first chunk for NUL bytes.
@@ -35,30 +27,33 @@ fn is_binary_file(path: &Path) -> io::Result<bool> {
     Ok(buffer[..bytes_read].contains(&0))
 }
 
-/// Validate that a resolved path stays within the given workspace root.
-/// Returns the canonical path on success, or an error if the path escapes
-/// the workspace boundary (e.g. via `../` traversal or symlink).
-#[allow(dead_code)]
-fn validate_workspace_boundary(resolved: &Path, workspace_root: &Path) -> io::Result<()> {
-    if !resolved.starts_with(workspace_root) {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            format!(
-                "path {} escapes workspace boundary {}",
-                resolved.display(),
-                workspace_root.display()
-            ),
-        ));
-    }
-    Ok(())
+/// Normalize path for output by converting backslashes to forward slashes.
+/// This ensures consistent path format in JSON responses across platforms.
+pub fn normalize_path_for_output(path: &Path) -> String {
+    dunce::simplified(path)
+        .as_os_str()
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+/// Normalize a path string relative to a base directory for output.
+fn normalize_path_for_output_in_dir(base: &Path, rel_path: &str) -> String {
+    let full = base.join(rel_path);
+    normalize_path_for_output(&full)
 }
 
 /// Text payload returned by file-reading operations.
+/// Content is returned by default (`full: true`); pass `full: false`
+/// for a token-light payload that omits `content`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TextFilePayload {
     #[serde(rename = "filePath")]
     pub file_path: String,
-    pub content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    pub checksum: String,
+    #[serde(rename = "bytesRead")]
+    pub bytes_read: usize,
     #[serde(rename = "numLines")]
     pub num_lines: usize,
     #[serde(rename = "startLine")]
@@ -89,41 +84,76 @@ pub struct StructuredPatchHunk {
     pub lines: Vec<String>,
 }
 
+/// Syntax validation result for write/edit operations.
+/// Binary or unknown types are `Skipped`; parse errors carry the error message and line.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SyntaxCheck {
+    Valid,
+    Invalid {
+        message: String,
+        line: Option<usize>,
+    },
+    Skipped,
+}
+
 /// Output envelope for full-file write operations.
+/// Includes a content preview (truncated) so the model can verify the
+/// new contents without re-reading the file.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WriteFileOutput {
     #[serde(rename = "type")]
     pub kind: String,
     #[serde(rename = "filePath")]
     pub file_path: String,
-    pub content: String,
-    #[serde(rename = "structuredPatch")]
-    pub structured_patch: Vec<StructuredPatchHunk>,
-    #[serde(rename = "originalFile")]
-    pub original_file: Option<String>,
-    #[serde(rename = "gitDiff")]
-    pub git_diff: Option<serde_json::Value>,
+    pub checksum: String,
+    #[serde(rename = "bytesWritten")]
+    pub bytes_written: usize,
+    #[serde(rename = "linesWritten")]
+    pub lines_written: usize,
+    /// Truncated preview of the file content *after* the write, so the
+    /// model can verify the change. `None` only when the file is too
+    /// large to preview. By default the preview is included.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_preview: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub syntax: Option<SyntaxCheck>,
 }
 
 /// Output envelope for targeted string-replacement edits.
+/// Includes a content preview (truncated) so the model can verify the
+/// change without re-reading the file. The full file is not echoed.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EditFileOutput {
+    #[serde(rename = "type")]
+    pub kind: String,
     #[serde(rename = "filePath")]
     pub file_path: String,
     #[serde(rename = "oldString")]
     pub old_string: String,
     #[serde(rename = "newString")]
     pub new_string: String,
-    #[serde(rename = "originalFile")]
-    pub original_file: String,
-    #[serde(rename = "structuredPatch")]
-    pub structured_patch: Vec<StructuredPatchHunk>,
-    #[serde(rename = "userModified")]
-    pub user_modified: bool,
-    #[serde(rename = "replaceAll")]
-    pub replace_all: bool,
-    #[serde(rename = "gitDiff")]
-    pub git_diff: Option<serde_json::Value>,
+    #[serde(rename = "newChecksum")]
+    pub new_checksum: String,
+    #[serde(rename = "bytesChanged")]
+    pub bytes_changed: isize,
+    #[serde(rename = "linesChanged")]
+    pub lines_changed: usize,
+    /// Number of times `old_string` matched in the file. Useful for
+    /// detecting ambiguity: if > 1 and `replace_all` was not requested,
+    /// the caller may have hit the wrong occurrence and should re-read
+    /// the file to verify.
+    #[serde(rename = "occurrencesMatched", default)]
+    pub occurrences_matched: usize,
+    #[serde(rename = "diffSummary")]
+    pub diff_summary: String,
+    /// Truncated preview of the file content *after* the edit, so the
+    /// model can verify the change. `None` only when the file is too
+    /// large to preview. By default the preview is included.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_preview: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub syntax: Option<SyntaxCheck>,
 }
 
 /// Result of a glob-based filename search.
@@ -182,10 +212,14 @@ pub struct GrepSearchOutput {
 }
 
 /// Reads a text file and returns a line-windowed payload.
+///
+/// When `full` is `Some(true)` (default) the entire selected window is returned
+/// in `content`; when `Some(false)`, `content` is `None` (token-light mode).
 pub fn read_file(
     path: &str,
     offset: Option<usize>,
     limit: Option<usize>,
+    full: Option<bool>,
 ) -> io::Result<ReadFileOutput> {
     let absolute_path = normalize_path(path)?;
 
@@ -211,18 +245,28 @@ pub fn read_file(
     }
 
     let content = fs::read_to_string(&absolute_path)?;
+    let checksum = format!("{:016x}", xxh3_64(content.as_bytes()));
     let lines: Vec<&str> = content.lines().collect();
     let start_index = offset.unwrap_or(0).min(lines.len());
     let end_index = limit.map_or(lines.len(), |limit| {
         start_index.saturating_add(limit).min(lines.len())
     });
     let selected = lines[start_index..end_index].join("\n");
+    let bytes_read = selected.len();
+
+    let content = if full == Some(false) {
+        None
+    } else {
+        Some(selected)
+    };
 
     Ok(ReadFileOutput {
         kind: String::from("text"),
         file: TextFilePayload {
-            file_path: absolute_path.to_string_lossy().into_owned(),
-            content: selected,
+            file_path: normalize_path_for_output(&absolute_path),
+            content,
+            checksum,
+            bytes_read,
             num_lines: end_index.saturating_sub(start_index),
             start_line: start_index.saturating_add(1),
             total_lines: lines.len(),
@@ -230,8 +274,42 @@ pub fn read_file(
     })
 }
 
-/// Replaces a file's contents and returns patch metadata.
-pub fn write_file(path: &str, content: &str) -> io::Result<WriteFileOutput> {
+/// Maximum bytes for an echoed `content_preview` on write/edit results.
+/// 2 KiB keeps the tool_result envelope small while still giving the
+/// model enough text to verify a single targeted change.
+const CONTENT_PREVIEW_MAX: usize = 2_048;
+
+/// Files larger than this threshold skip the `content_preview` in
+/// `new_file` output because the full content already exists in the
+/// `ToolUse` input.  For files ≤ this size the preview is included
+/// so the model can verify without re-reading.
+const CONTENT_PREVIEW_SKIP_THRESHOLD: usize = 512;
+
+/// Returns a truncated preview of the given content, or `None` when
+/// the content is empty. The preview is wrapped in [`CONTENT_PREVIEW_MAX`]
+/// bytes; truncation is indicated by a trailing marker so the model
+/// knows the echo was clipped.
+fn preview_for(content: &str) -> Option<String> {
+    if content.is_empty() {
+        return None;
+    }
+    if content.len() <= CONTENT_PREVIEW_MAX {
+        return Some(content.to_owned());
+    }
+    let mut end = CONTENT_PREVIEW_MAX;
+    while end > 0 && !content.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut out = String::with_capacity(end + 64);
+    out.push_str(&content[..end]);
+    out.push_str("\n…[truncated, full content written to file]");
+    Some(out)
+}
+
+/// Creates a new file and returns metadata plus a truncated content preview.
+/// When `force` is false (default), fails if the file already exists — use `edit_file` to modify.
+/// When `force` is true, overwrites the existing file entirely.
+pub fn new_file(path: &str, content: &str, force: bool) -> io::Result<WriteFileOutput> {
     if content.len() > MAX_WRITE_SIZE {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -244,126 +322,228 @@ pub fn write_file(path: &str, content: &str) -> io::Result<WriteFileOutput> {
     }
 
     let absolute_path = normalize_path_allow_missing(path)?;
-    let original_file = fs::read_to_string(&absolute_path).ok();
+
+    if absolute_path.exists() && absolute_path.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "path '{}' is a directory, cannot create file",
+                absolute_path.display()
+            ),
+        ));
+    }
+
+    let is_existing = absolute_path.exists();
+
+    if is_existing && !force {
+        let existing = fs::read_to_string(&absolute_path).unwrap_or_default();
+        let line_count = existing.lines().count();
+        let byte_count = existing.len();
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!(
+                "File already exists at '{}' ({} lines, {} bytes). \
+                 Use `edit_file` to modify existing files, \
+                 or set `force: true` to overwrite entirely.",
+                absolute_path.display(),
+                line_count,
+                byte_count
+            ),
+        ));
+    }
+
     if let Some(parent) = absolute_path.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(&absolute_path, content)?;
+
+    if is_existing {
+        // Overwrite mode: truncate + write
+        fs::write(&absolute_path, content)?;
+    } else {
+        // Atomic create: fails if file was created between our exists() check and now.
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&absolute_path)?;
+        file.write_all(content.as_bytes())?;
+    }
+
+    let checksum = format!("{:016x}", xxh3_64(content.as_bytes()));
+    let bytes_written = content.len();
+    let lines_written = if content.is_empty() {
+        0
+    } else {
+        content.lines().count()
+    };
 
     Ok(WriteFileOutput {
-        kind: if original_file.is_some() {
-            String::from("update")
+        kind: if is_existing {
+            String::from("overwrite")
         } else {
             String::from("create")
         },
-        file_path: absolute_path.to_string_lossy().into_owned(),
-        content: content.to_owned(),
-        structured_patch: make_patch(original_file.as_deref().unwrap_or(""), content),
-        original_file,
-        git_diff: None,
+        file_path: normalize_path_for_output(&absolute_path),
+        checksum,
+        bytes_written,
+        lines_written,
+        content_preview: if content.len() <= CONTENT_PREVIEW_SKIP_THRESHOLD {
+            preview_for(content)
+        } else {
+            None
+        },
+        syntax: Some(validate_syntax(&absolute_path, content)),
     })
 }
 
-/// Performs an in-file string replacement and returns patch metadata.
+/// Performs an in-file string replacement and returns metadata plus a
+/// truncated content preview so the model can verify the change.
 pub fn edit_file(
     path: &str,
     old_string: &str,
     new_string: &str,
     replace_all: bool,
+    expected_checksum: Option<&str>,
 ) -> io::Result<EditFileOutput> {
     let absolute_path = normalize_path(path)?;
-    let original_file = fs::read_to_string(&absolute_path)?;
+    let original_content_raw = fs::read_to_string(&absolute_path)?;
+
+    if let Some(expected) = expected_checksum {
+        let actual = format!("{:016x}", xxh3_64(original_content_raw.as_bytes()));
+        if actual != expected {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("expected checksum {expected} but current file checksum is {actual}"),
+            ));
+        }
+    }
+
+    // Normalize CRLF → LF so matching is consistent with read_file output
+    // which strips \r via .lines().join("\n").
+    let original_content = original_content_raw.replace("\r\n", "\n");
+
     if old_string == new_string {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "old_string and new_string must differ",
         ));
     }
-    if !original_file.contains(old_string) {
+    if !original_content.contains(old_string) {
+        let line_count = original_content.lines().count();
+        let tail: Vec<&str> = original_content
+            .lines()
+            .rev()
+            .take(5)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        let tail_preview = tail.join("\n");
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
-            "old_string not found in file",
+            format!(
+                "old_string not found in file ({} lines). \
+                 The file may have been modified since you last read it. \
+                 Last 5 lines of the file:
+---
+{}
+---
+\
+                 Please call read_file to see the current content before retrying.",
+                line_count, tail_preview
+            ),
         ));
     }
 
-    let updated = if replace_all {
-        original_file.replace(old_string, new_string)
+    let occurrences_matched = original_content.matches(old_string).count();
+
+    let new_content = if replace_all {
+        original_content.replace(old_string, new_string)
     } else {
-        original_file.replacen(old_string, new_string, 1)
+        original_content.replacen(old_string, new_string, 1)
     };
-    fs::write(&absolute_path, &updated)?;
+    fs::write(&absolute_path, &new_content)?;
+
+    let new_checksum = format!("{:016x}", xxh3_64(new_content.as_bytes()));
+    let bytes_changed = new_content.len() as isize - original_content.len() as isize;
+
+    let patch = make_patch(&original_content, &new_content);
+    let lines_changed: usize = patch.iter().map(|h| h.lines.len()).sum();
+
+    let diff_summary = if serde_json::to_string(&patch).map_or(true, |s| s.len() > 2048) {
+        serde_json::json!({
+            "truncated": true,
+            "hunks_count": patch.len(),
+            "first_hunk_range": patch.first().map(|h| {
+                format!("@@ -{},{} +{},{} @@", h.old_start, h.old_lines, h.new_start, h.new_lines)
+            }).unwrap_or_default(),
+            "total_lines_changed": lines_changed,
+        })
+        .to_string()
+    } else {
+        serde_json::to_string(&patch).unwrap_or_default()
+    };
 
     Ok(EditFileOutput {
-        file_path: absolute_path.to_string_lossy().into_owned(),
+        kind: String::from("edit"),
+        file_path: normalize_path_for_output(&absolute_path),
         old_string: old_string.to_owned(),
         new_string: new_string.to_owned(),
-        original_file: original_file.clone(),
-        structured_patch: make_patch(&original_file, &updated),
-        user_modified: false,
-        replace_all,
-        git_diff: None,
+        new_checksum,
+        bytes_changed,
+        lines_changed,
+        occurrences_matched,
+        diff_summary,
+        content_preview: preview_for(&new_content),
+        syntax: Some(validate_syntax(&absolute_path, &new_content)),
     })
 }
 
 /// Expands a glob pattern and returns matching filenames.
 pub fn glob_search(pattern: &str, path: Option<&str>) -> io::Result<GlobSearchOutput> {
-    glob_search_impl(pattern, path, None)
-}
-
-fn glob_search_impl(
-    pattern: &str,
-    path: Option<&str>,
-    workspace_root: Option<&Path>,
-) -> io::Result<GlobSearchOutput> {
     let started = Instant::now();
     let base_dir = path
         .map(normalize_path)
         .transpose()?
         .unwrap_or(std::env::current_dir()?);
-    let canonical_root = workspace_root.map(canonicalize_workspace_root);
-    if let Some(root) = canonical_root.as_deref() {
-        validate_workspace_boundary(&base_dir, root)?;
-    }
-    let search_pattern = if Path::new(pattern).is_absolute() {
-        pattern.to_owned()
-    } else {
-        base_dir.join(pattern).to_string_lossy().into_owned()
-    };
 
-    // The `glob` crate does not support brace expansion ({a,b,c}).
-    // Expand braces into multiple patterns so patterns like
-    // `Assets/**/*.{cs,uxml,uss}` work correctly.
-    let expanded = expand_braces(&search_pattern);
+    // `fd` is used only to enumerate files. Its `--glob` flag matches file
+    // basenames, not relative paths, which breaks patterns containing a path
+    // separator such as `nested/*.rs` (fd 10 on Windows). Matching is done in
+    // Rust with the `glob` crate against the relative path from the search
+    // root, so path-style patterns behave consistently on every platform.
+    let mut cmd = std::process::Command::new("fd");
+    cmd.arg("--type").arg("f")
+       .arg("--hidden").arg("--no-ignore")
+       .current_dir(&base_dir);
 
-    let mut seen = HashSet::new();
-    let mut matches = Vec::new();
-    for pat in &expanded {
-        let compiled = Pattern::new(pat)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
-        let walk_root = derive_glob_walk_root(pat);
-        if let Some(root) = canonical_root.as_deref() {
-            let canonical_walk_root = walk_root
-                .canonicalize()
-                .unwrap_or_else(|_| walk_root.clone());
-            validate_workspace_boundary(&canonical_walk_root, root)?;
-        }
-        let entries = WalkDir::new(&walk_root)
-            .into_iter()
-            .filter_entry(|entry| !should_skip_glob_dir(entry));
-        for entry in entries.flatten() {
-            let candidate = entry.path();
-            if entry.file_type().is_file()
-                && compiled.matches_path(candidate)
-                && seen.insert(candidate.to_path_buf())
-            {
-                if let Some(root) = canonical_root.as_deref() {
-                    let canonical_candidate = candidate.canonicalize()?;
-                    validate_workspace_boundary(&canonical_candidate, root)?;
-                }
-                matches.push(candidate.to_path_buf());
-            }
-        }
+    let output = cmd.output().map_err(|e| {
+        io::Error::new(io::ErrorKind::NotFound, format!("fd not found: {e}"))
+    })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, stderr.to_string()));
     }
+
+    // Rust-side glob matching against the relative path. Normalise Windows
+    // separators to `/` so `nested/*.rs` works regardless of platform.
+    // The `glob` crate (0.3) does not support `{a,b}` brace alternation, so
+    // expand braces into a list of alternative patterns and match any of them.
+    let glob_expression = pattern.replace('\\', "/");
+    let matchers = expand_brace_patterns(&glob_expression).map_err(|e| {
+        io::Error::new(io::ErrorKind::InvalidInput, format!("invalid glob pattern: {e}"))
+    })?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut matches: Vec<PathBuf> = stdout
+        .lines()
+        .filter(|l| !l.is_empty())
+        .filter_map(|line| {
+            let rel = line.replace('\\', "/");
+            let matched = matchers.iter().any(|p| p.matches(&rel));
+            matched.then(|| base_dir.join(line))
+        })
+        .collect();
 
     matches.sort_by_key(|path| {
         fs::metadata(path)
@@ -376,7 +556,7 @@ fn glob_search_impl(
     let filenames = matches
         .into_iter()
         .take(100)
-        .map(|path| path.to_string_lossy().into_owned())
+        .map(|path| normalize_path_for_output(&path))
         .collect::<Vec<_>>();
 
     Ok(GlobSearchOutput {
@@ -387,219 +567,194 @@ fn glob_search_impl(
     })
 }
 
-/// Runs a regex search over workspace files with optional context lines.
-pub fn grep_search(input: &GrepSearchInput) -> io::Result<GrepSearchOutput> {
-    grep_search_impl(input, None)
+/// Expand `{a,b}` brace alternations in a glob pattern into a list of
+/// alternative patterns. The `glob` crate (0.3) does not support brace
+/// syntax natively, so `*.{rs,toml}` is expanded to `["*.rs", "*.toml"]`.
+/// Nested and empty braces are not supported; a malformed brace sequence is
+/// left as-is (matching fd's lenient behaviour).
+fn expand_brace_patterns(pattern: &str) -> io::Result<Vec<glob::Pattern>> {
+    // Split at the first brace pair, expand it, and recurse on the suffix so
+    // multiple `{...}` groups (e.g. `a{b,c}d{e,f}`) all expand correctly.
+    let Some(open) = pattern.find('{') else {
+        let single = glob::Pattern::new(pattern).map_err(|e| {
+            io::Error::new(io::ErrorKind::InvalidInput, format!("invalid glob pattern `{pattern}`: {e}"))
+        })?;
+        return Ok(vec![single]);
+    };
+    let Some(close_rel) = pattern[open..].find('}') else {
+        // Unclosed brace — treat as literal.
+        let single = glob::Pattern::new(pattern).map_err(|e| {
+            io::Error::new(io::ErrorKind::InvalidInput, format!("invalid glob pattern `{pattern}`: {e}"))
+        })?;
+        return Ok(vec![single]);
+    };
+    let close = open + close_rel;
+    let prefix = &pattern[..open];
+    let body = &pattern[open + 1..close];
+    let suffix = &pattern[close + 1..];
+
+    let choices: Vec<&str> = body.split(',').filter(|c| !c.is_empty()).collect();
+    if choices.is_empty() {
+        // `{}` — treat as literal braces.
+        let single = glob::Pattern::new(pattern).map_err(|e| {
+            io::Error::new(io::ErrorKind::InvalidInput, format!("invalid glob pattern `{pattern}`: {e}"))
+        })?;
+        return Ok(vec![single]);
+    }
+
+    let mut patterns = Vec::new();
+    for choice in choices {
+        let combined = format!("{prefix}{choice}{suffix}");
+        patterns.extend(expand_brace_patterns(&combined)?);
+    }
+    Ok(patterns)
 }
 
-fn grep_search_impl(
-    input: &GrepSearchInput,
-    workspace_root: Option<&Path>,
-) -> io::Result<GrepSearchOutput> {
+/// Runs a regex search over workspace files with optional context lines.
+pub fn grep_search(input: &GrepSearchInput) -> io::Result<GrepSearchOutput> {
     let base_path = input
         .path
         .as_deref()
         .map(normalize_path)
         .transpose()?
         .unwrap_or(std::env::current_dir()?);
-    let canonical_root = workspace_root.map(canonicalize_workspace_root);
-    if let Some(root) = canonical_root.as_deref() {
-        validate_workspace_boundary(&base_path, root)?;
-    }
 
-    let regex = RegexBuilder::new(&input.pattern)
-        .case_insensitive(input.case_insensitive.unwrap_or(false))
-        .dot_matches_new_line(input.multiline.unwrap_or(false))
-        .build()
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
-
-    let glob_filter = input
-        .glob
-        .as_deref()
-        .map(Pattern::new)
-        .transpose()
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
-    let file_type = input.file_type.as_deref();
     let output_mode = input
         .output_mode
         .clone()
         .unwrap_or_else(|| String::from("files_with_matches"));
     let context = input.context.or(input.context_short).unwrap_or(0);
 
-    let mut filenames = Vec::new();
-    let mut content_lines = Vec::new();
-    let mut total_matches = 0usize;
+    let mut cmd = std::process::Command::new("rg");
+    cmd.arg("--no-heading")
+       .arg("--color").arg("never")
+       .arg("--line-number")
+       // Force rg to always print the file path prefix. When rg searches a
+       // single file argument it omits the path by default, which breaks the
+       // `path:...` parsing in the count/content modes below (a bare `2` or
+       // `1:text` line would be silently dropped, reporting 0 matches).
+       .arg("--with-filename");
 
-    for file_path in collect_search_files(&base_path)? {
-        if let Some(root) = canonical_root.as_deref() {
-            let canonical_file = file_path.canonicalize()?;
-            validate_workspace_boundary(&canonical_file, root)?;
-        }
-        if !matches_optional_filters(&file_path, glob_filter.as_ref(), file_type) {
-            continue;
-        }
+    if input.case_insensitive.unwrap_or(false) {
+        cmd.arg("--ignore-case");
+    }
+    if input.multiline.unwrap_or(false) {
+        cmd.arg("--multiline");
+    }
 
-        let Ok(file_contents) = fs::read_to_string(&file_path) else {
-            continue;
-        };
-
-        if output_mode == "count" {
-            let count = regex.find_iter(&file_contents).count();
-            if count > 0 {
-                filenames.push(file_path.to_string_lossy().into_owned());
-                total_matches += count;
-            }
-            continue;
-        }
-
-        let lines: Vec<&str> = file_contents.lines().collect();
-        let mut matched_lines = Vec::new();
-        for (index, line) in lines.iter().enumerate() {
-            if regex.is_match(line) {
-                total_matches += 1;
-                matched_lines.push(index);
+    match output_mode.as_str() {
+        "count" => { cmd.arg("--count-matches"); }
+        "content" => {
+            let before = input.before.unwrap_or(context);
+            let after = input.after.unwrap_or(context);
+            if before > 0 || after > 0 {
+                cmd.arg("-B").arg(before.to_string())
+                   .arg("-A").arg(after.to_string());
             }
         }
+        _ => { cmd.arg("--files-with-matches"); }
+    }
 
-        if matched_lines.is_empty() {
-            continue;
-        }
+    if let Some(ref glob_pat) = input.glob {
+        cmd.arg("--glob").arg(glob_pat);
+    }
+    if let Some(ref file_type) = input.file_type {
+        cmd.arg("--type").arg(file_type);
+    }
 
-        filenames.push(file_path.to_string_lossy().into_owned());
-        if output_mode == "content" {
-            for index in matched_lines {
-                let start = index.saturating_sub(input.before.unwrap_or(context));
-                let end = (index + input.after.unwrap_or(context) + 1).min(lines.len());
-                for (current, line) in lines.iter().enumerate().take(end).skip(start) {
-                    let prefix = if input.line_numbers.unwrap_or(true) {
-                        format!("{}:{}:", file_path.to_string_lossy(), current + 1)
-                    } else {
-                        format!("{}:", file_path.to_string_lossy())
-                    };
-                    content_lines.push(format!("{prefix}{line}"));
+    cmd.arg("--").arg(&input.pattern);
+
+    if base_path.is_file() {
+        cmd.arg(&base_path);
+    } else {
+        cmd.current_dir(&base_path);
+    }
+
+    let output = cmd.output().map_err(|e| {
+        io::Error::new(io::ErrorKind::NotFound, format!("rg not found: {e}"))
+    })?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    if !output.status.success() && output.status.code() != Some(1) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, stderr.to_string()));
+    }
+
+    let offset = input.offset.unwrap_or(0);
+    let head_limit = input.head_limit;
+
+    match output_mode.as_str() {
+        "count" => {
+            let mut filenames = Vec::new();
+            let mut total_matches = 0usize;
+            for line in stdout.lines() {
+                if let Some((path, count_str)) = line.rsplit_once(':') {
+                    if let Ok(count) = count_str.parse::<usize>() {
+                        total_matches += count;
+                        filenames.push(normalize_path_for_output_in_dir(&base_path, path));
+                    }
                 }
             }
+            let (filenames, applied_limit, applied_offset) =
+                apply_limit(filenames, head_limit, Some(offset));
+            Ok(GrepSearchOutput {
+                mode: Some(output_mode),
+                num_files: filenames.len(),
+                filenames,
+                content: None,
+                num_lines: None,
+                num_matches: Some(total_matches),
+                applied_limit,
+                applied_offset: applied_offset,
+            })
+        }
+        "content" => {
+            let mut content_lines = Vec::new();
+            let mut filenames_set = std::collections::HashSet::new();
+            for line in stdout.lines() {
+                if line.is_empty() { continue; }
+                if let Some(path) = line.split(':').next() {
+                    filenames_set.insert(normalize_path_for_output_in_dir(&base_path, path));
+                }
+                content_lines.push(line.to_string());
+            }
+            let (content_lines, applied_limit, applied_offset) =
+                apply_limit(content_lines, head_limit, Some(offset));
+            let filenames: Vec<String> = filenames_set.into_iter().collect();
+            Ok(GrepSearchOutput {
+                mode: Some(output_mode),
+                num_files: filenames.len(),
+                filenames,
+                content: Some(content_lines.join("\n")),
+                num_lines: Some(content_lines.len()),
+                num_matches: None,
+                applied_limit,
+                applied_offset: applied_offset,
+            })
+        }
+        _ => {
+            let mut filenames: Vec<String> = stdout
+                .lines()
+                .filter(|l| !l.is_empty())
+                .map(|l| normalize_path_for_output_in_dir(&base_path, l))
+                .collect();
+            filenames.sort();
+            filenames.dedup();
+            let (filenames, applied_limit, applied_offset) =
+                apply_limit(filenames, head_limit, Some(offset));
+            Ok(GrepSearchOutput {
+                mode: Some(output_mode),
+                num_files: filenames.len(),
+                filenames,
+                content: None,
+                num_lines: None,
+                num_matches: None,
+                applied_limit,
+                applied_offset: applied_offset,
+             })
         }
     }
-
-    let (filenames, applied_limit, applied_offset) =
-        apply_limit(filenames, input.head_limit, input.offset);
-    if output_mode == "content" {
-        return Ok(build_grep_content_output(
-            output_mode,
-            filenames,
-            content_lines,
-            input.head_limit,
-            input.offset,
-        ));
-    }
-
-    Ok(GrepSearchOutput {
-        mode: Some(output_mode.clone()),
-        num_files: filenames.len(),
-        filenames,
-        content: None,
-        num_lines: None,
-        num_matches: (output_mode == "count").then_some(total_matches),
-        applied_limit,
-        applied_offset,
-    })
-}
-
-fn build_grep_content_output(
-    output_mode: String,
-    filenames: Vec<String>,
-    content_lines: Vec<String>,
-    head_limit: Option<usize>,
-    offset: Option<usize>,
-) -> GrepSearchOutput {
-    let (lines, limit, offset) = apply_limit(content_lines, head_limit, offset);
-    GrepSearchOutput {
-        mode: Some(output_mode),
-        num_files: filenames.len(),
-        filenames,
-        num_lines: Some(lines.len()),
-        content: Some(lines.join("\n")),
-        num_matches: None,
-        applied_limit: limit,
-        applied_offset: offset,
-    }
-}
-
-fn canonicalize_workspace_root(workspace_root: &Path) -> PathBuf {
-    workspace_root
-        .canonicalize()
-        .unwrap_or_else(|_| workspace_root.to_path_buf())
-}
-
-fn should_skip_glob_dir(entry: &DirEntry) -> bool {
-    entry.file_type().is_dir()
-        && entry
-            .file_name()
-            .to_str()
-            .is_some_and(|name| GLOB_SEARCH_IGNORED_DIRS.contains(&name))
-}
-
-fn derive_glob_walk_root(pattern: &str) -> PathBuf {
-    let path = Path::new(pattern);
-    let mut prefix = PathBuf::new();
-    let mut saw_component = false;
-
-    for component in path.components() {
-        let text = component.as_os_str().to_string_lossy();
-        if component_contains_glob(&text) {
-            break;
-        }
-        prefix.push(component.as_os_str());
-        saw_component = true;
-    }
-
-    if saw_component {
-        prefix
-    } else {
-        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
-    }
-}
-
-fn component_contains_glob(component: &str) -> bool {
-    component.contains('*') || component.contains('?') || component.contains('[')
-}
-
-fn collect_search_files(base_path: &Path) -> io::Result<Vec<PathBuf>> {
-    if base_path.is_file() {
-        return Ok(vec![base_path.to_path_buf()]);
-    }
-
-    let mut files = Vec::new();
-    for entry in WalkDir::new(base_path) {
-        let entry = entry.map_err(|error| io::Error::other(error.to_string()))?;
-        if entry.file_type().is_file() {
-            files.push(entry.path().to_path_buf());
-        }
-    }
-    Ok(files)
-}
-
-fn matches_optional_filters(
-    path: &Path,
-    glob_filter: Option<&Pattern>,
-    file_type: Option<&str>,
-) -> bool {
-    if let Some(glob_filter) = glob_filter {
-        let path_string = path.to_string_lossy();
-        if !glob_filter.matches(&path_string) && !glob_filter.matches_path(path) {
-            return false;
-        }
-    }
-
-    if let Some(file_type) = file_type {
-        let extension = path.extension().and_then(|extension| extension.to_str());
-        if extension != Some(file_type) {
-            return false;
-        }
-    }
-
-    true
 }
 
 fn apply_limit<T>(
@@ -641,145 +796,358 @@ fn make_patch(original: &str, updated: &str) -> Vec<StructuredPatchHunk> {
     }]
 }
 
-fn normalize_path(path: &str) -> io::Result<PathBuf> {
-    let candidate = if Path::new(path).is_absolute() {
-        PathBuf::from(path)
-    } else {
-        std::env::current_dir()?.join(path)
-    };
-    candidate.canonicalize()
-}
+/// Expand environment variables in a path string.
+/// Supports `%VAR%` (Windows) and `${VAR}` (Unix) syntax.
+/// Non-existent variables are left as-is.
+fn expand_env_vars(path: &str) -> String {
+    let mut result = String::with_capacity(path.len() + 64);
+    let mut chars = path.char_indices().peekable();
 
-fn normalize_path_allow_missing(path: &str) -> io::Result<PathBuf> {
-    let candidate = if Path::new(path).is_absolute() {
-        PathBuf::from(path)
-    } else {
-        std::env::current_dir()?.join(path)
-    };
-
-    if let Ok(canonical) = candidate.canonicalize() {
-        return Ok(canonical);
-    }
-
-    if let Some(parent) = candidate.parent() {
-        let canonical_parent = parent
-            .canonicalize()
-            .unwrap_or_else(|_| parent.to_path_buf());
-        if let Some(name) = candidate.file_name() {
-            return Ok(canonical_parent.join(name));
+    while let Some((_, ch)) = chars.next() {
+        if ch == '%' {
+            let mut var_name = String::new();
+            let mut closed = false;
+            while let Some((_, c)) = chars.next() {
+                if c == '%' {
+                    closed = true;
+                    break;
+                }
+                var_name.push(c);
+            }
+            if closed {
+                if let Ok(val) = std::env::var(&var_name) {
+                    result.push_str(&val);
+                } else {
+                    result.push('%');
+                    result.push_str(&var_name);
+                    result.push('%');
+                }
+            } else {
+                result.push('%');
+                result.push_str(&var_name);
+            }
+        } else if ch == '$' && chars.peek().is_some_and(|(_, c)| *c == '{') {
+            chars.next();
+            let mut var_name = String::new();
+            let mut closed = false;
+            while let Some((_, c)) = chars.next() {
+                if c == '}' {
+                    closed = true;
+                    break;
+                }
+                var_name.push(c);
+            }
+            if closed {
+                if let Ok(val) = std::env::var(&var_name) {
+                    result.push_str(&val);
+                } else {
+                    result.push('$');
+                    result.push('{');
+                    result.push_str(&var_name);
+                    result.push('}');
+                }
+            } else {
+                result.push('$');
+                result.push('{');
+                result.push_str(&var_name);
+            }
+        } else {
+            result.push(ch);
         }
     }
 
-    Ok(candidate)
+    result
 }
 
-/// Read a file with workspace boundary enforcement.
+fn normalize_path_resolve(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut result = PathBuf::new();
+    for c in path.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                result.pop();
+            }
+            other => result.push(other.as_os_str()),
+        }
+    }
+    if result.as_os_str().is_empty() && !path.as_os_str().is_empty() {
+        result.push(".");
+    }
+    result
+}
+
+fn normalize_path(path: &str) -> io::Result<PathBuf> {
+    let expanded = expand_env_vars(strip_file_url(path));
+    let candidate = if Path::new(&expanded).is_absolute() {
+        PathBuf::from(&expanded)
+    } else {
+        std::env::current_dir()?.join(&expanded)
+    };
+    let cleaned = dunce::simplified(&candidate).to_path_buf();
+    if !cleaned.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("file not found: {}", candidate.display()),
+        ));
+    }
+    Ok(normalize_path_resolve(&cleaned))
+}
+
+fn normalize_path_allow_missing(path: &str) -> io::Result<PathBuf> {
+    let expanded = expand_env_vars(strip_file_url(path));
+    let candidate = if Path::new(&expanded).is_absolute() {
+        PathBuf::from(&expanded)
+    } else {
+        std::env::current_dir()?.join(&expanded)
+    };
+    let cleaned = dunce::simplified(&candidate).to_path_buf();
+    Ok(normalize_path_resolve(&cleaned))
+}
+
+fn strip_file_url(path: &str) -> &str {
+    let Some(rest) = path.strip_prefix("file://") else {
+        return path;
+    };
+    if rest.is_empty() || !rest.starts_with('/') {
+        return rest;
+    }
+    let bytes = rest.as_bytes();
+    if bytes.len() >= 3 && bytes[1].is_ascii_alphabetic() && bytes[2] == b':' {
+        &rest[1..]
+    } else {
+        rest
+    }
+}
+
+/// Read a file with workspace boundary enforcement that consults a
+/// `BoundaryPolicy` on out-of-workspace paths. When the path is
+/// inside the workspace, behavior is identical to
+/// `read_file_in_workspace`. When the path escapes the workspace, the
+/// policy decides: `Block` denies, `Allow` permits silently, and
+/// `Prompt` asks the human.
 #[allow(dead_code)]
-pub fn read_file_in_workspace(
+pub fn read_file_with_policy(
     path: &str,
     offset: Option<usize>,
     limit: Option<usize>,
     workspace_root: &Path,
+    policy: &BoundaryPolicy,
+    full: Option<bool>,
 ) -> io::Result<ReadFileOutput> {
     let absolute_path = normalize_path(path)?;
-    let canonical_root = canonicalize_workspace_root(workspace_root);
-    validate_workspace_boundary(&absolute_path, &canonical_root)?;
-    read_file(path, offset, limit)
+    let canonical_root = dunce::simplified(
+        &workspace_root
+            .canonicalize()
+            .unwrap_or_else(|_| workspace_root.to_path_buf()),
+    )
+    .to_path_buf();
+    let canonical_path = canonicalize_maybe_missing(&absolute_path);
+    let check = classify_boundary(&canonical_path, &canonical_root);
+    if matches!(check, BoundaryCheck::OutOfWorkspace { .. }) {
+        match policy.enforce_outside(&canonical_path, &canonical_root) {
+            PolicyOutcome::Proceed | PolicyOutcome::Approved { .. } => {}
+            PolicyOutcome::Denied(msg) => {
+                return Err(io::Error::new(io::ErrorKind::PermissionDenied, msg));
+            }
+        }
+    }
+    // `full` flows through: callers that want the default LLM-friendly
+    // echo pass `None` (or `Some(true)`); callers that need the
+    // legacy token-light payload pass `Some(false)`. A prior version
+    // hardcoded `None` here, which silently ignored `full: false`
+    // and always echoed the content.
+    read_file(
+        canonical_path.to_string_lossy().as_ref(),
+        offset,
+        limit,
+        full,
+    )
 }
 
-/// Write a file with workspace boundary enforcement.
+/// Write a file with workspace boundary enforcement that consults a
+/// `BoundaryPolicy` on out-of-workspace paths. See
+/// `read_file_with_policy` for the policy contract.
 #[allow(dead_code)]
-pub fn write_file_in_workspace(
+pub fn new_file_with_policy(
     path: &str,
     content: &str,
+    force: bool,
     workspace_root: &Path,
+    policy: &BoundaryPolicy,
 ) -> io::Result<WriteFileOutput> {
     let absolute_path = normalize_path_allow_missing(path)?;
-    let canonical_root = canonicalize_workspace_root(workspace_root);
-    validate_workspace_boundary(&absolute_path, &canonical_root)?;
-    write_file(path, content)
+    let canonical_root = dunce::simplified(
+        &workspace_root
+            .canonicalize()
+            .unwrap_or_else(|_| workspace_root.to_path_buf()),
+    )
+    .to_path_buf();
+    let canonical_path = canonicalize_maybe_missing(&absolute_path);
+    let check = classify_boundary(&canonical_path, &canonical_root);
+    if matches!(check, BoundaryCheck::OutOfWorkspace { .. }) {
+        match policy.enforce_outside(&canonical_path, &canonical_root) {
+            PolicyOutcome::Proceed | PolicyOutcome::Approved { .. } => {}
+            PolicyOutcome::Denied(msg) => {
+                return Err(io::Error::new(io::ErrorKind::PermissionDenied, msg));
+            }
+        }
+    }
+    new_file(canonical_path.to_string_lossy().as_ref(), content, force)
 }
 
-/// Edit a file with workspace boundary enforcement.
+/// Edit a file with workspace boundary enforcement that consults a
+/// `BoundaryPolicy` on out-of-workspace paths. See
+/// `read_file_with_policy` for the policy contract.
 #[allow(dead_code)]
-pub fn edit_file_in_workspace(
+pub fn edit_file_with_policy(
     path: &str,
     old_string: &str,
     new_string: &str,
     replace_all: bool,
+    expected_checksum: Option<&str>,
     workspace_root: &Path,
+    policy: &BoundaryPolicy,
 ) -> io::Result<EditFileOutput> {
     let absolute_path = normalize_path(path)?;
-    let canonical_root = canonicalize_workspace_root(workspace_root);
-    validate_workspace_boundary(&absolute_path, &canonical_root)?;
-    edit_file(path, old_string, new_string, replace_all)
+    let canonical_root = dunce::simplified(
+        &workspace_root
+            .canonicalize()
+            .unwrap_or_else(|_| workspace_root.to_path_buf()),
+    )
+    .to_path_buf();
+    let canonical_path = canonicalize_maybe_missing(&absolute_path);
+    let check = classify_boundary(&canonical_path, &canonical_root);
+    if matches!(check, BoundaryCheck::OutOfWorkspace { .. }) {
+        match policy.enforce_outside(&canonical_path, &canonical_root) {
+            PolicyOutcome::Proceed | PolicyOutcome::Approved { .. } => {}
+            PolicyOutcome::Denied(msg) => {
+                return Err(io::Error::new(io::ErrorKind::PermissionDenied, msg));
+            }
+        }
+    }
+    edit_file(
+        canonical_path.to_string_lossy().as_ref(),
+        old_string,
+        new_string,
+        replace_all,
+        expected_checksum,
+    )
 }
 
-/// Expand a glob pattern with workspace boundary enforcement.
+/// Expands a glob pattern with workspace boundary enforcement.
+/// Filters out any matching files that escape the workspace root.
+// Not yet wired through the tool dispatch chain; see ROADMAP for the
+// BoundaryPolicy threading work that will connect this.
 #[allow(dead_code)]
-pub fn glob_search_in_workspace(
+pub fn glob_search_with_policy(
     pattern: &str,
     path: Option<&str>,
     workspace_root: &Path,
+    policy: &BoundaryPolicy,
 ) -> io::Result<GlobSearchOutput> {
-    glob_search_impl(pattern, path, Some(workspace_root))
+    let result = glob_search(pattern, path)?;
+    let canonical_root = canonicalize_maybe_missing(workspace_root);
+    let filtered: Vec<String> = result
+        .filenames
+        .into_iter()
+        .filter(|f| {
+            let check = classify_boundary(Path::new(f), &canonical_root);
+            if matches!(check, BoundaryCheck::InWorkspace) {
+                return true;
+            }
+            matches!(
+                policy.enforce_outside(Path::new(f), &canonical_root),
+                PolicyOutcome::Proceed | PolicyOutcome::Approved { .. }
+            )
+        })
+        .collect();
+    let num_files = filtered.len();
+    let truncated = num_files > 100;
+    Ok(GlobSearchOutput {
+        num_files,
+        filenames: filtered.into_iter().take(100).collect(),
+        truncated,
+        ..result
+    })
 }
 
-/// Search file contents with workspace boundary enforcement.
+/// Runs a regex search with workspace boundary enforcement.
+/// Only searches files that pass the workspace boundary check.
+// Not yet wired through the tool dispatch chain; see ROADMAP for the
+// BoundaryPolicy threading work that will connect this.
 #[allow(dead_code)]
-pub fn grep_search_in_workspace(
+pub fn grep_search_with_policy(
     input: &GrepSearchInput,
     workspace_root: &Path,
+    policy: &BoundaryPolicy,
 ) -> io::Result<GrepSearchOutput> {
-    grep_search_impl(input, Some(workspace_root))
-}
+    let canonical_root = canonicalize_maybe_missing(workspace_root);
+    let base_path = input
+        .path
+        .as_deref()
+        .map(normalize_path)
+        .transpose()?
+        .unwrap_or(std::env::current_dir()?);
 
-/// Check whether a path is a symlink that resolves outside the workspace.
-#[allow(dead_code)]
-pub fn is_symlink_escape(path: &Path, workspace_root: &Path) -> io::Result<bool> {
-    let metadata = fs::symlink_metadata(path)?;
-    if !metadata.is_symlink() {
-        return Ok(false);
+    if matches!(
+        classify_boundary(&base_path, &canonical_root),
+        BoundaryCheck::OutOfWorkspace { .. }
+    ) && matches!(
+        policy.enforce_outside(&base_path, &canonical_root),
+        PolicyOutcome::Denied(_)
+    ) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "search root {} escapes workspace boundary",
+                base_path.display()
+            ),
+        ));
     }
-    let resolved = path.canonicalize()?;
-    let canonical_root = workspace_root
-        .canonicalize()
-        .unwrap_or_else(|_| workspace_root.to_path_buf());
-    Ok(!resolved.starts_with(&canonical_root))
+
+    let input_with_filter = GrepSearchInput {
+        path: Some(base_path.to_string_lossy().into_owned()),
+        ..input.clone()
+    };
+    grep_search(&input_with_filter)
 }
 
-/// Expand shell-style brace groups in a glob pattern.
-///
-/// Handles one level of braces: `foo.{a,b,c}` → `["foo.a", "foo.b", "foo.c"]`.
-/// Nested braces are not expanded (uncommon in practice).
-/// Patterns without braces pass through unchanged.
-fn expand_braces(pattern: &str) -> Vec<String> {
-    let Some(open) = pattern.find('{') else {
-        return vec![pattern.to_owned()];
-    };
-    let Some(close) = pattern[open..].find('}').map(|i| open + i) else {
-        // Unmatched brace — treat as literal.
-        return vec![pattern.to_owned()];
-    };
-    let prefix = &pattern[..open];
-    let suffix = &pattern[close + 1..];
-    let alternatives = &pattern[open + 1..close];
-    alternatives
-        .split(',')
-        .flat_map(|alt| expand_braces(&format!("{prefix}{alt}{suffix}")))
-        .collect()
+/// Validate file syntax based on extension.
+/// Returns `Valid` for well-formed JSON/TOML, `Invalid(reason)` for parse errors,
+/// or `Skipped` for unsupported or binary file types.
+fn validate_syntax(path: &Path, content: &str) -> SyntaxCheck {
+    match path.extension().and_then(|e| e.to_str()) {
+        Some("json") => match serde_json::from_str::<serde_json::Value>(content) {
+            Ok(_) => SyntaxCheck::Valid,
+            Err(e) => SyntaxCheck::Invalid {
+                message: e.to_string(),
+                line: Some(e.line()),
+            },
+        },
+        Some("toml") => match toml::from_str::<toml::Value>(content) {
+            Ok(_) => SyntaxCheck::Valid,
+            Err(e) => SyntaxCheck::Invalid {
+                message: e.to_string(),
+                line: None,
+            },
+        },
+        _ => SyntaxCheck::Skipped,
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::collections::BTreeSet;
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        component_contains_glob, derive_glob_walk_root, edit_file, expand_braces, glob_search,
-        grep_search, is_symlink_escape, read_file, read_file_in_workspace, write_file,
-        write_file_in_workspace, GrepSearchInput, MAX_WRITE_SIZE,
+        edit_file, glob_search, grep_search, new_file, new_file_with_policy,
+        preview_for, read_file, read_file_with_policy, GrepSearchInput, MAX_WRITE_SIZE,
     };
+    use crate::boundary::{BoundaryDecision, BoundaryPolicy, Prompter, PrompterError};
 
     fn temp_path(name: &str) -> std::path::PathBuf {
         let unique = SystemTime::now()
@@ -792,30 +1160,25 @@ mod tests {
     #[test]
     fn reads_and_writes_files() {
         let path = temp_path("read-write.txt");
-        let write_output = write_file(path.to_string_lossy().as_ref(), "one\ntwo\nthree")
+        let write_output = new_file(path.to_string_lossy().as_ref(), "one\ntwo\nthree", false)
             .expect("write should succeed");
         assert_eq!(write_output.kind, "create");
 
-        let read_output = read_file(path.to_string_lossy().as_ref(), Some(1), Some(1))
-            .expect("read should succeed");
-        assert_eq!(read_output.file.content, "two");
-    }
-
-    #[test]
-    fn edits_file_contents() {
-        let path = temp_path("edit.txt");
-        write_file(path.to_string_lossy().as_ref(), "alpha beta alpha")
-            .expect("initial write should succeed");
-        let output = edit_file(path.to_string_lossy().as_ref(), "alpha", "omega", true)
-            .expect("edit should succeed");
-        assert!(output.replace_all);
+        let read_output = read_file(
+            path.to_string_lossy().as_ref(),
+            Some(1),
+            Some(1),
+            Some(true),
+        )
+        .expect("read should succeed");
+        assert_eq!(read_output.file.content, Some("two".to_string()));
     }
 
     #[test]
     fn rejects_binary_files() {
         let path = temp_path("binary-test.bin");
         std::fs::write(&path, b"\x00\x01\x02\x03binary content").expect("write should succeed");
-        let result = read_file(path.to_string_lossy().as_ref(), None, None);
+        let result = read_file(path.to_string_lossy().as_ref(), None, None, None);
         assert!(result.is_err());
         let error = result.unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
@@ -826,7 +1189,7 @@ mod tests {
     fn rejects_oversized_writes() {
         let path = temp_path("oversize-write.txt");
         let huge = "x".repeat(MAX_WRITE_SIZE + 1);
-        let result = write_file(path.to_string_lossy().as_ref(), &huge);
+        let result = new_file(path.to_string_lossy().as_ref(), &huge, false);
         assert!(result.is_err());
         let error = result.unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
@@ -834,120 +1197,14 @@ mod tests {
     }
 
     #[test]
-    fn enforces_workspace_boundary() {
-        let workspace = temp_path("workspace-boundary");
-        std::fs::create_dir_all(&workspace).expect("workspace dir should be created");
-        let inside = workspace.join("inside.txt");
-        write_file(inside.to_string_lossy().as_ref(), "safe content")
-            .expect("write inside workspace should succeed");
-
-        // Reading inside workspace should succeed
-        let result =
-            read_file_in_workspace(inside.to_string_lossy().as_ref(), None, None, &workspace);
-        assert!(result.is_ok());
-
-        // Reading outside workspace should fail
-        let outside = temp_path("outside-boundary.txt");
-        write_file(outside.to_string_lossy().as_ref(), "unsafe content")
-            .expect("write outside should succeed");
-        let result =
-            read_file_in_workspace(outside.to_string_lossy().as_ref(), None, None, &workspace);
-        assert!(result.is_err());
-        let error = result.unwrap_err();
-        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
-        assert!(error.to_string().contains("escapes workspace"));
-    }
-
-    #[test]
-    fn detects_symlink_escape() {
-        let workspace = temp_path("symlink-workspace");
-        std::fs::create_dir_all(&workspace).expect("workspace dir should be created");
-        let outside = temp_path("symlink-target.txt");
-        std::fs::write(&outside, "target content").expect("target should write");
-
-        let link_path = workspace.join("escape-link.txt");
-        #[cfg(unix)]
-        {
-            std::os::unix::fs::symlink(&outside, &link_path).expect("symlink should create");
-            assert!(is_symlink_escape(&link_path, &workspace).expect("check should succeed"));
-        }
-
-        // Non-symlink file should not be an escape
-        let normal = workspace.join("normal.txt");
-        std::fs::write(&normal, "normal content").expect("normal file should write");
-        assert!(!is_symlink_escape(&normal, &workspace).expect("check should succeed"));
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn workspace_read_rejects_symlink_escape_regression_3007_class() {
-        let workspace = temp_path("workspace-read-symlink-escape");
-        let outside = temp_path("workspace-read-symlink-target");
-        std::fs::create_dir_all(&workspace).expect("workspace dir should be created");
-        std::fs::create_dir_all(&outside).expect("outside dir should be created");
-        let outside_file = outside.join("secret.txt");
-        std::fs::write(&outside_file, "outside secret").expect("outside file should write");
-
-        let link_path = workspace.join("linked-secret.txt");
-        std::os::unix::fs::symlink(&outside_file, &link_path).expect("symlink should create");
-
-        let result =
-            read_file_in_workspace(link_path.to_string_lossy().as_ref(), None, None, &workspace);
-
-        assert!(result.is_err(), "symlink escape must be rejected");
-        let error = result.unwrap_err();
-        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
-        assert!(
-            error.to_string().contains("escapes workspace"),
-            "error should explain workspace escape: {error}"
-        );
-
-        let _ = std::fs::remove_dir_all(&workspace);
-        let _ = std::fs::remove_dir_all(&outside);
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn workspace_write_rejects_parent_symlink_escape_regression_3007_class() {
-        let workspace = temp_path("workspace-write-symlink-escape");
-        let outside = temp_path("workspace-write-symlink-target");
-        std::fs::create_dir_all(&workspace).expect("workspace dir should be created");
-        std::fs::create_dir_all(&outside).expect("outside dir should be created");
-
-        let link_dir = workspace.join("linked-outside");
-        std::os::unix::fs::symlink(&outside, &link_dir).expect("symlink dir should create");
-        let escaped_child = link_dir.join("created.txt");
-
-        let result = write_file_in_workspace(
-            escaped_child.to_string_lossy().as_ref(),
-            "must not escape",
-            &workspace,
-        );
-
-        assert!(result.is_err(), "parent symlink escape must be rejected");
-        let error = result.unwrap_err();
-        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
-        assert!(
-            error.to_string().contains("escapes workspace"),
-            "error should explain workspace escape: {error}"
-        );
-        assert!(
-            !outside.join("created.txt").exists(),
-            "write should not create through an escaping symlink"
-        );
-
-        let _ = std::fs::remove_dir_all(&workspace);
-        let _ = std::fs::remove_dir_all(&outside);
-    }
-
-    #[test]
     fn globs_and_greps_directory() {
         let dir = temp_path("search-dir");
         std::fs::create_dir_all(&dir).expect("directory should be created");
         let file = dir.join("demo.rs");
-        write_file(
+        new_file(
             file.to_string_lossy().as_ref(),
             "fn main() {\n println!(\"hello\");\n}\n",
+            false,
         )
         .expect("file write should succeed");
 
@@ -976,36 +1233,6 @@ mod tests {
     }
 
     #[test]
-    fn expand_braces_no_braces() {
-        assert_eq!(expand_braces("*.rs"), vec!["*.rs"]);
-    }
-
-    #[test]
-    fn expand_braces_single_group() {
-        let mut result = expand_braces("Assets/**/*.{cs,uxml,uss}");
-        result.sort();
-        assert_eq!(
-            result,
-            vec!["Assets/**/*.cs", "Assets/**/*.uss", "Assets/**/*.uxml",]
-        );
-    }
-
-    #[test]
-    fn expand_braces_nested() {
-        let mut result = expand_braces("src/{a,b}.{rs,toml}");
-        result.sort();
-        assert_eq!(
-            result,
-            vec!["src/a.rs", "src/a.toml", "src/b.rs", "src/b.toml"]
-        );
-    }
-
-    #[test]
-    fn expand_braces_unmatched() {
-        assert_eq!(expand_braces("foo.{bar"), vec!["foo.{bar"]);
-    }
-
-    #[test]
     fn glob_search_with_braces_finds_files() {
         let dir = temp_path("glob-braces");
         std::fs::create_dir_all(&dir).unwrap();
@@ -1022,49 +1249,374 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn glob_search_skips_common_heavy_directories() {
-        let dir = temp_path("glob-ignored-dirs");
-        std::fs::create_dir_all(dir.join("src")).unwrap();
-        std::fs::create_dir_all(dir.join("docs")).unwrap();
-        std::fs::create_dir_all(dir.join("node_modules/pkg")).unwrap();
-        std::fs::create_dir_all(dir.join(".build/checkouts/pkg")).unwrap();
-        std::fs::create_dir_all(dir.join("target/debug/deps")).unwrap();
+    /// Test-only scripted prompter mirroring the one in
+    /// `boundary::tests::ScriptedPrompter`. We keep a local copy so
+    /// `file_ops` tests do not depend on `boundary::tests`.
+    struct ScriptedPrompter {
+        decisions: Mutex<VecDeque<Result<BoundaryDecision, PrompterError>>>,
+    }
 
-        std::fs::write(dir.join("src/AGENTS.md"), "src").unwrap();
-        std::fs::write(dir.join("docs/AGENTS.md"), "docs").unwrap();
-        std::fs::write(dir.join("node_modules/pkg/AGENTS.md"), "node_modules").unwrap();
-        std::fs::write(dir.join(".build/checkouts/pkg/AGENTS.md"), ".build").unwrap();
-        std::fs::write(dir.join("target/debug/deps/AGENTS.md"), "target").unwrap();
+    impl ScriptedPrompter {
+        fn new(decisions: Vec<BoundaryDecision>) -> Self {
+            Self {
+                decisions: Mutex::new(decisions.into_iter().map(Ok).collect()),
+            }
+        }
+    }
 
-        let result =
-            glob_search("**/AGENTS.md", Some(dir.to_str().unwrap())).expect("glob should succeed");
+    impl Prompter for ScriptedPrompter {
+        fn ask(
+            &self,
+            _path: &std::path::Path,
+            _workspace: &std::path::Path,
+        ) -> Result<BoundaryDecision, PrompterError> {
+            self.decisions
+                .lock()
+                .expect("scripted prompter mutex poisoned")
+                .pop_front()
+                .unwrap_or(Err(PrompterError::NoTty))
+        }
+    }
 
-        assert_eq!(result.num_files, 2, "ignored dirs should be pruned");
-        assert!(result
-            .filenames
-            .iter()
-            .any(|path| path.ends_with("src/AGENTS.md")));
-        assert!(result
-            .filenames
-            .iter()
-            .any(|path| path.ends_with("docs/AGENTS.md")));
-        assert!(!result
-            .filenames
-            .iter()
-            .any(|path| path.contains("node_modules")
-                || path.contains(".build")
-                || path.contains("/target/")));
-
-        let _ = std::fs::remove_dir_all(&dir);
+    fn outside_workspace_setup(label: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let workspace = temp_path(&format!("policy-ws-{label}"));
+        let outside = temp_path(&format!("policy-out-{label}"));
+        std::fs::create_dir_all(&workspace).expect("create workspace");
+        std::fs::create_dir_all(&outside).expect("create outside");
+        (workspace, outside)
     }
 
     #[test]
-    fn derive_glob_walk_root_stops_at_first_glob_component() {
-        let root = derive_glob_walk_root("/tmp/demo/**/AGENTS.md");
-        assert_eq!(root, PathBuf::from("/tmp/demo"));
-        assert!(component_contains_glob("**"));
-        assert!(component_contains_glob("*.rs"));
-        assert!(!component_contains_glob("src"));
+    fn read_file_with_policy_block_denies_outside_workspace() {
+        let (workspace, outside) = outside_workspace_setup("block-read");
+        let file = outside.join("data.txt");
+        new_file(file.to_string_lossy().as_ref(), "secret", false).expect("write outside");
+        let result = read_file_with_policy(
+            file.to_string_lossy().as_ref(),
+            None,
+            None,
+            &workspace,
+            &BoundaryPolicy::Block,
+            None,
+        );
+        let err = result.expect_err("block policy must reject");
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(err.to_string().contains("escapes workspace"));
+        let _ = std::fs::remove_dir_all(&workspace);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    fn read_file_with_policy_allow_permits_outside_workspace() {
+        let (workspace, outside) = outside_workspace_setup("allow-read");
+        let file = outside.join("data.txt");
+        new_file(file.to_string_lossy().as_ref(), "ok", false).expect("write outside");
+        let result = read_file_with_policy(
+            file.to_string_lossy().as_ref(),
+            None,
+            None,
+            &workspace,
+            &BoundaryPolicy::Allow,
+            None,
+        );
+        // The read should succeed; the policy admitted the access.
+        let payload = result.expect("allow policy must permit");
+        // Checksum is set even when content is not echoed.
+        assert!(!payload.file.checksum.is_empty());
+        let _ = std::fs::remove_dir_all(&workspace);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    fn read_file_with_policy_prompt_allow_once_returns_file() {
+        let (workspace, outside) = outside_workspace_setup("prompt-once");
+        let file = outside.join("data.txt");
+        new_file(file.to_string_lossy().as_ref(), "once", false).expect("write outside");
+        let prompter = Arc::new(ScriptedPrompter::new(vec![BoundaryDecision::AllowOnce]));
+        let session = Arc::new(Mutex::new(BTreeSet::<crate::boundary::ApprovedRoot>::new()));
+        let policy = BoundaryPolicy::Prompt {
+            prompter: prompter.clone(),
+            session_approved: session.clone(),
+            user_typed: Arc::new(Mutex::new(BTreeSet::<crate::boundary::ApprovedRoot>::new())),
+        };
+        let result = read_file_with_policy(
+            file.to_string_lossy().as_ref(),
+            None,
+            None,
+            &workspace,
+            &policy,
+            None,
+        );
+        let payload = result.expect("AllowOnce should admit the read");
+        assert!(!payload.file.checksum.is_empty());
+        assert!(session.lock().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&workspace);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    fn read_file_with_policy_prompt_deny_blocks_with_user_facing_error() {
+        let (workspace, outside) = outside_workspace_setup("prompt-deny");
+        let file = outside.join("data.txt");
+        new_file(file.to_string_lossy().as_ref(), "secret", false).expect("write outside");
+        let prompter = Arc::new(ScriptedPrompter::new(vec![BoundaryDecision::Deny]));
+        let session = Arc::new(Mutex::new(BTreeSet::<crate::boundary::ApprovedRoot>::new()));
+        let policy = BoundaryPolicy::Prompt {
+            prompter: prompter.clone(),
+            session_approved: session.clone(),
+            user_typed: Arc::new(Mutex::new(BTreeSet::<crate::boundary::ApprovedRoot>::new())),
+        };
+        let result = read_file_with_policy(
+            file.to_string_lossy().as_ref(),
+            None,
+            None,
+            &workspace,
+            &policy,
+            None,
+        );
+        let err = result.expect_err("Deny must reject");
+        assert!(err.to_string().contains("user denied access"));
+        let _ = std::fs::remove_dir_all(&workspace);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    fn read_file_with_policy_prompt_allow_session_skips_second_prompt() {
+        let (workspace, outside) = outside_workspace_setup("prompt-sess");
+        let file = outside.join("data.txt");
+        new_file(file.to_string_lossy().as_ref(), "sess", false).expect("write outside");
+        let prompter = Arc::new(ScriptedPrompter::new(vec![BoundaryDecision::AllowAlways]));
+        let session = Arc::new(Mutex::new(BTreeSet::<crate::boundary::ApprovedRoot>::new()));
+        let policy = BoundaryPolicy::Prompt {
+            prompter: prompter.clone(),
+            session_approved: session.clone(),
+            user_typed: Arc::new(Mutex::new(BTreeSet::<crate::boundary::ApprovedRoot>::new())),
+        };
+        let _ = read_file_with_policy(
+            file.to_string_lossy().as_ref(),
+            None,
+            None,
+            &workspace,
+            &policy,
+            None,
+        )
+        .expect("first read should succeed");
+        // The scripted prompter is now empty; a second read would
+        // surface a `NoTty` error if it were invoked.
+        let payload = read_file_with_policy(
+            file.to_string_lossy().as_ref(),
+            None,
+            None,
+            &workspace,
+            &policy,
+            None,
+        )
+        .expect("second read must not re-prompt");
+        assert!(!payload.file.checksum.is_empty());
+        let _ = std::fs::remove_dir_all(&workspace);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    fn read_file_with_policy_in_workspace_skips_policy_check() {
+        let (workspace, _outside) = outside_workspace_setup("in-ws");
+        let inside = workspace.join("in.txt");
+        new_file(inside.to_string_lossy().as_ref(), "inside", false).expect("write inside");
+        // Even with Block policy, an in-workspace path proceeds
+        // without consulting the prompter.
+        let prompter = Arc::new(ScriptedPrompter::new(vec![]));
+        let session = Arc::new(Mutex::new(BTreeSet::<crate::boundary::ApprovedRoot>::new()));
+        let policy = BoundaryPolicy::Prompt {
+            prompter: prompter.clone(),
+            session_approved: session.clone(),
+            user_typed: Arc::new(Mutex::new(BTreeSet::<crate::boundary::ApprovedRoot>::new())),
+        };
+        let result = read_file_with_policy(
+            inside.to_string_lossy().as_ref(),
+            None,
+            None,
+            &workspace,
+            &policy,
+            None,
+        );
+        let payload = result.expect("in-workspace read should succeed");
+        assert!(!payload.file.checksum.is_empty());
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
+    fn new_file_with_policy_strict_denies_outside_workspace() {
+        let (workspace, outside) = outside_workspace_setup("write-strict");
+        let target = outside.join("new.txt");
+        let result = new_file_with_policy(
+            target.to_string_lossy().as_ref(),
+            "x",
+            false,
+            &workspace,
+            &BoundaryPolicy::Block,
+        );
+        let err = result.expect_err("strict policy must reject");
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(err.to_string().contains("escapes workspace"));
+        let _ = std::fs::remove_dir_all(&workspace);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    fn new_file_with_policy_allow_writes_to_outside_workspace() {
+        let (workspace, outside) = outside_workspace_setup("write-allow");
+        let target = outside.join("new.txt");
+        let result = new_file_with_policy(
+            target.to_string_lossy().as_ref(),
+            "ok",
+            false,
+            &workspace,
+            &BoundaryPolicy::Allow,
+        );
+        let payload = result.expect("allow policy must permit write");
+        assert!(target.exists(), "file should be created");
+        let written = std::fs::read_to_string(&target).expect("read back");
+        assert_eq!(written, "ok");
+        assert!(payload.bytes_written > 0);
+        let _ = std::fs::remove_dir_all(&workspace);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    fn read_file_with_policy_respects_full_false_opt_out() {
+        // Regression: `full: false` must propagate through the
+        // policy wrapper. A prior version hardcoded `None` here,
+        // which silently echoed content even when the caller asked
+        // for a token-light payload.
+        let workspace = temp_path("full-false-workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace dir should be created");
+        let inside = workspace.join("echo.txt");
+        new_file(inside.to_string_lossy().as_ref(), "echo this", false)
+            .expect("write should succeed");
+        let payload_tokenlight = read_file_with_policy(
+            inside.to_string_lossy().as_ref(),
+            None,
+            None,
+            &workspace,
+            &BoundaryPolicy::Allow,
+            Some(false),
+        )
+        .expect("token-light read should succeed");
+        assert!(
+            payload_tokenlight.file.content.is_none(),
+            "full=false must suppress the content echo"
+        );
+        let payload_echo = read_file_with_policy(
+            inside.to_string_lossy().as_ref(),
+            None,
+            None,
+            &workspace,
+            &BoundaryPolicy::Allow,
+            None,
+        )
+        .expect("default read should succeed");
+        assert_eq!(
+            payload_echo
+                .file
+                .content
+                .as_deref()
+                .expect("content present by default"),
+            "echo this"
+        );
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
+    fn new_file_echoes_content_preview() {
+        let path = temp_path("preview-write.txt");
+        let payload = new_file(path.to_string_lossy().as_ref(), "alpha\nbeta\ngamma", false)
+            .expect("write should succeed");
+        let preview = payload
+            .content_preview
+            .as_deref()
+            .expect("content_preview must be populated by default");
+        assert!(preview.contains("alpha"));
+        assert!(preview.contains("beta"));
+        assert!(preview.contains("gamma"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn new_file_truncates_oversized_content_preview() {
+        let path = temp_path("preview-large.txt");
+        let large = "a".repeat(8_000);
+        let payload =
+            new_file(path.to_string_lossy().as_ref(), &large, false).expect("write should succeed");
+        // Large files skip the content_preview because the full content
+        // already exists in the ToolUse input (avoiding context doubling).
+        assert!(
+            payload.content_preview.is_none(),
+            "content_preview should be None for files larger than CONTENT_PREVIEW_SKIP_THRESHOLD"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn edit_file_echoes_content_preview_of_new_file() {
+        let path = temp_path("preview-edit.txt");
+        new_file(
+            path.to_string_lossy().as_ref(),
+            "first\nsecond\nthird",
+            false,
+        )
+        .expect("seed write should succeed");
+        let payload = edit_file(
+            path.to_string_lossy().as_ref(),
+            "second",
+            "SECOND-EDITED",
+            false,
+            None,
+        )
+        .expect("edit should succeed");
+        let preview = payload
+            .content_preview
+            .as_deref()
+            .expect("content_preview must be populated by default");
+        // Preview must reflect the *post-edit* state so the model can
+        // verify the change without re-reading the file.
+        assert!(preview.contains("SECOND-EDITED"));
+        assert!(!preview.contains("first\nsecond\nthird\nsecond"));
+        // The full new content must still be on disk.
+        let on_disk = std::fs::read_to_string(&path).expect("read back");
+        assert_eq!(on_disk, "first\nSECOND-EDITED\nthird");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn edit_file_matches_across_crlf_line_endings() {
+        let path = temp_path("crlf-edit.txt");
+        // Seed a file with Windows CRLF line endings.
+        std::fs::write(&path, "first\r\nsecond\r\nthird\r\n").expect("seed");
+        let payload = edit_file(
+            path.to_string_lossy().as_ref(),
+            "second",
+            "SECOND",
+            false,
+            None,
+        )
+        .expect("edit should succeed with LF old_string vs CRLF file");
+        assert!(payload
+            .content_preview
+            .as_deref()
+            .unwrap()
+            .contains("SECOND"));
+        let on_disk = std::fs::read_to_string(&path).expect("read back");
+        assert_eq!(on_disk, "first\nSECOND\nthird\n");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn preview_for_handles_empty_and_small_and_oversized() {
+        assert_eq!(preview_for(""), None);
+        assert_eq!(preview_for("hi"), Some("hi".to_owned()));
+        let big = "x".repeat(5_000);
+        let clipped = preview_for(&big).expect("non-empty");
+        assert!(clipped.contains("[truncated"));
+        assert!(clipped.len() < big.len());
     }
 }

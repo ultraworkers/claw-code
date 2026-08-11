@@ -3,6 +3,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::incremental_body::IncrementalBody;
+
 use runtime::format_usd;
 use runtime::{
     load_oauth_credentials, save_oauth_credentials, OAuthConfig, OAuthRefreshRequest,
@@ -17,10 +19,13 @@ use crate::http_client::build_http_client_or_default;
 use crate::prompt_cache::{PromptCache, PromptCacheRecord, PromptCacheStats};
 
 use super::{
-    anthropic_missing_credentials, model_token_limit, resolve_model_alias, Provider, ProviderFuture,
+    anthropic_missing_credentials, is_local_inference, model_token_limit, resolve_model_alias,
+    Provider, ProviderFuture,
 };
 use crate::sse::SseParser;
-use crate::types::{MessageDeltaEvent, MessageRequest, MessageResponse, StreamEvent, Usage};
+use crate::types::{
+    InputContentBlock, MessageDeltaEvent, MessageRequest, MessageResponse, StreamEvent, Usage,
+};
 
 pub const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 const REQUEST_ID_HEADER: &str = "request-id";
@@ -33,63 +38,37 @@ const DEFAULT_MAX_RETRIES: u32 = 8;
 pub enum AuthSource {
     None,
     ApiKey(String),
-    BearerToken(String),
-    ApiKeyAndBearer {
-        api_key: String,
-        bearer_token: String,
-    },
 }
 
 impl AuthSource {
     pub fn from_env() -> Result<Self, ApiError> {
-        let api_key = read_env_non_empty("ANTHROPIC_API_KEY")?;
-        let auth_token = read_env_non_empty("ANTHROPIC_AUTH_TOKEN")?;
-        match (api_key, auth_token) {
-            (Some(api_key), Some(bearer_token)) => Ok(Self::ApiKeyAndBearer {
-                api_key,
-                bearer_token,
-            }),
-            (Some(api_key), None) => Ok(Self::ApiKey(api_key)),
-            (None, Some(bearer_token)) => Ok(Self::BearerToken(bearer_token)),
-            (None, None) => Err(anthropic_missing_credentials()),
+        match read_env_non_empty("ANTHROPIC_API_KEY")? {
+            Some(api_key) => Ok(Self::ApiKey(api_key)),
+            None => Err(anthropic_missing_credentials()),
         }
     }
 
     #[must_use]
     pub fn api_key(&self) -> Option<&str> {
         match self {
-            Self::ApiKey(api_key) | Self::ApiKeyAndBearer { api_key, .. } => Some(api_key),
-            Self::None | Self::BearerToken(_) => None,
+            Self::ApiKey(api_key) => Some(api_key),
+            Self::None => None,
         }
     }
 
     #[must_use]
     pub fn bearer_token(&self) -> Option<&str> {
-        match self {
-            Self::BearerToken(token)
-            | Self::ApiKeyAndBearer {
-                bearer_token: token,
-                ..
-            } => Some(token),
-            Self::None | Self::ApiKey(_) => None,
-        }
+        None
     }
 
     #[must_use]
     pub fn masked_authorization_header(&self) -> &'static str {
-        if self.bearer_token().is_some() {
-            "Bearer [REDACTED]"
-        } else {
-            "<absent>"
-        }
+        "<absent>"
     }
 
     pub fn apply(&self, mut request_builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         if let Some(api_key) = self.api_key() {
             request_builder = request_builder.header("x-api-key", api_key);
-        }
-        if let Some(token) = self.bearer_token() {
-            request_builder = request_builder.bearer_auth(token);
         }
         request_builder
     }
@@ -105,8 +84,8 @@ pub struct OAuthTokenSet {
 }
 
 impl From<OAuthTokenSet> for AuthSource {
-    fn from(value: OAuthTokenSet) -> Self {
-        Self::BearerToken(value.access_token)
+    fn from(_value: OAuthTokenSet) -> Self {
+        Self::None
     }
 }
 
@@ -122,6 +101,7 @@ pub struct AnthropicClient {
     session_tracer: Option<SessionTracer>,
     prompt_cache: Option<PromptCache>,
     last_prompt_cache_record: Arc<Mutex<Option<PromptCacheRecord>>>,
+    incremental_body: Arc<std::sync::Mutex<Option<IncrementalBody>>>,
 }
 
 impl AnthropicClient {
@@ -138,6 +118,7 @@ impl AnthropicClient {
             session_tracer: None,
             prompt_cache: None,
             last_prompt_cache_record: Arc::new(Mutex::new(None)),
+            incremental_body: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -154,6 +135,7 @@ impl AnthropicClient {
             session_tracer: None,
             prompt_cache: None,
             last_prompt_cache_record: Arc::new(Mutex::new(None)),
+            incremental_body: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -168,27 +150,11 @@ impl AnthropicClient {
     }
 
     #[must_use]
-    pub fn with_auth_token(mut self, auth_token: Option<String>) -> Self {
-        match (
-            self.auth.api_key().map(ToOwned::to_owned),
-            auth_token.filter(|token| !token.is_empty()),
-        ) {
-            (Some(api_key), Some(bearer_token)) => {
-                self.auth = AuthSource::ApiKeyAndBearer {
-                    api_key,
-                    bearer_token,
-                };
-            }
-            (Some(api_key), None) => {
-                self.auth = AuthSource::ApiKey(api_key);
-            }
-            (None, Some(bearer_token)) => {
-                self.auth = AuthSource::BearerToken(bearer_token);
-            }
-            (None, None) => {
-                self.auth = AuthSource::None;
-            }
-        }
+    pub fn with_auth_token(mut self, _auth_token: Option<String>) -> Self {
+        self.auth = match self.auth.api_key().map(ToOwned::to_owned) {
+            Some(api_key) => AuthSource::ApiKey(api_key),
+            None => AuthSource::None,
+        };
         self
     }
 
@@ -208,19 +174,6 @@ impl AnthropicClient {
         self.max_retries = max_retries;
         self.initial_backoff = initial_backoff;
         self.max_backoff = max_backoff;
-        self
-    }
-
-    /// Replace the internal HTTP client with one that respects the given
-    /// timeout configuration. This controls connect and request-level
-    /// timeouts for all outbound API calls.
-    #[must_use]
-    pub fn with_timeout(mut self, timeout: &crate::http_client::TimeoutConfig) -> Self {
-        self.http = crate::http_client::build_http_client_with_opts(
-            &crate::http_client::ProxyConfig::from_env(),
-            timeout,
-        )
-        .unwrap_or_else(|_| reqwest::Client::new());
         self
     }
 
@@ -245,6 +198,12 @@ impl AnthropicClient {
     #[must_use]
     pub fn with_extra_body_param(mut self, key: impl Into<String>, value: Value) -> Self {
         self.request_profile = self.request_profile.with_extra_body(key, value);
+        self
+    }
+
+    #[must_use]
+    pub fn with_incremental_body(mut self) -> Self {
+        self.incremental_body = Arc::new(std::sync::Mutex::new(Some(IncrementalBody::new())));
         self
     }
 
@@ -354,9 +313,28 @@ impl AnthropicClient {
         request: &MessageRequest,
     ) -> Result<MessageStream, ApiError> {
         self.preflight_message_request(request).await?;
-        let response = self
-            .send_with_retry(&request.clone().with_streaming())
-            .await?;
+        // Structural update: only flip `stream` flag; all Arc fields
+        // (messages, system, cached_message_values) are O(1) clones.
+        let streaming_request = MessageRequest {
+            stream: true,
+            model: request.model.clone(),
+            max_tokens: request.max_tokens,
+            messages: Arc::clone(&request.messages),
+            system: request.system.clone(),
+            tools: request.tools.clone(),
+            tool_choice: request.tool_choice.clone(),
+            temperature: request.temperature,
+            top_p: request.top_p,
+            frequency_penalty: request.frequency_penalty,
+            presence_penalty: request.presence_penalty,
+            stop: request.stop.clone(),
+            reasoning_effort: request.reasoning_effort.clone(),
+            thinking: request.thinking.clone(),
+            cached_message_values: Arc::clone(&request.cached_message_values),
+            skip_tools: request.skip_tools,
+            tools_in_system_prompt: request.tools_in_system_prompt,
+        };
+        let response = self.send_with_retry(&streaming_request).await?;
         Ok(MessageStream {
             request_id: request_id_from_headers(response.headers()),
             response,
@@ -467,13 +445,7 @@ impl AnthropicClient {
                 break;
             }
 
-            let delay = if let Some(retry_after) = last_error.as_ref().and_then(|e| e.retry_after())
-            {
-                retry_after
-            } else {
-                self.jittered_backoff_for_attempt(attempts)?
-            };
-            tokio::time::sleep(delay).await;
+            tokio::time::sleep(self.jittered_backoff_for_attempt(attempts)?).await;
         }
 
         Err(ApiError::RetriesExhausted {
@@ -487,8 +459,56 @@ impl AnthropicClient {
         request: &MessageRequest,
     ) -> Result<reqwest::Response, ApiError> {
         let request_url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
-        let request_body = render_standard_messages_body(&self.request_profile, request)?;
-        let request_builder = self.build_request(&request_url).json(&request_body);
+
+        let request_builder = self
+            .build_request(&request_url)
+            .header("content-type", "application/json");
+
+        let has_tool_results = request.messages.iter().any(|m| {
+            m.content.iter().any(|b| matches!(b, InputContentBlock::ToolResult { .. }))
+        });
+
+        let request_builder = match self
+            .incremental_body
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_mut()
+        {
+            Some(cache) => {
+                cache.update(request);
+                if has_tool_results {
+                    // When tool_results exist in the cached prefix, add a
+                    // message-level cache_control marker so the server can
+                    // reuse the cached prefix, then inject cache_reference
+                    // on individual tool_result blocks.
+                    // Falls back to the Value path since build_bytes() can't
+                    // inject fields into pre-serialised message bytes.
+                    let mut body = cache.build();
+                    MessageRequest::apply_messages_cache_control(&mut body);
+                    MessageRequest::apply_cache_reference(&mut body);
+                    if let Some(object) = body.as_object_mut() {
+                        for (key, value) in &self.request_profile.extra_body {
+                            object.insert(key.clone(), value.clone());
+                        }
+                    }
+                    request_builder.body(serde_json::to_vec(&body)?)
+                } else {
+                    // Zero-alloc path: no tool_results, no cache_reference needed.
+                    request_builder.body(cache.build_bytes())
+                }
+            }
+            None => {
+                let mut body = request.render_anthropic_body()?;
+                if let Some(object) = body.as_object_mut() {
+                    for (key, value) in &self.request_profile.extra_body {
+                        object.insert(key.clone(), value.clone());
+                    }
+                }
+                strip_unsupported_beta_body_fields(&mut body);
+                request_builder.body(serde_json::to_vec(&body)?)
+            }
+        };
+
         request_builder.send().await.map_err(ApiError::from)
     }
 
@@ -505,17 +525,26 @@ impl AnthropicClient {
     }
 
     async fn preflight_message_request(&self, request: &MessageRequest) -> Result<(), ApiError> {
-        // Always run the local byte-estimate guard first. This catches
-        // oversized requests even if the remote count_tokens endpoint is
-        // unreachable, misconfigured, or unimplemented (e.g., third-party
-        // Anthropic-compatible gateways). If byte estimation already flags
-        // the request as oversized, reject immediately without a network
-        // round trip.
-        super::preflight_message_request(request)?;
+        // Run the local byte-estimate guard for non-local servers.
+        // Local inference endpoints (Ollama, LM Studio, mock services etc.)
+        // are exempt from the heuristic context-window check because they
+        // typically have different limits or none at all, and the heuristic
+        // can overcount tool definitions that appear both in `system` and
+        // the tools array.
+        if !is_local_inference() {
+            super::preflight_message_request(request)?;
+        }
 
         let Some(limit) = model_token_limit(&request.model) else {
             return Ok(());
         };
+
+        // Local inference endpoints (loopback mocks, Ollama, LM Studio) do not
+        // implement `/v1/messages/count_tokens`. Skip the second round-trip
+        // entirely under local inference to avoid an unsupported call.
+        if is_local_inference() {
+            return Ok(());
+        }
 
         // Best-effort refinement using the Anthropic count_tokens endpoint.
         // On any failure (network, parse, auth), fall back to the local
@@ -547,7 +576,8 @@ impl AnthropicClient {
             "{}/v1/messages/count_tokens",
             self.base_url.trim_end_matches('/')
         );
-        let request_body = render_standard_messages_body(&self.request_profile, request)?;
+        let mut request_body = self.request_profile.render_json_body(request)?;
+        strip_unsupported_beta_body_fields(&mut request_body);
         let response = self
             .build_request(&request_url)
             .json(&request_body)
@@ -617,9 +647,8 @@ fn jitter_for_base(base: Duration) -> Duration {
     }
     let raw_nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_or(0, |elapsed| {
-            u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX)
-        });
+        .map(|elapsed| u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX))
+        .unwrap_or(0);
     let tick = JITTER_COUNTER.fetch_add(1, Ordering::Relaxed);
     // splitmix64 finalizer — mixes the low bits so large bases still see
     // jitter across their full range instead of being clamped to subsec nanos.
@@ -636,19 +665,10 @@ fn jitter_for_base(base: Duration) -> Duration {
 
 impl AuthSource {
     pub fn from_env_or_saved() -> Result<Self, ApiError> {
-        if let Some(api_key) = read_env_non_empty("ANTHROPIC_API_KEY")? {
-            return match read_env_non_empty("ANTHROPIC_AUTH_TOKEN")? {
-                Some(bearer_token) => Ok(Self::ApiKeyAndBearer {
-                    api_key,
-                    bearer_token,
-                }),
-                None => Ok(Self::ApiKey(api_key)),
-            };
+        match read_env_non_empty("ANTHROPIC_API_KEY")? {
+            Some(api_key) => Ok(Self::ApiKey(api_key)),
+            None => Err(anthropic_missing_credentials()),
         }
-        if let Some(bearer_token) = read_env_non_empty("ANTHROPIC_AUTH_TOKEN")? {
-            return Ok(Self::BearerToken(bearer_token));
-        }
-        Err(anthropic_missing_credentials())
     }
 }
 
@@ -667,28 +687,17 @@ pub fn resolve_saved_oauth_token(config: &OAuthConfig) -> Result<Option<OAuthTok
 }
 
 pub fn has_auth_from_env_or_saved() -> Result<bool, ApiError> {
-    Ok(read_env_non_empty("ANTHROPIC_API_KEY")?.is_some()
-        || read_env_non_empty("ANTHROPIC_AUTH_TOKEN")?.is_some())
+    Ok(read_env_non_empty("ANTHROPIC_API_KEY")?.is_some())
 }
 
-pub fn resolve_startup_auth_source<F>(load_oauth_config: F) -> Result<AuthSource, ApiError>
+pub fn resolve_startup_auth_source<F>(_load_oauth_config: F) -> Result<AuthSource, ApiError>
 where
     F: FnOnce() -> Result<Option<OAuthConfig>, ApiError>,
 {
-    let _ = load_oauth_config;
-    if let Some(api_key) = read_env_non_empty("ANTHROPIC_API_KEY")? {
-        return match read_env_non_empty("ANTHROPIC_AUTH_TOKEN")? {
-            Some(bearer_token) => Ok(AuthSource::ApiKeyAndBearer {
-                api_key,
-                bearer_token,
-            }),
-            None => Ok(AuthSource::ApiKey(api_key)),
-        };
+    match read_env_non_empty("ANTHROPIC_API_KEY")? {
+        Some(api_key) => Ok(AuthSource::ApiKey(api_key)),
+        None => Err(anthropic_missing_credentials()),
     }
-    if let Some(bearer_token) = read_env_non_empty("ANTHROPIC_AUTH_TOKEN")? {
-        return Ok(AuthSource::BearerToken(bearer_token));
-    }
-    Err(anthropic_missing_credentials())
 }
 
 fn resolve_saved_oauth_token_set(
@@ -767,21 +776,17 @@ fn read_env_non_empty(key: &str) -> Result<Option<String>, ApiError> {
 fn read_api_key() -> Result<String, ApiError> {
     let auth = AuthSource::from_env_or_saved()?;
     auth.api_key()
-        .or_else(|| auth.bearer_token())
         .map(ToOwned::to_owned)
         .ok_or_else(anthropic_missing_credentials)
 }
 
-#[cfg(test)]
-fn read_auth_token() -> Option<String> {
-    read_env_non_empty("ANTHROPIC_AUTH_TOKEN")
-        .ok()
-        .and_then(std::convert::identity)
-}
-
 #[must_use]
 pub fn read_base_url() -> String {
-    std::env::var("ANTHROPIC_BASE_URL").unwrap_or_else(|_| DEFAULT_BASE_URL.to_string())
+    std::env::var("ANTHROPIC_BASE_URL")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .or_else(|| super::dotenv_value("ANTHROPIC_BASE_URL"))
+        .unwrap_or_else(|| DEFAULT_BASE_URL.to_string())
 }
 
 fn request_id_from_headers(headers: &reqwest::header::HeaderMap) -> Option<String> {
@@ -862,17 +867,19 @@ impl MessageStream {
             StreamEvent::MessageDelta(MessageDeltaEvent { usage, .. }) => {
                 self.latest_usage = Some(usage.clone());
             }
-            StreamEvent::MessageStop(_) if !self.usage_recorded => {
-                if let (Some(prompt_cache), Some(usage)) =
-                    (&self.prompt_cache, self.latest_usage.as_ref())
-                {
-                    let record = prompt_cache.record_usage(&self.request, usage);
-                    *self
-                        .last_prompt_cache_record
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(record);
+            StreamEvent::MessageStop(_) => {
+                if !self.usage_recorded {
+                    if let (Some(prompt_cache), Some(usage)) =
+                        (&self.prompt_cache, self.latest_usage.as_ref())
+                    {
+                        let record = prompt_cache.record_usage(&self.request, usage);
+                        *self
+                            .last_prompt_cache_record
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(record);
+                    }
+                    self.usage_recorded = true;
                 }
-                self.usage_recorded = true;
             }
             _ => {}
         }
@@ -885,12 +892,23 @@ async fn expect_success(response: reqwest::Response) -> Result<reqwest::Response
         return Ok(response);
     }
 
-    let headers = response.headers().clone();
-    let request_id = request_id_from_headers(&headers);
+    let request_id = request_id_from_headers(response.headers());
     let body = response.text().await.unwrap_or_else(|_| String::new());
-    let parsed_error = serde_json::from_str::<AnthropicErrorEnvelope>(&body).ok();
+    let parsed_error = serde_json::from_str::<AnthropicErrorEnvelope>(&body)
+        .ok()
+        // Fallback: also try flat format {"code":...,"message":...,"type":...} used by
+        // some API gateways/proxies when Anthropic returns a non-standard error body.
+        .or_else(|| {
+            serde_json::from_str::<FlatErrorBody>(&body)
+                .ok()
+                .map(|flat| AnthropicErrorEnvelope {
+                    error: AnthropicErrorBody {
+                        error_type: flat.type_,
+                        message: flat.message,
+                    },
+                })
+        });
     let retryable = is_retryable_status(status);
-    let retry_after = parse_retry_after(&headers, status);
 
     Err(ApiError::Api {
         status,
@@ -904,149 +922,19 @@ async fn expect_success(response: reqwest::Response) -> Result<reqwest::Response
         body,
         retryable,
         suggested_action: None,
-        retry_after,
     })
-}
-
-fn parse_retry_after(
-    headers: &reqwest::header::HeaderMap,
-    status: reqwest::StatusCode,
-) -> Option<std::time::Duration> {
-    if status != reqwest::StatusCode::TOO_MANY_REQUESTS {
-        return None;
-    }
-    headers
-        .get("retry-after")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<u64>().ok())
-        .map(std::time::Duration::from_secs)
 }
 
 const fn is_retryable_status(status: reqwest::StatusCode) -> bool {
     matches!(status.as_u16(), 408 | 409 | 429 | 500 | 502 | 503 | 504)
 }
 
-/// Some providers return HTTP 400 with an unparseable body when a gateway
-/// or proxy flakes (e.g. "HTTP 400 from backend (no parseable body)").
-/// These are transient network blips, not actual bad requests, and should
-/// be retried. We detect them by checking the body for known gateway error
-/// phrases.
-fn is_retryable_400(status: reqwest::StatusCode, body: &str) -> bool {
-    if status != reqwest::StatusCode::BAD_REQUEST {
-        return false;
-    }
-    let lowered = body.to_ascii_lowercase();
-    lowered.contains("no parseable body")
-        || lowered.contains("connection reset")
-        || lowered.contains("broken pipe")
-        || lowered.contains("empty reply from server")
-}
-
-/// Anthropic API keys (`sk-ant-*`) are accepted over the `x-api-key` header
-/// and rejected with HTTP 401 "Invalid bearer token" when sent as a Bearer
-/// token via `ANTHROPIC_AUTH_TOKEN`. This happens often enough in the wild
-/// (users copy-paste an `sk-ant-...` key into `ANTHROPIC_AUTH_TOKEN` because
-/// the env var name sounds auth-related) that a bare 401 error is useless.
-/// When we detect this exact shape, append a hint to the error message that
-/// points the user at the one-line fix.
-const SK_ANT_BEARER_HINT: &str = "sk-ant-* keys go in ANTHROPIC_API_KEY (x-api-key header), not ANTHROPIC_AUTH_TOKEN (Bearer header). Move your key to ANTHROPIC_API_KEY.";
-
-fn enrich_bearer_auth_error(error: ApiError, auth: &AuthSource) -> ApiError {
-    let ApiError::Api {
-        status,
-        error_type,
-        message,
-        request_id,
-        body,
-        retryable,
-        suggested_action,
-        retry_after,
-        ..
-    } = error
-    else {
-        return error;
-    };
-    if status.as_u16() != 401 {
-        return ApiError::Api {
-            status,
-            error_type,
-            message,
-            request_id,
-            body,
-            retryable,
-            suggested_action,
-            retry_after,
-        };
-    }
-    let Some(bearer_token) = auth.bearer_token() else {
-        return ApiError::Api {
-            status,
-            error_type,
-            message,
-            request_id,
-            body,
-            retryable,
-            suggested_action,
-            retry_after,
-        };
-    };
-    if !bearer_token.starts_with("sk-ant-") {
-        return ApiError::Api {
-            status,
-            error_type,
-            message,
-            request_id,
-            body,
-            retryable,
-            suggested_action,
-            retry_after,
-        };
-    }
-    // Only append the hint when the AuthSource is pure BearerToken. If both
-    // api_key and bearer_token are present (`ApiKeyAndBearer`), the x-api-key
-    // header is already being sent alongside the Bearer header and the 401
-    // is coming from a different cause — adding the hint would be misleading.
-    if auth.api_key().is_some() {
-        return ApiError::Api {
-            status,
-            error_type,
-            message,
-            request_id,
-            body,
-            retryable,
-            suggested_action,
-            retry_after,
-        };
-    }
-    let enriched_message = match message {
-        Some(existing) => Some(format!("{existing} — hint: {SK_ANT_BEARER_HINT}")),
-        None => Some(format!("hint: {SK_ANT_BEARER_HINT}")),
-    };
-    ApiError::Api {
-        status,
-        error_type,
-        message: enriched_message,
-        request_id,
-        body,
-        retryable,
-        suggested_action,
-        retry_after,
-    }
-}
-
-fn anthropic_wire_model(model: &str) -> &str {
-    model.strip_prefix("anthropic/").unwrap_or(model)
-}
-
-fn render_standard_messages_body(
-    request_profile: &AnthropicRequestProfile,
-    request: &MessageRequest,
-) -> Result<Value, serde_json::Error> {
-    let mut wire_request = request.clone();
-    wire_request.model = anthropic_wire_model(&request.model).to_string();
-    let mut body = request_profile.render_json_body(&wire_request)?;
-    strip_unsupported_beta_body_fields(&mut body);
-    Ok(body)
+/// `enrich_bearer_auth_error` is retained for the call site in the auth flow,
+/// but the `ANTHROPIC_AUTH_TOKEN` Bearer path was removed: `AuthSource` can now
+/// only be `ApiKey`/`None`, so `bearer_token()` is always `None` and this is a
+/// straight pass-through.
+fn enrich_bearer_auth_error(error: ApiError, _auth: &AuthSource) -> ApiError {
+    error
 }
 
 /// Remove beta-only body fields that the standard `/v1/messages` and
@@ -1080,12 +968,22 @@ struct AnthropicErrorBody {
     message: String,
 }
 
+/// Flat error format: `{"code":500,"message":"...","type":"server_error"}`.
+/// Used by some API gateways/proxies as a fallback when the standard
+/// `{"error":{"type":...,"message":...}}` envelope is not available.
+#[derive(Debug, Deserialize)]
+struct FlatErrorBody {
+    #[serde(rename = "type")]
+    type_: String,
+    message: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::{ALT_REQUEST_ID_HEADER, REQUEST_ID_HEADER};
     use std::io::{Read, Write};
     use std::net::TcpListener;
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::{Arc, Mutex, OnceLock};
     use std::thread;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -1156,19 +1054,26 @@ mod tests {
     #[test]
     fn read_api_key_requires_presence() {
         let _guard = env_lock();
+        let config_home = temp_config_home();
+        std::fs::create_dir_all(&config_home).expect("create config home");
+        std::env::set_var("CLAW_CONFIG_HOME", &config_home);
         std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
         std::env::remove_var("ANTHROPIC_API_KEY");
-        std::env::remove_var("CLAW_CONFIG_HOME");
         let error = super::read_api_key().expect_err("missing key should error");
         assert!(matches!(
             error,
             crate::error::ApiError::MissingCredentials { .. }
         ));
+        std::env::remove_var("CLAW_CONFIG_HOME");
+        cleanup_temp_config_home(&config_home);
     }
 
     #[test]
     fn read_api_key_requires_non_empty_value() {
         let _guard = env_lock();
+        let config_home = temp_config_home();
+        std::fs::create_dir_all(&config_home).expect("create config home");
+        std::env::set_var("CLAW_CONFIG_HOME", &config_home);
         std::env::set_var("ANTHROPIC_AUTH_TOKEN", "");
         std::env::remove_var("ANTHROPIC_API_KEY");
         let error = super::read_api_key().expect_err("empty key should error");
@@ -1177,6 +1082,8 @@ mod tests {
             crate::error::ApiError::MissingCredentials { .. }
         ));
         std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
+        std::env::remove_var("CLAW_CONFIG_HOME");
+        cleanup_temp_config_home(&config_home);
     }
 
     #[test]
@@ -1193,34 +1100,28 @@ mod tests {
     }
 
     #[test]
-    fn read_auth_token_reads_auth_token_env() {
-        let _guard = env_lock();
-        std::env::set_var("ANTHROPIC_AUTH_TOKEN", "auth-token");
-        assert_eq!(super::read_auth_token().as_deref(), Some("auth-token"));
-        std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
-    }
-
-    #[test]
-    fn oauth_token_maps_to_bearer_auth_source() {
+    fn oauth_token_maps_to_no_auth_source() {
+        // OAuth is no longer a source of API auth; the token set maps to None.
         let auth = AuthSource::from(OAuthTokenSet {
             access_token: "access-token".to_string(),
             refresh_token: Some("refresh".to_string()),
             expires_at: Some(123),
             scopes: vec!["scope:a".to_string()],
         });
-        assert_eq!(auth.bearer_token(), Some("access-token"));
         assert_eq!(auth.api_key(), None);
+        assert_eq!(auth, AuthSource::None);
     }
 
     #[test]
-    fn auth_source_from_env_combines_api_key_and_bearer_token() {
+    fn auth_source_from_env_uses_only_api_key() {
+        // given
         let _guard = env_lock();
-        std::env::set_var("ANTHROPIC_AUTH_TOKEN", "auth-token");
         std::env::set_var("ANTHROPIC_API_KEY", "legacy-key");
+        // when
         let auth = AuthSource::from_env().expect("env auth");
+        // then: only the API key path exists now.
         assert_eq!(auth.api_key(), Some("legacy-key"));
-        assert_eq!(auth.bearer_token(), Some("auth-token"));
-        std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
+        assert_eq!(auth, AuthSource::ApiKey("legacy-key".to_string()));
         std::env::remove_var("ANTHROPIC_API_KEY");
     }
 
@@ -1357,7 +1258,7 @@ mod tests {
         let request = MessageRequest {
             model: "claude-opus-4-6".to_string(),
             max_tokens: 64,
-            messages: vec![],
+            messages: Arc::new(vec![]),
             system: None,
             tools: None,
             tool_choice: None,
@@ -1486,27 +1387,6 @@ mod tests {
     }
 
     #[test]
-    fn auth_source_applies_headers() {
-        let auth = AuthSource::ApiKeyAndBearer {
-            api_key: "test-key".to_string(),
-            bearer_token: "proxy-token".to_string(),
-        };
-        let request = auth
-            .apply(reqwest::Client::new().post("https://example.test"))
-            .build()
-            .expect("request build");
-        let headers = request.headers();
-        assert_eq!(
-            headers.get("x-api-key").and_then(|v| v.to_str().ok()),
-            Some("test-key")
-        );
-        assert_eq!(
-            headers.get("authorization").and_then(|v| v.to_str().ok()),
-            Some("Bearer proxy-token")
-        );
-    }
-
-    #[test]
     fn strip_unsupported_beta_body_fields_removes_betas_array() {
         let mut body = serde_json::json!({
             "model": "claude-sonnet-4-6",
@@ -1594,7 +1474,7 @@ mod tests {
         let request = MessageRequest {
             model: "claude-sonnet-4-6".to_string(),
             max_tokens: 64,
-            messages: vec![],
+            messages: Arc::new(vec![]),
             system: None,
             tools: None,
             tool_choice: None,
@@ -1623,192 +1503,28 @@ mod tests {
     }
 
     #[test]
-    fn standard_messages_body_strips_anthropic_routing_prefix() {
-        let client = AnthropicClient::new("test-key");
-        let request = MessageRequest {
-            model: "anthropic/claude-opus-4-6".to_string(),
-            max_tokens: 64,
-            messages: vec![],
-            system: None,
-            tools: None,
-            tool_choice: None,
-            stream: false,
-            ..Default::default()
-        };
-
-        let rendered = super::render_standard_messages_body(client.request_profile(), &request)
-            .expect("body should render");
-
-        assert_eq!(rendered["model"], serde_json::json!("claude-opus-4-6"));
-        assert!(rendered.get("betas").is_none());
-    }
-
-    #[test]
-    fn enrich_bearer_auth_error_appends_sk_ant_hint_on_401_with_pure_bearer_token() {
-        // given
-        let auth = AuthSource::BearerToken("sk-ant-api03-deadbeef".to_string());
-        let error = crate::error::ApiError::Api {
-            status: reqwest::StatusCode::UNAUTHORIZED,
-            error_type: Some("authentication_error".to_string()),
-            message: Some("Invalid bearer token".to_string()),
-            request_id: Some("req_varleg_001".to_string()),
-            body: String::new(),
-            retryable: false,
-            suggested_action: None,
-            retry_after: None,
-        };
-
-        // when
-        let enriched = super::enrich_bearer_auth_error(error, &auth);
-
-        // then
-        let rendered = enriched.to_string();
-        assert!(
-            rendered.contains("Invalid bearer token"),
-            "existing provider message should be preserved: {rendered}"
-        );
-        assert!(
-            rendered.contains(
-                "sk-ant-* keys go in ANTHROPIC_API_KEY (x-api-key header), not ANTHROPIC_AUTH_TOKEN (Bearer header). Move your key to ANTHROPIC_API_KEY."
-            ),
-            "rendered error should include the sk-ant-* hint: {rendered}"
-        );
-        assert!(
-            rendered.contains("[trace req_varleg_001]"),
-            "request id should still flow through the enriched error: {rendered}"
-        );
-        match enriched {
-            crate::error::ApiError::Api { status, .. } => {
-                assert_eq!(status, reqwest::StatusCode::UNAUTHORIZED);
-            }
-            other => panic!("expected Api variant, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn enrich_bearer_auth_error_leaves_non_401_errors_unchanged() {
-        // given
-        let auth = AuthSource::BearerToken("sk-ant-api03-deadbeef".to_string());
-        let error = crate::error::ApiError::Api {
-            status: reqwest::StatusCode::INTERNAL_SERVER_ERROR,
-            error_type: Some("api_error".to_string()),
-            message: Some("internal server error".to_string()),
-            request_id: None,
-            body: String::new(),
-            retryable: true,
-            suggested_action: None,
-            retry_after: None,
-        };
-
-        // when
-        let enriched = super::enrich_bearer_auth_error(error, &auth);
-
-        // then
-        let rendered = enriched.to_string();
-        assert!(
-            !rendered.contains("sk-ant-*"),
-            "non-401 errors must not be annotated with the bearer hint: {rendered}"
-        );
-        assert!(
-            rendered.contains("internal server error"),
-            "original message must be preserved verbatim: {rendered}"
-        );
-    }
-
-    #[test]
-    fn enrich_bearer_auth_error_ignores_401_when_bearer_token_is_not_sk_ant() {
-        // given
-        let auth = AuthSource::BearerToken("oauth-access-token-opaque".to_string());
-        let error = crate::error::ApiError::Api {
-            status: reqwest::StatusCode::UNAUTHORIZED,
-            error_type: Some("authentication_error".to_string()),
-            message: Some("Invalid bearer token".to_string()),
-            request_id: None,
-            body: String::new(),
-            retryable: false,
-            suggested_action: None,
-            retry_after: None,
-        };
-
-        // when
-        let enriched = super::enrich_bearer_auth_error(error, &auth);
-
-        // then
-        let rendered = enriched.to_string();
-        assert!(
-            !rendered.contains("sk-ant-*"),
-            "oauth-style bearer tokens must not trigger the sk-ant-* hint: {rendered}"
-        );
-    }
-
-    #[test]
-    fn enrich_bearer_auth_error_skips_hint_when_api_key_header_is_also_present() {
-        // given
-        let auth = AuthSource::ApiKeyAndBearer {
-            api_key: "sk-ant-api03-legitimate".to_string(),
-            bearer_token: "sk-ant-api03-deadbeef".to_string(),
-        };
-        let error = crate::error::ApiError::Api {
-            status: reqwest::StatusCode::UNAUTHORIZED,
-            error_type: Some("authentication_error".to_string()),
-            message: Some("Invalid bearer token".to_string()),
-            request_id: None,
-            body: String::new(),
-            retryable: false,
-            suggested_action: None,
-            retry_after: None,
-        };
-
-        // when
-        let enriched = super::enrich_bearer_auth_error(error, &auth);
-
-        // then
-        let rendered = enriched.to_string();
-        assert!(
-            !rendered.contains("sk-ant-*"),
-            "hint should be suppressed when x-api-key header is already being sent: {rendered}"
-        );
-    }
-
-    #[test]
-    fn enrich_bearer_auth_error_ignores_401_when_auth_source_has_no_bearer() {
-        // given
+    fn enrich_bearer_auth_error_is_noop_without_bearer_token() {
+        // given: with the removed ANTHROPIC_AUTH_TOKEN Bearer path, AuthSource
+        // can only be ApiKey/None, so enrich_bearer_auth_error is a pass-through.
         let auth = AuthSource::ApiKey("sk-ant-api03-legitimate".to_string());
         let error = crate::error::ApiError::Api {
             status: reqwest::StatusCode::UNAUTHORIZED,
             error_type: Some("authentication_error".to_string()),
             message: Some("Invalid x-api-key".to_string()),
-            request_id: None,
+            request_id: Some("req_varleg_001".to_string()),
             body: String::new(),
             retryable: false,
             suggested_action: None,
-            retry_after: None,
         };
 
         // when
         let enriched = super::enrich_bearer_auth_error(error, &auth);
 
         // then
-        let rendered = enriched.to_string();
         assert!(
-            !rendered.contains("sk-ant-*"),
-            "bearer hint must not apply when AuthSource is ApiKey-only: {rendered}"
+            !enriched.to_string().contains("sk-ant-*"),
+            "bearer hint must never apply now that the Bearer path is removed: {}",
+            enriched
         );
-    }
-
-    #[test]
-    fn enrich_bearer_auth_error_passes_non_api_errors_through_unchanged() {
-        // given
-        let auth = AuthSource::BearerToken("sk-ant-api03-deadbeef".to_string());
-        let error = crate::error::ApiError::InvalidSseFrame("unterminated event");
-
-        // when
-        let enriched = super::enrich_bearer_auth_error(error, &auth);
-
-        // then
-        assert!(matches!(
-            enriched,
-            crate::error::ApiError::InvalidSseFrame(_)
-        ));
     }
 }

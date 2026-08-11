@@ -4,10 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
-
-[[bin]]
-name = "mock-anthropic-service"
-path = "src/main.rs"
+autobins = false
 
 [dependencies]
 api = { path = "../api" }
