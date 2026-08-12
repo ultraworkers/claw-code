@@ -34,6 +34,13 @@ pub struct IngestStats {
     pub embeddings_written: usize,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct IngestProgress {
+    pub files_done: usize,
+    pub files_total: usize,
+    pub chunks_total: usize,
+}
+
 fn should_skip_dir(path: &Path) -> bool {
     path.file_name()
         .and_then(std::ffi::OsStr::to_str)
@@ -95,6 +102,19 @@ pub async fn run_ingest(
     cfg: &EmbedConfig,
     client: &Client,
 ) -> Result<IngestStats, String> {
+    run_ingest_with_progress(workspaces, db_path, cfg, client, |_| {}).await
+}
+
+pub async fn run_ingest_with_progress<F>(
+    workspaces: &[PathBuf],
+    db_path: &Path,
+    cfg: &EmbedConfig,
+    client: &Client,
+    mut progress: F,
+) -> Result<IngestStats, String>
+where
+    F: FnMut(IngestProgress),
+{
     let conn = open_db(db_path)?;
 
     let mut all_files: Vec<(String, PathBuf)> = Vec::new();
@@ -142,8 +162,14 @@ pub async fn run_ingest(
         ..Default::default()
     };
 
-    for (rel, file) in all_files {
-        let Ok(meta) = std::fs::metadata(&file) else {
+    for (idx, (rel, file)) in all_files.iter().enumerate() {
+        progress(IngestProgress {
+            files_done: idx + 1,
+            files_total: all_files.len(),
+            chunks_total: stats.chunks_total,
+        });
+
+        let Ok(meta) = std::fs::metadata(file) else {
             continue;
         };
         let size_bytes =
@@ -155,17 +181,17 @@ pub async fn run_ingest(
             .and_then(|d| i64::try_from(d.as_millis()).ok())
             .unwrap_or(0);
 
-        let Ok(raw) = std::fs::read_to_string(&file) else {
+        let Ok(raw) = std::fs::read_to_string(file) else {
             continue;
         };
 
         let content_hash = blake3::hash(raw.as_bytes()).to_hex().to_string();
-        if file_is_unchanged(&conn, &rel, &content_hash, size_bytes, mtime_ms)? {
+        if file_is_unchanged(&conn, rel, &content_hash, size_bytes, mtime_ms)? {
             continue;
         }
 
         // Re-index this file: delete previous chunks (and embeddings) for path.
-        delete_file_and_chunks(&conn, &rel)?;
+        delete_file_and_chunks(&conn, rel)?;
 
         let pieces = chunk_text(&raw, CHUNK_CHARS, CHUNK_OVERLAP);
         if pieces.is_empty() {
@@ -179,16 +205,16 @@ pub async fn run_ingest(
                 i32::try_from(ord).map_err(|_| "file produced too many chunks".to_string())?;
             batch.push((ord_i32, piece));
             if batch.len() >= EMBED_BATCH {
-                flush_path_batch(&conn, &rel, &mut batch, client, cfg, &mut stats).await?;
+                flush_path_batch(&conn, rel, &mut batch, client, cfg, &mut stats).await?;
             }
         }
-        flush_path_batch(&conn, &rel, &mut batch, client, cfg, &mut stats).await?;
+        flush_path_batch(&conn, rel, &mut batch, client, cfg, &mut stats).await?;
 
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| i64::try_from(d.as_millis()).unwrap_or(0))
             .unwrap_or(0);
-        upsert_file_meta(&conn, &rel, &content_hash, size_bytes, mtime_ms, now_ms)?;
+        upsert_file_meta(&conn, rel, &content_hash, size_bytes, mtime_ms, now_ms)?;
     }
 
     // Delete entries for files that no longer exist.
@@ -216,4 +242,34 @@ fn repo_id_for_workspace(workspace: &Path) -> String {
         .to_hex()
         .to_string();
     format!("{name}-{h}", name = name, h = &hash[..8])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use reqwest::Client;
+    use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn run_ingest_with_progress_reports_all_files() {
+        std::env::set_var("CLAW_RAG_MOCK_PROVIDERS", "1");
+        let dir = tempdir().unwrap();
+        let ws = dir.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(ws.join("a.rs"), "alpha beta").unwrap();
+        std::fs::write(ws.join("b.rs"), "gamma delta").unwrap();
+        let db = dir.path().join("idx.sqlite");
+        let client = Client::new();
+        let cfg = EmbedConfig::mock_from_env().expect("mock embed config");
+        let mut seen = Vec::new();
+        let st = run_ingest_with_progress(&[ws.clone()], &db, &cfg, &client, |p| seen.push(p))
+            .await
+            .expect("ingest");
+        assert_eq!(st.files_indexed, 2);
+        let last = seen.last().expect("progress emitted");
+        assert_eq!(last.files_total, 2);
+        assert_eq!(last.files_done, 2);
+        assert!(last.chunks_total > 0);
+        std::env::remove_var("CLAW_RAG_MOCK_PROVIDERS");
+    }
 }
