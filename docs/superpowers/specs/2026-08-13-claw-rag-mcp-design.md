@@ -16,13 +16,18 @@
 ## 架构总览
 
 ```
-新 crate: crates/claw-rag-mcp
+独立项目: D:\tempo\claw-rag-mcp（不在 claw-code 仓库内）
+  ├─ Cargo.toml（独立 workspace，仅含本 crate）
   └─ bin: claw-rag-mcp
        │  - 自研极简 stdio MCP server（LSP Content-Length framing + JSON-RPC dispatch）
        │  - 协议子集: initialize / tools/list / tools/call
-       │  - 依赖: tokio, serde_json, claw-rag-service (lib)
-       └─ serverInfo: name=claw-rag, version=workspace version
+       │  - 依赖: tokio, serde_json
+       │  - path 依赖: claw-rag-service lib（query_index / run_ingest / chunk_count / EmbedConfig）
+       │              = D:\tempo\claw-code\rust\crates\claw-rag-service
+       └─ serverInfo: name=claw-rag, version=独立定义
 ```
+
+注意：位置决策已更新（用户确认）——**独立文件夹 `D:\tempo\claw-rag-mcp`**，path 依赖指向 claw-code 仓库的 rag-service，二者各自独立构建，不共享 workspace 依赖解析（`serde_json` 需在独立 Cargo.toml 中显式声明，不能引用 `workspace = true`）。
 
 - 二进制名：`claw-rag-mcp`
 - 协议版本：`2025-03-26`
@@ -85,6 +90,7 @@
 - 不实现 MCP resources / prompts / 认证。
 - 不改动 claw-analog 的 `retrieve_context` 实现。
 - 不新增对 `runtime` crate 的依赖（避免引入 plugins/telemetry）。
+- 不把项目放入 claw-code 仓库（独立文件夹，独立版本号）。
 
 ## 文档
 
