@@ -3454,7 +3454,7 @@ fn export_json_has_kind_702() {
     // On success stdout has kind:export; on failure stderr has type:error.
     // Either way, both envelopes must be valid JSON.
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr)
+    let _stderr = String::from_utf8_lossy(&output.stderr)
         .lines()
         .filter(|l| l.starts_with('{'))
         .collect::<Vec<_>>()
@@ -3546,8 +3546,8 @@ fn config_parse_error_has_typed_error_kind_and_hint_764() {
         !output.status.success(),
         "malformed settings.json should cause non-zero exit"
     );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let _stdout = String::from_utf8_lossy(&output.stdout);
+    let _stderr = String::from_utf8_lossy(&output.stderr);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let json_line = stdout
         .lines()
@@ -3581,8 +3581,8 @@ fn login_logout_removed_subcommands_have_error_kind_and_hint_765() {
             !output.status.success(),
             "claw {subcmd} should exit non-zero"
         );
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        let _stdout = String::from_utf8_lossy(&output.stdout);
+        let _stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);
         let json_line = stdout
             .lines()

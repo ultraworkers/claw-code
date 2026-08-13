@@ -66,7 +66,7 @@ async fn flush_path_batch(
     #[cfg(feature = "qdrant-index")]
     let mut qdrant_points: Vec<ChunkPoint> = Vec::with_capacity(batch.len());
 
-    for ((ord, t), vec) in batch.drain(..).zip(vecs.into_iter()) {
+    for ((ord, t), vec) in batch.drain(..).zip(vecs) {
         let dim = vec.len();
         let cid = insert_chunk(conn, path, ord, &t)?;
         insert_embedding(conn, cid, dim, &vec)?;
