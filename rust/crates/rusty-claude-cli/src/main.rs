@@ -14560,11 +14560,54 @@ mod tests {
         );
     }
 
-    fn env_lock() -> MutexGuard<'static, ()> {
+    /// Serialises tests that mutate process-global state, and isolates them from the
+    /// developer's real `~/.claw`.
+    ///
+    /// `parse_args` resolves defaults — notably `permissions.defaultMode` — through the
+    /// user-scope config, which `default_config_home()` reads from `CLAW_CONFIG_HOME`,
+    /// falling back to `$HOME/.claw`. Without an override, these tests therefore assert
+    /// against whatever the machine running them happens to have configured: a
+    /// `defaultMode` of `dontAsk` there resolves to `DangerFullAccess` and turns a dozen
+    /// `WorkspaceWrite` assertions red. Point the config home at a fresh empty directory
+    /// so "no user config" is the state under test, and restore the caller's value on drop.
+    ///
+    /// Tests that need a *populated* config home can still set `CLAW_CONFIG_HOME`
+    /// themselves after taking this guard; the guard restores the real value afterwards.
+    struct EnvGuard {
+        _lock: MutexGuard<'static, ()>,
+        config_home: PathBuf,
+        previous_config_home: Option<std::ffi::OsString>,
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match self.previous_config_home.take() {
+                Some(previous) => std::env::set_var("CLAW_CONFIG_HOME", previous),
+                None => std::env::remove_var("CLAW_CONFIG_HOME"),
+            }
+            // Best effort: a leftover temp dir must never fail a test.
+            let _ = std::fs::remove_dir_all(&self.config_home);
+        }
+    }
+
+    fn env_lock() -> EnvGuard {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
+        let lock = LOCK
+            .get_or_init(|| Mutex::new(()))
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        // Deliberately empty: the point is that no user settings.json is discoverable.
+        let config_home = temp_dir();
+        std::fs::create_dir_all(&config_home).expect("isolated config home should be creatable");
+        let previous_config_home = std::env::var_os("CLAW_CONFIG_HOME");
+        std::env::set_var("CLAW_CONFIG_HOME", &config_home);
+
+        EnvGuard {
+            _lock: lock,
+            config_home,
+            previous_config_home,
+        }
     }
 
     fn with_current_dir<T>(cwd: &Path, f: impl FnOnce() -> T) -> T {
@@ -15291,6 +15334,8 @@ mod tests {
 
     #[test]
     fn removed_login_and_logout_subcommands_error_helpfully() {
+        // Asserts a `Default`-sourced permission mode, so it must not see a user config.
+        let _guard = env_lock();
         let login = parse_args(&["login".to_string()]).expect_err("login should be removed");
         assert!(login.contains("ANTHROPIC_API_KEY"));
         let logout = parse_args(&["logout".to_string()]).expect_err("logout should be removed");

@@ -451,11 +451,16 @@ fn direct_resume_safe_slash_commands_route_to_local_json_actions_831() {
         .output()
         .expect("git init should launch");
 
-    for (command, expected_kind, expected_status) in [
-        ("/version", "version", "ok"),
-        ("/sandbox", "sandbox", "warn"),
-        ("/diff", "diff", "ok"),
-        ("/status", "status", "ok"),
+    // `/sandbox`'s status reflects the host's real sandbox capability, so it is the one
+    // entry with more than one legitimate value: "ok" where namespace isolation works,
+    // "warn" where it is unsupported and only the filesystem sandbox is active (#731).
+    // This test is about #831 routing — that these commands produce a local JSON action
+    // instead of `interactive_only` — not about the kernel the suite happens to run on.
+    for (command, expected_kind, expected_statuses) in [
+        ("/version", "version", &["ok"][..]),
+        ("/sandbox", "sandbox", &["ok", "warn"][..]),
+        ("/diff", "diff", &["ok"][..]),
+        ("/status", "status", &["ok"][..]),
     ] {
         let output = run_claw(&root, &["--output-format", "json", command], &[]);
         assert!(
@@ -470,9 +475,9 @@ fn direct_resume_safe_slash_commands_route_to_local_json_actions_831() {
             .unwrap_or_else(|_| panic!("{command} must emit JSON (#831), got: {stdout:?}"));
 
         assert_eq!(parsed["kind"], expected_kind, "{command} kind: {parsed}");
-        assert_eq!(
-            parsed["status"], expected_status,
-            "{command} status: {parsed}"
+        assert!(
+            expected_statuses.contains(&parsed["status"].as_str().unwrap_or_default()),
+            "{command} status should be one of {expected_statuses:?}: {parsed}"
         );
         assert_ne!(
             parsed["error_kind"], "interactive_only",
