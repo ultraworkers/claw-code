@@ -11,7 +11,27 @@ use serde::{Deserialize, Serialize};
 use walkdir::{DirEntry, WalkDir};
 
 /// Maximum file size that can be read (10 MB).
+///
+/// This is a *process* guard — it stops us slurping a huge or binary blob into memory. It is
+/// not a context guard: 10 MB is on the order of 2.5 M tokens, so it never fires on the files
+/// that actually blow a model's context window. `DEFAULT_READ_LINES` / `MAX_READ_CHARS` below
+/// are the context guard.
 const MAX_READ_SIZE: u64 = 10 * 1024 * 1024;
+
+/// Lines returned by `read_file` when the caller does not pass an explicit `limit`.
+///
+/// This is a *paging* size, not a refusal. An unbounded read is the easiest way for a model to
+/// destroy its own context: one 100 KB source file is ~25 k tokens, which does not fit alongside
+/// a system prompt in a 32 k window. When that happens the backend rejects the whole request and
+/// the session dies — so reading everything at once is what makes it stop. Returning a page plus
+/// `nextOffset` means the read always succeeds and the model can keep going.
+const DEFAULT_READ_LINES: usize = 2000;
+
+/// Hard ceiling on the characters `read_file` returns, applied even when `limit` is explicit.
+///
+/// `DEFAULT_READ_LINES` alone does not bound the payload: minified bundles, JSON blobs and
+/// generated sources routinely put megabytes on a handful of lines. ~64 KB is ~16 k tokens.
+const MAX_READ_CHARS: usize = 64 * 1024;
 
 /// Maximum file size that can be written (10 MB).
 const MAX_WRITE_SIZE: usize = 10 * 1024 * 1024;
@@ -65,6 +85,17 @@ pub struct TextFilePayload {
     pub start_line: usize,
     #[serde(rename = "totalLines")]
     pub total_lines: usize,
+    /// True when the file has more lines past this page. Signals the caller that it has NOT seen
+    /// the whole file, so it does not silently reason over a partial view.
+    #[serde(default)]
+    pub truncated: bool,
+    /// Line index to pass back as `offset` to continue reading. Absent once the file is exhausted.
+    #[serde(
+        rename = "nextOffset",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub next_offset: Option<usize>,
 }
 
 /// Output envelope for the `read_file` tool.
@@ -213,10 +244,27 @@ pub fn read_file(
     let content = fs::read_to_string(&absolute_path)?;
     let lines: Vec<&str> = content.lines().collect();
     let start_index = offset.unwrap_or(0).min(lines.len());
-    let end_index = limit.map_or(lines.len(), |limit| {
-        start_index.saturating_add(limit).min(lines.len())
-    });
+    // An absent `limit` pages rather than reading to EOF: see DEFAULT_READ_LINES.
+    let requested_end = start_index
+        .saturating_add(limit.unwrap_or(DEFAULT_READ_LINES))
+        .min(lines.len());
+
+    // Apply the character ceiling on top of the line window, so a file with very long lines
+    // cannot blow the budget the line cap was meant to enforce. Always yield at least one line,
+    // otherwise an oversized single line would return nothing and the caller could not advance.
+    let mut end_index = start_index;
+    let mut chars = 0usize;
+    for line in &lines[start_index..requested_end] {
+        let next = chars + line.chars().count() + 1;
+        if next > MAX_READ_CHARS && end_index > start_index {
+            break;
+        }
+        chars = next;
+        end_index += 1;
+    }
+
     let selected = lines[start_index..end_index].join("\n");
+    let truncated = end_index < lines.len();
 
     Ok(ReadFileOutput {
         kind: String::from("text"),
@@ -226,6 +274,8 @@ pub fn read_file(
             num_lines: end_index.saturating_sub(start_index),
             start_line: start_index.saturating_add(1),
             total_lines: lines.len(),
+            truncated,
+            next_offset: truncated.then_some(end_index),
         },
     })
 }
@@ -778,7 +828,8 @@ mod tests {
     use super::{
         component_contains_glob, derive_glob_walk_root, edit_file, expand_braces, glob_search,
         grep_search, is_symlink_escape, read_file, read_file_in_workspace, write_file,
-        write_file_in_workspace, GrepSearchInput, MAX_WRITE_SIZE,
+        write_file_in_workspace, GrepSearchInput, DEFAULT_READ_LINES, MAX_READ_CHARS,
+        MAX_WRITE_SIZE,
     };
 
     fn temp_path(name: &str) -> std::path::PathBuf {
@@ -799,6 +850,73 @@ mod tests {
         let read_output = read_file(path.to_string_lossy().as_ref(), Some(1), Some(1))
             .expect("read should succeed");
         assert_eq!(read_output.file.content, "two");
+    }
+
+    #[test]
+    fn unbounded_read_of_a_large_file_pages_instead_of_returning_everything() {
+        // Regression: an unbounded read used to return the whole file, which on a small-context
+        // backend overflows the window and the request is rejected outright — the session dies.
+        let path = temp_path("paged-read.txt");
+        let total = DEFAULT_READ_LINES + 500;
+        let body = (0..total)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        write_file(path.to_string_lossy().as_ref(), &body).expect("write should succeed");
+
+        let first = read_file(path.to_string_lossy().as_ref(), None, None).expect("first page");
+        assert_eq!(first.file.num_lines, DEFAULT_READ_LINES);
+        assert_eq!(first.file.total_lines, total);
+        assert!(first.file.truncated, "caller must be told it is partial");
+        assert_eq!(first.file.next_offset, Some(DEFAULT_READ_LINES));
+        assert!(first.file.content.starts_with("line 0\n"));
+
+        // The advertised next_offset must actually resume where the last page stopped.
+        let second = read_file(
+            path.to_string_lossy().as_ref(),
+            first.file.next_offset,
+            None,
+        )
+        .expect("second page");
+        assert_eq!(second.file.num_lines, 500);
+        assert!(!second.file.truncated, "the tail is the final page");
+        assert_eq!(second.file.next_offset, None);
+        assert!(second
+            .file
+            .content
+            .starts_with(&format!("line {DEFAULT_READ_LINES}\n")));
+    }
+
+    #[test]
+    fn char_ceiling_bounds_files_whose_lines_are_enormous() {
+        // A line cap alone does not bound the payload: minified bundles put megabytes on a few
+        // lines, so the byte ceiling has to apply too — and must still yield forward progress.
+        let path = temp_path("long-lines.txt");
+        let huge = "x".repeat(MAX_READ_CHARS);
+        let body = format!("{huge}\n{huge}\n{huge}");
+        write_file(path.to_string_lossy().as_ref(), &body).expect("write should succeed");
+
+        let page = read_file(path.to_string_lossy().as_ref(), None, None).expect("first page");
+        assert_eq!(page.file.num_lines, 1, "one oversized line still advances");
+        assert!(page.file.truncated);
+        assert_eq!(page.file.next_offset, Some(1));
+
+        // An explicit limit must not be able to defeat the ceiling.
+        let greedy = read_file(path.to_string_lossy().as_ref(), None, Some(3)).expect("greedy");
+        assert_eq!(greedy.file.num_lines, 1);
+        assert!(greedy.file.truncated);
+    }
+
+    #[test]
+    fn small_files_are_returned_whole_and_not_marked_truncated() {
+        let path = temp_path("small-read.txt");
+        write_file(path.to_string_lossy().as_ref(), "one\ntwo\nthree").expect("write");
+
+        let output = read_file(path.to_string_lossy().as_ref(), None, None).expect("read");
+        assert_eq!(output.file.content, "one\ntwo\nthree");
+        assert_eq!(output.file.num_lines, 3);
+        assert!(!output.file.truncated);
+        assert_eq!(output.file.next_offset, None);
     }
 
     #[test]
