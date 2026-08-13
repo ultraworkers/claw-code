@@ -2,7 +2,6 @@ use std::io::{self, IsTerminal, Write};
 
 use runtime::{save_user_provider_settings, ConfigLoader, RuntimeProviderConfig};
 
-
 const PROVIDERS: &[(&str, &str, &str)] = &[
     ("1", "Anthropic", "anthropic"),
     ("2", "xAI / Grok", "xai"),

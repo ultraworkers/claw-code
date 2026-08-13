@@ -1939,9 +1939,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         // Only reject for known top-level subcommands that don't use compact.
         let first = rest[0].as_str();
         if is_known_top_level_subcommand(first) && first != "prompt" {
-            return Err(format!(
-                "invalid_flag_value: --compact is only supported with prompt mode.\nUsage: claw --compact \"<prompt>\" or echo \"<prompt>\" | claw --compact"
-            ));
+            return Err("invalid_flag_value: --compact is only supported with prompt mode.\nUsage: claw --compact \"<prompt>\" or echo \"<prompt>\" | claw --compact".to_string());
         }
     }
 
@@ -3134,10 +3132,11 @@ fn print_model_validation_warning_status(
         usage,
         permission_mode,
         context,
-        None,
-        None,
-        allowed_tools,
-        Some(&format_selection),
+        &StatusJsonExtras {
+            allowed_tools,
+            format_selection: Some(&format_selection),
+            ..StatusJsonExtras::default()
+        },
     );
     let object = value
         .as_object_mut()
@@ -3213,9 +3212,7 @@ fn parse_system_prompt_args(
                 })?;
                 // #99: validate --date is a plausible date string (no newlines, reasonable length)
                 if value.contains('\n') || value.contains('\r') {
-                    return Err(format!(
-                        "invalid_flag_value: --date value contains invalid characters.\nUsage: --date <YYYY-MM-DD>"
-                    ));
+                    return Err("invalid_flag_value: --date value contains invalid characters.\nUsage: --date <YYYY-MM-DD>".to_string());
                 }
                 if value.len() > 20 {
                     return Err(format!(
@@ -3452,11 +3449,7 @@ impl DiagnosticCheck {
 
     fn json_value(&self) -> Value {
         // Derive a stable snake_case id from the check name for machine-readable keying (#704).
-        let id = self
-            .name
-            .to_ascii_lowercase()
-            .replace(' ', "_")
-            .replace('-', "_");
+        let id = self.name.to_ascii_lowercase().replace([' ', '-'], "_");
         let mut value = Map::from_iter([
             ("id".to_string(), Value::String(id.clone())),
             (
@@ -6589,10 +6582,8 @@ fn run_resume_command(
                     },
                     default_permission_mode().as_str(),
                     &context,
-                    None, // #148: resumed sessions don't have flag provenance
-                    None,
-                    None,
-                    None,
+                    // #148: resumed sessions don't have flag provenance
+                    &StatusJsonExtras::default(),
                 )),
             })
         }
@@ -6730,16 +6721,15 @@ fn run_resume_command(
         }
         SlashCommand::Plugins { action, target } => {
             // Only list is supported in resume mode (no runtime to reload)
-            match action.as_deref() {
-                Some(action @ ("install" | "uninstall" | "enable" | "disable" | "update")) => {
-                    // #777: use interactive_only: prefix + \n hint so #776's classify/split
-                    // emits error_kind:interactive_only + non-null hint instead of unknown+null.
-                    // Orchestrators can now detect this and switch to a live REPL instead of retrying.
-                    return Err(format!(
-                        "interactive_only: /plugins {action} requires a live session to reload the plugin runtime.\nStart `claw` and run `/plugins {action}` inside the REPL, or use `claw plugins {action}` as a direct CLI command."
-                    ).into());
-                }
-                _ => {}
+            if let Some(action @ ("install" | "uninstall" | "enable" | "disable" | "update")) =
+                action.as_deref()
+            {
+                // #777: use interactive_only: prefix + \n hint so #776's classify/split
+                // emits error_kind:interactive_only + non-null hint instead of unknown+null.
+                // Orchestrators can now detect this and switch to a live REPL instead of retrying.
+                return Err(format!(
+                    "interactive_only: /plugins {action} requires a live session to reload the plugin runtime.\nStart `claw` and run `/plugins {action}` inside the REPL, or use `claw plugins {action}` as a direct CLI command."
+                ).into());
             }
             let cwd = env::current_dir()?;
             let payload = plugins_command_payload_for(
@@ -7852,8 +7842,7 @@ impl LiveCli {
                     let max_compact_rounds = 4;
                     let preserve_schedule = [4, 2, 1, 0];
 
-                    for round in 0..max_compact_rounds {
-                        let preserve = preserve_schedule[round];
+                    for (round, &preserve) in preserve_schedule.iter().enumerate() {
                         println!(
                             "  Auto-compacting session (round {}/{}, preserving {} recent messages)...",
                             round + 1,
@@ -8611,8 +8600,8 @@ impl LiveCli {
         let cwd = env::current_dir()?;
         // #803: reject flag-shaped tokens in list filter for BOTH text and JSON modes.
         // Previously the guard was JSON-only (#793); text mode silently returned empty success.
-        if action.as_deref() == Some("list") {
-            if let Some(filter) = target.as_deref() {
+        if action == Some("list") {
+            if let Some(filter) = target {
                 if filter.starts_with('-') {
                     if matches!(output_format, CliOutputFormat::Json) {
                         // ROADMAP #817: this is a handled local inventory parse error.
@@ -9567,14 +9556,34 @@ fn print_status_snapshot(
                 usage,
                 permission_mode.mode.as_str(),
                 &context,
-                Some(&provenance),
-                Some(&permission_mode),
-                allowed_tools,
-                Some(&format_selection),
+                &StatusJsonExtras {
+                    provenance: Some(&provenance),
+                    permission_provenance: Some(&permission_mode),
+                    allowed_tools,
+                    format_selection: Some(&format_selection),
+                },
             ))?
         ),
     }
     Ok(())
+}
+
+/// Optional provenance and selection inputs for [`status_json_value`].
+///
+/// Grouped into a struct rather than trailing positional parameters: they are all
+/// `Option<&_>` and most callers pass `None` for most of them, which makes a
+/// positional tail easy to transpose silently.
+///
+/// `provenance` (#148) drives the `model_source` field ("flag" | "env" | "config" |
+/// "default") and `model_raw` (user input before alias resolution, or null when the
+/// source is "default"). Callers without provenance (legacy resume paths) leave it
+/// `None`, in which case both fields are omitted.
+#[derive(Default)]
+struct StatusJsonExtras<'a> {
+    provenance: Option<&'a ModelProvenance>,
+    permission_provenance: Option<&'a PermissionModeProvenance>,
+    allowed_tools: Option<&'a AllowedToolSet>,
+    format_selection: Option<&'a OutputFormatSelection>,
 }
 
 fn status_json_value(
@@ -9582,16 +9591,14 @@ fn status_json_value(
     usage: StatusUsage,
     permission_mode: &str,
     context: &StatusContext,
-    // #148: optional provenance for `model` field. Surfaces `model_source`
-    // ("flag" | "env" | "config" | "default") and `model_raw` (user input
-    // before alias resolution, or null when source is "default"). Callers
-    // that don't have provenance (legacy resume paths) pass None, in which
-    // case both new fields are omitted.
-    provenance: Option<&ModelProvenance>,
-    permission_provenance: Option<&PermissionModeProvenance>,
-    allowed_tools: Option<&AllowedToolSet>,
-    format_selection: Option<&OutputFormatSelection>,
+    extras: &StatusJsonExtras<'_>,
 ) -> serde_json::Value {
+    let StatusJsonExtras {
+        provenance,
+        permission_provenance,
+        allowed_tools,
+        format_selection,
+    } = *extras;
     // #143: top-level `status` marker so claws can distinguish
     // a clean run from a degraded run (config parse failed but other fields
     // are still populated). `config_load_error` carries the parse-error string
@@ -10073,9 +10080,7 @@ fn sandbox_json_value(status: &runtime::SandboxStatus) -> serde_json::Value {
     //        (#731: "not supported on macOS" is a degraded state, not a hard error;
     //         filesystem_active:true means partial containment is working)
     // error = enabled but unsupported AND no filesystem sandbox either (nothing active)
-    let top_status = if !status.enabled {
-        "ok"
-    } else if status.active {
+    let top_status = if !status.enabled || status.active {
         "ok"
     } else if status.supported {
         "warn"
@@ -10450,18 +10455,20 @@ fn render_doctor_help_json() -> serde_json::Value {
 }
 
 /// #683-#692: extract structured metadata from help prose
-fn extract_help_metadata(
-    topic: LocalHelpTopic,
-) -> (
-    Option<String>,      // usage
-    Option<String>,      // purpose
-    Option<String>,      // output description
-    Option<Vec<String>>, // formats
-    Option<Vec<String>>, // related
-    Option<Vec<String>>, // aliases
-    bool,                // local_only
-    bool,                // requires_credentials
-) {
+/// Parsed fields of a help topic: usage, purpose, output description, formats,
+/// related topics, aliases, local-only, requires-credentials.
+type HelpMetadata = (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<Vec<String>>,
+    Option<Vec<String>>,
+    Option<Vec<String>>,
+    bool,
+    bool,
+);
+
+fn extract_help_metadata(topic: LocalHelpTopic) -> HelpMetadata {
     let text = render_help_topic(topic);
     let mut usage = None;
     let mut purpose = None;
@@ -12999,9 +13006,7 @@ fn format_context_window_blocked_error(session_id: &str, error: &api::ApiError) 
         }
         api::ApiError::RetriesExhausted { last_error, .. } => {
             let detail = match last_error.as_ref() {
-                api::ApiError::Api(details) => {
-                    details.message.as_deref().unwrap_or(&details.body)
-                }
+                api::ApiError::Api(details) => details.message.as_deref().unwrap_or(&details.body),
                 other => return format_context_window_blocked_error(session_id, other),
             }
             .trim();
@@ -14010,39 +14015,37 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
             let content = message
                 .blocks
                 .iter()
-                .filter_map(|block| match block {
-                    ContentBlock::Text { text } => {
-                        Some(InputContentBlock::Text { text: text.clone() })
-                    }
+                .map(|block| match block {
+                    ContentBlock::Text { text } => InputContentBlock::Text { text: text.clone() },
                     ContentBlock::Thinking {
                         thinking,
                         signature,
                     } => {
                         // 保留 Thinking 块：OpenAI 兼容协议会把它转成 reasoning_content 字段
                         // 回传给 DeepSeek V4（避免 400 "reasoning_content must be passed back" 错误）
-                        Some(InputContentBlock::Thinking {
+                        InputContentBlock::Thinking {
                             thinking: thinking.clone(),
                             signature: signature.clone(),
-                        })
+                        }
                     }
-                    ContentBlock::ToolUse { id, name, input } => Some(InputContentBlock::ToolUse {
+                    ContentBlock::ToolUse { id, name, input } => InputContentBlock::ToolUse {
                         id: id.clone(),
                         name: name.clone(),
                         input: serde_json::from_str(input)
                             .unwrap_or_else(|_| serde_json::json!({ "raw": input })),
-                    }),
+                    },
                     ContentBlock::ToolResult {
                         tool_use_id,
                         output,
                         is_error,
                         ..
-                    } => Some(InputContentBlock::ToolResult {
+                    } => InputContentBlock::ToolResult {
                         tool_use_id: tool_use_id.clone(),
                         content: vec![ToolResultContentBlock::Text {
                             text: output.clone(),
                         }],
                         is_error: *is_error,
-                    }),
+                    },
                 })
                 .collect::<Vec<_>>();
             (!content.is_empty()).then(|| InputMessage {
@@ -15915,10 +15918,7 @@ mod tests {
             usage,
             "workspace-write",
             &context,
-            None,
-            None,
-            None,
-            None,
+            &super::StatusJsonExtras::default(),
         );
         assert_eq!(
             json.get("status").and_then(|v| v.as_str()),
@@ -15990,10 +15990,10 @@ mod tests {
             usage,
             "workspace-write",
             &context,
-            None,
-            None,
-            Some(&allowed),
-            None,
+            &super::StatusJsonExtras {
+                allowed_tools: Some(&allowed),
+                ..super::StatusJsonExtras::default()
+            },
         );
         assert_eq!(
             restricted_json
@@ -16023,10 +16023,7 @@ mod tests {
             usage,
             "workspace-write",
             &clean_context,
-            None,
-            None,
-            None,
-            None,
+            &super::StatusJsonExtras::default(),
         );
         assert_eq!(
             clean_json.get("status").and_then(|v| v.as_str()),
@@ -16974,7 +16971,7 @@ mod tests {
         for action in ["remove", "uninstall", "delete"] {
             assert_eq!(
                 parse_args(&["skills".to_string(), action.to_string()])
-                    .expect(&format!("skills {action} should parse")),
+                    .unwrap_or_else(|_| panic!("skills {action} should parse")),
                 CliAction::Skills {
                     args: Some(action.to_string()),
                     output_format: CliOutputFormat::Text,
@@ -17928,10 +17925,7 @@ mod tests {
             },
             "workspace-write",
             &context,
-            None,
-            None,
-            None,
-            None,
+            &super::StatusJsonExtras::default(),
         );
 
         assert_eq!(
