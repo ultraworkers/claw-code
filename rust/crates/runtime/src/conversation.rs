@@ -361,6 +361,23 @@ where
                 return Err(error);
             }
 
+            // Compact BEFORE the request goes out, not only after a reply lands.
+            //
+            // The usage-based check below is post-hoc: it can only see the context once a call
+            // has returned and reported its counters. Between that measurement and the next
+            // request the session can grow enormously — a reasoning model emitting a long
+            // <think> block, then a tool result carrying a large file. Observed live: a call
+            // measured at 17,858 prompt tokens generated 10,842 more, a read_file added ~19k on
+            // top, and the next request hit the provider at 47,755 tokens and was rejected
+            // outright. No amount of tuning the post-hoc threshold prevents that, because
+            // nothing measures the session in between.
+            //
+            // `estimate_session_tokens` is a local heuristic over the transcript, so this costs
+            // no API call and works before any usage has ever been recorded.
+            if let Some(compaction) = self.maybe_auto_compact_before_request() {
+                auto_compaction = Some(compaction);
+            }
+
             let request = ApiRequest {
                 system_prompt: self.system_prompt.clone(),
                 messages: self.session.messages.clone(),
@@ -568,6 +585,20 @@ where
         self.session
     }
 
+    /// Compaction check run immediately before a request is sent, based on a locally estimated
+    /// transcript size rather than on provider-reported usage.
+    ///
+    /// This is the guard that actually keeps a session inside the context window: it sees growth
+    /// that usage counters cannot, because it runs after tool results and long generations have
+    /// been appended but before the request that would carry them is built.
+    fn maybe_auto_compact_before_request(&mut self) -> Option<AutoCompactionEvent> {
+        let estimated = estimate_session_tokens(&self.session);
+        if estimated < self.auto_compaction_input_tokens_threshold as usize {
+            return None;
+        }
+        self.compact_now()
+    }
+
     fn maybe_auto_compact(&mut self) -> Option<AutoCompactionEvent> {
         // Gate on the LIVE context size — the most recent call's input counters — not on a
         // cumulative running total, and count cached input as the context it is.
@@ -586,6 +617,11 @@ where
             return None;
         }
 
+        self.compact_now()
+    }
+
+    /// Compacts the session unconditionally, returning `None` when there was nothing to remove.
+    fn compact_now(&mut self) -> Option<AutoCompactionEvent> {
         let result = compact_session(
             &self.session,
             CompactionConfig {
@@ -863,7 +899,7 @@ mod tests {
         AssistantEvent, AutoCompactionEvent, ConversationRuntime, PromptCacheEvent, RuntimeError,
         StaticToolExecutor, ToolExecutor, DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD,
     };
-    use crate::compact::CompactionConfig;
+    use crate::compact::{estimate_session_tokens, CompactionConfig};
     use crate::config::{RuntimeFeatureConfig, RuntimeHookConfig};
     use crate::permissions::{
         PermissionMode, PermissionPolicy, PermissionPromptDecision, PermissionPrompter,
@@ -1755,6 +1791,81 @@ mod tests {
         assert_eq!(
             third.auto_compaction, None,
             "compaction must not latch on once the threshold has been crossed"
+        );
+    }
+
+    /// Usage-based compaction is post-hoc: it only sees the context AFTER a call returns. A
+    /// large tool result (or a long reasoning block) appended after that measurement can blow
+    /// the window on the very next request, which the provider rejects outright — so there must
+    /// also be a check BEFORE the request goes out, based on a locally estimated session size.
+    #[test]
+    fn auto_compaction_fires_before_the_first_request_when_the_session_is_already_oversized() {
+        struct RecordingApi {
+            largest_request_messages: std::rc::Rc<std::cell::Cell<usize>>,
+        }
+        impl ApiClient for RecordingApi {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                self.largest_request_messages.set(
+                    self.largest_request_messages
+                        .get()
+                        .max(request.messages.len()),
+                );
+                Ok(vec![
+                    AssistantEvent::TextDelta("done".to_string()),
+                    // Deliberately no Usage event: nothing has been measured yet, which is
+                    // exactly the situation the pre-send check has to cover.
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        // Six messages that are individually large — the shape of a session that has just
+        // absorbed a couple of big file reads.
+        let bulk = "x".repeat(40_000);
+        let mut session = Session::new();
+        for _ in 0..3 {
+            session
+                .messages
+                .push(crate::session::ConversationMessage::user_text(bulk.clone()));
+            session
+                .messages
+                .push(crate::session::ConversationMessage::assistant(vec![
+                    ContentBlock::Text { text: bulk.clone() },
+                ]));
+        }
+        let before = estimate_session_tokens(&session);
+        assert!(
+            before > 24_000,
+            "test fixture must start over the threshold, got {before}"
+        );
+
+        let largest = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        let mut runtime = ConversationRuntime::new(
+            session,
+            RecordingApi {
+                largest_request_messages: std::rc::Rc::clone(&largest),
+            },
+            StaticToolExecutor::new().register("glob_search", |_| Ok(String::new())),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_auto_compaction_input_tokens_threshold(24_000);
+
+        let summary = runtime
+            .run_turn("trigger", None)
+            .expect("turn should succeed");
+
+        assert!(
+            summary.auto_compaction.is_some(),
+            "an already-oversized session must compact before the request is sent"
+        );
+        assert!(
+            estimate_session_tokens(runtime.session()) < before,
+            "compaction must actually shrink the session"
+        );
+        assert!(
+            largest.get() < 8,
+            "the request must be sent with the compacted history, not the original 7 messages"
         );
     }
 
