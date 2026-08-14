@@ -31,7 +31,27 @@ const DEFAULT_READ_LINES: usize = 2000;
 ///
 /// `DEFAULT_READ_LINES` alone does not bound the payload: minified bundles, JSON blobs and
 /// generated sources routinely put megabytes on a handful of lines. ~64 KB is ~16 k tokens.
-const MAX_READ_CHARS: usize = 64 * 1024;
+///
+/// That default assumes a large (200 k) context window. Against a small self-hosted backend it
+/// is far too generous: two reads at this size put a request over 47 k tokens, which a 32 k
+/// window rejects outright — and compaction cannot recover it, because the preserved recent
+/// messages ARE the oversized tool results. Override with [`MAX_READ_CHARS_ENV_VAR`].
+const DEFAULT_MAX_READ_CHARS: usize = 64 * 1024;
+
+/// Environment override for [`DEFAULT_MAX_READ_CHARS`], in characters.
+const MAX_READ_CHARS_ENV_VAR: &str = "CLAW_MAX_READ_CHARS";
+
+/// Effective character ceiling for one `read_file` page.
+///
+/// Read per call rather than cached: a long-lived process should pick up a changed budget, and
+/// this runs once per read, not per line.
+fn max_read_chars() -> usize {
+    std::env::var(MAX_READ_CHARS_ENV_VAR)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .filter(|chars| *chars > 0)
+        .unwrap_or(DEFAULT_MAX_READ_CHARS)
+}
 
 /// Maximum file size that can be written (10 MB).
 const MAX_WRITE_SIZE: usize = 10 * 1024 * 1024;
@@ -254,9 +274,10 @@ pub fn read_file(
     // otherwise an oversized single line would return nothing and the caller could not advance.
     let mut end_index = start_index;
     let mut chars = 0usize;
+    let char_ceiling = max_read_chars();
     for line in &lines[start_index..requested_end] {
         let next = chars + line.chars().count() + 1;
-        if next > MAX_READ_CHARS && end_index > start_index {
+        if next > char_ceiling && end_index > start_index {
             break;
         }
         chars = next;
@@ -827,10 +848,17 @@ mod tests {
 
     use super::{
         component_contains_glob, derive_glob_walk_root, edit_file, expand_braces, glob_search,
-        grep_search, is_symlink_escape, read_file, read_file_in_workspace, write_file,
-        write_file_in_workspace, GrepSearchInput, DEFAULT_READ_LINES, MAX_READ_CHARS,
-        MAX_WRITE_SIZE,
+        grep_search, is_symlink_escape, max_read_chars, read_file, read_file_in_workspace,
+        write_file, write_file_in_workspace, GrepSearchInput, DEFAULT_MAX_READ_CHARS,
+        DEFAULT_READ_LINES, MAX_READ_CHARS_ENV_VAR, MAX_WRITE_SIZE,
     };
+
+    /// Serializes the tests that mutate `CLAW_MAX_READ_CHARS`; env vars are process-global.
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 
     fn temp_path(name: &str) -> std::path::PathBuf {
         let unique = SystemTime::now()
@@ -891,8 +919,10 @@ mod tests {
     fn char_ceiling_bounds_files_whose_lines_are_enormous() {
         // A line cap alone does not bound the payload: minified bundles put megabytes on a few
         // lines, so the byte ceiling has to apply too — and must still yield forward progress.
+        let _guard = env_lock();
+        std::env::remove_var(MAX_READ_CHARS_ENV_VAR);
         let path = temp_path("long-lines.txt");
-        let huge = "x".repeat(MAX_READ_CHARS);
+        let huge = "x".repeat(DEFAULT_MAX_READ_CHARS);
         let body = format!("{huge}\n{huge}\n{huge}");
         write_file(path.to_string_lossy().as_ref(), &body).expect("write should succeed");
 
@@ -905,6 +935,63 @@ mod tests {
         let greedy = read_file(path.to_string_lossy().as_ref(), None, Some(3)).expect("greedy");
         assert_eq!(greedy.file.num_lines, 1);
         assert!(greedy.file.truncated);
+    }
+
+    /// The 64 KB default is a 200 k-context number. A small self-hosted backend must be able to
+    /// shrink it, or two reads overflow a 32 k window in a single turn.
+    #[test]
+    fn read_char_ceiling_is_configurable_via_the_environment() {
+        let _guard = env_lock();
+        let path = temp_path("configurable-ceiling.txt");
+        // 40 lines of 100 chars = ~4 KB: far under the default ceiling, over a 1 KB one.
+        let body = (0..40)
+            .map(|_| "y".repeat(100))
+            .collect::<Vec<_>>()
+            .join("\n");
+        write_file(path.to_string_lossy().as_ref(), &body).expect("write should succeed");
+
+        std::env::remove_var(MAX_READ_CHARS_ENV_VAR);
+        let whole = read_file(path.to_string_lossy().as_ref(), None, None).expect("default read");
+        assert_eq!(
+            whole.file.num_lines, 40,
+            "default ceiling returns the file whole"
+        );
+        assert!(!whole.file.truncated);
+
+        std::env::set_var(MAX_READ_CHARS_ENV_VAR, "1024");
+        let clipped = read_file(path.to_string_lossy().as_ref(), None, None).expect("clipped read");
+        std::env::remove_var(MAX_READ_CHARS_ENV_VAR);
+        assert!(
+            clipped.file.num_lines < 40,
+            "a smaller ceiling must actually clip, got {} lines",
+            clipped.file.num_lines
+        );
+        assert!(
+            clipped.file.truncated,
+            "a clipped page must report truncated"
+        );
+        assert_eq!(
+            clipped.file.next_offset,
+            Some(clipped.file.num_lines),
+            "the caller must be told where to resume"
+        );
+    }
+
+    #[test]
+    fn read_char_ceiling_ignores_junk_and_zero_values() {
+        let _guard = env_lock();
+        for value in ["", "0", "-5", "not-a-number"] {
+            std::env::set_var(MAX_READ_CHARS_ENV_VAR, value);
+            assert_eq!(
+                max_read_chars(),
+                DEFAULT_MAX_READ_CHARS,
+                "{value:?} must fall back to the default rather than disabling reads"
+            );
+        }
+        std::env::set_var(MAX_READ_CHARS_ENV_VAR, "24000");
+        assert_eq!(max_read_chars(), 24_000);
+        std::env::remove_var(MAX_READ_CHARS_ENV_VAR);
+        assert_eq!(max_read_chars(), DEFAULT_MAX_READ_CHARS);
     }
 
     #[test]

@@ -95,10 +95,21 @@ pub fn get_compact_continuation_message(
 #[must_use]
 pub fn compact_session(session: &Session, config: CompactionConfig) -> CompactionResult {
     if !should_compact(session, config) {
+        // "Nothing to drop" is not the same as "nothing to do". A session can exceed the window
+        // while holding fewer messages than `preserve_recent_messages` — a single read of a large
+        // file does it — and message-granular compaction has no move to make there. Trim the
+        // payloads anyway, so the one lever that still works is not gated behind the one that
+        // does not.
+        let mut trimmed_session = session.clone();
+        trimmed_session.messages = session
+            .messages
+            .iter()
+            .map(truncate_oversized_tool_results)
+            .collect();
         return CompactionResult {
             summary: String::new(),
             formatted_summary: String::new(),
-            compacted_session: session.clone(),
+            compacted_session: trimmed_session,
             removed_message_count: 0,
         };
     }
@@ -165,7 +176,14 @@ pub fn compact_session(session: &Session, config: CompactionConfig) -> Compactio
         k
     };
     let removed = &session.messages[compacted_prefix_len..keep_from];
-    let preserved = session.messages[keep_from..].to_vec();
+    // Dropping whole messages is not enough on its own. An agentic turn is five messages
+    // (user / assistant+tool_use / tool_result / assistant+tool_use / tool_result), so the
+    // preserved tail IS the pair of tool results that overflowed the window, and the only
+    // message compaction may drop is the short user prompt. Trim the payloads that must stay.
+    let preserved = session.messages[keep_from..]
+        .iter()
+        .map(truncate_oversized_tool_results)
+        .collect::<Vec<_>>();
     let summary =
         merge_compact_summaries(existing_summary.as_deref(), &summarize_messages(removed));
     let formatted_summary = format_compact_summary(&summary);
@@ -188,6 +206,78 @@ pub fn compact_session(session: &Session, config: CompactionConfig) -> Compactio
         compacted_session,
         removed_message_count: removed.len(),
     }
+}
+
+/// Largest tool-result payload compaction will preserve verbatim, in characters.
+///
+/// ~16 KB is ~4 k tokens: big enough that ordinary tool output is never touched, small enough
+/// that several preserved results still fit a small window.
+const MAX_PRESERVED_TOOL_RESULT_CHARS: usize = 16 * 1024;
+
+/// Characters kept from the tail of a trimmed payload. The head carries the structure a model
+/// needs to recognise what it read; the tail is where a file's most recent edits usually are.
+const PRESERVED_TOOL_RESULT_TAIL_CHARS: usize = 2 * 1024;
+
+/// Returns `message` with any oversized `ToolResult` payload replaced by a head/tail excerpt.
+///
+/// Clones only when something is actually trimmed, so the common path stays cheap.
+fn truncate_oversized_tool_results(message: &ConversationMessage) -> ConversationMessage {
+    let needs_trim = message.blocks.iter().any(|block| match block {
+        ContentBlock::ToolResult { output, .. } => {
+            output.chars().count() > MAX_PRESERVED_TOOL_RESULT_CHARS
+        }
+        _ => false,
+    });
+    if !needs_trim {
+        return message.clone();
+    }
+
+    let blocks = message
+        .blocks
+        .iter()
+        .map(|block| match block {
+            ContentBlock::ToolResult {
+                tool_use_id,
+                tool_name,
+                output,
+                is_error,
+            } => ContentBlock::ToolResult {
+                tool_use_id: tool_use_id.clone(),
+                tool_name: tool_name.clone(),
+                output: excerpt_tool_result(output),
+                is_error: *is_error,
+            },
+            other => other.clone(),
+        })
+        .collect();
+
+    ConversationMessage {
+        role: message.role,
+        blocks,
+        usage: message.usage,
+    }
+}
+
+/// Builds a head + marker + tail excerpt of an oversized tool-result payload.
+///
+/// Operates on chars, not bytes, so a multi-byte boundary can never be split.
+fn excerpt_tool_result(output: &str) -> String {
+    let chars: Vec<char> = output.chars().collect();
+    let total = chars.len();
+    if total <= MAX_PRESERVED_TOOL_RESULT_CHARS {
+        return output.to_string();
+    }
+
+    let tail_len = PRESERVED_TOOL_RESULT_TAIL_CHARS.min(total);
+    let head_len = MAX_PRESERVED_TOOL_RESULT_CHARS.saturating_sub(tail_len);
+    let elided = total.saturating_sub(head_len + tail_len);
+    if elided == 0 {
+        return output.to_string();
+    }
+
+    let head: String = chars[..head_len].iter().collect();
+    let tail: String = chars[total - tail_len..].iter().collect();
+    format!("{head}\n\n[... {elided} characters elided by compaction; re-read this file if you need the omitted portion ...]\n\n{tail}")
 }
 
 fn compacted_summary_prefix_len(session: &Session) -> usize {
@@ -573,7 +663,7 @@ fn extract_summary_timeline(summary: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        collect_key_files, compact_session, format_compact_summary,
+        collect_key_files, compact_session, estimate_session_tokens, format_compact_summary,
         get_compact_continuation_message, infer_pending_work, should_compact, CompactionConfig,
     };
     use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
@@ -763,6 +853,185 @@ mod tests {
     /// user(ToolResult) pair at the boundary. An orphaned tool-result message
     /// without the preceding assistant `tool_calls` causes a 400 on the
     /// OpenAI-compat path (gaebal-gajae repro 2026-04-09).
+    /// The failure this exists for: an agentic turn is 5 messages (user / assistant+tool_use /
+    /// tool_result / assistant+tool_use / tool_result), so `preserve_recent_messages: 4` protects
+    /// exactly the two giant tool results that overflow the window. Message-granular compaction
+    /// can only drop the tiny user prompt, so the payloads themselves must be trimmed.
+    #[test]
+    fn compaction_truncates_oversized_tool_results_it_must_preserve() {
+        let huge = "z".repeat(80_000);
+        let mut session = Session::new();
+        session
+            .push_message(ConversationMessage::user_text("read two files"))
+            .expect("user message");
+        session
+            .push_message(ConversationMessage::assistant(vec![
+                ContentBlock::ToolUse {
+                    id: "call-1".to_string(),
+                    name: "read_file".to_string(),
+                    input: "{\"path\":\"a.rs\"}".to_string(),
+                },
+            ]))
+            .expect("assistant tool use");
+        session
+            .push_message(ConversationMessage::tool_result(
+                "call-1",
+                "read_file",
+                huge.clone(),
+                false,
+            ))
+            .expect("tool result");
+        session
+            .push_message(ConversationMessage::assistant(vec![
+                ContentBlock::ToolUse {
+                    id: "call-2".to_string(),
+                    name: "read_file".to_string(),
+                    input: "{\"path\":\"b.rs\"}".to_string(),
+                },
+            ]))
+            .expect("second assistant tool use");
+        session
+            .push_message(ConversationMessage::tool_result(
+                "call-2",
+                "read_file",
+                huge.clone(),
+                false,
+            ))
+            .expect("second tool result");
+
+        let before = estimate_session_tokens(&session);
+        let result = compact_session(
+            &session,
+            CompactionConfig {
+                preserve_recent_messages: 4,
+                max_estimated_tokens: 0,
+            },
+        );
+        let after = estimate_session_tokens(&result.compacted_session);
+
+        assert!(
+            after < before / 2,
+            "compaction must shrink an oversized preserved tool result: {before} -> {after}"
+        );
+
+        let preserved_output = result
+            .compacted_session
+            .messages
+            .iter()
+            .flat_map(|message| &message.blocks)
+            .find_map(|block| match block {
+                ContentBlock::ToolResult { output, .. } => Some(output.clone()),
+                _ => None,
+            })
+            .expect("the tool result must still be present, not deleted");
+
+        assert!(
+            preserved_output.len() < huge.len(),
+            "the payload must actually be trimmed"
+        );
+        assert!(
+            preserved_output.contains("elided"),
+            "the model must be told the view is partial, got: {}",
+            &preserved_output[..preserved_output.len().min(200)]
+        );
+        assert!(
+            preserved_output.starts_with('z'),
+            "the head of the output must be kept"
+        );
+        assert!(
+            preserved_output.ends_with('z'),
+            "the tail of the output must be kept"
+        );
+    }
+
+    /// A session can exceed the window while holding FEWER messages than
+    /// `preserve_recent_messages` — one read of a large file does it. `should_compact` returns
+    /// false there (nothing is droppable), so trimming must not be gated behind it.
+    #[test]
+    fn oversized_tool_results_are_trimmed_even_when_no_message_can_be_dropped() {
+        let huge = "q".repeat(80_000);
+        let mut session = Session::new();
+        session
+            .push_message(ConversationMessage::user_text("read one enormous file"))
+            .expect("user message");
+        session
+            .push_message(ConversationMessage::assistant(vec![
+                ContentBlock::ToolUse {
+                    id: "call-1".to_string(),
+                    name: "read_file".to_string(),
+                    input: "{\"path\":\"huge.rs\"}".to_string(),
+                },
+            ]))
+            .expect("assistant tool use");
+        session
+            .push_message(ConversationMessage::tool_result(
+                "call-1",
+                "read_file",
+                huge,
+                false,
+            ))
+            .expect("tool result");
+
+        // 3 messages, preserve 4: there is nothing to remove, yet the session is far too big.
+        let before = estimate_session_tokens(&session);
+        let result = compact_session(
+            &session,
+            CompactionConfig {
+                preserve_recent_messages: 4,
+                max_estimated_tokens: 0,
+            },
+        );
+        let after = estimate_session_tokens(&result.compacted_session);
+
+        assert!(
+            after < before / 2,
+            "an untrimmable session must still have its payloads trimmed: {before} -> {after}"
+        );
+    }
+
+    /// Trimming must not touch payloads that already fit — otherwise every ordinary tool result
+    /// would grow an elision marker it does not need.
+    #[test]
+    fn compaction_leaves_small_tool_results_untouched() {
+        let small = "ok".repeat(50);
+        let mut session = Session::new();
+        for index in 0..6 {
+            session
+                .push_message(ConversationMessage::user_text(format!("turn {index}")))
+                .expect("user message");
+            session
+                .push_message(ConversationMessage::tool_result(
+                    format!("call-{index}"),
+                    "read_file",
+                    small.clone(),
+                    false,
+                ))
+                .expect("tool result");
+        }
+
+        let result = compact_session(
+            &session,
+            CompactionConfig {
+                preserve_recent_messages: 4,
+                max_estimated_tokens: 0,
+            },
+        );
+
+        for block in result
+            .compacted_session
+            .messages
+            .iter()
+            .flat_map(|message| &message.blocks)
+        {
+            if let ContentBlock::ToolResult { output, .. } = block {
+                assert_eq!(
+                    output, &small,
+                    "a small tool result must pass through as-is"
+                );
+            }
+        }
+    }
+
     #[test]
     fn compaction_does_not_split_tool_use_tool_result_pair() {
         use crate::session::{ContentBlock, Session};

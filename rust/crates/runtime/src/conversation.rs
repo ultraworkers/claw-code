@@ -620,7 +620,7 @@ where
         self.compact_now()
     }
 
-    /// Compacts the session unconditionally, returning `None` when there was nothing to remove.
+    /// Compacts the session unconditionally, returning `None` when nothing actually changed.
     fn compact_now(&mut self) -> Option<AutoCompactionEvent> {
         let result = compact_session(
             &self.session,
@@ -630,7 +630,12 @@ where
             },
         );
 
-        if result.removed_message_count == 0 {
+        // `removed_message_count` alone is the wrong test for "did anything happen": compaction
+        // also trims oversized tool-result payloads in messages it must PRESERVE, and on a
+        // session too short to have anything droppable that trimming is the entire result.
+        // Gating on the count would compute the smaller session and then throw it away.
+        let shrank = result.compacted_session.messages != self.session.messages;
+        if result.removed_message_count == 0 && !shrank {
             return None;
         }
 

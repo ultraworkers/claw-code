@@ -10275,6 +10275,12 @@ mod tests {
 
     #[test]
     fn repl_executes_python_code() {
+        // Resolving the python runtime reads PATH, and PATH is process-global: the PowerShell
+        // tests below blank it while they run. Without this guard that races and this test
+        // intermittently fails with "python runtime not found" on a machine that has python.
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let result = execute_tool(
             "REPL",
             &json!({"language": "python", "code": "print(1 + 1)", "timeout_ms": 500}),
