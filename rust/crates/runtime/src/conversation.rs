@@ -569,7 +569,18 @@ where
     }
 
     fn maybe_auto_compact(&mut self) -> Option<AutoCompactionEvent> {
-        if self.usage_tracker.cumulative_usage().input_tokens
+        // Gate on the LIVE context size — the most recent call's input counters — not on a
+        // cumulative running total, and count cached input as the context it is.
+        //
+        // The previous gate (`cumulative_usage().input_tokens`) was wrong twice over:
+        //   1. It ignored `cache_read_input_tokens`. With prompt caching a warm call reports
+        //      `input_tokens: 2`, so the counter crawled and compaction never fired however
+        //      large the context grew.
+        //   2. Summing across calls is not a context measurement, and the sum never decreased,
+        //      so once it did trip, every later iteration compacted forever.
+        // Reading the latest turn fixes both: it rises with the real context and falls back
+        // below the threshold as soon as a compaction has done its job.
+        if self.usage_tracker.current_turn_usage().total_input_tokens()
             < self.auto_compaction_input_tokens_threshold
         {
             return None;
@@ -1618,6 +1629,133 @@ mod tests {
             .expect("turn should succeed");
         assert_eq!(summary.auto_compaction, None);
         assert_eq!(runtime.session().messages.len(), 2);
+    }
+
+    /// Prompt caching reports the bulk of the context as `cache_read_input_tokens` and leaves
+    /// `input_tokens` at a token or two, so a gate that reads `input_tokens` alone never fires
+    /// on a cached session no matter how large the context has grown.
+    #[test]
+    fn auto_compaction_counts_cached_context_toward_threshold() {
+        struct CachedApi;
+        impl ApiClient for CachedApi {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                Ok(vec![
+                    AssistantEvent::TextDelta("done".to_string()),
+                    AssistantEvent::Usage(TokenUsage {
+                        input_tokens: 2,
+                        output_tokens: 4,
+                        cache_creation_input_tokens: 1_804,
+                        cache_read_input_tokens: 112_639,
+                    }),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let mut session = Session::new();
+        session.messages = vec![
+            crate::session::ConversationMessage::user_text("one"),
+            crate::session::ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "two".to_string(),
+            }]),
+            crate::session::ConversationMessage::user_text("three"),
+            crate::session::ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "four".to_string(),
+            }]),
+        ];
+
+        let mut runtime = ConversationRuntime::new(
+            session,
+            CachedApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_auto_compaction_input_tokens_threshold(100_000);
+
+        let summary = runtime
+            .run_turn("trigger", None)
+            .expect("turn should succeed");
+
+        assert_eq!(
+            summary.auto_compaction,
+            Some(AutoCompactionEvent {
+                removed_message_count: 2,
+            })
+        );
+    }
+
+    /// The threshold describes the LIVE context, not a monotonic running total. Once compaction
+    /// has shrunk the context back down, later small turns must not keep compacting.
+    #[test]
+    fn auto_compaction_stops_once_the_context_shrinks_again() {
+        struct ShrinkingApi {
+            calls: u32,
+        }
+        impl ApiClient for ShrinkingApi {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                let call = self.calls;
+                self.calls += 1;
+                // The first call is over budget; every call after it is small.
+                let input_tokens = if call == 0 { 150_000 } else { 900 };
+                Ok(vec![
+                    AssistantEvent::TextDelta("done".to_string()),
+                    AssistantEvent::Usage(TokenUsage {
+                        input_tokens,
+                        output_tokens: 4,
+                        cache_creation_input_tokens: 0,
+                        cache_read_input_tokens: 0,
+                    }),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let mut session = Session::new();
+        session.messages = vec![
+            crate::session::ConversationMessage::user_text("one"),
+            crate::session::ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "two".to_string(),
+            }]),
+            crate::session::ConversationMessage::user_text("three"),
+            crate::session::ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "four".to_string(),
+            }]),
+        ];
+
+        let mut runtime = ConversationRuntime::new(
+            session,
+            ShrinkingApi { calls: 0 },
+            // Every turn after a compaction runs the session health probe, which calls
+            // `glob_search`; without it the probe fails the turn before the assertion is reached.
+            StaticToolExecutor::new().register("glob_search", |_| Ok(String::new())),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_auto_compaction_input_tokens_threshold(100_000);
+
+        let first = runtime.run_turn("trigger", None).expect("first turn");
+        assert!(
+            first.auto_compaction.is_some(),
+            "the over-budget turn should compact"
+        );
+
+        let second = runtime.run_turn("again", None).expect("second turn");
+        assert_eq!(
+            second.auto_compaction, None,
+            "a small turn after compaction must not compact again"
+        );
+        let third = runtime.run_turn("and again", None).expect("third turn");
+        assert_eq!(
+            third.auto_compaction, None,
+            "compaction must not latch on once the threshold has been crossed"
+        );
     }
 
     #[test]
