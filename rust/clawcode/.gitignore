@@ -1,0 +1,8 @@
+rust/target/
+# Temporary local debugging tools
+dump_output.txt
+# Per-project conversation transcripts (terminal-visible mirror of sessions)
+.claw/transcripts/
+# Local environment secrets — never commit live API keys
+claw/.env
+claw/.env_deepseek

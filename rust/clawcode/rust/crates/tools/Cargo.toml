@@ -1,0 +1,33 @@
+[package]
+name = "tools"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+agents = { path = "../agents" }
+dunce.workspace = true
+api = { path = "../api" }
+commands = { path = "../commands" }
+pdf-extract = "0.12"
+calamine = "0.24"
+rust_xlsxwriter = "0.78"
+docx-rs = "0.4.22"
+plugins = { path = "../plugins" }
+runtime = { path = "../runtime" }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+scraper = "0.21"
+serde = { version = "1", features = ["derive"] }
+serde_json.workspace = true
+tokio = { version = "1", features = ["rt-multi-thread"] }
+url = "2"
+crossterm = "0.29"
+jiff = "0.2"
+unicode-width = "0.2.2"
+
+[dev-dependencies]
+agents = { path = "../agents", features = ["test-utils"] }
+
+[lints]
+workspace = true

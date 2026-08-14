@@ -1,0 +1,50 @@
+[package]
+name = "claw-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "claw"
+path = "src/main.rs"
+
+[dependencies]
+api = { path = "../api" }
+commands = { path = "../commands" }
+dunce.workspace = true
+compat-harness = { path = "../compat-harness" }
+crossterm = "0.28"
+unicode-width = "0.2"
+pulldown-cmark = "0.13"
+rustyline = "15"
+runtime = { path = "../runtime" }
+plugins = { path = "../plugins" }
+serde = { version = "1", features = ["derive"] }
+serde_json.workspace = true
+syntect = "5"
+tokio = { version = "1", features = ["rt-multi-thread", "signal", "time"] }
+tools = { path = "../tools" }
+mime_guess = "2.0.5"
+base64 = "0.22.1"
+chardetng = "0.1"
+image = "0.25"
+sha2 = "0.10"
+phf = { version = "0.11", features = ["macros"] }
+dialoguer = "0.11"
+inquire = "0.9.4"
+
+[build-dependencies]
+# 2.x is the API our build.rs uses (compile(path, embed_resource::NONE)).
+# 0.3.x was never published; the crate jumped 1.x -> 2.x -> 3.x.
+embed-resource = "2.5"
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+mock-anthropic-service = { path = "../mock-anthropic-service" }
+runtime = { path = "../runtime" }
+serde_json.workspace = true
+tokio = { version = "1", features = ["rt-multi-thread"] }
+

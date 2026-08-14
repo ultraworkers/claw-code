@@ -1,1 +1,0 @@
-{"messages":[{"blocks":[{"text":"build","type":"text"}],"role":"user"},{"blocks":[{"text":"\n\nI'll build the Rust project.\n\n<tool_use>\n<server_name>shell</server_name>\n<tool_name","type":"text"}],"role":"assistant","usage":{"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"input_tokens":1963,"output_tokens":32}}],"version":1}
