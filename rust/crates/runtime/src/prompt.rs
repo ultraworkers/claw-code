@@ -42,7 +42,25 @@ pub const SYSTEM_PROMPT_DYNAMIC_BOUNDARY: &str = "__SYSTEM_PROMPT_DYNAMIC_BOUNDA
 pub const FRONTIER_MODEL_NAME: &str = "Claude Opus 4.6";
 const MAX_INSTRUCTION_FILE_CHARS: usize = 4_000;
 const MAX_TOTAL_INSTRUCTION_CHARS: usize = 12_000;
-const MAX_GIT_DIFF_CHARS: usize = 50_000;
+/// Character budget for the git diff snapshot embedded in the system prompt.
+///
+/// This lives in the *system prompt*, so its cost is paid on every session whose
+/// working tree has changed — and a diff changes on essentially every edit. The
+/// previous 50_000 budget was four times the entire instruction-file budget and
+/// could add ~15_000 tokens to the prompt from a single modified file, which is
+/// affordable against a hosted frontier model and ruinous against a local one.
+///
+/// Override with `CLAW_MAX_GIT_DIFF_CHARS`. `0` drops the diff snapshot entirely;
+/// git status and the recent-commit list are unaffected.
+const DEFAULT_MAX_GIT_DIFF_CHARS: usize = 4_000;
+const MAX_GIT_DIFF_CHARS_ENV_VAR: &str = "CLAW_MAX_GIT_DIFF_CHARS";
+
+fn max_git_diff_chars() -> usize {
+    std::env::var(MAX_GIT_DIFF_CHARS_ENV_VAR)
+        .ok()
+        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or(DEFAULT_MAX_GIT_DIFF_CHARS)
+}
 
 /// Neutral identity for the model family line in generated prompts.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -451,8 +469,15 @@ fn read_git_diff(cwd: &Path) -> Option<String> {
 }
 
 fn truncate_diff(mut diff: String) -> String {
-    if diff.len() > MAX_GIT_DIFF_CHARS {
-        let mut end = MAX_GIT_DIFF_CHARS;
+    let budget = max_git_diff_chars();
+    // A zero budget means "omit the diff", not "truncate to nothing" -- returning
+    // an empty string here would still push an empty "Git diff snapshot:" heading
+    // into the prompt.
+    if budget == 0 {
+        return String::new();
+    }
+    if diff.len() > budget {
+        let mut end = budget;
         while !diff.is_char_boundary(end) {
             end -= 1;
         }
@@ -730,7 +755,8 @@ mod tests {
         collapse_blank_lines, display_context_path, normalize_instruction_content,
         render_instruction_content, render_instruction_files, truncate_diff,
         truncate_instruction_content, ContextFile, ModelFamilyIdentity, ProjectContext,
-        SystemPromptBuilder, MAX_GIT_DIFF_CHARS, SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
+        SystemPromptBuilder, DEFAULT_MAX_GIT_DIFF_CHARS, MAX_GIT_DIFF_CHARS_ENV_VAR,
+        SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
     };
     use crate::config::ConfigLoader;
     use std::fs;
@@ -1392,8 +1418,19 @@ mod tests {
         assert!(rendered.contains("Project rules"));
     }
 
+    /// Serializes the tests that read or mutate `CLAW_MAX_GIT_DIFF_CHARS`; env vars
+    /// are process-global and the default-budget tests fail if another test leaves
+    /// an override set.
+    fn diff_env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     #[test]
     fn truncate_diff_preserves_short_content() {
+        let _guard = diff_env_lock();
+        std::env::remove_var(MAX_GIT_DIFF_CHARS_ENV_VAR);
         let short = "a".repeat(1_000);
         let result = truncate_diff(short.clone());
         assert_eq!(result, short);
@@ -1401,24 +1438,49 @@ mod tests {
     }
 
     #[test]
+    fn truncate_diff_honors_env_override() {
+        let _guard = diff_env_lock();
+        std::env::set_var(MAX_GIT_DIFF_CHARS_ENV_VAR, "100");
+        let result = truncate_diff("z".repeat(1_000));
+        std::env::remove_var(MAX_GIT_DIFF_CHARS_ENV_VAR);
+        let marker = "\n\n... [diff truncated — too large for system prompt]";
+        assert!(result.ends_with(marker));
+        assert_eq!(result.len() - marker.len(), 100);
+    }
+
+    #[test]
+    fn truncate_diff_zero_budget_omits_the_snapshot_entirely() {
+        // Zero must yield nothing at all -- a truncated-to-empty body would still
+        // drag a "Git diff snapshot:" heading and the truncation marker into the
+        // prompt, which is the opposite of what the operator asked for.
+        let _guard = diff_env_lock();
+        std::env::set_var(MAX_GIT_DIFF_CHARS_ENV_VAR, "0");
+        let result = truncate_diff("z".repeat(1_000));
+        std::env::remove_var(MAX_GIT_DIFF_CHARS_ENV_VAR);
+        assert!(result.is_empty());
+    }
+
+    #[test]
     fn truncate_diff_caps_oversized_content() {
-        let large = "x".repeat(MAX_GIT_DIFF_CHARS + 5_000);
+        let _guard = diff_env_lock();
+        std::env::remove_var(MAX_GIT_DIFF_CHARS_ENV_VAR);
+        let large = "x".repeat(DEFAULT_MAX_GIT_DIFF_CHARS + 5_000);
         let result = truncate_diff(large);
         assert!(result.contains("... [diff truncated — too large for system prompt]"));
-        // The body before the marker must be at most MAX_GIT_DIFF_CHARS bytes
+        // The body before the marker must be at most DEFAULT_MAX_GIT_DIFF_CHARS bytes
         let marker = "\n\n... [diff truncated — too large for system prompt]";
         let body_len = result.len() - marker.len();
-        assert!(body_len <= MAX_GIT_DIFF_CHARS);
+        assert!(body_len <= DEFAULT_MAX_GIT_DIFF_CHARS);
     }
 
     #[test]
     fn truncate_diff_respects_utf8_char_boundaries() {
-        // Build a string where MAX_GIT_DIFF_CHARS falls in the middle of a
+        // Build a string where DEFAULT_MAX_GIT_DIFF_CHARS falls in the middle of a
         // multi-byte character (U+1F600 = 4 bytes in UTF-8).
-        let prefix_len = MAX_GIT_DIFF_CHARS - 2;
+        let prefix_len = DEFAULT_MAX_GIT_DIFF_CHARS - 2;
         let mut input = "a".repeat(prefix_len);
         // Append a 4-byte emoji so bytes [prefix_len..prefix_len+4] are the
-        // emoji.  MAX_GIT_DIFF_CHARS lands at prefix_len+2, inside the emoji.
+        // emoji.  DEFAULT_MAX_GIT_DIFF_CHARS lands at prefix_len+2, inside the emoji.
         input.push('\u{1F600}');
         input.push_str(&"b".repeat(10_000));
 
@@ -1430,7 +1492,7 @@ mod tests {
         // inside it would be invalid UTF-8.
         let marker = "\n\n... [diff truncated — too large for system prompt]";
         let body = &result[..result.len() - marker.len()];
-        assert!(body.len() <= MAX_GIT_DIFF_CHARS);
+        assert!(body.len() <= DEFAULT_MAX_GIT_DIFF_CHARS);
         assert!(body.is_char_boundary(body.len()));
     }
 }
