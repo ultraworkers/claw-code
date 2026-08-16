@@ -7763,15 +7763,20 @@ impl LiveCli {
         match result {
             Ok(summary) => {
                 self.replace_runtime(runtime)?;
+                // The assistant response was already streamed to the terminal live
+                // during the turn (emit_output = true), so reprinting the full text
+                // here would duplicate the entire message. When text was streamed,
+                // emit a newline first so `spinner.finish`'s line-clear lands on a
+                // fresh line instead of erasing the last streamed line.
+                let final_text = final_assistant_text(&summary);
+                if !final_text.is_empty() {
+                    println!();
+                }
                 spinner.finish(
                     "✨ Done",
                     TerminalRenderer::new().color_theme(),
                     &mut stdout,
                 )?;
-                let final_text = final_assistant_text(&summary);
-                if !final_text.is_empty() {
-                    println!("{final_text}");
-                }
                 println!();
                 if let Some(event) = summary.auto_compaction {
                     println!(
@@ -7903,6 +7908,9 @@ impl LiveCli {
                         match new_runtime.run_turn(input, Some(&mut rp)) {
                             Ok(summary) => {
                                 self.replace_runtime(new_runtime)?;
+                                if !final_assistant_text(&summary).is_empty() {
+                                    println!();
+                                }
                                 spinner.finish(
                                     if round == 0 {
                                         "✨ Done (after auto-compact)"
