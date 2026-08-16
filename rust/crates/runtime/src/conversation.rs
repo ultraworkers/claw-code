@@ -18,6 +18,38 @@ use crate::usage::{TokenUsage, UsageTracker};
 const DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD: u32 = 100_000;
 const AUTO_COMPACTION_THRESHOLD_ENV_VAR: &str = "CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS";
 
+const DEFAULT_MAX_STALL_NUDGES: usize = 3;
+const MAX_STALL_NUDGES_ENV_VAR: &str = "CLAW_MAX_STALL_NUDGES";
+
+/// Injected when the model narrates its next step (or asks for a go-ahead mid-task)
+/// instead of emitting the tool call that would perform it.
+const STALL_NUDGE_PROMPT: &str = "[auto-continue] You ended the turn without calling a tool, \
+     but the work is not finished. Do not describe the next step and do not ask for \
+     confirmation — issue the tool call now and keep going until the task is done. If \
+     everything asked for is genuinely complete, reply with a one-line summary containing \
+     no forward-looking sentence.";
+
+/// Phrases that mark text as an announcement of work the model has not performed yet.
+/// Matched against the final non-empty line of the assistant's reply.
+const PENDING_ACTION_MARKERS: [&str; 16] = [
+    "let me ",
+    "let's ",
+    "lets ",
+    "i'll ",
+    "i will ",
+    "i'm going to",
+    "i am going to",
+    "going to run",
+    "about to ",
+    "now running",
+    "now checking",
+    "now i",
+    "next i",
+    "next, i",
+    "proceeding to",
+    "moving on to",
+];
+
 /// Fully assembled request payload sent to the upstream model client.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApiRequest {
@@ -140,6 +172,7 @@ pub struct ConversationRuntime<C, T> {
     hook_abort_signal: HookAbortSignal,
     hook_progress_reporter: Option<Box<dyn HookProgressReporter>>,
     session_tracer: Option<SessionTracer>,
+    max_stall_nudges: usize,
 }
 
 impl<C, T> ConversationRuntime<C, T>
@@ -189,7 +222,15 @@ where
             hook_abort_signal: HookAbortSignal::default(),
             hook_progress_reporter: None,
             session_tracer: None,
+            max_stall_nudges: max_stall_nudges_from_env(),
         }
+    }
+
+    /// Override how many auto-continue nudges a stalled turn may receive. `0` disables them.
+    #[must_use]
+    pub fn with_max_stall_nudges(mut self, max_stall_nudges: usize) -> Self {
+        self.max_stall_nudges = max_stall_nudges;
+        self
     }
 
     #[must_use]
@@ -350,6 +391,9 @@ where
         let mut prompt_cache_events = Vec::new();
         let mut iterations = 0;
         let mut auto_compaction = None;
+        let max_stall_nudges = self.max_stall_nudges;
+        let mut stall_nudges = 0;
+        let mut tools_ran = false;
 
         loop {
             iterations += 1;
@@ -429,8 +473,30 @@ where
             }
 
             if pending_tool_uses.is_empty() {
+                // A reply with no tool call usually means the turn is done. On small local
+                // models it just as often means the model narrated the next step — or asked
+                // for a go-ahead mid-task — and then emitted EOS, leaving the announced work
+                // undone. Nudge it back into the loop instead of dropping the user at the
+                // prompt, bounded so a model that insists it is finished still gets to stop.
+                let stalled = stall_nudges < max_stall_nudges
+                    && is_stalled_reply(
+                        &assistant_text(
+                            assistant_messages
+                                .last()
+                                .expect("assistant message pushed above"),
+                        ),
+                        tools_ran,
+                    );
+                if stalled {
+                    stall_nudges += 1;
+                    self.session
+                        .push_user_text(STALL_NUDGE_PROMPT)
+                        .map_err(|error| RuntimeError::new(error.to_string()))?;
+                    continue;
+                }
                 break;
             }
+            tools_ran = true;
 
             for (tool_use_id, tool_name, input) in pending_tool_uses {
                 let pre_hook_result = self.run_pre_tool_use_hook(&tool_name, &input);
@@ -771,6 +837,54 @@ fn parse_auto_compaction_threshold(value: Option<&str>) -> u32 {
         .unwrap_or(DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD)
 }
 
+/// How many auto-continue nudges a single turn may inject. `0` disables the behaviour.
+#[must_use]
+pub fn max_stall_nudges_from_env() -> usize {
+    parse_max_stall_nudges(std::env::var(MAX_STALL_NUDGES_ENV_VAR).ok().as_deref())
+}
+
+#[must_use]
+fn parse_max_stall_nudges(value: Option<&str>) -> usize {
+    value
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .unwrap_or(DEFAULT_MAX_STALL_NUDGES)
+}
+
+/// Concatenated text of an assistant message, ignoring thinking and tool blocks.
+#[must_use]
+fn assistant_text(message: &ConversationMessage) -> String {
+    message
+        .blocks
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// True when a tool-less reply is a stall rather than a finished turn.
+///
+/// Small local models routinely narrate the next tool call in prose and then emit EOS, which
+/// ends the turn with the announced work never performed. `after_tool_use` additionally treats
+/// a mid-task question as a stall: once tools have run in this turn, stopping to ask for a
+/// go-ahead is the same failure wearing a different hat.
+#[must_use]
+fn is_stalled_reply(text: &str, after_tool_use: bool) -> bool {
+    let Some(last_line) = text.lines().map(str::trim).rfind(|line| !line.is_empty()) else {
+        return false;
+    };
+    let lowered = last_line.to_lowercase();
+
+    if after_tool_use && last_line.ends_with('?') {
+        return true;
+    }
+    PENDING_ACTION_MARKERS
+        .iter()
+        .any(|marker| lowered.contains(marker))
+}
+
 fn build_assistant_message(
     events: Vec<AssistantEvent>,
 ) -> Result<
@@ -900,9 +1014,10 @@ impl ToolExecutor for StaticToolExecutor {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_assistant_message, parse_auto_compaction_threshold, ApiClient, ApiRequest,
-        AssistantEvent, AutoCompactionEvent, ConversationRuntime, PromptCacheEvent, RuntimeError,
-        StaticToolExecutor, ToolExecutor, DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD,
+        build_assistant_message, is_stalled_reply, parse_auto_compaction_threshold,
+        parse_max_stall_nudges, ApiClient, ApiRequest, AssistantEvent, AutoCompactionEvent,
+        ConversationRuntime, PromptCacheEvent, RuntimeError, StaticToolExecutor, ToolExecutor,
+        DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD, DEFAULT_MAX_STALL_NUDGES,
     };
     use crate::compact::{estimate_session_tokens, CompactionConfig};
     use crate::config::{RuntimeFeatureConfig, RuntimeHookConfig};
@@ -2128,5 +2243,137 @@ mod tests {
 
         // then
         assert_eq!(error.to_string(), "upstream failed");
+    }
+
+    fn text_only(text: &str) -> Vec<AssistantEvent> {
+        vec![
+            AssistantEvent::TextDelta(text.to_string()),
+            AssistantEvent::MessageStop,
+        ]
+    }
+
+    struct CountingApi {
+        calls: usize,
+        replies: Vec<Vec<AssistantEvent>>,
+    }
+
+    impl ApiClient for CountingApi {
+        fn stream(&mut self, _request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+            let reply = self
+                .replies
+                .get(self.calls)
+                .cloned()
+                .unwrap_or_else(|| text_only("Now running the next probe:"));
+            self.calls += 1;
+            Ok(reply)
+        }
+    }
+
+    fn nudge_runtime(
+        replies: Vec<Vec<AssistantEvent>>,
+        max_stall_nudges: usize,
+    ) -> ConversationRuntime<CountingApi, StaticToolExecutor> {
+        ConversationRuntime::new(
+            Session::new(),
+            CountingApi { calls: 0, replies },
+            StaticToolExecutor::new().register("probe", |_| Ok("probe output".to_string())),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_max_stall_nudges(max_stall_nudges)
+    }
+
+    #[test]
+    fn announced_but_uncalled_tool_is_auto_continued() {
+        // given: the model narrates the next probe instead of calling it
+        let mut runtime = nudge_runtime(
+            vec![
+                text_only("Now running the Ford EEC-V tuner probe (ATSP1):"),
+                vec![
+                    AssistantEvent::ToolUse {
+                        id: "tool-1".to_string(),
+                        name: "probe".to_string(),
+                        input: "atsp1".to_string(),
+                    },
+                    AssistantEvent::MessageStop,
+                ],
+                text_only("No response on ATSP1, which is expected here."),
+            ],
+            3,
+        );
+
+        // when
+        let summary = runtime.run_turn("run the probes", None).expect("turn runs");
+
+        // then: the nudge pulled it back into the loop and the tool actually ran
+        assert_eq!(summary.iterations, 3);
+        assert_eq!(summary.tool_results.len(), 1);
+    }
+
+    #[test]
+    fn nudges_are_bounded_so_a_stuck_model_still_stops() {
+        // given: every reply is an announcement and nothing is ever called
+        let mut runtime = nudge_runtime(Vec::new(), 2);
+
+        // when
+        let summary = runtime.run_turn("run the probes", None).expect("turn runs");
+
+        // then: initial reply plus exactly two nudged retries
+        assert_eq!(summary.iterations, 3);
+        assert!(summary.tool_results.is_empty());
+    }
+
+    #[test]
+    fn a_plain_completion_is_not_nudged() {
+        // given
+        let mut runtime = nudge_runtime(vec![text_only("The DTC scan came back clean.")], 3);
+
+        // when
+        let summary = runtime.run_turn("scan for codes", None).expect("turn runs");
+
+        // then
+        assert_eq!(summary.iterations, 1);
+    }
+
+    #[test]
+    fn zero_budget_disables_auto_continue() {
+        // given
+        let mut runtime = nudge_runtime(vec![text_only("Let me run the DTC scan.")], 0);
+
+        // when
+        let summary = runtime.run_turn("scan for codes", None).expect("turn runs");
+
+        // then
+        assert_eq!(summary.iterations, 1);
+    }
+
+    #[test]
+    fn a_question_stalls_only_after_a_tool_has_run() {
+        assert!(is_stalled_reply("Should I run the DTC scan next?", true));
+        assert!(!is_stalled_reply("Which port is the adapter on?", false));
+    }
+
+    #[test]
+    fn stall_detection_reads_the_last_line_not_the_whole_reply() {
+        // an announcement earlier in the reply does not make a finished turn look stalled
+        assert!(!is_stalled_reply(
+            "Let me check the port.\nThe scan finished with no codes stored.",
+            true
+        ));
+        assert!(is_stalled_reply(
+            "The scan finished.\nNext I'll read the freeze-frame data.",
+            true
+        ));
+    }
+
+    #[test]
+    fn stall_nudge_budget_parses_from_env_value() {
+        // asserted against the literal, not the constant: comparing the parser to the same
+        // constant it falls back to would pass no matter what the default became
+        assert_eq!(DEFAULT_MAX_STALL_NUDGES, 3);
+        assert_eq!(parse_max_stall_nudges(None), 3);
+        assert_eq!(parse_max_stall_nudges(Some("not a number")), 3);
+        assert_eq!(parse_max_stall_nudges(Some(" 5 ")), 5);
+        assert_eq!(parse_max_stall_nudges(Some("0")), 0);
     }
 }

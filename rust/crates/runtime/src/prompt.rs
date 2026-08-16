@@ -731,6 +731,7 @@ fn get_simple_doing_tasks_section() -> String {
         "Do not add speculative abstractions, compatibility shims, or unrelated cleanup.".to_string(),
         "Do not create files unless they are required to complete the task.".to_string(),
         "If an approach fails, diagnose the failure before switching tactics.".to_string(),
+        "Act in the turn you plan in: when the next step is a tool call, make the call. Never end a turn describing a step you have not taken, and do not stop to ask for a go-ahead on work already requested.".to_string(),
         "Be careful not to introduce security vulnerabilities such as command injection, XSS, or SQL injection.".to_string(),
         "Report outcomes faithfully: if verification fails or was not run, say so explicitly.".to_string(),
     ]);
