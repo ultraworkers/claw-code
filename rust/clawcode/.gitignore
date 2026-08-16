@@ -1,0 +1,5 @@
+rust/target/
+# Temporary local debugging tools
+dump_output.txt
+# Per-project conversation transcripts (terminal-visible mirror of sessions)
+.claw/transcripts/
