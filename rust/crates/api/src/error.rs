@@ -255,6 +255,25 @@ impl ApiError {
         }
     }
 
+    /// True for failures whose own text cannot say what went wrong: transport, decode, and frame
+    /// errors.
+    ///
+    /// These matter because a server that answers an oversized request with a non-SSE HTTP 500
+    /// body lands here rather than in [`Self::is_context_window_failure`] — reqwest reports
+    /// "error decoding response body" and the real cause is lost. Callers that know how large the
+    /// request was can combine the two signals; callers that do not must treat this as unknown,
+    /// never as an overflow.
+    #[must_use]
+    pub fn is_ambiguous_transport_failure(&self) -> bool {
+        match self {
+            Self::Http(_) | Self::Json { .. } | Self::InvalidSseFrame(_) => true,
+            Self::RetriesExhausted { last_error, .. } => {
+                last_error.is_ambiguous_transport_failure()
+            }
+            _ => false,
+        }
+    }
+
     #[must_use]
     pub fn is_context_window_failure(&self) -> bool {
         match self {

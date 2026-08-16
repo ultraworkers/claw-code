@@ -20,6 +20,15 @@ const AUTO_COMPACTION_THRESHOLD_ENV_VAR: &str = "CLAUDE_CODE_AUTO_COMPACT_INPUT_
 
 const DEFAULT_MAX_STALL_NUDGES: usize = 3;
 const MAX_STALL_NUDGES_ENV_VAR: &str = "CLAW_MAX_STALL_NUDGES";
+/// Placeholder recorded in the trace when a turn is resumed rather than started, so the trace
+/// does not attribute a second user message to a turn that only had one.
+const RESUMED_TURN_MARKER: &str = "[resumed turn]";
+/// Operator-declared context window. Kept as a literal rather than imported because `runtime`
+/// sits below `api` in the dependency graph; `api::context_window_override` reads the same name.
+const CONTEXT_WINDOW_ENV_VAR: &str = "CLAW_CONTEXT_WINDOW";
+/// Share of a declared context window at which compaction is triggered, leaving the remainder
+/// as headroom for the reply plus whatever the next tool result carries.
+const AUTO_COMPACTION_WINDOW_PERCENT: u32 = 70;
 
 /// Injected when the model narrates its next step (or asks for a go-ahead mid-task)
 /// instead of emitting the tool call that would perform it.
@@ -122,6 +131,7 @@ impl std::error::Error for ToolError {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeError {
     message: String,
+    context_window: bool,
 }
 
 impl RuntimeError {
@@ -129,7 +139,27 @@ impl RuntimeError {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            context_window: false,
         }
+    }
+
+    /// A failure the caller may be able to clear by shrinking the session.
+    ///
+    /// This is a decision the API layer makes and hands up, not one the caller reconstructs by
+    /// matching substrings against the rendered message. Recovering from context exhaustion means
+    /// discarding conversation history, so a transport hiccup misread as an overflow destroys the
+    /// session for no reason — the classification has to come from whoever saw the real error.
+    #[must_use]
+    pub fn context_window(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            context_window: true,
+        }
+    }
+
+    #[must_use]
+    pub const fn is_context_window_failure(&self) -> bool {
+        self.context_window
     }
 }
 
@@ -362,14 +392,33 @@ where
         }
     }
 
-    #[allow(clippy::too_many_lines)]
     pub fn run_turn(
         &mut self,
         user_input: impl Into<String>,
+        prompter: Option<&mut dyn PermissionPrompter>,
+    ) -> Result<TurnSummary, RuntimeError> {
+        self.drive_turn(Some(user_input.into()), prompter)
+    }
+
+    /// Continues the turn already recorded in the session, without adding a user message.
+    ///
+    /// Recovery paths retry a turn that failed part-way through. Calling [`Self::run_turn`] again
+    /// with the original input would append that input a second time and invite the model to redo
+    /// tool calls whose side effects have already landed. Resuming reads the transcript as it
+    /// stands — including the tool results that did complete — and carries on from there.
+    pub fn resume_turn(
+        &mut self,
+        prompter: Option<&mut dyn PermissionPrompter>,
+    ) -> Result<TurnSummary, RuntimeError> {
+        self.drive_turn(None, prompter)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn drive_turn(
+        &mut self,
+        user_input: Option<String>,
         mut prompter: Option<&mut dyn PermissionPrompter>,
     ) -> Result<TurnSummary, RuntimeError> {
-        let user_input = user_input.into();
-
         // ROADMAP #38: Session-health canary - probe if context was compacted
         if self.session.compaction.is_some() {
             if let Err(error) = self.run_session_health_probe() {
@@ -381,10 +430,15 @@ where
             }
         }
 
-        self.record_turn_started(&user_input);
-        self.session
-            .push_user_text(user_input)
-            .map_err(|error| RuntimeError::new(error.to_string()))?;
+        match user_input {
+            Some(user_input) => {
+                self.record_turn_started(&user_input);
+                self.session
+                    .push_user_text(user_input)
+                    .map_err(|error| RuntimeError::new(error.to_string()))?;
+            }
+            None => self.record_turn_started(RESUMED_TURN_MARKER),
+        }
 
         let mut assistant_messages = Vec::new();
         let mut tool_results = Vec::new();
@@ -437,6 +491,7 @@ where
                 match build_assistant_message(events) {
                     Ok(result) => result,
                     Err(error) => {
+                        let error = self.classify_empty_reply(error);
                         self.record_turn_failed(iterations, &error);
                         return Err(error);
                     }
@@ -489,8 +544,13 @@ where
                     );
                 if stalled {
                     stall_nudges += 1;
+                    // Pushed as a system turn, not a user one. The model needs to see it, but the
+                    // transcript must not claim the user asked for it: this text is persisted,
+                    // re-sent on every later request, and folded into the next compaction summary,
+                    // where a user-labelled nudge becomes indistinguishable from something the
+                    // user actually said.
                     self.session
-                        .push_user_text(STALL_NUDGE_PROMPT)
+                        .push_message(ConversationMessage::system_text(STALL_NUDGE_PROMPT))
                         .map_err(|error| RuntimeError::new(error.to_string()))?;
                     continue;
                 }
@@ -657,6 +717,25 @@ where
     /// This is the guard that actually keeps a session inside the context window: it sees growth
     /// that usage counters cannot, because it runs after tool results and long generations have
     /// been appended but before the request that would carry them is built.
+    /// Decides whether an empty or unreadable reply was an overflow, by size rather than by text.
+    ///
+    /// A stream that produces no content says nothing about why. Some backends answer an
+    /// oversized request that way instead of with a typed error, so the failure is worth
+    /// recovering from — but only when the session was already large enough for that to be the
+    /// plausible cause. Below the compaction threshold it is a blip, and discarding the
+    /// transcript would cost more than the retry could win.
+    fn classify_empty_reply(&self, error: RuntimeError) -> RuntimeError {
+        if error.is_context_window_failure() {
+            return error;
+        }
+        if estimate_session_tokens(&self.session)
+            >= self.auto_compaction_input_tokens_threshold as usize
+        {
+            return RuntimeError::context_window(error.to_string());
+        }
+        error
+    }
+
     fn maybe_auto_compact_before_request(&mut self) -> Option<AutoCompactionEvent> {
         let estimated = estimate_session_tokens(&self.session);
         if estimated < self.auto_compaction_input_tokens_threshold as usize {
@@ -822,19 +901,40 @@ where
 /// Reads the automatic compaction threshold from the environment.
 #[must_use]
 pub fn auto_compaction_threshold_from_env() -> u32 {
-    parse_auto_compaction_threshold(
+    resolve_auto_compaction_threshold(
         std::env::var(AUTO_COMPACTION_THRESHOLD_ENV_VAR)
             .ok()
             .as_deref(),
+        std::env::var(CONTEXT_WINDOW_ENV_VAR).ok().as_deref(),
+    )
+}
+
+/// Resolves the threshold from an explicit setting, else from the declared context window.
+///
+/// `DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD` is a 200k-window number. Against a smaller
+/// server it sits above the window entirely, so the pre-request guard can never fire and the
+/// first sign of trouble is the backend rejecting the request. Deriving from the declared window
+/// keeps the guard meaningful without every caller having to compute a second number by hand.
+#[must_use]
+fn resolve_auto_compaction_threshold(explicit: Option<&str>, context_window: Option<&str>) -> u32 {
+    if let Some(threshold) = parse_positive_u32(explicit) {
+        return threshold;
+    }
+    parse_positive_u32(context_window).map_or(
+        DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD,
+        |window| {
+            (u64::from(window) * u64::from(AUTO_COMPACTION_WINDOW_PERCENT) / 100)
+                .try_into()
+                .unwrap_or(DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD)
+        },
     )
 }
 
 #[must_use]
-fn parse_auto_compaction_threshold(value: Option<&str>) -> u32 {
+fn parse_positive_u32(value: Option<&str>) -> Option<u32> {
     value
         .and_then(|raw| raw.trim().parse::<u32>().ok())
-        .filter(|threshold| *threshold > 0)
-        .unwrap_or(DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD)
+        .filter(|parsed| *parsed > 0)
 }
 
 /// How many auto-continue nudges a single turn may inject. `0` disables the behaviour.
@@ -1014,10 +1114,11 @@ impl ToolExecutor for StaticToolExecutor {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_assistant_message, is_stalled_reply, parse_auto_compaction_threshold,
-        parse_max_stall_nudges, ApiClient, ApiRequest, AssistantEvent, AutoCompactionEvent,
-        ConversationRuntime, PromptCacheEvent, RuntimeError, StaticToolExecutor, ToolExecutor,
-        DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD, DEFAULT_MAX_STALL_NUDGES,
+        assistant_text, build_assistant_message, is_stalled_reply, parse_max_stall_nudges,
+        resolve_auto_compaction_threshold, ApiClient, ApiRequest, AssistantEvent,
+        AutoCompactionEvent, ConversationRuntime, PromptCacheEvent, RuntimeError,
+        StaticToolExecutor, ToolExecutor, DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD,
+        DEFAULT_MAX_STALL_NUDGES,
     };
     use crate::compact::{estimate_session_tokens, CompactionConfig};
     use crate::config::{RuntimeFeatureConfig, RuntimeHookConfig};
@@ -1992,16 +2093,41 @@ mod tests {
     #[test]
     fn auto_compaction_threshold_defaults_and_parses_values() {
         assert_eq!(
-            parse_auto_compaction_threshold(None),
+            resolve_auto_compaction_threshold(None, None),
             DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD
         );
-        assert_eq!(parse_auto_compaction_threshold(Some("4321")), 4321);
+        assert_eq!(resolve_auto_compaction_threshold(Some("4321"), None), 4321);
         assert_eq!(
-            parse_auto_compaction_threshold(Some("0")),
+            resolve_auto_compaction_threshold(Some("0"), None),
             DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD
         );
         assert_eq!(
-            parse_auto_compaction_threshold(Some("not-a-number")),
+            resolve_auto_compaction_threshold(Some("not-a-number"), None),
+            DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD
+        );
+    }
+
+    #[test]
+    fn auto_compaction_threshold_derives_from_a_declared_context_window() {
+        // 70% of 65536, so the guard sits inside the window instead of 34k above it.
+        assert_eq!(
+            resolve_auto_compaction_threshold(None, Some("65536")),
+            45875
+        );
+    }
+
+    #[test]
+    fn an_explicit_threshold_still_wins_over_the_declared_window() {
+        assert_eq!(
+            resolve_auto_compaction_threshold(Some("48000"), Some("65536")),
+            48000
+        );
+    }
+
+    #[test]
+    fn an_unparseable_context_window_falls_back_to_the_default_threshold() {
+        assert_eq!(
+            resolve_auto_compaction_threshold(None, Some("plenty")),
             DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD
         );
     }
@@ -2171,6 +2297,146 @@ mod tests {
 
         // then
         assert_eq!(error.to_string(), "unknown tool: missing");
+    }
+
+    /// Replays a fixed script of stream outcomes, one per call.
+    struct ScriptedApi {
+        steps: Vec<Result<Vec<AssistantEvent>, String>>,
+        calls: usize,
+    }
+
+    impl ScriptedApi {
+        fn new(steps: Vec<Result<Vec<AssistantEvent>, String>>) -> Self {
+            Self { steps, calls: 0 }
+        }
+    }
+
+    impl ApiClient for ScriptedApi {
+        fn stream(&mut self, _request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+            let step = self
+                .steps
+                .get(self.calls)
+                .cloned()
+                .unwrap_or_else(|| Err("script exhausted".to_string()));
+            self.calls += 1;
+            step.map_err(RuntimeError::new)
+        }
+    }
+
+    fn tool_call_events(id: &str) -> Vec<AssistantEvent> {
+        vec![
+            AssistantEvent::ToolUse {
+                id: id.to_string(),
+                name: "echo".to_string(),
+                input: "payload".to_string(),
+            },
+            AssistantEvent::MessageStop,
+        ]
+    }
+
+    fn scripted_runtime(
+        steps: Vec<Result<Vec<AssistantEvent>, String>>,
+    ) -> ConversationRuntime<ScriptedApi, StaticToolExecutor> {
+        ConversationRuntime::new(
+            Session::new(),
+            ScriptedApi::new(steps),
+            StaticToolExecutor::new().register("echo", |input| Ok(input.to_string())),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+    }
+
+    #[test]
+    fn a_failed_turn_keeps_the_results_of_tools_that_already_ran() {
+        // given: a turn whose first iteration runs a tool, and whose second call dies
+        let mut runtime = scripted_runtime(vec![
+            Ok(tool_call_events("tool-1")),
+            Err("upstream failed".to_string()),
+        ]);
+
+        // when
+        runtime
+            .run_turn("do the thing", None)
+            .expect_err("the second call fails");
+
+        // then: the executed tool's result is still in the transcript. The side effect happened;
+        // a caller that discards this record will let the model run the same tool again.
+        let tool_results = runtime
+            .session()
+            .messages
+            .iter()
+            .filter(|message| {
+                message
+                    .blocks
+                    .iter()
+                    .any(|block| matches!(block, ContentBlock::ToolResult { .. }))
+            })
+            .count();
+        assert_eq!(tool_results, 1);
+    }
+
+    #[test]
+    fn resume_turn_continues_without_appending_another_user_message() {
+        // given: a session that already carries a user turn and a completed tool result
+        let mut runtime = scripted_runtime(vec![
+            Ok(tool_call_events("tool-1")),
+            Err("upstream failed".to_string()),
+            Ok(vec![
+                AssistantEvent::TextDelta("done".to_string()),
+                AssistantEvent::MessageStop,
+            ]),
+        ]);
+        runtime.run_turn("do the thing", None).expect_err("fails");
+        let user_messages_before = runtime
+            .session()
+            .messages
+            .iter()
+            .filter(|message| message.role == MessageRole::User)
+            .count();
+
+        // when
+        runtime
+            .resume_turn(None)
+            .expect("the resumed turn succeeds");
+
+        // then: the prompt was not repeated
+        let user_messages_after = runtime
+            .session()
+            .messages
+            .iter()
+            .filter(|message| message.role == MessageRole::User)
+            .count();
+        assert_eq!(user_messages_before, user_messages_after);
+    }
+
+    #[test]
+    fn a_stall_nudge_is_recorded_as_a_system_turn_not_a_user_one() {
+        // given: a reply that announces work and stops, so the nudge fires once
+        let mut runtime = nudge_runtime(
+            vec![
+                text_only("Let me check the logs."),
+                text_only("The logs were clean."),
+            ],
+            1,
+        );
+        runtime
+            .run_turn("check the logs", None)
+            .expect("the nudged turn completes");
+
+        // then: exactly one user message — the real one
+        let user_messages = runtime
+            .session()
+            .messages
+            .iter()
+            .filter(|message| message.role == MessageRole::User)
+            .count();
+        assert_eq!(user_messages, 1);
+        assert!(runtime
+            .session()
+            .messages
+            .iter()
+            .any(|message| message.role == MessageRole::System
+                && assistant_text(message).contains("[auto-continue]")));
     }
 
     #[test]

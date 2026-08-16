@@ -72,6 +72,22 @@ use tools::{
 
 const DEFAULT_MODEL: &str = "anthropic/claude-opus-4-7";
 
+/// Ceiling on model/tool round trips within one turn.
+///
+/// `ConversationRuntime` defaults to `usize::MAX`, which for the interactive and `-p` paths means
+/// no ceiling at all: a model that keeps re-reading the same file loops until the user kills it.
+/// Spawned subagents have always been bounded; this gives the top-level loop the same treatment.
+const DEFAULT_MAX_TURN_ITERATIONS: usize = 32;
+const MAX_TURN_ITERATIONS_ENV_VAR: &str = "CLAW_MAX_TURN_ITERATIONS";
+
+fn max_turn_iterations_from_env() -> usize {
+    std::env::var(MAX_TURN_ITERATIONS_ENV_VAR)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .filter(|iterations| *iterations > 0)
+        .unwrap_or(DEFAULT_MAX_TURN_ITERATIONS)
+}
+
 /// #148: Model provenance for `claw status` JSON/text output. Records where
 /// the resolved model string came from so claws don't have to re-read argv
 /// to audit whether their `--model` flag was honored vs falling back to env
@@ -7773,6 +7789,15 @@ impl LiveCli {
                 Ok(())
             }
             Err(error) => {
+                // Salvage the transcript before the failed runtime is torn down.
+                //
+                // `prepare_turn_runtime` handed `run_turn` a CLONE of the session, and the turn
+                // mutated only that clone — appending the user message, each assistant reply, and
+                // a tool_result for every tool that actually executed. Dropping the clone throws
+                // all of that away while the side effects of those tools remain on disk, so the
+                // retry below would re-issue them against a session that shows no sign they ever
+                // ran. Adopting the clone keeps the record and the reality in step.
+                *self.runtime.session_mut() = runtime.session().clone();
                 runtime.shutdown_plugins()?;
                 spinner.fail(
                     "❌ Request failed",
@@ -7792,37 +7817,17 @@ impl LiveCli {
                 // This eliminates the need for users to manually run /compact when they
                 // hit context limits - the recovery happens automatically.
                 //
-                // Detection: We look for "context_window" or "Context window" in the error
-                // message, which covers error types like:
-                // - "context_window_blocked"
-                // - "Context window blocked"
-                // - "This model's maximum context length is X tokens..."
+                // Detection: the API layer classified this when it still had the typed error and
+                // the outgoing request in hand — see `AnthropicRuntimeClient::runtime_error_from_api`.
+                // It is deliberately NOT re-derived from the rendered message here: compaction
+                // discards conversation history, and the substrings that used to gate it
+                // ("error decoding response body", "Failed to parse input at pos") are emitted by
+                // ordinary transport failures as well as by overflow, so a dropped connection cost
+                // the session its transcript.
                 // ============================================================================
 
                 let error_str = error.to_string();
-                // Detect context window overflow. Some providers (e.g. OpenAI-compat backends)
-                // return 400 with "no parseable body" instead of a proper context_length_exceeded
-                // error when the request is too large to even parse — treat that as context overflow too.
-                // Also detect model-specific context error markers (e.g. llama.cpp returns
-                // "Context size has been exceeded." / "exceed_context_size_error" / "exceeds the available context size").
-                let is_context_window = error_str.contains("context_window")
-                    || error_str.contains("Context window")
-                    || error_str.contains("no parseable body")
-                    || error_str.contains("exceed_context_size")
-                    || error_str.contains("exceeds the available context size")
-                    || error_str
-                        .to_ascii_lowercase()
-                        .contains("context size has been exceeded");
-
-                // Also treat "assistant stream produced no content" and reqwest decode failures
-                // as recoverable errors that may benefit from auto-compaction. Some backends (e.g.
-                // llama.cpp) return a non-SSE HTTP 500 body when context overflows, causing
-                // reqwest to fail with "error decoding response body" — treat that as context overflow too.
-                let is_no_content = error_str.contains("assistant stream produced no content")
-                    || error_str.contains("Failed to parse input at pos")
-                    || error_str.contains("error decoding response body");
-
-                if is_context_window || is_no_content {
+                if error.is_context_window_failure() {
                     // If the error tells us the server's actual context window, adapt our
                     // auto-compaction threshold so future auto-compact-trigger checks are accurate.
                     if let Some(window) = extract_context_window_tokens_from_error(&error_str) {
@@ -7889,7 +7894,11 @@ impl LiveCli {
                         drop(hook_abort_monitor);
 
                         let mut rp = CliPermissionPrompter::new(self.permission_mode);
-                        match new_runtime.run_turn(input, Some(&mut rp)) {
+                        // Resume, do not replay. The salvaged session already carries this turn's
+                        // user message and every tool result that completed before the failure;
+                        // re-running `run_turn(input, ..)` would duplicate the prompt and invite a
+                        // second execution of tools that are not idempotent.
+                        match new_runtime.resume_turn(Some(&mut rp)) {
                             Ok(summary) => {
                                 self.replace_runtime(new_runtime)?;
                                 spinner.finish(
@@ -7913,20 +7922,7 @@ impl LiveCli {
                             }
                             Err(retry_error) => {
                                 let retry_str = retry_error.to_string();
-                                let still_context_window = retry_str.contains("context_window")
-                                    || retry_str.contains("Context window")
-                                    || retry_str.contains("no parseable body")
-                                    || retry_str.contains("exceed_context_size")
-                                    || retry_str.contains("exceeds the available context size")
-                                    || retry_str
-                                        .to_ascii_lowercase()
-                                        .contains("context size has been exceeded");
-                                let still_no_content = retry_str
-                                    .contains("assistant stream produced no content")
-                                    || retry_str.contains("Failed to parse input at pos")
-                                    || retry_str.contains("error decoding response body");
-
-                                if (still_context_window || still_no_content)
+                                if retry_error.is_context_window_failure()
                                     && round + 1 < max_compact_rounds
                                 {
                                     // If the retry error reveals the context window, adapt threshold.
@@ -12443,7 +12439,8 @@ fn build_runtime_with_plugin_state(
         policy,
         system_prompt,
         &feature_config,
-    );
+    )
+    .with_max_iterations(max_turn_iterations_from_env());
     if emit_output {
         runtime = runtime.with_hook_progress_reporter(Box::new(CliHookProgressReporter));
     }
@@ -12681,7 +12678,49 @@ impl ApiClient for AnthropicRuntimeClient {
     }
 }
 
+/// How full a request must be, as a percentage of the declared context window, before an
+/// unreadable failure is taken to mean the window overflowed.
+const AMBIGUOUS_FAILURE_WINDOW_PERCENT: u64 = 85;
+
+/// True when a request was close enough to the window that an otherwise unreadable failure is
+/// most likely an overflow.
+///
+/// This is the piece that lets transport errors be classified without matching on their prose.
+/// A backend can answer an oversized request with a non-SSE 500 that reqwest reports as
+/// "error decoding response body"; the same string also appears when the connection simply
+/// dropped. What separates them is not the text, it is whether the request we just sent had any
+/// room left. Requires a declared window — with none, every request looks small and this
+/// correctly returns false.
+fn request_fills_context_window(request: &MessageRequest) -> bool {
+    let Some(limit) = api::model_token_limit(&request.model) else {
+        return false;
+    };
+    let estimated =
+        api::estimate_message_request_input_tokens(request).saturating_add(request.max_tokens);
+    u64::from(estimated) * 100
+        >= u64::from(limit.context_window_tokens) * AMBIGUOUS_FAILURE_WINDOW_PERCENT
+}
+
 impl AnthropicRuntimeClient {
+    /// Converts an API failure into a runtime error, carrying the overflow verdict with it.
+    ///
+    /// The verdict is made here, where the error still has its type and the request is still in
+    /// hand, rather than reconstructed downstream from the rendered message.
+    fn runtime_error_from_api(
+        &self,
+        error: &api::ApiError,
+        request: &MessageRequest,
+    ) -> RuntimeError {
+        let message = format_user_visible_api_error(&self.session_id, error);
+        if error.is_context_window_failure()
+            || (error.is_ambiguous_transport_failure() && request_fills_context_window(request))
+        {
+            RuntimeError::context_window(message)
+        } else {
+            RuntimeError::new(message)
+        }
+    }
+
     /// Consume a single streaming response, optionally applying a stall
     /// timeout on the first event for post-tool continuations.
     #[allow(clippy::too_many_lines)]
@@ -12694,9 +12733,7 @@ impl AnthropicRuntimeClient {
             .client
             .stream_message(message_request)
             .await
-            .map_err(|error| {
-                RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
-            })?;
+            .map_err(|error| self.runtime_error_from_api(&error, message_request))?;
         let mut stdout = io::stdout();
         let mut sink = io::sink();
         let out: &mut dyn Write = if self.emit_output {
@@ -12717,9 +12754,8 @@ impl AnthropicRuntimeClient {
         loop {
             let next = if apply_stall_timeout && !received_any_event {
                 match tokio::time::timeout(POST_TOOL_STALL_TIMEOUT, stream.next_event()).await {
-                    Ok(inner) => inner.map_err(|error| {
-                        RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
-                    })?,
+                    Ok(inner) => inner
+                        .map_err(|error| self.runtime_error_from_api(&error, message_request))?,
                     Err(_elapsed) => {
                         return Err(RuntimeError::new(
                             "post-tool stall: model did not respond within timeout",
@@ -12727,9 +12763,10 @@ impl AnthropicRuntimeClient {
                     }
                 }
             } else {
-                stream.next_event().await.map_err(|error| {
-                    RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
-                })?
+                stream
+                    .next_event()
+                    .await
+                    .map_err(|error| self.runtime_error_from_api(&error, message_request))?
             };
 
             let Some(event) = next else {
@@ -12869,9 +12906,7 @@ impl AnthropicRuntimeClient {
                 ..message_request.clone()
             })
             .await
-            .map_err(|error| {
-                RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
-            })?;
+            .map_err(|error| self.runtime_error_from_api(&error, message_request))?;
         let mut events = response_to_events(response, out)?;
         push_prompt_cache_record(&self.client, &mut events);
         Ok(events)
