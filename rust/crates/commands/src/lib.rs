@@ -138,7 +138,7 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "memory",
         aliases: &[],
-        summary: "Inspect loaded Claude instruction memory files",
+        summary: "Show instruction files and persistent auto memory",
         argument_hint: None,
         resume_supported: true,
     },
