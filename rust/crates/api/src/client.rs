@@ -262,4 +262,21 @@ mod tests {
             other => panic!("Expected ProviderClient::OpenAi for local model, got: {other:?}"),
         }
     }
+
+    #[test]
+    fn is_local_openai_compatible_base_url_is_reachable_via_crate_root() {
+        // Regression: this helper must stay `pub` and re-exported from the
+        // crate root so `rusty-claude-cli`'s model-syntax validation can
+        // reuse the same local/private-address detection used here to
+        // waive the API-key requirement.
+        assert!(crate::is_local_openai_compatible_base_url(
+            "http://127.0.0.1:1234/v1"
+        ));
+        assert!(crate::is_local_openai_compatible_base_url(
+            "http://192.168.1.50:8000/v1"
+        ));
+        assert!(!crate::is_local_openai_compatible_base_url(
+            "https://openrouter.ai/api/v1"
+        ));
+    }
 }

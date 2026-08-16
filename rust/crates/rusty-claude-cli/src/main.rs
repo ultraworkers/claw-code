@@ -2986,7 +2986,18 @@ fn is_local_openai_model_syntax(model: &str) -> bool {
     if let Some(rest) = model.strip_prefix("local/") {
         return !rest.is_empty() && rest.split('/').all(|segment| !segment.is_empty());
     }
-    std::env::var_os("OPENAI_BASE_URL").is_some() && (model.contains(':') || model.contains('.'))
+    let Ok(base_url) = std::env::var("OPENAI_BASE_URL") else {
+        return false;
+    };
+    // A local/private OPENAI_BASE_URL (Ollama, LM Studio, llama.cpp, vLLM, ...)
+    // is trusted to accept any non-empty model name the server actually
+    // serves, matching the OLLAMA_HOST bypass above. Remote gateways keep the
+    // stricter dot/colon-tag heuristic so a bare typo doesn't silently route
+    // to a paid hosted API.
+    if api::is_local_openai_compatible_base_url(&base_url) {
+        return !model.is_empty();
+    }
+    model.contains(':') || model.contains('.')
 }
 
 fn config_alias_for_current_dir(alias: &str) -> Option<String> {
@@ -19827,5 +19838,38 @@ mod alias_resolution_tests {
         assert!(validate_model_syntax("qwen3.6:27b-nvfp4").is_ok());
         // Empty model still rejected
         assert!(validate_model_syntax("").is_err());
+    }
+
+    #[test]
+    fn local_openai_base_url_bypasses_bare_model_names() {
+        let _guard = ollama_env_lock();
+        let _ollama_env = EnvVarGuard::unset("OLLAMA_HOST");
+        // LM Studio's default port; a bare alias with no dot/colon/slash,
+        // as LM Studio and llama.cpp commonly register models under.
+        let _openai_env = EnvVarGuard::set("OPENAI_BASE_URL", "http://127.0.0.1:1234/v1");
+        assert!(validate_model_syntax("mistral").is_ok());
+        assert!(validate_model_syntax("local-7b").is_ok());
+        // Empty model is still rejected even when the base URL is local.
+        assert!(validate_model_syntax("").is_err());
+    }
+
+    #[test]
+    fn private_network_openai_base_url_bypasses_bare_model_names() {
+        let _guard = ollama_env_lock();
+        let _ollama_env = EnvVarGuard::unset("OLLAMA_HOST");
+        let _openai_env = EnvVarGuard::set("OPENAI_BASE_URL", "http://192.168.1.50:8000/v1");
+        assert!(validate_model_syntax("mistral").is_ok());
+    }
+
+    #[test]
+    fn remote_openai_base_url_still_requires_provider_model_or_tag_syntax() {
+        let _guard = ollama_env_lock();
+        let _ollama_env = EnvVarGuard::unset("OLLAMA_HOST");
+        let _openai_env = EnvVarGuard::set("OPENAI_BASE_URL", "https://openrouter.ai/api/v1");
+        // A bare name with no dot/colon/slash against a remote gateway must
+        // keep failing so a typo doesn't silently route to a paid hosted API.
+        assert!(validate_model_syntax("mistral").is_err());
+        // The existing dot/colon-tag heuristic still applies for remote hosts.
+        assert!(validate_model_syntax("qwen2.5-coder:7b").is_ok());
     }
 }
