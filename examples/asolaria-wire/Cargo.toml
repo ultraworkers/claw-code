@@ -1,0 +1,18 @@
+[package]
+name = "asolaria-wire-bench"
+version = "0.1.0"
+edition = "2021"
+description = "Reproducible benchmark: json=0 binary + SHA-256 hash-chain vs JSON text for agent event logs"
+license = "MIT"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+
+[[bin]]
+name = "asolaria_wire_bench"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
