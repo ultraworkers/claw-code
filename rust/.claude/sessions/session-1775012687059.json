@@ -1,1 +1,0 @@
-{"messages":[{"blocks":[{"text":"exit","type":"text"}],"role":"user"},{"blocks":[{"text":"\n\nGoodbye! 👋","type":"text"}],"role":"assistant","usage":{"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"input_tokens":4272,"output_tokens":10}}],"version":1}

@@ -8,7 +8,7 @@ publish.workspace = true
 [dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 runtime = { path = "../runtime" }
-serde = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive", "rc"] }
 serde_json.workspace = true
 telemetry = { path = "../telemetry" }
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "time"] }

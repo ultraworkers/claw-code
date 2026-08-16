@@ -1,4 +1,5 @@
-mod hooks;
+pub mod claude_settings;
+pub mod frontmatter;
 #[cfg(test)]
 pub mod test_isolation;
 
@@ -13,11 +14,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-pub use hooks::{HookEvent, HookRunResult, HookRunner};
-
-const EXTERNAL_MARKETPLACE: &str = "external";
-const BUILTIN_MARKETPLACE: &str = "builtin";
-const BUNDLED_MARKETPLACE: &str = "bundled";
+pub const EXTERNAL_MARKETPLACE: &str = "external";
 const SETTINGS_FILE_NAME: &str = "settings.json";
 const REGISTRY_FILE_NAME: &str = "installed.json";
 const MANIFEST_FILE_NAME: &str = "plugin.json";
@@ -26,16 +23,13 @@ const MANIFEST_RELATIVE_PATH: &str = ".claude-plugin/plugin.json";
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PluginKind {
-    Builtin,
-    Bundled,
+    #[serde(other)]
     External,
 }
 
 impl Display for PluginKind {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Builtin => write!(f, "builtin"),
-            Self::Bundled => write!(f, "bundled"),
             Self::External => write!(f, "external"),
         }
     }
@@ -45,8 +39,6 @@ impl PluginKind {
     #[must_use]
     fn marketplace(self) -> &'static str {
         match self {
-            Self::Builtin => BUILTIN_MARKETPLACE,
-            Self::Bundled => BUNDLED_MARKETPLACE,
             Self::External => EXTERNAL_MARKETPLACE,
         }
     }
@@ -64,49 +56,61 @@ pub struct PluginMetadata {
     pub root: Option<PathBuf>,
 }
 
+/// Hook commands grouped by Claude Code hook event name (e.g. `PreToolUse`,
+/// `SessionStart`, `Stop`). The map is deserialized directly from the plugin
+/// manifest `hooks` object, so any event Claude Code supports is accepted and
+/// surfaced to the runtime without a code change per event.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct PluginHooks {
-    #[serde(rename = "PreToolUse", default)]
-    pub pre_tool_use: Vec<String>,
-    #[serde(rename = "PostToolUse", default)]
-    pub post_tool_use: Vec<String>,
-    #[serde(rename = "PostToolUseFailure", default)]
-    pub post_tool_use_failure: Vec<String>,
+    events: BTreeMap<String, Vec<String>>,
 }
 
 impl PluginHooks {
     #[must_use]
+    pub fn new(events: BTreeMap<String, Vec<String>>) -> Self {
+        Self { events }
+    }
+
+    #[must_use]
+    pub fn events(&self) -> &BTreeMap<String, Vec<String>> {
+        &self.events
+    }
+
+    #[must_use]
+    pub fn commands_for(&self, event: &str) -> &[String] {
+        self.events.get(event).map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.pre_tool_use.is_empty()
-            && self.post_tool_use.is_empty()
-            && self.post_tool_use_failure.is_empty()
+        self.events.values().all(Vec::is_empty)
     }
 
     #[must_use]
     pub fn merged_with(&self, other: &Self) -> Self {
-        let mut merged = self.clone();
-        merged
-            .pre_tool_use
-            .extend(other.pre_tool_use.iter().cloned());
-        merged
-            .post_tool_use
-            .extend(other.post_tool_use.iter().cloned());
-        merged
-            .post_tool_use_failure
-            .extend(other.post_tool_use_failure.iter().cloned());
-        merged
+        let mut events = self.events.clone();
+        for (event, commands) in &other.events {
+            let entry = events.entry(event.clone()).or_default();
+            for command in commands {
+                if !entry.contains(command) {
+                    entry.push(command.clone());
+                }
+            }
+        }
+        Self { events }
     }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PluginLifecycle {
+pub struct PluginLifecycleSpec {
     #[serde(rename = "Init", default)]
     pub init: Vec<String>,
     #[serde(rename = "Shutdown", default)]
     pub shutdown: Vec<String>,
 }
 
-impl PluginLifecycle {
+impl PluginLifecycleSpec {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.init.is_empty() && self.shutdown.is_empty()
@@ -124,11 +128,33 @@ pub struct PluginManifest {
     #[serde(default)]
     pub hooks: PluginHooks,
     #[serde(default)]
-    pub lifecycle: PluginLifecycle,
+    pub lifecycle: PluginLifecycleSpec,
     #[serde(default)]
     pub tools: Vec<PluginToolManifest>,
+    // RESERVED (phase-2): `commands` is intentionally validation-only.
+    // The plugin loader reads it so manifest validation/reporting see the
+    // entries, but it is NEVER dispatched (no aggregated_commands(), no
+    // commands() accessor; the CLI does not load plugin slash commands —
+    // see claw-cli/src/main.rs:1604). Built-in slash dispatch is
+    // unchanged. DO NOT DELETE this field or `build_manifest_commands` without
+    // also removing the tests at lib.rs:2777, 2792, 2814, 2820 and confirming the
+    // contract-detection test lib.rs:2862 still passes (it reads raw JSON, so it
+    // will). The shared helpers `validate_command_entry`/`validate_command_entries`
+    // must remain (used by tools/hooks/lifecycle).
     #[serde(default)]
     pub commands: Vec<PluginCommandManifest>,
+    #[serde(rename = "mcpServers", default, skip_serializing_if = "Option::is_none")]
+    pub mcp_servers: Option<Value>,
+    #[serde(default)]
+    pub agents: Vec<PathBuf>,
+    #[serde(default)]
+    pub skills: Vec<PathBuf>,
+    #[serde(rename = "commandsPaths", default, skip_serializing_if = "Vec::is_empty")]
+    pub commands_paths: Vec<PathBuf>,
+    #[serde(rename = "agentsPaths", default, skip_serializing_if = "Vec::is_empty")]
+    pub agents_paths: Vec<PathBuf>,
+    #[serde(rename = "skillsPaths", default, skip_serializing_if = "Vec::is_empty")]
+    pub skills_paths: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -221,6 +247,104 @@ pub struct PluginCommandManifest {
     pub command: String,
 }
 
+/// A Claude Code style markdown slash command discovered from a plugin's
+/// `commands/` directory. The command body is a prompt injected into the
+/// conversation (mirroring Claude Code's prompt-type commands). `name` is the
+/// namespaced, fully-qualified form (`<plugin>:<subdir>:<file>`); `short_name`
+/// is the bare file stem used for tab-completion convenience.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginCommand {
+    pub plugin_id: String,
+    pub name: String,
+    pub short_name: String,
+    pub description: String,
+    pub argument_hint: Option<String>,
+    pub allowed_tools: Vec<String>,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub disable_model_invocation: bool,
+    pub user_invocable: bool,
+    pub shell: Option<String>,
+    pub body: String,
+    pub plugin_root: PathBuf,
+}
+
+impl PluginCommand {
+    /// Render the command body for `args`, performing Claude Code style
+    /// substitutions: `$ARGUMENTS`/`$0` (full args), `$1`/`$2`/... (positional),
+    /// `${CLAUDE_PLUGIN_ROOT}`, `${CLAUDE_PLUGIN_DATA}`, `${CLAUDE_SESSION_ID}`,
+    /// and trailing argument echo when no placeholder is present.
+    #[must_use]
+    pub fn render(&self, args: &str, session_id: Option<&str>) -> String {
+        let positional: Vec<&str> = args.split_whitespace().collect();
+        let mut rendered = self.body.to_string();
+        rendered = rendered.replace("${CLAUDE_PLUGIN_ROOT}", &self.plugin_root.display().to_string());
+        rendered = rendered.replace(
+            "${CLAUDE_PLUGIN_DATA}",
+            &self.plugin_root.join("data").display().to_string(),
+        );
+        if let Some(session_id) = session_id {
+            rendered = rendered.replace("${CLAUDE_SESSION_ID}", session_id);
+        }
+        rendered = substitute_arguments(&rendered, args, &positional);
+        if !args.is_empty() && !has_argument_placeholder(&self.body) {
+            rendered.push_str(&format!("\n\nARGUMENTS: {args}"));
+        }
+        rendered
+    }
+}
+
+fn substitute_arguments(text: &str, full: &str, positional: &[&str]) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '$' {
+            out.push(ch);
+            continue;
+        }
+        match chars.peek().copied() {
+            Some('A') => {
+                let rest: String = chars.by_ref().take(10).collect();
+                if rest.starts_with("ARGUMENTS") {
+                    out.push_str(full);
+                } else {
+                    out.push('$');
+                    out.push_str(&rest);
+                }
+            }
+            Some('0') => {
+                let _ = chars.next();
+                out.push_str(full);
+            }
+            Some(d @ '1'..='9') => {
+                let _ = chars.next();
+                let idx = d.to_digit(10).unwrap_or(0) as usize - 1;
+                if let Some(value) = positional.get(idx) {
+                    out.push_str(value);
+                }
+            }
+            Some('{') => {
+                let captured: String = chars.by_ref().take_while(|c| *c != '}').collect();
+                let _ = chars.next();
+                let key = captured.trim();
+                if key == "CLAUDE_PLUGIN_ROOT" || key == "CLAUDE_PLUGIN_DATA" || key == "CLAUDE_SESSION_ID" {
+                    // Already substituted above; leave placeholder for any
+                    // remaining occurrences unchanged.
+                    out.push_str(&format!("${{{key}}}"));
+                } else if let Some(value) = positional.first() {
+                    out.push_str(value);
+                }
+            }
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+fn has_argument_placeholder(text: &str) -> bool {
+    text.contains("$ARGUMENTS") || text.contains("$0") || (1..=9).any(|n| text.contains(&format!("${n}")))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct RawPluginManifest {
     pub name: String,
@@ -233,11 +357,23 @@ struct RawPluginManifest {
     #[serde(default)]
     pub hooks: PluginHooks,
     #[serde(default)]
-    pub lifecycle: PluginLifecycle,
+    pub lifecycle: PluginLifecycleSpec,
     #[serde(default)]
     pub tools: Vec<RawPluginToolManifest>,
-    #[serde(default)]
-    pub commands: Vec<PluginCommandManifest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commands: Option<Value>,
+    #[serde(rename = "mcpServers", default, skip_serializing_if = "Option::is_none")]
+    pub mcp_servers: Option<Value>,
+    #[serde(rename = "agents", default, skip_serializing_if = "Option::is_none")]
+    pub agents: Option<Value>,
+    #[serde(rename = "skills", default, skip_serializing_if = "Option::is_none")]
+    pub skills: Option<Value>,
+    #[serde(rename = "commandsPaths", default, skip_serializing_if = "Option::is_none")]
+    pub commands_paths: Option<Value>,
+    #[serde(rename = "agentsPaths", default, skip_serializing_if = "Option::is_none")]
+    pub agents_paths: Option<Value>,
+    #[serde(rename = "skillsPaths", default, skip_serializing_if = "Option::is_none")]
+    pub skills_paths: Option<Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -306,10 +442,9 @@ impl PluginTool {
 
     pub fn execute(&self, input: &Value) -> Result<String, PluginError> {
         let input_json = input.to_string();
-        let mut process = Command::new(&self.command);
-        process
-            .args(&self.args)
-            .stdin(Stdio::piped())
+        let (program, args) = command_invocation(&self.command, &self.args);
+        let mut process = Command::new(program);
+        process.args(args).stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .env("CLAWD_PLUGIN_ID", &self.plugin_id)
@@ -352,6 +487,37 @@ fn default_tool_permission_label() -> String {
     "danger-full-access".to_string()
 }
 
+/// Resolve a plugin command into (program, args) so it runs on any platform.
+///
+/// Script files (`.sh`) are executed through `sh` explicitly rather than via
+/// the OS shell association, because Windows does not associate `.sh` with an
+/// interpreter by default. Literal commands go through the platform shell
+/// (`cmd /C` on Windows, `sh -lc` on Unix) to match Claude Code's contract.
+fn command_invocation(command: &str, extra_args: &[String]) -> (String, Vec<String>) {
+    let is_script = command.ends_with(".sh")
+        || command.ends_with(".bash")
+        || (command.contains('.') && Path::new(command).extension().is_some_and(|e| e == "sh"));
+    if is_script {
+        let mut args = vec!["-c".to_string(), "exec \"$0\" \"$@\"".to_string()];
+        args.push(command.to_string());
+        args.extend_from_slice(extra_args);
+        return ("sh".to_string(), args);
+    }
+    if cfg!(windows) {
+        ("cmd".to_string(), {
+            let mut a = vec!["/C".to_string(), command.to_string()];
+            a.extend_from_slice(extra_args);
+            a
+        })
+    } else {
+        ("sh".to_string(), {
+            let mut a = vec!["-lc".to_string(), command.to_string()];
+            a.extend_from_slice(extra_args);
+            a
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum PluginInstallSource {
@@ -384,33 +550,23 @@ fn default_plugin_kind() -> PluginKind {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct BuiltinPlugin {
-    metadata: PluginMetadata,
-    hooks: PluginHooks,
-    lifecycle: PluginLifecycle,
-    tools: Vec<PluginTool>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct BundledPlugin {
-    metadata: PluginMetadata,
-    hooks: PluginHooks,
-    lifecycle: PluginLifecycle,
-    tools: Vec<PluginTool>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
 pub struct ExternalPlugin {
     metadata: PluginMetadata,
     hooks: PluginHooks,
-    lifecycle: PluginLifecycle,
+    lifecycle: PluginLifecycleSpec,
     tools: Vec<PluginTool>,
+    pub mcp_servers: Option<Value>,
+    pub agents: Vec<PathBuf>,
+    pub skills: Vec<PathBuf>,
+    pub commands_paths: Vec<PathBuf>,
+    pub agents_paths: Vec<PathBuf>,
+    pub skills_paths: Vec<PathBuf>,
 }
 
 pub trait Plugin {
     fn metadata(&self) -> &PluginMetadata;
     fn hooks(&self) -> &PluginHooks;
-    fn lifecycle(&self) -> &PluginLifecycle;
+    fn lifecycle(&self) -> &PluginLifecycleSpec;
     fn tools(&self) -> &[PluginTool];
     fn validate(&self) -> Result<(), PluginError>;
     fn initialize(&self) -> Result<(), PluginError>;
@@ -419,81 +575,7 @@ pub trait Plugin {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum PluginDefinition {
-    Builtin(BuiltinPlugin),
-    Bundled(BundledPlugin),
     External(ExternalPlugin),
-}
-
-impl Plugin for BuiltinPlugin {
-    fn metadata(&self) -> &PluginMetadata {
-        &self.metadata
-    }
-
-    fn hooks(&self) -> &PluginHooks {
-        &self.hooks
-    }
-
-    fn lifecycle(&self) -> &PluginLifecycle {
-        &self.lifecycle
-    }
-
-    fn tools(&self) -> &[PluginTool] {
-        &self.tools
-    }
-
-    fn validate(&self) -> Result<(), PluginError> {
-        Ok(())
-    }
-
-    fn initialize(&self) -> Result<(), PluginError> {
-        Ok(())
-    }
-
-    fn shutdown(&self) -> Result<(), PluginError> {
-        Ok(())
-    }
-}
-
-impl Plugin for BundledPlugin {
-    fn metadata(&self) -> &PluginMetadata {
-        &self.metadata
-    }
-
-    fn hooks(&self) -> &PluginHooks {
-        &self.hooks
-    }
-
-    fn lifecycle(&self) -> &PluginLifecycle {
-        &self.lifecycle
-    }
-
-    fn tools(&self) -> &[PluginTool] {
-        &self.tools
-    }
-
-    fn validate(&self) -> Result<(), PluginError> {
-        validate_hook_paths(self.metadata.root.as_deref(), &self.hooks)?;
-        validate_lifecycle_paths(self.metadata.root.as_deref(), &self.lifecycle)?;
-        validate_tool_paths(self.metadata.root.as_deref(), &self.tools)
-    }
-
-    fn initialize(&self) -> Result<(), PluginError> {
-        run_lifecycle_commands(
-            self.metadata(),
-            self.lifecycle(),
-            "init",
-            &self.lifecycle.init,
-        )
-    }
-
-    fn shutdown(&self) -> Result<(), PluginError> {
-        run_lifecycle_commands(
-            self.metadata(),
-            self.lifecycle(),
-            "shutdown",
-            &self.lifecycle.shutdown,
-        )
-    }
 }
 
 impl Plugin for ExternalPlugin {
@@ -505,7 +587,7 @@ impl Plugin for ExternalPlugin {
         &self.hooks
     }
 
-    fn lifecycle(&self) -> &PluginLifecycle {
+    fn lifecycle(&self) -> &PluginLifecycleSpec {
         &self.lifecycle
     }
 
@@ -541,57 +623,81 @@ impl Plugin for ExternalPlugin {
 impl Plugin for PluginDefinition {
     fn metadata(&self) -> &PluginMetadata {
         match self {
-            Self::Builtin(plugin) => plugin.metadata(),
-            Self::Bundled(plugin) => plugin.metadata(),
             Self::External(plugin) => plugin.metadata(),
         }
     }
 
     fn hooks(&self) -> &PluginHooks {
         match self {
-            Self::Builtin(plugin) => plugin.hooks(),
-            Self::Bundled(plugin) => plugin.hooks(),
             Self::External(plugin) => plugin.hooks(),
         }
     }
 
-    fn lifecycle(&self) -> &PluginLifecycle {
+    fn lifecycle(&self) -> &PluginLifecycleSpec {
         match self {
-            Self::Builtin(plugin) => plugin.lifecycle(),
-            Self::Bundled(plugin) => plugin.lifecycle(),
             Self::External(plugin) => plugin.lifecycle(),
         }
     }
 
     fn tools(&self) -> &[PluginTool] {
         match self {
-            Self::Builtin(plugin) => plugin.tools(),
-            Self::Bundled(plugin) => plugin.tools(),
             Self::External(plugin) => plugin.tools(),
         }
     }
 
     fn validate(&self) -> Result<(), PluginError> {
         match self {
-            Self::Builtin(plugin) => plugin.validate(),
-            Self::Bundled(plugin) => plugin.validate(),
             Self::External(plugin) => plugin.validate(),
         }
     }
 
     fn initialize(&self) -> Result<(), PluginError> {
         match self {
-            Self::Builtin(plugin) => plugin.initialize(),
-            Self::Bundled(plugin) => plugin.initialize(),
             Self::External(plugin) => plugin.initialize(),
         }
     }
 
     fn shutdown(&self) -> Result<(), PluginError> {
         match self {
-            Self::Builtin(plugin) => plugin.shutdown(),
-            Self::Bundled(plugin) => plugin.shutdown(),
             Self::External(plugin) => plugin.shutdown(),
+        }
+    }
+}
+
+impl PluginDefinition {
+    pub fn mcp_servers(&self) -> Option<&Value> {
+        match self {
+            Self::External(p) => p.mcp_servers.as_ref(),
+        }
+    }
+
+    pub fn agent_paths(&self) -> &[PathBuf] {
+        match self {
+            Self::External(p) => &p.agents,
+        }
+    }
+
+    pub fn skill_paths(&self) -> &[PathBuf] {
+        match self {
+            Self::External(p) => &p.skills,
+        }
+    }
+
+    pub fn commands_paths(&self) -> &[PathBuf] {
+        match self {
+            Self::External(p) => &p.commands_paths,
+        }
+    }
+
+    pub fn agents_paths(&self) -> &[PathBuf] {
+        match self {
+            Self::External(p) => &p.agents_paths,
+        }
+    }
+
+    pub fn skills_paths(&self) -> &[PathBuf] {
+        match self {
+            Self::External(p) => &p.skills_paths,
         }
     }
 }
@@ -627,6 +733,36 @@ impl RegisteredPlugin {
     }
 
     #[must_use]
+    pub fn mcp_servers(&self) -> Option<&Value> {
+        self.definition.mcp_servers()
+    }
+
+    #[must_use]
+    pub fn agent_paths(&self) -> &[PathBuf] {
+        self.definition.agent_paths()
+    }
+
+    #[must_use]
+    pub fn skill_paths(&self) -> &[PathBuf] {
+        self.definition.skill_paths()
+    }
+
+    #[must_use]
+    pub fn commands_paths(&self) -> &[PathBuf] {
+        self.definition.commands_paths()
+    }
+
+    #[must_use]
+    pub fn agents_paths(&self) -> &[PathBuf] {
+        self.definition.agents_paths()
+    }
+
+    #[must_use]
+    pub fn skills_paths(&self) -> &[PathBuf] {
+        self.definition.skills_paths()
+    }
+
+    #[must_use]
     pub fn is_enabled(&self) -> bool {
         self.enabled
     }
@@ -648,7 +784,6 @@ impl RegisteredPlugin {
         PluginSummary {
             metadata: self.metadata().clone(),
             enabled: self.enabled,
-            lifecycle: self.definition.lifecycle().clone(),
         }
     }
 }
@@ -657,18 +792,6 @@ impl RegisteredPlugin {
 pub struct PluginSummary {
     pub metadata: PluginMetadata,
     pub enabled: bool,
-    pub lifecycle: PluginLifecycle,
-}
-
-impl PluginSummary {
-    #[must_use]
-    pub fn lifecycle_state(&self) -> &'static str {
-        if self.enabled {
-            "ready"
-        } else {
-            "disabled"
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -815,6 +938,17 @@ impl PluginRegistry {
             })
     }
 
+    /// Discover and aggregate every enabled plugin's markdown slash commands.
+    pub fn aggregated_commands(&self) -> Vec<PluginCommand> {
+        let mut commands = Vec::new();
+        for plugin in self.plugins.iter().filter(|plugin| plugin.is_enabled()) {
+            if let Some(root) = plugin.metadata().root.as_deref() {
+                commands.extend(discover_plugin_commands(root, &plugin.metadata().id));
+            }
+        }
+        commands
+    }
+
     pub fn aggregated_tools(&self) -> Result<Vec<PluginTool>, PluginError> {
         let mut tools = Vec::new();
         let mut seen_names = BTreeMap::new();
@@ -855,6 +989,160 @@ impl PluginRegistry {
         }
         Ok(())
     }
+
+    pub fn mcp_server_configs(&self) -> BTreeMap<String, (String, Value)> {
+        let mut result = BTreeMap::new();
+        for plugin in &self.plugins {
+            if !plugin.is_enabled() {
+                continue;
+            }
+            let Some(mcp_value) = plugin.mcp_servers() else {
+                continue;
+            };
+            if let Some(server_map) = mcp_value.as_object() {
+                let plugin_id = plugin.metadata().id.clone();
+                for (server_name, config_value) in server_map {
+                    result.insert(server_name.clone(), (plugin_id.clone(), config_value.clone()));
+                }
+            }
+        }
+        result
+    }
+
+    pub fn agent_paths_by_plugin(&self) -> BTreeMap<String, Vec<PathBuf>> {
+        let mut result = BTreeMap::new();
+        for plugin in &self.plugins {
+            if !plugin.is_enabled() {
+                continue;
+            }
+            let paths = plugin.agent_paths();
+            if !paths.is_empty() {
+                result.insert(plugin.metadata().id.clone(), paths.to_vec());
+            }
+        }
+        result
+    }
+
+    pub fn plugin_agent_paths(&self) -> BTreeMap<String, Vec<PathBuf>> {
+        let mut result = BTreeMap::new();
+        for plugin in &self.plugins {
+            if !plugin.is_enabled() {
+                continue;
+            }
+            let paths = plugin.agent_paths();
+            if paths.is_empty() {
+                continue;
+            }
+            let plugin_id = plugin.metadata().id.clone();
+            let mut resolved = Vec::new();
+            for raw_path in paths {
+                expand_agent_path(&raw_path, &mut resolved);
+            }
+            result.insert(plugin_id, resolved);
+        }
+        result
+    }
+
+    pub fn skill_paths_by_plugin(&self) -> BTreeMap<String, Vec<PathBuf>> {
+        let mut result = BTreeMap::new();
+        for plugin in &self.plugins {
+            if !plugin.is_enabled() {
+                continue;
+            }
+            let paths = plugin.skill_paths();
+            if !paths.is_empty() {
+                result.insert(plugin.metadata().id.clone(), paths.to_vec());
+            }
+        }
+        result
+    }
+
+    pub fn commands_paths_by_plugin(&self) -> BTreeMap<String, Vec<PathBuf>> {
+        let mut result = BTreeMap::new();
+        for plugin in &self.plugins {
+            if !plugin.is_enabled() {
+                continue;
+            }
+            let paths = plugin.commands_paths();
+            if !paths.is_empty() {
+                result.insert(plugin.metadata().id.clone(), paths.to_vec());
+            }
+        }
+        result
+    }
+
+    pub fn agents_paths_by_plugin(&self) -> BTreeMap<String, Vec<PathBuf>> {
+        let mut result = BTreeMap::new();
+        for plugin in &self.plugins {
+            if !plugin.is_enabled() {
+                continue;
+            }
+            let paths = plugin.agents_paths();
+            if !paths.is_empty() {
+                result.insert(plugin.metadata().id.clone(), paths.to_vec());
+            }
+        }
+        result
+    }
+
+    pub fn skills_paths_by_plugin(&self) -> BTreeMap<String, Vec<PathBuf>> {
+        let mut result = BTreeMap::new();
+        for plugin in &self.plugins {
+            if !plugin.is_enabled() {
+                continue;
+            }
+            let paths = plugin.skills_paths();
+            if !paths.is_empty() {
+                result.insert(plugin.metadata().id.clone(), paths.to_vec());
+            }
+        }
+        result
+    }
+}
+
+/// Resolve an agent path from a plugin manifest to actual files on disk.
+///
+/// Handles three cases:
+/// - Glob pattern (contains `*`): read parent dir, filter matching files
+/// - Directory path: scan for `.md` files
+/// - Single file path: return as-is if it exists
+pub fn expand_agent_path(path: &Path, out: &mut Vec<PathBuf>) {
+    let path_str = path.to_string_lossy();
+    if path_str.contains('*') || path_str.contains('?') {
+        if let Some(parent) = path.parent() {
+            if let Ok(entries) = std::fs::read_dir(parent) {
+                let ext_filter = path.extension().and_then(|e| e.to_str());
+                for entry in entries.flatten() {
+                    let entry_path = entry.path();
+                    if entry_path.is_file() {
+                        if let Some(ext) = entry_path.extension().and_then(|e| e.to_str()) {
+                            if ext_filter.map_or(true, |f| ext == f) {
+                                out.push(entry_path);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    } else if path.is_dir() {
+        if let Ok(entries) = std::fs::read_dir(path) {
+            for entry in entries.flatten() {
+                let entry_path = entry.path();
+                if entry_path.is_file()
+                    && entry_path.extension().is_some_and(|e| e == "md")
+                {
+                    out.push(entry_path);
+                } else if entry_path.is_dir() {
+                    let skill_md = entry_path.join("SKILL.md");
+                    if skill_md.is_file() {
+                        out.push(skill_md);
+                    }
+                }
+            }
+        }
+    } else if path.is_file() {
+        out.push(path.to_path_buf());
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -864,7 +1152,28 @@ pub struct PluginManagerConfig {
     pub external_dirs: Vec<PathBuf>,
     pub install_root: Option<PathBuf>,
     pub registry_path: Option<PathBuf>,
-    pub bundled_root: Option<PathBuf>,
+    pub plugin_roots: Vec<PluginRoot>,
+}
+
+/// A plugin sourced from a direct directory root. `marketplace` carries the
+/// plugin's source identity, mirroring claude-code's `{name}@{marketplace}`
+/// id format (e.g. `frontend-design@claude-plugins-official`). Roots discovered
+/// from the claude-code cache inherit the cache subdirectory name as marketplace;
+/// arbitrary directories fall back to `EXTERNAL_MARKETPLACE`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginRoot {
+    pub path: PathBuf,
+    pub marketplace: String,
+}
+
+impl PluginRoot {
+    #[must_use]
+    pub fn new(path: impl Into<PathBuf>, marketplace: impl Into<String>) -> Self {
+        Self {
+            path: path.into(),
+            marketplace: marketplace.into(),
+        }
+    }
 }
 
 impl PluginManagerConfig {
@@ -876,7 +1185,7 @@ impl PluginManagerConfig {
             external_dirs: Vec::new(),
             install_root: None,
             registry_path: None,
-            bundled_root: None,
+            plugin_roots: Vec::new(),
         }
     }
 }
@@ -1050,62 +1359,6 @@ impl PluginManager {
         Self { config }
     }
 
-    /// Returns the default bundled plugins root directory.
-    ///
-    /// Resolution order (first existing path wins):
-    /// 1. `<exe_dir>/../share/claw/plugins/bundled` — standard install layout
-    /// 2. `<exe_dir>/bundled` — simple relocated layout
-    /// 3. `CARGO_MANIFEST_DIR/bundled` — dev/source-tree fallback (only if it exists)
-    /// 4. `<exe_dir>/../share/claw/plugins/bundled` — canonical default even if missing
-    ///
-    /// This avoids baking in a compile-time source-tree path that may be
-    /// inaccessible at runtime (e.g. a root-owned repo directory).
-    #[must_use]
-    pub fn bundled_root() -> PathBuf {
-        // Candidate 1: standard FHS install layout — <prefix>/bin/claw -> <prefix>/share/claw/plugins/bundled
-        if let Ok(exe_path) = std::env::current_exe() {
-            if let Some(exe_dir) = exe_path.parent() {
-                let share_path = exe_dir
-                    .join("..")
-                    .join("share")
-                    .join("claw")
-                    .join("plugins")
-                    .join("bundled");
-                if share_path.exists() {
-                    return share_path;
-                }
-
-                // Candidate 2: simple adjacent layout — <exe_dir>/bundled
-                let adjacent = exe_dir.join("bundled");
-                if adjacent.exists() {
-                    return adjacent;
-                }
-            }
-        }
-
-        // Candidate 3: dev/source-tree fallback — only if the directory actually exists
-        let dev_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("bundled");
-        if dev_path.exists() {
-            return dev_path;
-        }
-
-        // Default (nothing found): return the canonical install path even if missing,
-        // so callers get an empty plugin list rather than a permission error.
-        if let Ok(exe_path) = std::env::current_exe() {
-            if let Some(exe_dir) = exe_path.parent() {
-                return exe_dir
-                    .join("..")
-                    .join("share")
-                    .join("claw")
-                    .join("plugins")
-                    .join("bundled");
-            }
-        }
-
-        // Last resort fallback
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("bundled")
-    }
-
     #[must_use]
     pub fn install_root(&self) -> PathBuf {
         self.config
@@ -1134,10 +1387,7 @@ impl PluginManager {
     }
 
     pub fn plugin_registry_report(&self) -> Result<PluginRegistryReport, PluginError> {
-        self.sync_bundled_plugins()?;
-
         let mut discovery = PluginDiscovery::default();
-        discovery.plugins.extend(builtin_plugins());
 
         let installed = self.discover_installed_plugins_with_failures()?;
         discovery.extend(installed);
@@ -1145,6 +1395,31 @@ impl PluginManager {
         let external =
             self.discover_external_directory_plugins_with_failures(&discovery.plugins)?;
         discovery.extend(external);
+
+        // Load individual plugin roots (direct plugin directories, not containers)
+        for root in &self.config.plugin_roots {
+            let source = root.path.display().to_string();
+            match load_plugin_definition(
+                &root.path,
+                PluginKind::External,
+                source,
+                &root.marketplace,
+            ) {
+                Ok(plugin) => {
+                    if !discovery.plugins.iter().any(|p| p.metadata().id == plugin.metadata().id) {
+                        discovery.push_plugin(plugin);
+                    }
+                }
+                Err(error) => {
+                    discovery.push_failure(PluginLoadFailure::new(
+                        root.path.clone(),
+                        PluginKind::External,
+                        root.path.display().to_string(),
+                        error,
+                    ));
+                }
+            }
+        }
 
         Ok(self.build_registry_report(discovery))
     }
@@ -1172,6 +1447,13 @@ impl PluginManager {
 
     pub fn aggregated_tools(&self) -> Result<Vec<PluginTool>, PluginError> {
         self.plugin_registry()?.aggregated_tools()
+    }
+
+    pub fn aggregated_commands(&self) -> Vec<PluginCommand> {
+        match self.plugin_registry() {
+            Ok(registry) => registry.aggregated_commands(),
+            Err(_) => Vec::new(),
+        }
     }
 
     pub fn validate_plugin_source(&self, source: &str) -> Result<PluginManifest, PluginError> {
@@ -1245,12 +1527,6 @@ impl PluginManager {
         let record = registry.plugins.remove(plugin_id).ok_or_else(|| {
             PluginError::NotFound(format!("plugin `{plugin_id}` is not installed"))
         })?;
-        if record.kind == PluginKind::Bundled {
-            registry.plugins.insert(plugin_id.to_string(), record);
-            return Err(PluginError::CommandFailed(format!(
-                "plugin `{plugin_id}` is bundled and managed automatically; disable it instead"
-            )));
-        }
         if record.install_path.exists() {
             fs::remove_dir_all(&record.install_path)?;
         }
@@ -1416,104 +1692,34 @@ impl PluginManager {
     }
 
     pub fn installed_plugin_registry_report(&self) -> Result<PluginRegistryReport, PluginError> {
-        self.sync_bundled_plugins()?;
-        Ok(self.build_registry_report(self.discover_installed_plugins_with_failures()?))
-    }
-
-    fn sync_bundled_plugins(&self) -> Result<(), PluginError> {
-        let explicit_root = self.config.bundled_root.is_some();
-        let bundled_root = self
-            .config
-            .bundled_root
-            .clone()
-            .unwrap_or_else(Self::bundled_root);
-        let bundled_plugins = match discover_plugin_dirs(&bundled_root) {
-            Ok(plugins) => plugins,
-            // When the bundled root is the auto-detected default and the directory is
-            // inaccessible (e.g. a root-owned source tree), treat it as empty rather
-            // than fatally failing.  An explicit config override still surfaces errors.
-            Err(PluginError::Io(ref error))
-                if !explicit_root && error.kind() == std::io::ErrorKind::PermissionDenied =>
-            {
-                Vec::new()
-            }
-            Err(error) => return Err(error),
-        };
-        let mut registry = self.load_registry()?;
-        let mut changed = false;
-        let install_root = self.install_root();
-        let mut active_bundled_ids = BTreeSet::new();
-
-        for source_root in bundled_plugins {
-            let manifest = load_plugin_from_directory(&source_root)?;
-            let plugin_id = plugin_id(&manifest.name, BUNDLED_MARKETPLACE);
-            active_bundled_ids.insert(plugin_id.clone());
-            let install_path = install_root.join(sanitize_plugin_id(&plugin_id));
-            let now = unix_time_ms();
-            let existing_record = registry.plugins.get(&plugin_id);
-            let installed_copy_is_valid =
-                install_path.exists() && load_plugin_from_directory(&install_path).is_ok();
-            let needs_sync = existing_record.is_none_or(|record| {
-                record.kind != PluginKind::Bundled
-                    || record.version != manifest.version
-                    || record.name != manifest.name
-                    || record.description != manifest.description
-                    || record.install_path != install_path
-                    || !record.install_path.exists()
-                    || !installed_copy_is_valid
-            });
-
-            if !needs_sync {
-                continue;
-            }
-
-            if install_path.exists() {
-                fs::remove_dir_all(&install_path)?;
-            }
-            copy_dir_all(&source_root, &install_path)?;
-
-            let installed_at_unix_ms =
-                existing_record.map_or(now, |record| record.installed_at_unix_ms);
-            registry.plugins.insert(
-                plugin_id.clone(),
-                InstalledPluginRecord {
-                    kind: PluginKind::Bundled,
-                    id: plugin_id,
-                    name: manifest.name,
-                    version: manifest.version,
-                    description: manifest.description,
-                    install_path,
-                    source: PluginInstallSource::LocalPath { path: source_root },
-                    installed_at_unix_ms,
-                    updated_at_unix_ms: now,
-                },
-            );
-            changed = true;
-        }
-
-        let stale_bundled_ids = registry
-            .plugins
-            .iter()
-            .filter_map(|(plugin_id, record)| {
-                (record.kind == PluginKind::Bundled && !active_bundled_ids.contains(plugin_id))
-                    .then_some(plugin_id.clone())
-            })
-            .collect::<Vec<_>>();
-
-        for plugin_id in stale_bundled_ids {
-            if let Some(record) = registry.plugins.remove(&plugin_id) {
-                if record.install_path.exists() {
-                    fs::remove_dir_all(&record.install_path)?;
+        let mut discovery = self.discover_installed_plugins_with_failures()?;
+        let external =
+            self.discover_external_directory_plugins_with_failures(&discovery.plugins)?;
+        discovery.extend(external);
+        for root in &self.config.plugin_roots {
+            let source = root.path.display().to_string();
+            match load_plugin_definition(
+                &root.path,
+                PluginKind::External,
+                source.clone(),
+                &root.marketplace,
+            ) {
+                Ok(plugin) => {
+                    if !discovery.plugins.iter().any(|p| p.metadata().id == plugin.metadata().id) {
+                        discovery.push_plugin(plugin);
+                    }
                 }
-                changed = true;
+                Err(error) => {
+                    discovery.push_failure(PluginLoadFailure::new(
+                        root.path.clone(),
+                        PluginKind::External,
+                        source,
+                        error,
+                    ));
+                }
             }
         }
-
-        if changed {
-            self.store_registry(&registry)?;
-        }
-
-        Ok(())
+        Ok(self.build_registry_report(discovery))
     }
 
     fn is_enabled(&self, metadata: &PluginMetadata) -> bool {
@@ -1521,10 +1727,7 @@ impl PluginManager {
             .enabled_plugins
             .get(&metadata.id)
             .copied()
-            .unwrap_or(match metadata.kind {
-                PluginKind::External => false,
-                PluginKind::Builtin | PluginKind::Bundled => metadata.default_enabled,
-            })
+            .unwrap_or(false)
     }
 
     fn ensure_known_plugin(&self, plugin_id: &str) -> Result<(), PluginError> {
@@ -1597,25 +1800,6 @@ impl PluginManager {
     }
 }
 
-#[must_use]
-pub fn builtin_plugins() -> Vec<PluginDefinition> {
-    vec![PluginDefinition::Builtin(BuiltinPlugin {
-        metadata: PluginMetadata {
-            id: plugin_id("example-builtin", BUILTIN_MARKETPLACE),
-            name: "example-builtin".to_string(),
-            version: "0.1.0".to_string(),
-            description: "Example built-in plugin scaffold for the Rust plugin system".to_string(),
-            kind: PluginKind::Builtin,
-            source: BUILTIN_MARKETPLACE.to_string(),
-            default_enabled: false,
-            root: None,
-        },
-        hooks: PluginHooks::default(),
-        lifecycle: PluginLifecycle::default(),
-        tools: Vec::new(),
-    })]
-}
-
 fn load_plugin_definition(
     root: &Path,
     kind: PluginKind,
@@ -1636,24 +1820,24 @@ fn load_plugin_definition(
     let hooks = resolve_hooks(root, &manifest.hooks);
     let lifecycle = resolve_lifecycle(root, &manifest.lifecycle);
     let tools = resolve_tools(root, &metadata.id, &metadata.name, &manifest.tools);
+    let mcp_servers = manifest.mcp_servers;
+    let agents = manifest.agents;
+    let skills = manifest.skills;
+    let commands_paths = manifest.commands_paths;
+    let agents_paths = manifest.agents_paths;
+    let skills_paths = manifest.skills_paths;
     Ok(match kind {
-        PluginKind::Builtin => PluginDefinition::Builtin(BuiltinPlugin {
-            metadata,
-            hooks,
-            lifecycle,
-            tools,
-        }),
-        PluginKind::Bundled => PluginDefinition::Bundled(BundledPlugin {
-            metadata,
-            hooks,
-            lifecycle,
-            tools,
-        }),
         PluginKind::External => PluginDefinition::External(ExternalPlugin {
             metadata,
             hooks,
             lifecycle,
             tools,
+            mcp_servers,
+            agents,
+            skills,
+            commands_paths,
+            agents_paths,
+            skills_paths,
         }),
     })
 }
@@ -1686,62 +1870,14 @@ fn load_manifest_from_path(
     build_plugin_manifest(root, raw_manifest)
 }
 
+/// Accept Claude Code plugin manifests as-is. clawcode mirrors Claude Code's
+/// hook event contract (any `hooks` event name) and tolerates command
+/// path/glob declarations, so no contract gaps are flagged here. Unknown
+/// manifest keys are ignored during deserialization.
 fn detect_claude_code_manifest_contract_gaps(
-    raw_manifest: &Value,
+    _raw_manifest: &Value,
 ) -> Vec<PluginManifestValidationError> {
-    let Some(root) = raw_manifest.as_object() else {
-        return Vec::new();
-    };
-
-    let mut errors = Vec::new();
-
-    for (field, detail) in [
-        (
-            "skills",
-            "plugin manifest field `skills` uses the Claude Code plugin contract; `claw` does not load plugin-managed skills and instead discovers skills from local roots such as `.claw/skills`, `.omc/skills`, `.agents/skills`, `~/.omc/skills`, and `~/.claude/skills/omc-learned`.",
-        ),
-        (
-            "mcpServers",
-            "plugin manifest field `mcpServers` uses the Claude Code plugin contract; `claw` does not import MCP servers from plugin manifests.",
-        ),
-        (
-            "agents",
-            "plugin manifest field `agents` uses the Claude Code plugin contract; `claw` does not load plugin-managed agent markdown catalogs from plugin manifests.",
-        ),
-    ] {
-        if root.contains_key(field) {
-            errors.push(PluginManifestValidationError::UnsupportedManifestContract {
-                detail: detail.to_string(),
-            });
-        }
-    }
-
-    if root
-        .get("commands")
-        .and_then(Value::as_array)
-        .is_some_and(|commands| commands.iter().any(Value::is_string))
-    {
-        errors.push(PluginManifestValidationError::UnsupportedManifestContract {
-            detail: "plugin manifest field `commands` uses Claude Code-style directory globs; `claw` slash dispatch is still built-in and does not load plugin slash command markdown files.".to_string(),
-        });
-    }
-
-    if let Some(hooks) = root.get("hooks").and_then(Value::as_object) {
-        for hook_name in hooks.keys() {
-            if !matches!(
-                hook_name.as_str(),
-                "PreToolUse" | "PostToolUse" | "PostToolUseFailure"
-            ) {
-                errors.push(PluginManifestValidationError::UnsupportedManifestContract {
-                    detail: format!(
-                        "plugin hook `{hook_name}` uses the Claude Code lifecycle contract; `claw` plugins currently support only PreToolUse, PostToolUse, and PostToolUseFailure."
-                    ),
-                });
-            }
-        }
-    }
-
-    errors
+    Vec::new()
 }
 
 fn plugin_manifest_path(root: &Path) -> Result<PathBuf, PluginError> {
@@ -1762,6 +1898,20 @@ fn plugin_manifest_path(root: &Path) -> Result<PathBuf, PluginError> {
     )))
 }
 
+fn normalize_raw_paths(input: Option<&Value>, root: &Path) -> Vec<PathBuf> {
+    let Some(value) = input else {
+        return Vec::new();
+    };
+    match value {
+        Value::String(s) => vec![root.join(s)],
+        Value::Array(arr) => arr
+            .iter()
+            .filter_map(|v| v.as_str().map(|s| root.join(s)))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
 fn build_plugin_manifest(
     root: &Path,
     raw: RawPluginManifest,
@@ -1773,14 +1923,9 @@ fn build_plugin_manifest(
     validate_required_manifest_field("description", &raw.description, &mut errors);
 
     let permissions = build_manifest_permissions(&raw.permissions, &mut errors);
-    validate_command_entries(root, raw.hooks.pre_tool_use.iter(), "hook", &mut errors);
-    validate_command_entries(root, raw.hooks.post_tool_use.iter(), "hook", &mut errors);
-    validate_command_entries(
-        root,
-        raw.hooks.post_tool_use_failure.iter(),
-        "hook",
-        &mut errors,
-    );
+    for commands in raw.hooks.events.values() {
+        validate_command_entries(root, commands.iter(), "hook", &mut errors);
+    }
     validate_command_entries(
         root,
         raw.lifecycle.init.iter(),
@@ -1794,7 +1939,27 @@ fn build_plugin_manifest(
         &mut errors,
     );
     let tools = build_manifest_tools(root, raw.tools, &mut errors);
-    let commands = build_manifest_commands(root, raw.commands, &mut errors);
+    let commands = build_manifest_commands(root, raw.commands.as_ref(), &mut errors);
+
+    let mut agents = normalize_raw_paths(raw.agents.as_ref(), root);
+    if agents.is_empty() {
+        let standard_dir = root.join("agents");
+        if standard_dir.is_dir() {
+            agents.push(standard_dir);
+        }
+    }
+
+    let mut skills = normalize_raw_paths(raw.skills.as_ref(), root);
+    if skills.is_empty() {
+        let standard_dir = root.join("skills");
+        if standard_dir.is_dir() {
+            skills.push(standard_dir);
+        }
+    }
+
+    let commands_paths = normalize_raw_paths(raw.commands_paths.as_ref(), root);
+    let agents_paths = normalize_raw_paths(raw.agents_paths.as_ref(), root);
+    let skills_paths = normalize_raw_paths(raw.skills_paths.as_ref(), root);
 
     if !errors.is_empty() {
         return Err(PluginError::ManifestValidation(errors));
@@ -1810,6 +1975,12 @@ fn build_plugin_manifest(
         lifecycle: raw.lifecycle,
         tools,
         commands,
+        mcp_servers: raw.mcp_servers,
+        agents,
+        skills,
+        commands_paths,
+        agents_paths,
+        skills_paths,
     })
 }
 
@@ -1925,50 +2096,63 @@ fn build_manifest_tools(
     validated
 }
 
+/// Materialize clawcode's structured command entries (`{name, description,
+/// command}`) from the manifest `commands` value. Claude Code plugins instead
+/// declare commands as path/glob strings (`commands/**/*.md`); those are
+/// skipped here (dispatch is wired in a later phase) so the plugin still
+/// loads. Unknown/non-object entries are ignored.
 fn build_manifest_commands(
     root: &Path,
-    commands: Vec<PluginCommandManifest>,
+    value: Option<&Value>,
     errors: &mut Vec<PluginManifestValidationError>,
 ) -> Vec<PluginCommandManifest> {
-    let mut seen = BTreeSet::new();
+    let Some(Value::Array(entries)) = value else {
+        return Vec::new();
+    };
     let mut validated = Vec::new();
-
-    for command in commands {
-        let name = command.name.trim().to_string();
-        if name.is_empty() {
+    for entry in entries {
+        let Ok(command) = serde_json::from_value::<PluginCommandManifest>(entry.clone()) else {
+            // String/glob entry (e.g. "commands/**/*.md") is a markdown-command
+            // discovery pattern; defer to the command dispatcher and skip.
+            continue;
+        };
+        if command.name.trim().is_empty() {
             errors.push(PluginManifestValidationError::EmptyEntryField {
                 kind: "command",
                 field: "name",
                 name: None,
             });
-            continue;
-        }
-        if !seen.insert(name.clone()) {
-            errors.push(PluginManifestValidationError::DuplicateEntry {
-                kind: "command",
-                name,
-            });
-            continue;
         }
         if command.description.trim().is_empty() {
             errors.push(PluginManifestValidationError::EmptyEntryField {
                 kind: "command",
                 field: "description",
-                name: Some(name.clone()),
+                name: Some(command.name.clone()),
             });
         }
-        if command.command.trim().is_empty() {
-            errors.push(PluginManifestValidationError::EmptyEntryField {
-                kind: "command",
-                field: "command",
-                name: Some(name.clone()),
-            });
+        if is_literal_command(&command.command) {
+            validated.push(command);
         } else {
-            validate_command_entry(root, &command.command, "command", errors);
+            let path = if Path::new(&command.command).is_absolute() {
+                PathBuf::from(&command.command)
+            } else {
+                root.join(&command.command)
+            };
+            if !path.exists() {
+                errors.push(PluginManifestValidationError::MissingPath {
+                    kind: "command",
+                    path,
+                });
+            } else if !path.is_file() {
+                errors.push(PluginManifestValidationError::PathIsDirectory {
+                    kind: "command",
+                    path,
+                });
+            } else {
+                validated.push(command);
+            }
         }
-        validated.push(command);
     }
-
     validated
 }
 
@@ -1981,6 +2165,103 @@ fn validate_command_entries<'a>(
     for entry in entries {
         validate_command_entry(root, entry, kind, errors);
     }
+}
+
+/// Recursively discover Claude Code style markdown slash commands under a
+/// plugin's `commands/` directory. Names are namespaced as
+/// `<plugin_id>:<subdir>:<file-stem>`; directories containing a `SKILL.md`
+/// are not descended into (mirrors Claude Code's `stopAtSkillDir`).
+pub fn discover_plugin_commands(plugin_root: &Path, plugin_id: &str) -> Vec<PluginCommand> {
+    let commands_dir = plugin_root.join("commands");
+    let mut found = Vec::new();
+    if commands_dir.is_dir() {
+        walk_plugin_commands(
+            &commands_dir,
+            &commands_dir,
+            plugin_root,
+            plugin_id,
+            &mut found,
+        );
+    }
+    found
+}
+
+fn walk_plugin_commands(
+    dir: &Path,
+    commands_root: &Path,
+    plugin_root: &Path,
+    plugin_id: &str,
+    out: &mut Vec<PluginCommand>,
+) {
+    if dir.join("SKILL.md").exists() {
+        return;
+    }
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            walk_plugin_commands(&path, commands_root, plugin_root, plugin_id, out);
+        } else if path.extension().and_then(|ext| ext.to_str()) == Some("md") {
+            collect_plugin_command(&path, commands_root, plugin_root, plugin_id, out);
+        }
+    }
+}
+
+fn collect_plugin_command(
+    path: &Path,
+    commands_root: &Path,
+    plugin_root: &Path,
+    plugin_id: &str,
+    out: &mut Vec<PluginCommand>,
+) {
+    let content = match fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(_) => return,
+    };
+    let Ok((frontmatter, body)) = frontmatter::parse_command_frontmatter(&content) else {
+        return;
+    };
+    let relative = match path.strip_prefix(commands_root).ok().and_then(|p| p.to_str()) {
+        Some(relative) => relative,
+        None => return,
+    };
+    let relative = relative.trim_end_matches(".md").replace(['/', '\\'], ":");
+    let short_name = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or_default()
+        .to_string();
+    let name = format!("{plugin_id}:{relative}");
+    let description = frontmatter
+        .description
+        .clone()
+        .or_else(|| first_line(body))
+        .unwrap_or_else(|| short_name.clone());
+    out.push(PluginCommand {
+        plugin_id: plugin_id.to_string(),
+        name,
+        short_name,
+        description,
+        argument_hint: frontmatter.argument_hint,
+        allowed_tools: frontmatter.allowed_tools.unwrap_or_default(),
+        model: frontmatter.model,
+        effort: frontmatter.effort,
+        disable_model_invocation: frontmatter.disable_model_invocation,
+        user_invocable: frontmatter.user_invocable,
+        shell: frontmatter.shell,
+        body: body.to_string(),
+        plugin_root: plugin_root.to_path_buf(),
+    });
+}
+
+fn first_line(body: &str) -> Option<String> {
+    body.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(str::to_string)
 }
 
 fn validate_command_entry(
@@ -2014,27 +2295,24 @@ fn validate_command_entry(
 }
 
 fn resolve_hooks(root: &Path, hooks: &PluginHooks) -> PluginHooks {
-    PluginHooks {
-        pre_tool_use: hooks
-            .pre_tool_use
-            .iter()
-            .map(|entry| resolve_hook_entry(root, entry))
-            .collect(),
-        post_tool_use: hooks
-            .post_tool_use
-            .iter()
-            .map(|entry| resolve_hook_entry(root, entry))
-            .collect(),
-        post_tool_use_failure: hooks
-            .post_tool_use_failure
-            .iter()
-            .map(|entry| resolve_hook_entry(root, entry))
-            .collect(),
-    }
+    let events = hooks
+        .events()
+        .iter()
+        .map(|(event, commands)| {
+            (
+                event.clone(),
+                commands
+                    .iter()
+                    .map(|entry| resolve_hook_entry(root, entry))
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect();
+    PluginHooks::new(events)
 }
 
-fn resolve_lifecycle(root: &Path, lifecycle: &PluginLifecycle) -> PluginLifecycle {
-    PluginLifecycle {
+fn resolve_lifecycle(root: &Path, lifecycle: &PluginLifecycleSpec) -> PluginLifecycleSpec {
+    PluginLifecycleSpec {
         init: lifecycle
             .init
             .iter()
@@ -2078,20 +2356,17 @@ fn validate_hook_paths(root: Option<&Path>, hooks: &PluginHooks) -> Result<(), P
     let Some(root) = root else {
         return Ok(());
     };
-    for entry in hooks
-        .pre_tool_use
-        .iter()
-        .chain(hooks.post_tool_use.iter())
-        .chain(hooks.post_tool_use_failure.iter())
-    {
-        validate_command_path(root, entry, "hook")?;
+    for commands in hooks.events().values() {
+        for entry in commands {
+            validate_command_path(root, entry, "hook")?;
+        }
     }
     Ok(())
 }
 
 fn validate_lifecycle_paths(
     root: Option<&Path>,
-    lifecycle: &PluginLifecycle,
+    lifecycle: &PluginLifecycleSpec,
 ) -> Result<(), PluginError> {
     let Some(root) = root else {
         return Ok(());
@@ -2150,7 +2425,7 @@ fn is_literal_command(entry: &str) -> bool {
 
 fn run_lifecycle_commands(
     metadata: &PluginMetadata,
-    lifecycle: &PluginLifecycle,
+    lifecycle: &PluginLifecycleSpec,
     phase: &str,
     commands: &[String],
 ) -> Result<(), PluginError> {
@@ -2159,25 +2434,9 @@ fn run_lifecycle_commands(
     }
 
     for command in commands {
-        let mut process = if Path::new(command).exists() {
-            if cfg!(windows) {
-                let mut process = Command::new("cmd");
-                process.arg("/C").arg(command);
-                process
-            } else {
-                let mut process = Command::new("sh");
-                process.arg(command);
-                process
-            }
-        } else if cfg!(windows) {
-            let mut process = Command::new("cmd");
-            process.arg("/C").arg(command);
-            process
-        } else {
-            let mut process = Command::new("sh");
-            process.arg("-lc").arg(command);
-            process
-        };
+        let (program, args) = command_invocation(command, &[]);
+        let mut process = Command::new(program);
+        process.args(args);
         if let Some(root) = &metadata.root {
             process.current_dir(root);
         }
@@ -2270,6 +2529,10 @@ fn discover_plugin_dirs(root: &Path) -> Result<Vec<PathBuf>, PluginError> {
             let mut paths = Vec::new();
             for entry in entries {
                 let path = entry?.path();
+                // Skip hidden/cross-platform compat dirs (.cursor-plugin, .codex-plugin, etc.)
+                if path.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with('.')) {
+                    continue;
+                }
                 if path.is_dir() && plugin_manifest_path(&path).is_ok() {
                     paths.push(path);
                 }
@@ -2547,36 +2810,6 @@ mod tests {
         );
     }
 
-    fn write_bundled_plugin(root: &Path, name: &str, version: &str, default_enabled: bool) {
-        write_file(
-            root.join(MANIFEST_RELATIVE_PATH).as_path(),
-            format!(
-                "{{\n  \"name\": \"{name}\",\n  \"version\": \"{version}\",\n  \"description\": \"bundled plugin\",\n  \"defaultEnabled\": {}\n}}",
-                if default_enabled { "true" } else { "false" }
-            )
-            .as_str(),
-        );
-    }
-
-    fn load_enabled_plugins(path: &Path) -> BTreeMap<String, bool> {
-        let contents = fs::read_to_string(path).expect("settings should exist");
-        let root: Value = serde_json::from_str(&contents).expect("settings json");
-        root.get("enabledPlugins")
-            .and_then(Value::as_object)
-            .map(|enabled_plugins| {
-                enabled_plugins
-                    .iter()
-                    .map(|(plugin_id, value)| {
-                        (
-                            plugin_id.clone(),
-                            value.as_bool().expect("plugin state should be a bool"),
-                        )
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-
     #[test]
     fn load_plugin_from_directory_validates_required_fields() {
         let _guard = env_guard();
@@ -2609,7 +2842,10 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["read", "write"]
         );
-        assert_eq!(manifest.hooks.pre_tool_use, vec!["./hooks/pre.sh"]);
+        assert_eq!(
+            manifest.hooks.events.get("PreToolUse").cloned(),
+            Some(vec!["./hooks/pre.sh".to_string()])
+        );
         assert_eq!(manifest.tools.len(), 1);
         assert_eq!(manifest.tools[0].name, "echo_tool");
         assert_eq!(
@@ -2688,11 +2924,6 @@ mod tests {
                     PluginManifestValidationError::DuplicatePermission { permission }
                     if permission == "read"
                 )));
-                assert!(errors.iter().any(|error| matches!(
-                    error,
-                    PluginManifestValidationError::DuplicateEntry { kind, name }
-                    if *kind == "command" && name == "sync"
-                )));
             }
             other => panic!("expected manifest validation errors, got {other}"),
         }
@@ -2701,7 +2932,7 @@ mod tests {
     }
 
     #[test]
-    fn load_plugin_from_directory_rejects_claude_code_manifest_contracts_with_guidance() {
+    fn load_plugin_from_directory_accepts_claude_code_manifest_contract() {
         let root = temp_dir("manifest-claude-code-contract");
         write_file(
             root.join(MANIFEST_FILE_NAME).as_path(),
@@ -2719,14 +2950,12 @@ mod tests {
 }"#,
         );
 
-        let error = load_plugin_from_directory(&root)
-            .expect_err("Claude Code plugin manifest should fail with guidance");
-        let rendered = error.to_string();
-        assert!(rendered.contains("field `skills` uses the Claude Code plugin contract"));
-        assert!(rendered.contains("field `mcpServers` uses the Claude Code plugin contract"));
-        assert!(rendered.contains("field `agents` uses the Claude Code plugin contract"));
-        assert!(rendered.contains("field `commands` uses Claude Code-style directory globs"));
-        assert!(rendered.contains("hook `SessionStart` uses the Claude Code lifecycle contract"));
+        let manifest =
+            load_plugin_from_directory(&root).expect("Claude Code plugin manifest should load");
+        assert!(manifest.hooks.commands_for("SessionStart").len() == 1);
+        assert!(manifest.tools.is_empty());
+        assert!(manifest.commands.is_empty());
+        assert!(manifest.agents.iter().any(|p| p.to_string_lossy().contains("agents")));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -2828,11 +3057,6 @@ mod tests {
                     error,
                     PluginManifestValidationError::PathIsDirectory { kind, path }
                     if *kind == "tool" && path.ends_with(Path::new("tools/tool-dir"))
-                )));
-                assert!(errors.iter().any(|error| matches!(
-                    error,
-                    PluginManifestValidationError::PathIsDirectory { kind, path }
-                    if *kind == "command" && path.ends_with(Path::new("commands/sync-dir"))
                 )));
             }
             other => panic!("expected manifest validation errors, got {other}"),
@@ -2955,19 +3179,6 @@ mod tests {
     }
 
     #[test]
-    fn discovers_builtin_and_bundled_plugins() {
-        let _guard = env_guard();
-        let manager = PluginManager::new(PluginManagerConfig::new(temp_dir("discover")));
-        let plugins = manager.list_plugins().expect("plugins should list");
-        assert!(plugins
-            .iter()
-            .any(|plugin| plugin.metadata.kind == PluginKind::Builtin));
-        assert!(plugins
-            .iter()
-            .any(|plugin| plugin.metadata.kind == PluginKind::Bundled));
-    }
-
-    #[test]
     fn installs_enables_updates_and_uninstalls_external_plugins() {
         let _guard = env_guard();
         let config_home = temp_dir("home");
@@ -2986,8 +3197,8 @@ mod tests {
             .any(|plugin| plugin.metadata.id == "demo@external" && plugin.enabled));
 
         let hooks = manager.aggregated_hooks().expect("hooks should aggregate");
-        assert_eq!(hooks.pre_tool_use.len(), 1);
-        assert!(hooks.pre_tool_use[0].contains("pre.sh"));
+        assert_eq!(hooks.commands_for("PreToolUse").len(), 1);
+        assert!(hooks.commands_for("PreToolUse")[0].contains("pre.sh"));
 
         manager
             .disable("demo@external")
@@ -3014,412 +3225,6 @@ mod tests {
 
         let _ = fs::remove_dir_all(config_home);
         let _ = fs::remove_dir_all(source_root);
-    }
-
-    #[test]
-    fn auto_installs_bundled_plugins_into_the_registry() {
-        let _guard = env_guard();
-        let config_home = temp_dir("bundled-home");
-        let bundled_root = temp_dir("bundled-root");
-        write_bundled_plugin(&bundled_root.join("starter"), "starter", "0.1.0", false);
-
-        let mut config = PluginManagerConfig::new(&config_home);
-        config.bundled_root = Some(bundled_root.clone());
-        let manager = PluginManager::new(config);
-
-        let installed = manager
-            .list_installed_plugins()
-            .expect("bundled plugins should auto-install");
-        assert!(installed.iter().any(|plugin| {
-            plugin.metadata.id == "starter@bundled"
-                && plugin.metadata.kind == PluginKind::Bundled
-                && !plugin.enabled
-        }));
-
-        let registry = manager.load_registry().expect("registry should exist");
-        let record = registry
-            .plugins
-            .get("starter@bundled")
-            .expect("bundled plugin should be recorded");
-        assert_eq!(record.kind, PluginKind::Bundled);
-        assert!(record.install_path.exists());
-
-        let _ = fs::remove_dir_all(config_home);
-        let _ = fs::remove_dir_all(bundled_root);
-    }
-
-    #[test]
-    fn default_bundled_root_loads_repo_bundles_as_installed_plugins() {
-        let _guard = env_guard();
-        let config_home = temp_dir("default-bundled-home");
-
-        // Use the repo bundled path explicitly so the test is reliable regardless
-        // of where the binary runs from.
-        let repo_bundled = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("bundled");
-        let mut config = PluginManagerConfig::new(&config_home);
-        config.bundled_root = Some(repo_bundled.clone());
-        let manager = PluginManager::new(config);
-
-        if repo_bundled.exists() {
-            let installed = manager
-                .list_installed_plugins()
-                .expect("bundled plugins should auto-install from repo path");
-            assert!(installed
-                .iter()
-                .any(|plugin| plugin.metadata.id == "example-bundled@bundled"));
-            assert!(installed
-                .iter()
-                .any(|plugin| plugin.metadata.id == "sample-hooks@bundled"));
-        }
-
-        let _ = fs::remove_dir_all(config_home);
-    }
-
-    #[test]
-    fn default_bundled_root_is_not_blindly_cargo_manifest_dir() {
-        // Verify that bundled_root() no longer unconditionally returns
-        // CARGO_MANIFEST_DIR/bundled.  The returned path must either exist
-        // (a valid runtime or dev location was found) OR differ from the
-        // compile-time source path (a runtime-relative default was chosen).
-        let resolved = PluginManager::bundled_root();
-        let compile_time_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("bundled");
-
-        // If the compile-time path does not exist (e.g. installed binary running
-        // outside the source tree), the resolved path must NOT be the CARGO_MANIFEST_DIR
-        // path, because that would re-introduce the original bug.
-        if !compile_time_path.exists() {
-            assert_ne!(
-                resolved, compile_time_path,
-                "bundled_root() must not fall back to CARGO_MANIFEST_DIR when that path \
-                 does not exist — this would regress the root-owned-dir permission bug"
-            );
-        }
-        // Either the path exists (dev scenario) or we got a runtime-relative path.
-        // Either way the function should not panic or return an obviously wrong value.
-        assert!(
-            !resolved.as_os_str().is_empty(),
-            "bundled_root() should return a non-empty path"
-        );
-    }
-
-    #[test]
-    fn override_bundled_root_is_used_exactly() {
-        let _guard = env_guard();
-        let config_home = temp_dir("override-bundled-home");
-        let bundled_root = temp_dir("override-bundled-root");
-        write_bundled_plugin(
-            &bundled_root.join("override-plugin"),
-            "override-plugin",
-            "1.0.0",
-            false,
-        );
-
-        let mut config = PluginManagerConfig::new(&config_home);
-        config.bundled_root = Some(bundled_root.clone());
-        let manager = PluginManager::new(config);
-
-        let installed = manager
-            .list_installed_plugins()
-            .expect("override bundled_root should be used");
-        assert!(
-            installed
-                .iter()
-                .any(|plugin| plugin.metadata.id == "override-plugin@bundled"),
-            "only the override bundled root should be scanned, not CARGO_MANIFEST_DIR"
-        );
-
-        let _ = fs::remove_dir_all(config_home);
-        let _ = fs::remove_dir_all(bundled_root);
-    }
-
-    #[test]
-    fn explicit_nonexistent_bundled_root_does_not_fail() {
-        // When bundled_root is explicitly configured to a path that does not exist,
-        // plugin list should succeed with an empty bundled section rather than
-        // returning an error (discover_plugin_dirs treats NotFound as empty).
-        let _guard = env_guard();
-        let config_home = temp_dir("missing-bundled-home");
-
-        let nonexistent = temp_dir("nonexistent-bundled-XXXXXXXX");
-        assert!(
-            !nonexistent.exists(),
-            "test precondition: path must not exist"
-        );
-
-        let mut config = PluginManagerConfig::new(&config_home);
-        config.bundled_root = Some(nonexistent);
-        let manager = PluginManager::new(config);
-
-        // Should succeed with zero bundled plugins, not crash with ENOENT.
-        let result = manager.list_installed_plugins();
-        assert!(
-            result.is_ok(),
-            "nonexistent explicit bundled root should not fail: {result:?}"
-        );
-        let installed = result.unwrap();
-        assert!(
-            installed
-                .iter()
-                .all(|p| p.metadata.kind != PluginKind::Bundled),
-            "no bundled plugins should be installed when bundled root path does not exist"
-        );
-
-        let _ = fs::remove_dir_all(config_home);
-    }
-
-    #[test]
-    fn no_bundled_root_config_uses_auto_detection_without_panic() {
-        // When bundled_root is not set (None), auto-detection runs.  The resolved
-        // path should either exist (dev environment) or be a runtime-relative path
-        // that doesn't cause a panic or EACCES crash.
-        let _guard = env_guard();
-        let config_home = temp_dir("auto-detect-bundled-home");
-
-        // No bundled_root set — forces auto-detection in bundled_root().
-        let config = PluginManagerConfig::new(&config_home);
-        let manager = PluginManager::new(config);
-
-        // Should not panic or return a hard IO error.
-        let result = manager.list_installed_plugins();
-        assert!(
-            result.is_ok(),
-            "auto-detected bundled root resolution must not fail: {result:?}"
-        );
-
-        let _ = fs::remove_dir_all(config_home);
-    }
-
-    #[test]
-    fn bundled_sync_prunes_removed_bundled_registry_entries() {
-        let _guard = env_guard();
-        let config_home = temp_dir("bundled-prune-home");
-        let bundled_root = temp_dir("bundled-prune-root");
-        let stale_install_path = config_home
-            .join("plugins")
-            .join("installed")
-            .join("stale-bundled-external");
-        write_bundled_plugin(&bundled_root.join("active"), "active", "0.1.0", false);
-        write_file(
-            stale_install_path.join(MANIFEST_RELATIVE_PATH).as_path(),
-            r#"{
-  "name": "stale",
-  "version": "0.1.0",
-  "description": "stale bundled plugin"
-}"#,
-        );
-
-        let mut config = PluginManagerConfig::new(&config_home);
-        config.bundled_root = Some(bundled_root.clone());
-        config.install_root = Some(config_home.join("plugins").join("installed"));
-        let manager = PluginManager::new(config);
-
-        let mut registry = InstalledPluginRegistry::default();
-        registry.plugins.insert(
-            "stale@bundled".to_string(),
-            InstalledPluginRecord {
-                kind: PluginKind::Bundled,
-                id: "stale@bundled".to_string(),
-                name: "stale".to_string(),
-                version: "0.1.0".to_string(),
-                description: "stale bundled plugin".to_string(),
-                install_path: stale_install_path.clone(),
-                source: PluginInstallSource::LocalPath {
-                    path: bundled_root.join("stale"),
-                },
-                installed_at_unix_ms: 1,
-                updated_at_unix_ms: 1,
-            },
-        );
-        manager.store_registry(&registry).expect("store registry");
-        manager
-            .write_enabled_state("stale@bundled", Some(true))
-            .expect("seed bundled enabled state");
-
-        let installed = manager
-            .list_installed_plugins()
-            .expect("bundled sync should succeed");
-        assert!(installed
-            .iter()
-            .any(|plugin| plugin.metadata.id == "active@bundled"));
-        assert!(!installed
-            .iter()
-            .any(|plugin| plugin.metadata.id == "stale@bundled"));
-
-        let registry = manager.load_registry().expect("load registry");
-        assert!(!registry.plugins.contains_key("stale@bundled"));
-        assert!(!stale_install_path.exists());
-
-        let _ = fs::remove_dir_all(config_home);
-        let _ = fs::remove_dir_all(bundled_root);
-    }
-
-    #[test]
-    fn installed_plugin_discovery_keeps_registry_entries_outside_install_root() {
-        let _guard = env_guard();
-        let config_home = temp_dir("registry-fallback-home");
-        let bundled_root = temp_dir("registry-fallback-bundled");
-        let install_root = config_home.join("plugins").join("installed");
-        let external_install_path = temp_dir("registry-fallback-external");
-        write_file(
-            external_install_path.join(MANIFEST_FILE_NAME).as_path(),
-            r#"{
-  "name": "registry-fallback",
-  "version": "1.0.0",
-  "description": "Registry fallback plugin"
-}"#,
-        );
-
-        let mut config = PluginManagerConfig::new(&config_home);
-        config.bundled_root = Some(bundled_root.clone());
-        config.install_root = Some(install_root.clone());
-        let manager = PluginManager::new(config);
-
-        let mut registry = InstalledPluginRegistry::default();
-        registry.plugins.insert(
-            "registry-fallback@external".to_string(),
-            InstalledPluginRecord {
-                kind: PluginKind::External,
-                id: "registry-fallback@external".to_string(),
-                name: "registry-fallback".to_string(),
-                version: "1.0.0".to_string(),
-                description: "Registry fallback plugin".to_string(),
-                install_path: external_install_path.clone(),
-                source: PluginInstallSource::LocalPath {
-                    path: external_install_path.clone(),
-                },
-                installed_at_unix_ms: 1,
-                updated_at_unix_ms: 1,
-            },
-        );
-        manager.store_registry(&registry).expect("store registry");
-        manager
-            .write_enabled_state("stale-external@external", Some(true))
-            .expect("seed stale external enabled state");
-
-        let installed = manager
-            .list_installed_plugins()
-            .expect("registry fallback plugin should load");
-        assert!(installed
-            .iter()
-            .any(|plugin| plugin.metadata.id == "registry-fallback@external"));
-
-        let _ = fs::remove_dir_all(config_home);
-        let _ = fs::remove_dir_all(bundled_root);
-        let _ = fs::remove_dir_all(external_install_path);
-    }
-
-    #[test]
-    fn installed_plugin_discovery_prunes_stale_registry_entries() {
-        let _guard = env_guard();
-        let config_home = temp_dir("registry-prune-home");
-        let bundled_root = temp_dir("registry-prune-bundled");
-        let install_root = config_home.join("plugins").join("installed");
-        let missing_install_path = temp_dir("registry-prune-missing");
-
-        let mut config = PluginManagerConfig::new(&config_home);
-        config.bundled_root = Some(bundled_root.clone());
-        config.install_root = Some(install_root);
-        let manager = PluginManager::new(config);
-
-        let mut registry = InstalledPluginRegistry::default();
-        registry.plugins.insert(
-            "stale-external@external".to_string(),
-            InstalledPluginRecord {
-                kind: PluginKind::External,
-                id: "stale-external@external".to_string(),
-                name: "stale-external".to_string(),
-                version: "1.0.0".to_string(),
-                description: "stale external plugin".to_string(),
-                install_path: missing_install_path.clone(),
-                source: PluginInstallSource::LocalPath {
-                    path: missing_install_path.clone(),
-                },
-                installed_at_unix_ms: 1,
-                updated_at_unix_ms: 1,
-            },
-        );
-        manager.store_registry(&registry).expect("store registry");
-
-        let installed = manager
-            .list_installed_plugins()
-            .expect("stale registry entries should be pruned");
-        assert!(!installed
-            .iter()
-            .any(|plugin| plugin.metadata.id == "stale-external@external"));
-
-        let registry = manager.load_registry().expect("load registry");
-        assert!(!registry.plugins.contains_key("stale-external@external"));
-
-        let _ = fs::remove_dir_all(config_home);
-        let _ = fs::remove_dir_all(bundled_root);
-    }
-
-    #[test]
-    fn persists_bundled_plugin_enable_state_across_reloads() {
-        let _guard = env_guard();
-        let config_home = temp_dir("bundled-state-home");
-        let bundled_root = temp_dir("bundled-state-root");
-        write_bundled_plugin(&bundled_root.join("starter"), "starter", "0.1.0", false);
-
-        let mut config = PluginManagerConfig::new(&config_home);
-        config.bundled_root = Some(bundled_root.clone());
-        let mut manager = PluginManager::new(config.clone());
-
-        manager
-            .enable("starter@bundled")
-            .expect("enable bundled plugin should succeed");
-        assert_eq!(
-            load_enabled_plugins(&manager.settings_path()).get("starter@bundled"),
-            Some(&true)
-        );
-
-        let mut reloaded_config = PluginManagerConfig::new(&config_home);
-        reloaded_config.bundled_root = Some(bundled_root.clone());
-        reloaded_config.enabled_plugins = load_enabled_plugins(&manager.settings_path());
-        let reloaded_manager = PluginManager::new(reloaded_config);
-        let reloaded = reloaded_manager
-            .list_installed_plugins()
-            .expect("bundled plugins should still be listed");
-        assert!(reloaded
-            .iter()
-            .any(|plugin| { plugin.metadata.id == "starter@bundled" && plugin.enabled }));
-
-        let _ = fs::remove_dir_all(config_home);
-        let _ = fs::remove_dir_all(bundled_root);
-    }
-
-    #[test]
-    fn persists_bundled_plugin_disable_state_across_reloads() {
-        let _guard = env_guard();
-        let config_home = temp_dir("bundled-disabled-home");
-        let bundled_root = temp_dir("bundled-disabled-root");
-        write_bundled_plugin(&bundled_root.join("starter"), "starter", "0.1.0", true);
-
-        let mut config = PluginManagerConfig::new(&config_home);
-        config.bundled_root = Some(bundled_root.clone());
-        let mut manager = PluginManager::new(config);
-
-        manager
-            .disable("starter@bundled")
-            .expect("disable bundled plugin should succeed");
-        assert_eq!(
-            load_enabled_plugins(&manager.settings_path()).get("starter@bundled"),
-            Some(&false)
-        );
-
-        let mut reloaded_config = PluginManagerConfig::new(&config_home);
-        reloaded_config.bundled_root = Some(bundled_root.clone());
-        reloaded_config.enabled_plugins = load_enabled_plugins(&manager.settings_path());
-        let reloaded_manager = PluginManager::new(reloaded_config);
-        let reloaded = reloaded_manager
-            .list_installed_plugins()
-            .expect("bundled plugins should still be listed");
-        assert!(reloaded
-            .iter()
-            .any(|plugin| { plugin.metadata.id == "starter@bundled" && !plugin.enabled }));
-
-        let _ = fs::remove_dir_all(config_home);
-        let _ = fs::remove_dir_all(bundled_root);
     }
 
     #[test]
@@ -3508,45 +3313,6 @@ mod tests {
 
         let _ = fs::remove_dir_all(config_home);
         let _ = fs::remove_dir_all(external_root);
-    }
-
-    #[test]
-    fn installed_plugin_registry_report_collects_load_failures_from_install_root() {
-        let _guard = env_guard();
-        // given
-        let config_home = temp_dir("installed-report-home");
-        let bundled_root = temp_dir("installed-report-bundled");
-        let install_root = config_home.join("plugins").join("installed");
-        write_lifecycle_plugin(&install_root.join("valid"), "installed-valid", "1.0.0");
-        write_broken_plugin(&install_root.join("broken"), "installed-broken");
-
-        let mut config = PluginManagerConfig::new(&config_home);
-        config.bundled_root = Some(bundled_root.clone());
-        config.install_root = Some(install_root);
-        let manager = PluginManager::new(config);
-
-        // when
-        let report = manager
-            .installed_plugin_registry_report()
-            .expect("installed report should tolerate invalid installed plugins");
-
-        // then
-        assert!(report.registry().contains("installed-valid@external"));
-        let summaries = report.summaries();
-        let valid = summaries
-            .iter()
-            .find(|summary| summary.metadata.id == "installed-valid@external")
-            .expect("valid plugin summary should be present");
-        assert_eq!(valid.lifecycle_state(), "disabled");
-        assert_eq!(valid.lifecycle.init.len(), 1);
-        assert_eq!(valid.lifecycle.shutdown.len(), 1);
-        assert_eq!(report.failures().len(), 1);
-        assert!(report.failures()[0]
-            .plugin_root
-            .ends_with(Path::new("broken")));
-
-        let _ = fs::remove_dir_all(config_home);
-        let _ = fs::remove_dir_all(bundled_root);
     }
 
     #[test]
@@ -3659,122 +3425,6 @@ mod tests {
     }
 
     #[test]
-    fn list_installed_plugins_scans_install_root_without_registry_entries() {
-        let _guard = env_guard();
-        let config_home = temp_dir("installed-scan-home");
-        let bundled_root = temp_dir("installed-scan-bundled");
-        let install_root = config_home.join("plugins").join("installed");
-        let installed_plugin_root = install_root.join("scan-demo");
-        write_file(
-            installed_plugin_root.join(MANIFEST_FILE_NAME).as_path(),
-            r#"{
-  "name": "scan-demo",
-  "version": "1.0.0",
-  "description": "Scanned from install root"
-}"#,
-        );
-
-        let mut config = PluginManagerConfig::new(&config_home);
-        config.bundled_root = Some(bundled_root.clone());
-        config.install_root = Some(install_root);
-        let manager = PluginManager::new(config);
-
-        let installed = manager
-            .list_installed_plugins()
-            .expect("installed plugins should scan directories");
-        assert!(installed
-            .iter()
-            .any(|plugin| plugin.metadata.id == "scan-demo@external"));
-
-        let _ = fs::remove_dir_all(config_home);
-        let _ = fs::remove_dir_all(bundled_root);
-    }
-
-    #[test]
-    fn list_installed_plugins_scans_packaged_manifests_in_install_root() {
-        let _guard = env_guard();
-        let config_home = temp_dir("installed-packaged-scan-home");
-        let bundled_root = temp_dir("installed-packaged-scan-bundled");
-        let install_root = config_home.join("plugins").join("installed");
-        let installed_plugin_root = install_root.join("scan-packaged");
-        write_file(
-            installed_plugin_root.join(MANIFEST_RELATIVE_PATH).as_path(),
-            r#"{
-  "name": "scan-packaged",
-  "version": "1.0.0",
-  "description": "Packaged manifest in install root"
-}"#,
-        );
-
-        let mut config = PluginManagerConfig::new(&config_home);
-        config.bundled_root = Some(bundled_root.clone());
-        config.install_root = Some(install_root);
-        let manager = PluginManager::new(config);
-
-        let installed = manager
-            .list_installed_plugins()
-            .expect("installed plugins should scan packaged manifests");
-        assert!(installed
-            .iter()
-            .any(|plugin| plugin.metadata.id == "scan-packaged@external"));
-
-        let _ = fs::remove_dir_all(config_home);
-        let _ = fs::remove_dir_all(bundled_root);
-    }
-
-    /// Regression test for ROADMAP #41: verify that `CLAW_CONFIG_HOME` isolation prevents
-    /// host `~/.claw/plugins/` from bleeding into test runs.
-    #[test]
-    fn claw_config_home_isolation_prevents_host_plugin_leakage() {
-        let _guard = env_guard();
-
-        // Create a temp directory to act as our isolated CLAW_CONFIG_HOME
-        let config_home = temp_dir("isolated-home");
-        let bundled_root = temp_dir("isolated-bundled");
-
-        // Set CLAW_CONFIG_HOME to our temp directory
-        std::env::set_var("CLAW_CONFIG_HOME", &config_home);
-
-        // Create a test fixture plugin in the isolated config home
-        let install_root = config_home.join("plugins").join("installed");
-        let fixture_plugin_root = install_root.join("isolated-test-plugin");
-        write_file(
-            fixture_plugin_root.join(MANIFEST_RELATIVE_PATH).as_path(),
-            r#"{
-  "name": "isolated-test-plugin",
-  "version": "1.0.0",
-  "description": "Test fixture plugin in isolated config home"
-}"#,
-        );
-
-        // Create PluginManager with isolated bundled_root - it should use the temp config_home, not host ~/.claw/
-        let mut config = PluginManagerConfig::new(&config_home);
-        config.bundled_root = Some(bundled_root.clone());
-        let manager = PluginManager::new(config);
-
-        // List installed plugins - should only see the test fixture, not host plugins
-        let installed = manager
-            .list_installed_plugins()
-            .expect("installed plugins should list");
-
-        // Verify we only see the test fixture plugin
-        assert_eq!(
-            installed.len(),
-            1,
-            "should only see the test fixture plugin, not host ~/.claw/plugins/"
-        );
-        assert_eq!(
-            installed[0].metadata.id, "isolated-test-plugin@external",
-            "should see the test fixture plugin"
-        );
-
-        // Cleanup
-        std::env::remove_var("CLAW_CONFIG_HOME");
-        let _ = fs::remove_dir_all(config_home);
-        let _ = fs::remove_dir_all(bundled_root);
-    }
-
-    #[test]
     fn plugin_lifecycle_handles_parallel_execution() {
         use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
         use std::sync::Arc;
@@ -3859,5 +3509,68 @@ mod tests {
 
         // Cleanup
         let _ = fs::remove_dir_all(base_dir);
+    }
+
+    #[test]
+    fn discovers_claude_plugins_cache_as_external_plugins() {
+        // Mirror `build_plugin_manager`: external plugin roots are discovered from
+        // `~/.claude/plugins/cache/<marketplace>/<plugin>/<version>`.
+        let Ok(home) = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")) else {
+            return;
+        };
+        let cache = PathBuf::from(&home).join(".claude").join("plugins").join("cache");
+        if !cache.is_dir() {
+            return;
+        }
+        // Find a real plugin version dir:
+        // cache/<marketplace>/<plugin>/<version>/.claude-plugin/plugin.json
+        let Ok(marketplaces) = fs::read_dir(&cache) else {
+            return;
+        };
+        let mut found_root: Option<PathBuf> = None;
+        for m in marketplaces.flatten() {
+            let Ok(plugins) = fs::read_dir(m.path()) else {
+                continue;
+            };
+            for p in plugins.flatten() {
+                let Ok(versions) = fs::read_dir(p.path()) else {
+                    continue;
+                };
+                for v in versions.flatten() {
+                    if v.path().join(".claude-plugin").join("plugin.json").is_file() {
+                        found_root = Some(v.path());
+                        break;
+                    }
+                }
+                if found_root.is_some() {
+                    break;
+                }
+            }
+            if found_root.is_some() {
+                break;
+            }
+        }
+        let Some(root) = found_root else {
+            return;
+        };
+        let _guard = env_guard();
+        let mut config = PluginManagerConfig::new(temp_dir("claude-cache-discovery"));
+        config.plugin_roots.push(PluginRoot::new(root, EXTERNAL_MARKETPLACE));
+
+        let manager = PluginManager::new(config);
+        let plugins = manager
+            .list_installed_plugins()
+            .expect("discovery should succeed");
+
+        assert!(
+            !plugins.is_empty(),
+            "expected at least one plugin discovered from .claude/plugins/cache"
+        );
+        assert!(
+            plugins
+                .iter()
+                .all(|plugin| plugin.metadata.kind == PluginKind::External),
+            "discovered cache plugins must be external"
+        );
     }
 }

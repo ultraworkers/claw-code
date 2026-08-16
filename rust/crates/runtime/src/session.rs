@@ -1,23 +1,25 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::{Display, Formatter};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::OnceLock;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use base64::Engine;
+use crate::conversation::merge_tool_result_messages;
+use crate::image_cache::ImageCache;
+use crate::image_store::ImageStore;
 use crate::json::{JsonError, JsonValue};
 use crate::usage::TokenUsage;
-use serde::{Deserialize, Serialize};
 
 const SESSION_VERSION: u32 = 1;
 const ROTATE_AFTER_BYTES: u64 = 256 * 1024;
 const MAX_ROTATED_FILES: usize = 3;
-const MAX_JSONL_FIELD_CHARS: usize = 16 * 1024;
-const JSONL_TRUNCATION_MARKER: &str = "… [truncated for session JSONL]";
-const JSONL_REDACTION_MARKER: &str = "[redacted]";
 static SESSION_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 static LAST_TIMESTAMP_MS: AtomicU64 = AtomicU64::new(0);
+static LAST_SEC: AtomicU64 = AtomicU64::new(0);
 
 /// Speaker role associated with a persisted conversation message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,19 +31,15 @@ pub enum MessageRole {
 }
 
 /// Structured message content stored inside a [`Session`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ContentBlock {
     Text {
         text: String,
     },
-    Thinking {
-        thinking: String,
-        signature: Option<String>,
-    },
     ToolUse {
         id: String,
         name: String,
-        input: String,
+        input: serde_json::Value,
     },
     ToolResult {
         tool_use_id: String,
@@ -49,22 +47,74 @@ pub enum ContentBlock {
         output: String,
         is_error: bool,
     },
+    Image {
+        /// MIME type (e.g. "image/png").
+        mime_type: String,
+        /// Base64-encoded image payload.
+        data: String,
+        /// Original filename (if available), used for display.
+        filename: Option<String>,
+    },
+    ImageRef {
+        /// SHA-256 hex hash of the compressed image data.
+        hash_hex: String,
+        /// MIME type (e.g. "image/png").
+        mime_type: String,
+        /// Original filename (if available).
+        filename: Option<String>,
+    },
+    /// Model thinking/reasoning content.
+    Thinking {
+        thinking: String,
+        signature: Option<String>,
+    },
+    /// Redacted model thinking returned by the provider. The `data` ciphertext
+    /// must be persisted and echoed back verbatim for the tool-use round-trip;
+    /// unlike a normal thinking block it carries no signature.
+    RedactedThinking {
+        data: String,
+    },
 }
 
 /// One conversation message with optional token-usage metadata.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct ConversationMessage {
     pub role: MessageRole,
     pub blocks: Vec<ContentBlock>,
     pub usage: Option<TokenUsage>,
+    /// In-memory timestamp for time-based context filtering (not persisted).
+    /// Used by `context.rs` to expire WebSearch/WebFetch results after a TTL.
+    pub created_at: Instant,
+    /// Populated on first call to `estimate_message_tokens`. Messages are
+    /// append-only within a session, so this cache is never invalidated.
+    /// Serialisation skips this field (it is derived from content).
+    pub cached_tokens: OnceLock<usize>,
+    /// Cached serialised `InputMessage` JSON Value, populated by
+    /// `convert_messages_cached` after the first conversion.  Survives within
+    /// a single `filter_for_api` batch and is reused across retries.
+    /// Serialisation skips this field.
+    pub cached_input_message: OnceLock<serde_json::Value>,
 }
 
+impl PartialEq for ConversationMessage {
+    fn eq(&self, other: &Self) -> bool {
+        self.role == other.role && self.blocks == other.blocks && self.usage == other.usage
+        // cached_tokens intentionally excluded — it's a computation cache
+    }
+}
+
+impl Eq for ConversationMessage {}
+
 /// Metadata describing the latest compaction that summarized a session.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SessionCompaction {
     pub count: u32,
     pub removed_message_count: usize,
     pub summary: String,
+    /// Ratio of estimated tokens removed by the last compaction, if known.
+    /// `None` means "not yet compacted" or "ratio is stale".
+    /// Persisted via custom JSON using i64-millionths encoding to avoid NaN/Inf.
+    pub last_savings_ratio: Option<f64>,
 }
 
 /// Provenance recorded when a session is forked from another session.
@@ -84,25 +134,6 @@ pub struct SessionPromptEntry {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SessionPersistence {
     path: PathBuf,
-}
-
-/// Running-state liveness classification for a session heartbeat.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SessionLiveness {
-    Healthy,
-    Stalled,
-    TransportDead,
-    Unknown,
-}
-
-/// Heartbeat emitted from canonical session state, independent of terminal rendering.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SessionHeartbeat {
-    pub session_id: String,
-    pub observed_at_ms: u64,
-    pub transport_alive: bool,
-    pub liveness: SessionLiveness,
 }
 
 /// Persisted conversational state for the runtime and CLI session manager.
@@ -130,6 +161,7 @@ pub struct Session {
     pub last_health_check_ms: Option<u64>,
     pub model: Option<String>,
     persistence: Option<SessionPersistence>,
+    pub image_cache: ImageCache,
 }
 
 impl PartialEq for Session {
@@ -146,8 +178,6 @@ impl PartialEq for Session {
             && self.last_health_check_ms == other.last_health_check_ms
     }
 }
-
-impl Eq for Session {}
 
 /// Errors raised while loading, parsing, or saving sessions.
 #[derive(Debug)]
@@ -198,6 +228,7 @@ impl Session {
             last_health_check_ms: None,
             model: None,
             persistence: None,
+            image_cache: ImageCache::new(),
         }
     }
 
@@ -231,31 +262,8 @@ impl Session {
     pub fn save_to_path(&self, path: impl AsRef<Path>) -> Result<(), SessionError> {
         let path = path.as_ref();
         let snapshot = self.render_jsonl_snapshot()?;
-        // #112: wrap ENOENT during rotate as concurrent modification
-        match rotate_session_file_if_needed(path) {
-            Ok(()) => {}
-            Err(SessionError::Io(ref io_err)) if io_err.kind() == std::io::ErrorKind::NotFound => {
-                return Err(SessionError::Io(std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    format!(
-                        "session file was removed during save (possible concurrent modification): {io_err}"
-                    ),
-                )));
-            }
-            Err(e) => return Err(e),
-        }
-        write_atomic(path, &snapshot).map_err(|e| {
-            // #112: wrap ENOENT during write as concurrent modification
-            match &e {
-                SessionError::Io(io_err) if io_err.kind() == std::io::ErrorKind::NotFound => {
-                    SessionError::Io(std::io::Error::new(
-                        std::io::ErrorKind::NotFound,
-                        format!("session file was removed during write (possible concurrent modification): {io_err}"),
-                    ))
-                }
-                _ => e,
-            }
-        })?;
+        rotate_session_file_if_needed(path)?;
+        write_atomic(path, &snapshot)?;
         cleanup_rotated_logs(path)?;
         Ok(())
     }
@@ -296,43 +304,31 @@ impl Session {
         self.push_message(ConversationMessage::user_text(text))
     }
 
-    pub fn record_health_check(&mut self, timestamp_ms: u64) {
-        self.last_health_check_ms = Some(timestamp_ms);
-        self.touch();
-    }
-
-    #[must_use]
-    pub fn heartbeat_at(
-        &self,
-        now_ms: u64,
-        stalled_after_ms: u64,
-        transport_alive: bool,
-    ) -> SessionHeartbeat {
-        let liveness = match (transport_alive, self.last_health_check_ms) {
-            (false, _) => SessionLiveness::TransportDead,
-            (true, Some(last)) if now_ms.saturating_sub(last) <= stalled_after_ms => {
-                SessionLiveness::Healthy
-            }
-            (true, Some(_)) => SessionLiveness::Stalled,
-            (true, None) => SessionLiveness::Unknown,
-        };
-
-        SessionHeartbeat {
-            session_id: self.session_id.clone(),
-            observed_at_ms: now_ms,
-            transport_alive,
-            liveness,
-        }
+    pub fn push_user_content(
+        &mut self,
+        content_blocks: Vec<ContentBlock>,
+    ) -> Result<(), SessionError> {
+        self.push_message(ConversationMessage::user_content(content_blocks))
     }
 
     pub fn record_compaction(&mut self, summary: impl Into<String>, removed_message_count: usize) {
         self.touch();
         let count = self.compaction.as_ref().map_or(1, |value| value.count + 1);
+        let last_savings_ratio = self.compaction.as_ref().and_then(|c| c.last_savings_ratio);
         self.compaction = Some(SessionCompaction {
             count,
             removed_message_count,
             summary: summary.into(),
+            last_savings_ratio,
         });
+    }
+
+    /// Override the savings ratio on the existing compaction record.
+    /// Used by `maybe_auto_compact` to set the ratio computed after compaction.
+    pub fn set_compaction_savings_ratio(&mut self, ratio: Option<f64>) {
+        if let Some(ref mut compaction) = self.compaction {
+            compaction.last_savings_ratio = ratio;
+        }
     }
 
     #[must_use]
@@ -354,6 +350,7 @@ impl Session {
             last_health_check_ms: self.last_health_check_ms,
             model: self.model.clone(),
             persistence: None,
+            image_cache: ImageCache::new(),
         }
     }
 
@@ -436,7 +433,6 @@ impl Session {
             .get("created_at_ms")
             .map(|value| required_u64_from_value(value, "created_at_ms"))
             .transpose()?
-            .or_else(|| parse_created_at_ms_from_session_id(&session_id))
             .unwrap_or(now);
         let updated_at_ms = object
             .get("updated_at_ms")
@@ -471,7 +467,7 @@ impl Session {
             session_id,
             created_at_ms,
             updated_at_ms,
-            messages,
+            messages: Self::normalize_legacy_tool_messages(messages),
             compaction,
             fork,
             workspace_root,
@@ -479,6 +475,7 @@ impl Session {
             last_health_check_ms: None,
             model,
             persistence: None,
+            image_cache: ImageCache::new(),
         })
     }
 
@@ -524,10 +521,7 @@ impl Session {
                 "session_meta" => {
                     version = required_u32(object, "version")?;
                     session_id = Some(required_string(object, "session_id")?);
-                    created_at_ms = object
-                        .get("created_at_ms")
-                        .map(|value| required_u64_from_value(value, "created_at_ms"))
-                        .transpose()?;
+                    created_at_ms = Some(required_u64(object, "created_at_ms")?);
                     updated_at_ms = Some(required_u64(object, "updated_at_ms")?);
                     fork = object.get("fork").map(SessionFork::from_json).transpose()?;
                     workspace_root = object
@@ -570,16 +564,12 @@ impl Session {
         }
 
         let now = current_time_millis();
-        let session_id = session_id.unwrap_or_else(generate_session_id);
-        let created_at_ms = created_at_ms
-            .or_else(|| parse_created_at_ms_from_session_id(&session_id))
-            .unwrap_or(now);
         Ok(Self {
             version,
-            session_id,
-            created_at_ms,
-            updated_at_ms: updated_at_ms.unwrap_or(created_at_ms),
-            messages,
+            session_id: session_id.unwrap_or_else(generate_session_id),
+            created_at_ms: created_at_ms.unwrap_or(now),
+            updated_at_ms: updated_at_ms.unwrap_or(created_at_ms.unwrap_or(now)),
+            messages: Self::normalize_legacy_tool_messages(messages),
             compaction,
             fork,
             workspace_root,
@@ -587,7 +577,30 @@ impl Session {
             last_health_check_ms: None,
             model,
             persistence: None,
+            image_cache: ImageCache::new(),
         })
+    }
+
+    /// Merge consecutive tool-role messages into one. Sessions saved before the
+    /// parallel-tool-result merge fix may contain one `tool_result` message per
+    /// parallel call, which the Anthropic API rejects ("`tool_use` ids were
+    /// found without `tool_result` blocks immediately after"). Normalising on
+    /// load keeps resumed sessions wire-valid.
+    fn normalize_legacy_tool_messages(messages: Vec<ConversationMessage>) -> Vec<ConversationMessage> {
+        let mut result = Vec::with_capacity(messages.len());
+        for message in messages {
+            if message.role == MessageRole::Tool
+                && result
+                    .last()
+                    .is_some_and(|last: &ConversationMessage| last.role == MessageRole::Tool)
+            {
+                let last = result.pop().expect("last tool message just checked");
+                result.push(merge_tool_result_messages(vec![last, message]));
+            } else {
+                result.push(message);
+            }
+        }
+        result
     }
 
     /// Record a user prompt with the current wall-clock timestamp.
@@ -618,7 +631,7 @@ impl Session {
         lines.extend(
             self.messages
                 .iter()
-                .map(|message| message_record(message).render()),
+                .map(|message| message_record(&filter_toolresult_for_persist(message)).render()),
         );
         let mut rendered = lines.join("\n");
         rendered.push('\n');
@@ -630,6 +643,12 @@ impl Session {
             return Ok(());
         };
 
+        // Filter WebFetch ToolResult content before persisting to JSONL.
+        // Full content is still in memory (self.messages) and visible to the AI,
+        // but we only store a short marker in the file to avoid bloating it
+        // with repeated web page content on cache hits.
+        let filtered = filter_toolresult_for_persist(message);
+
         let needs_bootstrap = !path.exists() || fs::metadata(path)?.len() == 0;
         if needs_bootstrap {
             self.save_to_path(path)?;
@@ -637,7 +656,13 @@ impl Session {
         }
 
         let mut file = OpenOptions::new().append(true).open(path)?;
-        writeln!(file, "{}", message_record(message).render())?;
+        let pos = file.metadata()?.len();
+        let record = message_record(&filtered).render();
+        if let Err(e) = writeln!(file, "{record}") {
+            // Truncate to known-good position to prevent partial JSONL corruption
+            let _ = file.set_len(pos);
+            return Err(SessionError::Io(e));
+        }
         Ok(())
     }
 
@@ -708,6 +733,95 @@ impl Default for Session {
     }
 }
 
+pub fn externalize_content_block_image(
+    block: &mut ContentBlock,
+    store: &ImageStore,
+    b64_cache: &mut HashMap<String, String>,
+) -> Result<(), SessionError> {
+    match block {
+        ContentBlock::Image {
+            mime_type,
+            data,
+            filename,
+        } => {
+            // data is already base64 of final compressed bytes from input.rs
+            // Store directly — no double compression
+            let raw_bytes = base64::engine::general_purpose::STANDARD
+                .decode(data.as_bytes())
+                .map_err(|e| SessionError::Format(format!("base64 decode: {e}")))?;
+            let hash_hex = store.store(&raw_bytes, mime_type)?;
+            // Write .b64 sidecar for future fast-path loads
+            let raw_path = store.path_for(&hash_hex, mime_type);
+            let b64_path = raw_path.with_extension(format!("{}.b64", raw_path.extension().unwrap_or_default().to_string_lossy()));
+            let _ = std::fs::write(&b64_path, data.as_bytes());
+            // Cache the same base64 string for hot-path reuse
+            b64_cache.insert(hash_hex.clone(), data.clone());
+            let stored_mime = mime_type.clone();
+            *block = ContentBlock::ImageRef {
+                hash_hex,
+                mime_type: stored_mime,
+                filename: filename.take(),
+            };
+        }
+        ContentBlock::ImageRef {
+            hash_hex,
+            mime_type,
+            ..
+        } => {
+            // Image already stored by input.rs, just populate the base64 cache
+            if !b64_cache.contains_key(hash_hex) {
+                match store.load_base64(hash_hex, mime_type) {
+                    Ok(b64) => {
+                        b64_cache.insert(hash_hex.clone(), b64);
+                    }
+                    Err(e) => {
+                        eprintln!("[IMAGE] Failed to cache base64 for {hash_hex}: {e}");
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+#[allow(dead_code)]
+pub fn resolve_content_block_image(block: &mut ContentBlock, store: &ImageStore) -> Result<(), SessionError> {
+    if let ContentBlock::ImageRef {
+        hash_hex,
+        mime_type,
+        filename,
+    } = block
+    {
+        let base64_data = store.load_base64(hash_hex, mime_type)?;
+        *block = ContentBlock::Image {
+            mime_type: mime_type.clone(),
+            data: base64_data,
+            filename: filename.take(),
+        };
+    }
+    Ok(())
+}
+
+pub fn externalize_message_images(
+    msg: &mut ConversationMessage,
+    store: &ImageStore,
+    b64_cache: &mut HashMap<String, String>,
+) -> Result<(), SessionError> {
+    for block in &mut msg.blocks {
+        externalize_content_block_image(block, store, b64_cache)?;
+    }
+    Ok(())
+}
+
+#[allow(dead_code)]
+pub fn resolve_message_images(msg: &mut ConversationMessage, store: &ImageStore) -> Result<(), SessionError> {
+    for block in &mut msg.blocks {
+        resolve_content_block_image(block, store)?;
+    }
+    Ok(())
+}
+
 impl ConversationMessage {
     #[must_use]
     pub fn user_text(text: impl Into<String>) -> Self {
@@ -715,6 +829,21 @@ impl ConversationMessage {
             role: MessageRole::User,
             blocks: vec![ContentBlock::Text { text: text.into() }],
             usage: None,
+            created_at: Instant::now(),
+            cached_tokens: OnceLock::new(),
+            cached_input_message: OnceLock::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn user_content(blocks: Vec<ContentBlock>) -> Self {
+        Self {
+            role: MessageRole::User,
+            blocks,
+            usage: None,
+            created_at: Instant::now(),
+            cached_tokens: OnceLock::new(),
+            cached_input_message: OnceLock::new(),
         }
     }
 
@@ -724,6 +853,9 @@ impl ConversationMessage {
             role: MessageRole::Assistant,
             blocks,
             usage: None,
+            created_at: Instant::now(),
+            cached_tokens: OnceLock::new(),
+            cached_input_message: OnceLock::new(),
         }
     }
 
@@ -733,6 +865,9 @@ impl ConversationMessage {
             role: MessageRole::Assistant,
             blocks,
             usage,
+            created_at: Instant::now(),
+            cached_tokens: OnceLock::new(),
+            cached_input_message: OnceLock::new(),
         }
     }
 
@@ -752,6 +887,9 @@ impl ConversationMessage {
                 is_error,
             }],
             usage: None,
+            created_at: Instant::now(),
+            cached_tokens: OnceLock::new(),
+            cached_input_message: OnceLock::new(),
         }
     }
 
@@ -811,6 +949,9 @@ impl ConversationMessage {
             role,
             blocks,
             usage,
+            created_at: Instant::now(),
+            cached_tokens: OnceLock::new(),
+            cached_input_message: OnceLock::new(),
         })
     }
 }
@@ -824,22 +965,6 @@ impl ContentBlock {
                 object.insert("type".to_string(), JsonValue::String("text".to_string()));
                 object.insert("text".to_string(), JsonValue::String(text.clone()));
             }
-            Self::Thinking {
-                thinking,
-                signature,
-            } => {
-                object.insert(
-                    "type".to_string(),
-                    JsonValue::String("thinking".to_string()),
-                );
-                object.insert("thinking".to_string(), JsonValue::String(thinking.clone()));
-                if let Some(signature) = signature {
-                    object.insert(
-                        "signature".to_string(),
-                        JsonValue::String(signature.clone()),
-                    );
-                }
-            }
             Self::ToolUse { id, name, input } => {
                 object.insert(
                     "type".to_string(),
@@ -847,7 +972,43 @@ impl ContentBlock {
                 );
                 object.insert("id".to_string(), JsonValue::String(id.clone()));
                 object.insert("name".to_string(), JsonValue::String(name.clone()));
-                object.insert("input".to_string(), JsonValue::String(input.clone()));
+                object.insert("input".to_string(), JsonValue::String(input.to_string()));
+            }
+            Self::Image {
+                mime_type,
+                data,
+                filename,
+            } => {
+                object.insert("type".to_string(), JsonValue::String("image".to_string()));
+                object.insert(
+                    "mime_type".to_string(),
+                    JsonValue::String(mime_type.clone()),
+                );
+                object.insert("data".to_string(), JsonValue::String(data.clone()));
+                if let Some(name) = filename {
+                    object.insert("filename".to_string(), JsonValue::String(name.clone()));
+                }
+            }
+            Self::ImageRef {
+                hash_hex,
+                mime_type,
+                filename,
+            } => {
+                object.insert(
+                    "type".to_string(),
+                    JsonValue::String("image_ref".to_string()),
+                );
+                object.insert(
+                    "hash_hex".to_string(),
+                    JsonValue::String(hash_hex.clone()),
+                );
+                object.insert(
+                    "mime_type".to_string(),
+                    JsonValue::String(mime_type.clone()),
+                );
+                if let Some(name) = filename {
+                    object.insert("filename".to_string(), JsonValue::String(name.clone()));
+                }
             }
             Self::ToolResult {
                 tool_use_id,
@@ -870,6 +1031,28 @@ impl ContentBlock {
                 object.insert("output".to_string(), JsonValue::String(output.clone()));
                 object.insert("is_error".to_string(), JsonValue::Bool(*is_error));
             }
+            Self::Thinking { thinking, signature } => {
+                object.insert("type".to_string(), JsonValue::String("thinking".to_string()));
+                // Persist the thinking content so a resumed session can echo the
+                // block back to the Anthropic API verbatim (content + signature).
+                // `from_json` restores both fields; the field is optional so old
+                // session files (signature-only) still load.
+                if !thinking.is_empty() {
+                    object.insert("thinking".to_string(), JsonValue::String(thinking.clone()));
+                }
+                if let Some(sig) = signature {
+                    object.insert("signature".to_string(), JsonValue::String(sig.clone()));
+                }
+            }
+            Self::RedactedThinking { data } => {
+                object.insert(
+                    "type".to_string(),
+                    JsonValue::String("redacted_thinking".to_string()),
+                );
+                // Persist the ciphertext verbatim so a resumed session can echo
+                // the redacted block back to the Anthropic API unchanged.
+                object.insert("data".to_string(), JsonValue::String(data.clone()));
+            }
         }
         JsonValue::Object(object)
     }
@@ -886,17 +1069,31 @@ impl ContentBlock {
             "text" => Ok(Self::Text {
                 text: required_string(object, "text")?,
             }),
-            "thinking" => Ok(Self::Thinking {
-                thinking: required_string(object, "thinking")?,
-                signature: object
-                    .get("signature")
+            "tool_use" => {
+                let input_str = required_string(object, "input")?;
+                let input = serde_json::from_str(&input_str)
+                    .unwrap_or_else(|_| serde_json::Value::String(input_str.clone()));
+                Ok(Self::ToolUse {
+                    id: required_string(object, "id")?,
+                    name: required_string(object, "name")?,
+                    input,
+                })
+            }
+            "image" => Ok(Self::Image {
+                mime_type: required_string(object, "mime_type")?,
+                data: required_string(object, "data")?,
+                filename: object
+                    .get("filename")
                     .and_then(JsonValue::as_str)
-                    .map(String::from),
+                    .map(ToOwned::to_owned),
             }),
-            "tool_use" => Ok(Self::ToolUse {
-                id: required_string(object, "id")?,
-                name: required_string(object, "name")?,
-                input: required_string(object, "input")?,
+            "image_ref" => Ok(Self::ImageRef {
+                hash_hex: required_string(object, "hash_hex")?,
+                mime_type: required_string(object, "mime_type")?,
+                filename: object
+                    .get("filename")
+                    .and_then(JsonValue::as_str)
+                    .map(ToOwned::to_owned),
             }),
             "tool_result" => Ok(Self::ToolResult {
                 tool_use_id: required_string(object, "tool_use_id")?,
@@ -906,6 +1103,27 @@ impl ContentBlock {
                     .get("is_error")
                     .and_then(JsonValue::as_bool)
                     .ok_or_else(|| SessionError::Format("missing is_error".to_string()))?,
+            }),
+            "thinking" => Ok(Self::Thinking {
+                // Backward-compatible: old sessions have `thinking` field, new ones don't.
+                // Either way, we restore with empty thinking content (only signature matters
+                // for API round-trip).
+                thinking: object
+                    .get("thinking")
+                    .and_then(JsonValue::as_str)
+                    .map(ToOwned::to_owned)
+                    .unwrap_or_default(),
+                signature: object
+                    .get("signature")
+                    .and_then(JsonValue::as_str)
+                    .map(ToOwned::to_owned),
+            }),
+            "redacted_thinking" => Ok(Self::RedactedThinking {
+                data: object
+                    .get("data")
+                    .and_then(JsonValue::as_str)
+                    .map(ToOwned::to_owned)
+                    .unwrap_or_default(),
             }),
             other => Err(SessionError::Format(format!(
                 "unsupported block type: {other}"
@@ -932,6 +1150,13 @@ impl SessionCompaction {
             "summary".to_string(),
             JsonValue::String(self.summary.clone()),
         );
+        if let Some(ratio) = self.last_savings_ratio {
+            let safe = if ratio.is_finite() { ratio } else { 0.0 };
+            object.insert(
+                "last_savings_ratio".to_string(),
+                JsonValue::Number((safe * 1_000_000.0).round() as i64),
+            );
+        }
         Ok(JsonValue::Object(object))
     }
 
@@ -954,8 +1179,15 @@ impl SessionCompaction {
         );
         object.insert(
             "summary".to_string(),
-            JsonValue::String(sanitize_jsonl_field(&self.summary)),
+            JsonValue::String(self.summary.clone()),
         );
+        if let Some(ratio) = self.last_savings_ratio {
+            let safe = if ratio.is_finite() { ratio } else { 0.0 };
+            object.insert(
+                "last_savings_ratio".to_string(),
+                JsonValue::Number((safe * 1_000_000.0).round() as i64),
+            );
+        }
         Ok(JsonValue::Object(object))
     }
 
@@ -963,10 +1195,15 @@ impl SessionCompaction {
         let object = value
             .as_object()
             .ok_or_else(|| SessionError::Format("compaction must be an object".to_string()))?;
+        let last_savings_ratio = object
+            .get("last_savings_ratio")
+            .and_then(JsonValue::as_i64)
+            .map(|v| v as f64 / 1_000_000.0);
         Ok(Self {
             count: required_u32(object, "count")?,
             removed_message_count: required_usize(object, "removed_message_count")?,
             summary: required_string(object, "summary")?,
+            last_savings_ratio,
         })
     }
 }
@@ -1014,10 +1251,7 @@ impl SessionPromptEntry {
             "timestamp_ms".to_string(),
             JsonValue::Number(i64::try_from(self.timestamp_ms).unwrap_or(i64::MAX)),
         );
-        object.insert(
-            "text".to_string(),
-            JsonValue::String(sanitize_jsonl_field(&self.text)),
-        );
+        object.insert("text".to_string(), JsonValue::String(self.text.clone()));
         JsonValue::Object(object)
     }
 
@@ -1032,166 +1266,177 @@ impl SessionPromptEntry {
     }
 }
 
+/// Replace large ToolResult outputs AND ToolUse inputs with short markers
+/// before persisting to JSONL. The full content remains in `self.messages`
+/// (in-memory) so the AI can still read it during the current turn.
+///
+/// Applies to tools that produce large outputs or accept large inputs:
+/// - WebFetch: web page content
+/// - read_file: file content
+/// - new_file: file content in `content` input field + output echo
+/// - edit_file: code diff in `old_string`/`new_string` input fields + output
+/// - bash: command output
+/// - grep_search: search results
+fn filter_toolresult_for_persist(message: &ConversationMessage) -> ConversationMessage {
+    /// Tools whose ToolResult output should be replaced with a marker in JSONL.
+    const FILTER_TOOLS: &[&str] = &[
+        "WebFetch", "read_file", "new_file", "edit_file", "bash", "grep_search",
+    ];
+    /// Tools whose ToolUse input should be replaced with a marker in JSONL.
+    const FILTER_INPUT_TOOLS: &[&str] = &["new_file", "edit_file"];
+    /// Minimum output size (bytes) to trigger filtering.
+    const MIN_SIZE: usize = 500;
+
+    let blocks = message
+        .blocks
+        .iter()
+        .map(|block| match block {
+            // Filter ToolResult output
+            ContentBlock::ToolResult {
+                tool_use_id,
+                tool_name,
+                output,
+                is_error,
+            } if !is_error
+                && output.len() > MIN_SIZE
+                && FILTER_TOOLS.contains(&tool_name.as_str()) =>
+            {
+                let marker = persist_marker(tool_name, output);
+                ContentBlock::ToolResult {
+                    tool_use_id: tool_use_id.clone(),
+                    tool_name: tool_name.clone(),
+                    output: marker,
+                    is_error: *is_error,
+                }
+            }
+            // Filter ToolUse input (new_file content, edit_file old_string/new_string)
+            ContentBlock::ToolUse { id, name, input }
+                if input.to_string().len() > MIN_SIZE
+                    && FILTER_INPUT_TOOLS.contains(&name.as_str()) =>
+            {
+                let input_str = input.to_string();
+                let marker = input_marker(name, &input_str);
+                ContentBlock::ToolUse {
+                    id: id.clone(),
+                    name: name.clone(),
+                    input: serde_json::Value::String(marker),
+                }
+            }
+            other => other.clone(),
+        })
+        .collect();
+    ConversationMessage {
+        role: message.role,
+        blocks,
+        usage: message.usage.clone(),
+        created_at: message.created_at,
+        cached_tokens: message.cached_tokens.clone(),
+        cached_input_message: OnceLock::new(),
+    }
+}
+
+/// Generate a short marker for JSONL persistence, including file path when available.
+fn persist_marker(tool_name: &str, output: &str) -> String {
+    match tool_name {
+        "read_file" => {
+            let path = extract_json_str(output, "filePath").unwrap_or_default();
+            let lines = extract_json_num(output, "numLines")
+                .or_else(|| extract_json_num(output, "lineCount"))
+                .unwrap_or("?".into());
+            format!("[read_file: {path}, {lines} lines]")
+        }
+        "new_file" => {
+            let path = extract_json_str(output, "filePath")
+                .or_else(|| extract_json_str(output, "path"))
+                .unwrap_or_default();
+            format!("[new_file: {path}]")
+        }
+        "edit_file" => {
+            let path = extract_json_str(output, "filePath")
+                .or_else(|| extract_json_str(output, "path"))
+                .unwrap_or_default();
+            let diff = extract_json_str(output, "diffPath").unwrap_or_default();
+            format!("[edit_file: {path}, diff={diff}]")
+        }
+        "bash" => {
+            format!("[bash: {} chars]", output.chars().count())
+        }
+        "WebFetch" => {
+            format!("[WebFetch: {} chars]", output.chars().count())
+        }
+        "grep_search" => {
+            let files = extract_json_num(output, "num_files").unwrap_or("?".into());
+            format!("[grep_search: {files} files]")
+        }
+        _ => format!("[{tool_name}: {} chars cached]", output.chars().count()),
+    }
+}
+
+/// Generate a short marker for ToolUse input fields in JSONL.
+/// Preserves file path but drops large content/old_string/new_string.
+fn input_marker(tool_name: &str, input: &str) -> String {
+    match tool_name {
+        "new_file" => {
+            let path = extract_json_str(input, "path").unwrap_or_default();
+            let chars = input.chars().count();
+            format!(r#"{{"path":"{path}","content":"[{chars} chars]"}}"#)
+        }
+        "edit_file" => {
+            let path = extract_json_str(input, "path").unwrap_or_default();
+            let replace_all = if input.contains("\"replace_all\":true")
+                || input.contains("\"replace_all\": true")
+            {
+                "true"
+            } else {
+                "false"
+            };
+            let chars = input.chars().count();
+            format!(
+                r#"{{"path":"{path}","old_string":"[{chars} chars]","new_string":"[{chars} chars]","replace_all":{replace_all}}}"#
+            )
+        }
+        _ => format!(r#"{{"_filtered":"{chars} chars"}}"#, chars = input.chars().count()),
+    }
+}
+
+/// Extract a string value from JSON by key (fast path, no full parse).
+fn extract_json_str(json: &str, key: &str) -> Option<String> {
+    let pattern = format!("\"{key}\":");
+    let idx = json.find(&pattern)?;
+    let rest = &json[idx + pattern.len()..];
+    let rest = rest.trim_start();
+    if rest.starts_with('"') {
+        let end = rest[1..].find('"')?;
+        Some(rest[1..1 + end].to_string())
+    } else {
+        None
+    }
+}
+
+/// Extract a numeric value from JSON by key (fast path, no full parse).
+fn extract_json_num(json: &str, key: &str) -> Option<String> {
+    let pattern = format!("\"{key}\":");
+    let idx = json.find(&pattern)?;
+    let rest = &json[idx + pattern.len()..];
+    let rest = rest.trim_start();
+    if rest.starts_with("null") {
+        return Some("null".to_string());
+    }
+    let end = rest
+        .find(|c: char| !c.is_ascii_digit() && c != '-' && c != '.')
+        .unwrap_or(rest.len());
+    if end > 0 {
+        Some(rest[..end].to_string())
+    } else {
+        None
+    }
+}
+
 fn message_record(message: &ConversationMessage) -> JsonValue {
     let mut object = BTreeMap::new();
     object.insert("type".to_string(), JsonValue::String("message".to_string()));
-    object.insert("message".to_string(), persisted_message_json(message));
+    object.insert("message".to_string(), message.to_json());
     JsonValue::Object(object)
-}
-
-fn persisted_message_json(message: &ConversationMessage) -> JsonValue {
-    let mut object = BTreeMap::new();
-    object.insert(
-        "role".to_string(),
-        JsonValue::String(
-            match message.role {
-                MessageRole::System => "system",
-                MessageRole::User => "user",
-                MessageRole::Assistant => "assistant",
-                MessageRole::Tool => "tool",
-            }
-            .to_string(),
-        ),
-    );
-    object.insert(
-        "blocks".to_string(),
-        JsonValue::Array(message.blocks.iter().map(persisted_block_json).collect()),
-    );
-    if let Some(usage) = message.usage {
-        object.insert("usage".to_string(), usage_to_json(usage));
-    }
-    JsonValue::Object(object)
-}
-
-fn persisted_block_json(block: &ContentBlock) -> JsonValue {
-    let mut object = BTreeMap::new();
-    match block {
-        ContentBlock::Text { text } => {
-            object.insert("type".to_string(), JsonValue::String("text".to_string()));
-            object.insert(
-                "text".to_string(),
-                JsonValue::String(sanitize_jsonl_field(text)),
-            );
-        }
-        ContentBlock::Thinking {
-            thinking,
-            signature,
-        } => {
-            object.insert(
-                "type".to_string(),
-                JsonValue::String("thinking".to_string()),
-            );
-            object.insert(
-                "thinking".to_string(),
-                JsonValue::String(sanitize_jsonl_field(thinking)),
-            );
-            if let Some(signature) = signature {
-                object.insert(
-                    "signature".to_string(),
-                    JsonValue::String(sanitize_jsonl_field(signature)),
-                );
-            }
-        }
-        ContentBlock::ToolUse { id, name, input } => {
-            object.insert(
-                "type".to_string(),
-                JsonValue::String("tool_use".to_string()),
-            );
-            object.insert(
-                "id".to_string(),
-                JsonValue::String(sanitize_jsonl_field(id)),
-            );
-            object.insert("name".to_string(), JsonValue::String(name.clone()));
-            object.insert(
-                "input".to_string(),
-                JsonValue::String(sanitize_jsonl_field(input)),
-            );
-        }
-        ContentBlock::ToolResult {
-            tool_use_id,
-            tool_name,
-            output,
-            is_error,
-        } => {
-            object.insert(
-                "type".to_string(),
-                JsonValue::String("tool_result".to_string()),
-            );
-            object.insert(
-                "tool_use_id".to_string(),
-                JsonValue::String(sanitize_jsonl_field(tool_use_id)),
-            );
-            object.insert(
-                "tool_name".to_string(),
-                JsonValue::String(tool_name.clone()),
-            );
-            object.insert(
-                "output".to_string(),
-                JsonValue::String(sanitize_jsonl_field(output)),
-            );
-            object.insert("is_error".to_string(), JsonValue::Bool(*is_error));
-        }
-    }
-    JsonValue::Object(object)
-}
-
-fn sanitize_jsonl_field(value: &str) -> String {
-    truncate_jsonl_field(&redact_jsonl_secrets(value))
-}
-
-fn truncate_jsonl_field(value: &str) -> String {
-    let char_count = value.chars().count();
-    if char_count <= MAX_JSONL_FIELD_CHARS {
-        return value.to_string();
-    }
-
-    let keep = MAX_JSONL_FIELD_CHARS.saturating_sub(JSONL_TRUNCATION_MARKER.chars().count());
-    let mut truncated = value.chars().take(keep).collect::<String>();
-    truncated.push_str(JSONL_TRUNCATION_MARKER);
-    truncated
-}
-
-fn redact_jsonl_secrets(value: &str) -> String {
-    let mut redacted = value.to_string();
-    for marker in [
-        "ANTHROPIC_API_KEY=",
-        "ANTHROPIC_AUTH_TOKEN=",
-        "OPENAI_API_KEY=",
-        "DASHSCOPE_API_KEY=",
-        "XAI_API_KEY=",
-        "Authorization: Bearer ",
-        "authorization: Bearer ",
-        "Bearer sk-",
-        "sk-ant-",
-    ] {
-        redacted = redact_after_marker(&redacted, marker);
-    }
-    redacted
-}
-
-fn redact_after_marker(value: &str, marker: &str) -> String {
-    let mut output = String::with_capacity(value.len());
-    let mut rest = value;
-
-    while let Some(index) = rest.find(marker) {
-        let (before, after_before) = rest.split_at(index);
-        output.push_str(before);
-        output.push_str(marker);
-        output.push_str(JSONL_REDACTION_MARKER);
-
-        let secret_start = marker.len();
-        let after_marker = &after_before[secret_start..];
-        let secret_end = after_marker
-            .char_indices()
-            .find_map(|(idx, ch)| {
-                (ch.is_whitespace() || matches!(ch, '\'' | '"' | ',' | '}' | ']')).then_some(idx)
-            })
-            .unwrap_or(after_marker.len());
-        rest = &after_marker[secret_end..];
-    }
-
-    output.push_str(rest);
-    output
 }
 
 fn usage_to_json(usage: TokenUsage) -> JsonValue {
@@ -1279,12 +1524,14 @@ fn i64_from_usize(value: usize, key: &str) -> Result<i64, SessionError> {
 }
 
 fn workspace_root_to_string(path: &Path) -> Result<String, SessionError> {
-    path.to_str().map(ToOwned::to_owned).ok_or_else(|| {
+    let path = dunce::simplified(path).to_owned();
+    let s = path.to_str().ok_or_else(|| {
         SessionError::Format(format!(
             "workspace_root is not valid UTF-8: {}",
             path.display()
         ))
-    })
+    })?;
+    Ok(s.to_string())
 }
 
 fn normalize_optional_string(value: Option<String>) -> Option<String> {
@@ -1301,9 +1548,8 @@ fn normalize_optional_string(value: Option<String>) -> Option<String> {
 fn current_time_millis() -> u64 {
     let wall_clock = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
         .unwrap_or_default();
-
     let mut candidate = wall_clock;
     loop {
         let previous = LAST_TIMESTAMP_MS.load(Ordering::Relaxed);
@@ -1322,19 +1568,36 @@ fn current_time_millis() -> u64 {
     }
 }
 
-pub(crate) fn parse_created_at_ms_from_session_id(session_id: &str) -> Option<u64> {
-    let timestamp_and_suffix = session_id.strip_prefix("session-")?;
-    let (timestamp, suffix) = timestamp_and_suffix.split_once('-')?;
-    if suffix.is_empty() {
-        return None;
+fn current_time_secs() -> u64 {
+    let wall_clock = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut candidate = wall_clock;
+    loop {
+        let previous = LAST_SEC.load(Ordering::Relaxed);
+        if candidate <= previous {
+            candidate = previous.saturating_add(1);
+        }
+        match LAST_SEC.compare_exchange(previous, candidate, Ordering::SeqCst, Ordering::SeqCst)
+        {
+            Ok(_) => return candidate,
+            Err(actual) => candidate = actual.saturating_add(1),
+        }
     }
-    timestamp.parse::<u64>().ok()
+}
+
+fn hhmmss_from_epoch(secs: u64) -> String {
+    jiff::Timestamp::new(secs as i64, 0)
+        .unwrap()
+        .to_zoned(jiff::tz::TimeZone::system())
+        .strftime("%H%M%S")
+        .to_string()
 }
 
 fn generate_session_id() -> String {
-    let millis = current_time_millis();
-    let counter = SESSION_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("session-{millis}-{counter}")
+    let secs = current_time_secs();
+    format!("session-{}-{secs}", hhmmss_from_epoch(secs))
 }
 
 fn write_atomic(path: &Path, contents: &str) -> Result<(), SessionError> {
@@ -1420,9 +1683,8 @@ fn cleanup_rotated_logs(path: &Path) -> Result<(), SessionError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        cleanup_rotated_logs, current_time_millis, parse_created_at_ms_from_session_id,
-        rotate_session_file_if_needed, ContentBlock, ConversationMessage, MessageRole, Session,
-        SessionFork,
+        cleanup_rotated_logs, current_time_millis, rotate_session_file_if_needed, ContentBlock,
+        ConversationMessage, MessageRole, Session, SessionFork,
     };
     use crate::json::JsonValue;
     use crate::usage::TokenUsage;
@@ -1455,7 +1717,7 @@ mod tests {
                     ContentBlock::ToolUse {
                         id: "tool-1".to_string(),
                         name: "bash".to_string(),
-                        input: "echo hi".to_string(),
+                        input: serde_json::Value::String("echo hi".to_string()),
                     },
                 ],
                 Some(TokenUsage {
@@ -1487,38 +1749,104 @@ mod tests {
     }
 
     #[test]
-    fn persists_assistant_thinking_block_round_trip_through_jsonl() {
-        // given
+    fn thinking_content_round_trips_through_jsonl() {
         let mut session = Session::new();
         session
-            .push_message(ConversationMessage::assistant(vec![
-                ContentBlock::Thinking {
-                    thinking: "trace the path through session persistence".to_string(),
-                    signature: Some("sig-123".to_string()),
-                },
-            ]))
-            .expect("thinking block should append");
-        let path = temp_session_path("thinking-jsonl");
+            .push_user_text("think and answer")
+            .expect("user message should append");
+        session
+            .push_message(ConversationMessage::assistant(vec![ContentBlock::Thinking {
+                thinking: "reasoning text".to_string(),
+                signature: Some("sig123".to_string()),
+            }]))
+            .expect("assistant message should append");
 
-        // when
+        let path = temp_session_path("thinking");
         session.save_to_path(&path).expect("session should save");
         let restored = Session::load_from_path(&path).expect("session should load");
         fs::remove_file(&path).expect("temp file should be removable");
 
-        // then
-        assert_eq!(restored, session);
-        assert_eq!(
-            restored.messages[0].blocks[0],
-            ContentBlock::Thinking {
-                thinking: "trace the path through session persistence".to_string(),
-                signature: Some("sig-123".to_string()),
-            }
-        );
+        let block = &restored.messages[1].blocks[0];
+        assert!(matches!(
+            block,
+            ContentBlock::Thinking { thinking, signature }
+                if thinking == "reasoning text" && signature.as_deref() == Some("sig123")
+        ));
     }
 
     #[test]
-    fn loads_legacy_session_json_object() {
-        let path = temp_session_path("legacy");
+    fn redacted_thinking_round_trips_through_jsonl() {
+        let mut session = Session::new();
+        session
+            .push_user_text("think and answer")
+            .expect("user message should append");
+        session
+            .push_message(ConversationMessage::assistant(vec![ContentBlock::RedactedThinking {
+                data: "ciphertext_blob_abc".to_string(),
+            }]))
+            .expect("assistant message should append");
+
+        let path = temp_session_path("redacted_thinking");
+        session.save_to_path(&path).expect("session should save");
+        let restored = Session::load_from_path(&path).expect("session should load");
+        fs::remove_file(&path).expect("temp file should be removable");
+
+        let block = &restored.messages[1].blocks[0];
+        assert!(matches!(
+            block,
+            ContentBlock::RedactedThinking { data }
+                if data == "ciphertext_blob_abc"
+        ));
+    }
+
+    #[test]
+    fn load_merges_legacy_split_tool_result_messages() {
+        let mut session = Session::new();
+        session
+            .push_user_text("do parallel tools")
+            .expect("user message should append");
+        session
+            .push_message(ConversationMessage::assistant(vec![
+                ContentBlock::ToolUse {
+                    id: "tool-a".to_string(),
+                    name: "bash".to_string(),
+                    input: serde_json::Value::String("echo a".to_string()),
+                },
+                ContentBlock::ToolUse {
+                    id: "tool-b".to_string(),
+                    name: "bash".to_string(),
+                    input: serde_json::Value::String("echo b".to_string()),
+                },
+            ]))
+            .expect("assistant message should append");
+        session
+            .push_message(ConversationMessage::tool_result("tool-a", "bash", "a", false))
+            .expect("tool result should append");
+        session
+            .push_message(ConversationMessage::tool_result("tool-b", "bash", "b", false))
+            .expect("tool result should append");
+
+        // Serialize the pre-merge layout directly: two consecutive tool messages.
+        let path = temp_session_path("legacy-tools");
+        session.save_to_path(&path).expect("session should save");
+        let restored = Session::load_from_path(&path).expect("session should load");
+        fs::remove_file(&path).expect("temp file should be removable");
+
+        let tool_messages: Vec<_> = restored
+            .messages
+            .iter()
+            .filter(|message| message.role == MessageRole::Tool)
+            .collect();
+        assert_eq!(
+            tool_messages.len(),
+            1,
+            "split tool results must be merged on load"
+        );
+        assert_eq!(tool_messages[0].blocks.len(), 2);
+    }
+
+    #[test]
+    fn loads_legacy_session_json_object() {        let path = temp_session_path("legacy");
         let legacy = JsonValue::Object(
             [
                 ("version".to_string(), JsonValue::Number(1)),
@@ -1544,44 +1872,6 @@ mod tests {
     }
 
     #[test]
-    fn created_at_parser_requires_full_session_id_shape() {
-        assert_eq!(
-            parse_created_at_ms_from_session_id("session-1743724800123-0"),
-            Some(1_743_724_800_123)
-        );
-        assert_eq!(
-            parse_created_at_ms_from_session_id("session-1743724800123"),
-            None
-        );
-        assert_eq!(
-            parse_created_at_ms_from_session_id("session-1743724800123-"),
-            None
-        );
-        assert_eq!(
-            parse_created_at_ms_from_session_id("other-1743724800123-0"),
-            None
-        );
-    }
-
-    #[test]
-    fn loads_legacy_jsonl_created_at_from_session_id_when_meta_omits_it() {
-        let path = temp_session_path("legacy-jsonl-created-at");
-        fs::write(
-            &path,
-            r#"{"type":"session_meta","version":3,"session_id":"session-1743724800123-0","updated_at_ms":1743724800456}
-"#,
-        )
-        .expect("legacy jsonl should write");
-
-        let restored = Session::load_from_path(&path).expect("legacy jsonl should load");
-        fs::remove_file(&path).expect("temp file should be removable");
-
-        assert_eq!(restored.session_id, "session-1743724800123-0");
-        assert_eq!(restored.created_at_ms, 1_743_724_800_123);
-        assert_eq!(restored.updated_at_ms, 1_743_724_800_456);
-    }
-
-    #[test]
     fn appends_messages_to_persisted_jsonl_session() {
         let path = temp_session_path("append");
         let mut session = Session::new().with_persistence_path(path.clone());
@@ -1602,54 +1892,6 @@ mod tests {
 
         assert_eq!(restored.messages.len(), 2);
         assert_eq!(restored.messages[0], ConversationMessage::user_text("hi"));
-    }
-
-    #[test]
-    fn jsonl_persistence_redacts_and_truncates_oversized_payload_fields() {
-        let path = temp_session_path("jsonl-safeguards");
-        let secret = "sk-live-secret-should-not-persist";
-        let oversized_output = format!(
-            "OPENAI_API_KEY={secret}\n{}",
-            "tool-output ".repeat(super::MAX_JSONL_FIELD_CHARS)
-        );
-        let mut session = Session::new();
-        session
-            .push_message(ConversationMessage::assistant(vec![
-                ContentBlock::ToolUse {
-                    id: "tool-1".to_string(),
-                    name: "bash".to_string(),
-                    input: format!("Authorization: Bearer {secret}"),
-                },
-            ]))
-            .expect("tool use should append");
-        session
-            .push_message(ConversationMessage::tool_result(
-                "tool-1",
-                "bash",
-                oversized_output,
-                false,
-            ))
-            .expect("tool result should append");
-
-        session.save_to_path(&path).expect("session should save");
-        let persisted = fs::read_to_string(&path).expect("session jsonl should read");
-        let restored = Session::load_from_path(&path).expect("session should load");
-        fs::remove_file(&path).expect("temp file should be removable");
-
-        assert!(
-            !persisted.contains(secret),
-            "secret leaked into JSONL: {persisted}"
-        );
-        assert!(persisted.contains(super::JSONL_REDACTION_MARKER));
-        assert!(persisted.contains(super::JSONL_TRUNCATION_MARKER));
-
-        let ContentBlock::ToolResult { output, .. } = &restored.messages[1].blocks[0] else {
-            panic!("restored second message should be a tool result");
-        };
-        assert!(!output.contains(secret));
-        assert!(output.contains(super::JSONL_REDACTION_MARKER));
-        assert!(output.ends_with(super::JSONL_TRUNCATION_MARKER));
-        assert!(output.chars().count() <= super::MAX_JSONL_FIELD_CHARS);
     }
 
     #[test]
@@ -1883,9 +2125,10 @@ mod tests {
     }
 }
 
-/// Per-worktree session isolation: returns a session directory namespaced
-/// by the workspace fingerprint of the given working directory.
-/// This prevents parallel `opencode serve` instances from colliding.
+/// Returns the shared sessions directory.
+/// All workspaces share a single `~/.claw/sessions/` directory; workspace
+/// isolation is enforced at the session metadata level (workspace_root field),
+/// not at the filesystem level.
 /// Called by external consumers (e.g. clawhip) to enumerate sessions for a CWD.
 #[allow(dead_code)]
 pub fn workspace_sessions_dir(cwd: &std::path::Path) -> Result<std::path::PathBuf, SessionError> {
@@ -1900,7 +2143,7 @@ mod workspace_sessions_dir_tests {
     use std::fs;
 
     #[test]
-    fn workspace_sessions_dir_returns_fingerprinted_path_for_valid_cwd() {
+    fn workspace_sessions_dir_returns_shared_path_for_valid_cwd() {
         let tmp = std::env::temp_dir().join("claw-session-dir-test");
         fs::create_dir_all(&tmp).expect("create temp dir");
 
@@ -1910,52 +2153,11 @@ mod workspace_sessions_dir_tests {
             "workspace_sessions_dir should succeed for a valid CWD, got: {result:?}"
         );
         let dir = result.unwrap();
-        // The returned path should be non-empty and end with a hash component
         assert!(!dir.as_os_str().is_empty());
         // Two calls with the same CWD should produce identical paths (deterministic)
         let result2 = workspace_sessions_dir(&tmp).unwrap();
         assert_eq!(dir, result2, "workspace_sessions_dir must be deterministic");
 
         fs::remove_dir_all(&tmp).ok();
-    }
-
-    #[test]
-    fn workspace_sessions_dir_differs_for_different_cwds() {
-        let tmp_a = std::env::temp_dir().join("claw-session-dir-a");
-        let tmp_b = std::env::temp_dir().join("claw-session-dir-b");
-        fs::create_dir_all(&tmp_a).expect("create dir a");
-        fs::create_dir_all(&tmp_b).expect("create dir b");
-
-        let dir_a = workspace_sessions_dir(&tmp_a).expect("dir a");
-        let dir_b = workspace_sessions_dir(&tmp_b).expect("dir b");
-        assert_ne!(
-            dir_a, dir_b,
-            "different CWDs must produce different session dirs"
-        );
-
-        fs::remove_dir_all(&tmp_a).ok();
-        fs::remove_dir_all(&tmp_b).ok();
-    }
-    #[test]
-    fn session_heartbeat_classifies_healthy_stalled_transport_dead_and_unknown() {
-        let mut session = Session::new();
-        assert_eq!(
-            session.heartbeat_at(1_000, 500, true).liveness,
-            SessionLiveness::Unknown
-        );
-
-        session.record_health_check(800);
-        assert_eq!(
-            session.heartbeat_at(1_000, 500, true).liveness,
-            SessionLiveness::Healthy
-        );
-        assert_eq!(
-            session.heartbeat_at(2_000, 500, true).liveness,
-            SessionLiveness::Stalled
-        );
-        assert_eq!(
-            session.heartbeat_at(1_000, 500, false).liveness,
-            SessionLiveness::TransportDead
-        );
     }
 }

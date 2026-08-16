@@ -1,0 +1,22 @@
+{
+  "url_1": {
+    "enable": true,
+    "url": "https://www.bing.com/search?q={search} site:ithome.com"
+  },
+  "url_2": {
+    "enable": true,
+    "url": "https://www.google.com/search?q={search}"
+  },
+  "url_3": {
+    "enable": false,
+    "url": "https://www.sogou.com/web?query={search}"
+  },
+  "url_4": {
+    "enable": true,
+    "url": "https://search.yahoo.co.jp/search?p={search}"
+  },
+  "url_5": {
+    "enable": false,
+    "url": "https://search.naver.com/search.naver?query={search}"
+  }
+}

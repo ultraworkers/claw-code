@@ -183,6 +183,7 @@ mod tests {
     fn init_repo(path: &Path) {
         fs::create_dir_all(path).expect("create repo dir");
         run(path, &["init", "--quiet", "-b", "main"]);
+        run(path, &["config", "core.autocrlf", "false"]);
         run(path, &["config", "user.email", "tests@example.com"]);
         run(path, &["config", "user.name", "Stale Branch Tests"]);
         fs::write(path.join("init.txt"), "initial\n").expect("write init file");

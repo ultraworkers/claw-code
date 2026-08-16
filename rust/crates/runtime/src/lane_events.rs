@@ -175,7 +175,7 @@ impl SessionIdentity {
 pub struct LaneOwnership {
     /// Owner/assignee identity
     pub owner: String,
-    /// Workflow scope (e.g., claw-code-dogfood, external-git-maintenance)
+    /// Workflow scope (e.g., clawcode-dogfood, external-git-maintenance)
     pub workflow_scope: String,
     /// Whether the watcher is expected to act, observe, or ignore
     pub watcher_action: WatcherAction,
@@ -449,21 +449,18 @@ pub fn compute_event_fingerprint(
     status: &LaneEventStatus,
     data: Option<&serde_json::Value>,
 ) -> String {
-    use sha2::{Digest, Sha256};
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
 
-    let payload = serde_json::json!({
-        "event": event,
-        "status": status,
-        "data": data,
-    });
-    let canonical = serde_json::to_vec(&payload).unwrap_or_default();
-    let digest = Sha256::digest(canonical);
-    let mut fingerprint = String::with_capacity(16);
-    for byte in &digest[..8] {
-        use std::fmt::Write as _;
-        write!(&mut fingerprint, "{byte:02x}").expect("writing to String should not fail");
+    let mut hasher = DefaultHasher::new();
+    format!("{event:?}").hash(&mut hasher);
+    format!("{status:?}").hash(&mut hasher);
+    if let Some(d) = data {
+        serde_json::to_string(d)
+            .unwrap_or_default()
+            .hash(&mut hasher);
     }
-    fingerprint
+    format!("{:016x}", hasher.finish())
 }
 
 /// Classification of event terminality for reconciliation.
@@ -1048,7 +1045,6 @@ impl LaneEvent {
             emitted_at,
         )
         .with_optional_detail(detail)
-        .with_terminal_fingerprint()
     }
 
     #[must_use]
@@ -1102,7 +1098,7 @@ impl LaneEvent {
             event =
                 event.with_data(serde_json::to_value(subphase).expect("subphase should serialize"));
         }
-        event.with_terminal_fingerprint()
+        event
     }
 
     /// Ship prepared — §4.44.5
@@ -1174,21 +1170,6 @@ impl LaneEvent {
     #[must_use]
     pub fn with_data(mut self, data: Value) -> Self {
         self.data = Some(data);
-        if is_terminal_event(self.event) {
-            self = self.with_terminal_fingerprint();
-        }
-        self
-    }
-
-    #[must_use]
-    fn with_terminal_fingerprint(mut self) -> Self {
-        if is_terminal_event(self.event) {
-            self.metadata.event_fingerprint = Some(compute_event_fingerprint(
-                &self.event,
-                &self.status,
-                self.data.as_ref(),
-            ));
-        }
         self
     }
 }
@@ -1395,39 +1376,6 @@ mod tests {
     }
 
     #[test]
-    fn convenience_terminal_events_attach_and_refresh_fingerprints() {
-        let finished = LaneEvent::finished("2026-04-04T00:00:00Z", Some("done".to_string()));
-        let initial_fingerprint = finished
-            .metadata
-            .event_fingerprint
-            .clone()
-            .expect("finished events should carry terminal fingerprint");
-
-        let with_payload = finished.with_data(json!({"result": "ok", "attempt": 1}));
-        assert!(with_payload.metadata.event_fingerprint.is_some());
-        assert_ne!(
-            Some(initial_fingerprint),
-            with_payload.metadata.event_fingerprint,
-            "payload changes must refresh the actionable terminal fingerprint"
-        );
-    }
-
-    #[test]
-    fn tool_style_finished_events_dedupe_after_payload_is_added() {
-        let first = LaneEvent::finished("2026-04-04T00:00:00Z", Some("done".to_string()))
-            .with_data(json!({"result": "ok"}));
-        let duplicate = LaneEvent::finished("2026-04-04T00:00:01Z", Some("done again".to_string()))
-            .with_data(json!({"result": "ok"}));
-
-        assert_eq!(
-            first.metadata.event_fingerprint,
-            duplicate.metadata.event_fingerprint
-        );
-        let deduped = dedupe_terminal_events(&[first, duplicate]);
-        assert_eq!(deduped.len(), 1);
-    }
-
-    #[test]
     fn commit_events_can_carry_worktree_and_supersession_metadata() {
         let event = LaneEvent::commit_created(
             "2026-04-04T00:00:00Z",
@@ -1614,12 +1562,12 @@ mod tests {
     fn lane_ownership_binding_includes_workflow_scope() {
         let ownership = LaneOwnership {
             owner: "claw-1".to_string(),
-            workflow_scope: "claw-code-dogfood".to_string(),
+            workflow_scope: "clawcode-dogfood".to_string(),
             watcher_action: WatcherAction::Act,
         };
 
         assert_eq!(ownership.owner, "claw-1");
-        assert_eq!(ownership.workflow_scope, "claw-code-dogfood");
+        assert_eq!(ownership.workflow_scope, "clawcode-dogfood");
         assert_eq!(ownership.watcher_action, WatcherAction::Act);
     }
 
@@ -2382,7 +2330,7 @@ mod tests {
     fn lane_ownership_attached_to_metadata() {
         let ownership = LaneOwnership {
             owner: "bot-1".to_string(),
-            workflow_scope: "claw-code-dogfood".to_string(),
+            workflow_scope: "clawcode-dogfood".to_string(),
             watcher_action: WatcherAction::Act,
         };
 
@@ -2399,7 +2347,7 @@ mod tests {
         assert_eq!(event.metadata.ownership.as_ref().unwrap().owner, "bot-1");
         assert_eq!(
             event.metadata.ownership.as_ref().unwrap().workflow_scope,
-            "claw-code-dogfood"
+            "clawcode-dogfood"
         );
         assert_eq!(
             event.metadata.ownership.as_ref().unwrap().watcher_action,
@@ -2490,7 +2438,7 @@ mod tests {
 
         let observe_ownership = LaneOwnership {
             owner: "monitor-bot".to_string(),
-            workflow_scope: "claw-code-dogfood".to_string(),
+            workflow_scope: "clawcode-dogfood".to_string(),
             watcher_action: WatcherAction::Observe,
         };
 

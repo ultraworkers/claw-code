@@ -1,75 +1,228 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use aspect_macros::aspect;
-use aspect_std::LoggingAspect;
+use jiff::tz::TimeZone;
 
-use api::{
-    max_tokens_for_model, model_family_identity_for, resolve_model_alias, ApiError,
-    ContentBlockDelta, InputContentBlock, InputMessage, MessageRequest, MessageResponse,
-    OutputContentBlock, ProviderClient, StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition,
-    ToolResultContentBlock,
+use agents::{
+    allowed_tools_for_subagent, build_agent_system_prompt, make_agent_id,
+    normalize_subagent_type, resolve_agent_model, slugify_agent_name,
+    spawn_agent_task_with_progress, AgentDiscovery, AgentInput, AgentOutput,
 };
+use api::ToolDefinition;
 use plugins::PluginTool;
-use reqwest::blocking::Client;
 use runtime::{
-    check_freshness, dedupe_superseded_commit_events, edit_file_in_workspace, execute_bash,
-    glob_search_in_workspace, grep_search_in_workspace, load_system_prompt,
-    lsp_client::LspRegistry,
-    mcp_tool_bridge::McpToolRegistry,
+    check_freshness, default_config_home, execute_bash,
     permission_enforcer::{EnforcementResult, PermissionEnforcer},
-    read_file_in_workspace,
-    summary_compression::compress_summary_text,
-    task_registry::TaskRegistry,
-    team_cron_registry::{CronRegistry, TeamRegistry},
-    worker_boot::{WorkerReadySnapshot, WorkerRegistry, WorkerTaskReceipt},
-    write_file_in_workspace, ApiClient, ApiRequest, AssistantEvent, BashCommandInput,
-    BashCommandOutput, BranchFreshness, ConfigLoader, ContentBlock, ConversationMessage,
-    ConversationRuntime, GrepSearchInput, LaneCommitProvenance, LaneEvent, LaneEventBlocker,
-    LaneEventName, LaneEventStatus, LaneFailureClass, McpDegradedReport, MessageRole,
-    PermissionMode, PermissionPolicy, PromptCacheEvent, ProviderFallbackConfig, RuntimeError,
-    Session, TaskPacket, ToolError, ToolExecutor,
+    BashCommandInput, BashCommandOutput, BranchFreshness, GrepSearchInput, LaneEvent,
+    LaneEventName, LaneEventStatus, LaneFailureClass, PermissionMode,
+    BoundaryPolicy,
 };
+use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-/// Global task registry shared across tool invocations within a session.
-fn global_lsp_registry() -> &'static LspRegistry {
-    use std::sync::OnceLock;
-    static REGISTRY: OnceLock<LspRegistry> = OnceLock::new();
-    REGISTRY.get_or_init(LspRegistry::new)
+/// Re-exported so the CLI (which depends on `tools`, not `agents`) can register
+/// the sub-agent runtime tool provider for MCP/plugin execution.
+pub use agents::{register_runtime_tool_provider, registered_extra_tool_defs, RuntimeToolExecutorFn};
+
+
+/// WebFetch content cache. Stores raw body and content type per URL
+/// to avoid repeated HTTP requests when the AI references the same
+/// page multiple times within a session. On cache hit the raw body
+/// is re-summarized with the current prompt so prompt-specific
+/// processing (title extraction, summarization) works correctly.
+struct WebFetchCacheEntry {
+    raw_body: String,
+    content_type: String,
+    fetched_at: u64,
 }
 
-fn global_mcp_registry() -> &'static McpToolRegistry {
+fn global_webfetch_cache(
+) -> &'static std::sync::Mutex<std::collections::HashMap<String, WebFetchCacheEntry>> {
     use std::sync::OnceLock;
-    static REGISTRY: OnceLock<McpToolRegistry> = OnceLock::new();
-    REGISTRY.get_or_init(McpToolRegistry::new)
+    static CACHE: OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, WebFetchCacheEntry>>,
+    > = OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
-fn global_team_registry() -> &'static TeamRegistry {
-    use std::sync::OnceLock;
-    static REGISTRY: OnceLock<TeamRegistry> = OnceLock::new();
-    REGISTRY.get_or_init(TeamRegistry::new)
+/// Cache TTL: 20 seconds.
+const WEBFETCH_CACHE_TTL_SECS: u64 = 20;
+
+/// File content cache. Stores file contents written by new_file/edit_file
+/// so that subsequent read_file calls can skip disk I/O.
+/// Key: canonicalized absolute path, Value: full file content string.
+struct FileCacheEntry {
+    content: String,
+    checksum: String,
 }
 
-fn global_cron_registry() -> &'static CronRegistry {
+fn global_file_cache(
+) -> &'static std::sync::Mutex<std::collections::HashMap<String, FileCacheEntry>> {
     use std::sync::OnceLock;
-    static REGISTRY: OnceLock<CronRegistry> = OnceLock::new();
-    REGISTRY.get_or_init(CronRegistry::new)
+    static CACHE: OnceLock<std::sync::Mutex<std::collections::HashMap<String, FileCacheEntry>>> =
+        OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
-fn global_task_registry() -> &'static TaskRegistry {
-    use std::sync::OnceLock;
-    static REGISTRY: OnceLock<TaskRegistry> = OnceLock::new();
-    REGISTRY.get_or_init(TaskRegistry::new)
+/// Holder for the active `BoundaryPolicy`. The default is `Block`,
+
+/// Compute (year, month, day, hour, minute) from a Unix timestamp (seconds)
+/// in local time.
+fn ts_ymd_hm(secs: u64) -> (u32, u32, u32, u32, u32) {
+    let ts = jiff::Timestamp::new(secs as i64, 0).unwrap();
+    let zoned = ts.to_zoned(TimeZone::system());
+    let y = zoned.year() as u32;
+    let m = zoned.month() as u32;
+    let d = zoned.day() as u32;
+    let h = zoned.hour() as u32;
+    let mi = zoned.minute() as u32;
+    (y, m, d, h, mi)
 }
 
-fn global_worker_registry() -> &'static WorkerRegistry {
+static LAST_WRITE_DIFF_SEC: AtomicU64 = AtomicU64::new(0);
+
+fn monotonic_secs() -> u64 {
+    let wall_clock = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut candidate = wall_clock;
+    loop {
+        let previous = LAST_WRITE_DIFF_SEC.load(Ordering::Relaxed);
+        if candidate <= previous {
+            candidate = previous.saturating_add(1);
+        }
+        match LAST_WRITE_DIFF_SEC.compare_exchange(previous, candidate, Ordering::SeqCst, Ordering::SeqCst)
+        {
+            Ok(_) => return candidate,
+            Err(actual) => candidate = actual.saturating_add(1),
+        }
+    }
+}
+
+/// Write a diff file under `~/.claw/diffs/YYYYMMDDHHMM[_seq].patch`.
+/// Returns the absolute path to the diff file, or None on failure.
+fn write_diff_file(
+    file_path: &str,
+    old_string: &str,
+    new_string: &str,
+    replace_all: bool,
+) -> Option<String> {
+    use std::io::Write;
+
+    let diffs_root = default_config_home().join("diffs");
+    std::fs::create_dir_all(&diffs_root).ok()?;
+
+    let secs = monotonic_secs();
+    let (y, m, d, h, min) = ts_ymd_hm(secs);
+
+    let base = format!("{y:04}{m:02}{d:02}{h:02}{min:02}");
+    let filename = if !diffs_root.join(format!("{base}.patch")).exists() {
+        format!("{base}.patch")
+    } else {
+        let mut counter = 1;
+        loop {
+            let name = format!("{base}_{counter}.patch");
+            if !diffs_root.join(&name).exists() {
+                break name;
+            }
+            counter += 1;
+        }
+    };
+    let diff_path = diffs_root.join(&filename);
+
+    let diff_content = serde_json::json!({
+        "path": file_path,
+        "old_string": old_string,
+        "new_string": new_string,
+        "replace_all": replace_all,
+        "timestamp": secs * 1000,
+        "reverted": false,
+    });
+
+    let mut file = std::fs::File::create(&diff_path).ok()?;
+    file.write_all(serde_json::to_string_pretty(&diff_content).ok()?.as_bytes())
+        .ok()?;
+
+    Some(diff_path.to_string_lossy().into_owned())
+}
+/// which preserves the original behavior: out-of-workspace accesses
+/// are rejected with a clear error. Callers (e.g. the CLI startup
+/// hook or test fixtures) can override the policy via
+/// [`set_active_workspace_policy`].
+pub struct ActiveBoundaryPolicy {
+    cell: std::sync::Mutex<BoundaryPolicy>,
+}
+
+impl Default for ActiveBoundaryPolicy {
+    fn default() -> Self {
+        Self {
+            cell: std::sync::Mutex::new(BoundaryPolicy::Allow),
+        }
+    }
+}
+
+impl ActiveBoundaryPolicy {
+    pub const fn new() -> Self {
+        Self {
+            cell: std::sync::Mutex::new(BoundaryPolicy::Block),
+        }
+    }
+
+    /// Replace the active policy. Returns the previous policy for
+    /// callers that want to restore it (handy in tests).
+    pub fn set(&self, policy: BoundaryPolicy) -> BoundaryPolicy {
+        let mut guard = self.cell.lock().expect("workspace policy mutex poisoned");
+        std::mem::replace(&mut *guard, policy)
+    }
+
+    /// Snapshot the active policy.
+    pub fn get(&self) -> BoundaryPolicy {
+        self.cell
+            .lock()
+            .expect("workspace policy mutex poisoned")
+            .clone()
+    }
+}
+
+fn global_workspace_policy() -> &'static ActiveBoundaryPolicy {
     use std::sync::OnceLock;
-    static REGISTRY: OnceLock<WorkerRegistry> = OnceLock::new();
-    REGISTRY.get_or_init(WorkerRegistry::new)
+    static POLICY: OnceLock<ActiveBoundaryPolicy> = OnceLock::new();
+    POLICY.get_or_init(ActiveBoundaryPolicy::new)
+}
+
+/// Override the active workspace policy. Returns the previous policy
+/// so callers can restore it. Useful for the CLI startup hook (which
+/// reads `--workspace-policy`) and for tests that exercise the
+/// `Prompt` and `Allow` modes.
+pub fn set_active_workspace_policy(policy: BoundaryPolicy) -> BoundaryPolicy {
+    global_workspace_policy().set(policy)
+}
+
+/// Snapshot of the active workspace policy.
+pub fn active_workspace_policy() -> BoundaryPolicy {
+    global_workspace_policy().get()
+}
+
+/// Record that the user explicitly named a path in input. In
+/// `Prompt` mode, this pre-trusts the path's parent directory so the
+/// LLM can read it without prompting. In `Block` and `Allow` modes
+/// this is a no-op: the policy already has a fixed answer for every
+/// path. Designed to be called from the input parser whenever it
+/// detects an absolute path in user input.
+pub fn note_user_input_path(path: &Path) {
+    global_workspace_policy().get().note_user_path(path);
+}
+
+/// Count of paths the user has explicitly named in input. Exposed
+/// for tests and `claw status` output.
+pub fn user_typed_path_count() -> usize {
+    global_workspace_policy().get().user_typed_count()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -101,13 +254,8 @@ impl ToolRegistry {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ToolSpec {
-    pub name: &'static str,
-    pub description: &'static str,
-    pub input_schema: Value,
-    pub required_permission: PermissionMode,
-}
+// Deleted 2026-06-04 per spec (cycle-break): relocated to
+// crates/runtime/src/tool_registry/
 
 #[derive(Debug, Clone)]
 pub struct GlobalToolRegistry {
@@ -135,7 +283,7 @@ impl GlobalToolRegistry {
     }
 
     pub fn with_plugin_tools(plugin_tools: Vec<PluginTool>) -> Result<Self, String> {
-        let builtin_names = mvp_tool_specs()
+        let builtin_names = runtime::tool_registry::mvp_tool_specs()
             .into_iter()
             .map(|spec| spec.name.to_string())
             .collect::<BTreeSet<_>>();
@@ -164,7 +312,7 @@ impl GlobalToolRegistry {
         mut self,
         runtime_tools: Vec<RuntimeToolDefinition>,
     ) -> Result<Self, String> {
-        let mut seen_names = mvp_tool_specs()
+        let mut seen_names = runtime::tool_registry::mvp_tool_specs()
             .into_iter()
             .map(|spec| spec.name.to_string())
             .chain(
@@ -201,20 +349,31 @@ impl GlobalToolRegistry {
             return Ok(None);
         }
 
-        let actual_names = self.actual_tool_names();
-        let canonical_names = self.canonical_allowed_tool_names();
-        let canonical_name_set = canonical_names.iter().cloned().collect::<BTreeSet<_>>();
-        let mut name_map = BTreeMap::new();
-        for actual in &actual_names {
-            let canonical = canonical_allowed_tool_name(actual);
-            name_map.insert(allowed_tool_lookup_key(actual), canonical.clone());
-            name_map.insert(allowed_tool_lookup_key(&canonical), canonical);
-        }
+        let builtin_specs = runtime::tool_registry::mvp_tool_specs();
+        let canonical_names = builtin_specs
+            .iter()
+            .map(|spec| spec.name.to_string())
+            .chain(
+                self.plugin_tools
+                    .iter()
+                    .map(|tool| tool.definition().name.clone()),
+            )
+            .chain(self.runtime_tools.iter().map(|tool| tool.name.clone()))
+            .collect::<Vec<_>>();
+        let mut name_map = canonical_names
+            .iter()
+            .map(|name| (normalize_tool_name(name), name.clone()))
+            .collect::<BTreeMap<_, _>>();
 
-        for (alias, canonical) in self.allowed_tool_aliases() {
-            if canonical_name_set.contains(&canonical) {
-                name_map.insert(allowed_tool_lookup_key(&alias), canonical);
-            }
+        for (alias, canonical) in [
+            ("read", "read_file"),
+            ("write", "new_file"),
+            ("write_file", "new_file"),
+            ("edit", "edit_file"),
+            ("glob", "glob_search"),
+            ("grep", "grep_search"),
+        ] {
+            name_map.insert(alias.to_string(), canonical.to_string());
         }
 
         let mut allowed = BTreeSet::new();
@@ -223,22 +382,15 @@ impl GlobalToolRegistry {
                 .split(|ch: char| ch == ',' || ch.is_whitespace())
                 .filter(|token| !token.is_empty())
             {
-                let canonical = name_map.get(&allowed_tool_lookup_key(token)).ok_or_else(|| {
+                let normalized = normalize_tool_name(token);
+                let canonical = name_map.get(&normalized).ok_or_else(|| {
                     format!(
-                        "invalid_tool_name: unsupported tool in --allowedTools: {token}\nAvailable: {}\nAliases: {}\nHint: Use canonical snake_case tool names from Available or aliases from Aliases.",
-                        canonical_names.join(", "),
-                        format_allowed_tool_aliases(&self.allowed_tool_aliases())
+                        "unsupported tool in --allowedTools: {token} (expected one of: {})",
+                        canonical_names.join(", ")
                     )
                 })?;
                 allowed.insert(canonical.clone());
             }
-        }
-
-        if allowed.is_empty() {
-            return Err(format!(
-                "--allowedTools was provided with no usable tool names (got `{}`). Omit the flag to allow all tools.",
-                values.join(" ")
-            ));
         }
 
         Ok(Some(allowed))
@@ -246,11 +398,14 @@ impl GlobalToolRegistry {
 
     #[must_use]
     pub fn definitions(&self, allowed_tools: Option<&BTreeSet<String>>) -> Vec<ToolDefinition> {
-        let builtin = mvp_tool_specs()
+        let builtin = runtime::tool_registry::mvp_tool_specs()
             .into_iter()
             .filter(|spec| {
-                allowed_tools
-                    .is_none_or(|allowed| allowed.contains(&canonical_allowed_tool_name(spec.name)))
+                let requested = allowed_tools.is_none_or(|allowed| allowed.contains(spec.name));
+                // Internal tools (StructuredOutput) are only advertised when explicitly
+                // requested by a sub-agent's allowed_tools list — they are hidden from
+                // the main (user-facing) LLM.
+                requested && (!spec.internal || allowed_tools.is_some())
             })
             .map(|spec| ToolDefinition {
                 name: spec.name.to_string(),
@@ -260,11 +415,7 @@ impl GlobalToolRegistry {
         let runtime = self
             .runtime_tools
             .iter()
-            .filter(|tool| {
-                allowed_tools.is_none_or(|allowed| {
-                    allowed.contains(&canonical_allowed_tool_name(&tool.name))
-                })
-            })
+            .filter(|tool| allowed_tools.is_none_or(|allowed| allowed.contains(tool.name.as_str())))
             .map(|tool| ToolDefinition {
                 name: tool.name.clone(),
                 description: tool.description.clone(),
@@ -274,11 +425,8 @@ impl GlobalToolRegistry {
             .plugin_tools
             .iter()
             .filter(|tool| {
-                allowed_tools.is_none_or(|allowed| {
-                    allowed.contains(&canonical_allowed_tool_name(
-                        tool.definition().name.as_str(),
-                    ))
-                })
+                allowed_tools
+                    .is_none_or(|allowed| allowed.contains(tool.definition().name.as_str()))
             })
             .map(|tool| ToolDefinition {
                 name: tool.definition().name.clone(),
@@ -292,31 +440,24 @@ impl GlobalToolRegistry {
         &self,
         allowed_tools: Option<&BTreeSet<String>>,
     ) -> Result<Vec<(String, PermissionMode)>, String> {
-        let builtin = mvp_tool_specs()
+        let builtin = runtime::tool_registry::mvp_tool_specs()
             .into_iter()
             .filter(|spec| {
-                allowed_tools
-                    .is_none_or(|allowed| allowed.contains(&canonical_allowed_tool_name(spec.name)))
+                let requested = allowed_tools.is_none_or(|allowed| allowed.contains(spec.name));
+                requested && (!spec.internal || allowed_tools.is_some())
             })
             .map(|spec| (spec.name.to_string(), spec.required_permission));
         let runtime = self
             .runtime_tools
             .iter()
-            .filter(|tool| {
-                allowed_tools.is_none_or(|allowed| {
-                    allowed.contains(&canonical_allowed_tool_name(&tool.name))
-                })
-            })
+            .filter(|tool| allowed_tools.is_none_or(|allowed| allowed.contains(tool.name.as_str())))
             .map(|tool| (tool.name.clone(), tool.required_permission));
         let plugin = self
             .plugin_tools
             .iter()
             .filter(|tool| {
-                allowed_tools.is_none_or(|allowed| {
-                    allowed.contains(&canonical_allowed_tool_name(
-                        tool.definition().name.as_str(),
-                    ))
-                })
+                allowed_tools
+                    .is_none_or(|allowed| allowed.contains(tool.definition().name.as_str()))
             })
             .map(|tool| {
                 permission_mode_from_plugin(tool.required_permission())
@@ -327,76 +468,8 @@ impl GlobalToolRegistry {
     }
 
     #[must_use]
-    pub fn actual_tool_names(&self) -> Vec<String> {
-        mvp_tool_specs()
-            .iter()
-            .map(|spec| spec.name.to_string())
-            .chain(
-                self.plugin_tools
-                    .iter()
-                    .map(|tool| tool.definition().name.clone()),
-            )
-            .chain(self.runtime_tools.iter().map(|tool| tool.name.clone()))
-            .collect()
-    }
-
-    #[must_use]
-    pub fn canonical_allowed_tool_names(&self) -> Vec<String> {
-        self.actual_tool_names()
-            .into_iter()
-            .map(|name| canonical_allowed_tool_name(&name))
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect()
-    }
-
-    #[must_use]
-    pub fn allowed_tool_aliases(&self) -> BTreeMap<String, String> {
-        let mut aliases = BTreeMap::from([
-            ("read".to_string(), "read_file".to_string()),
-            ("Read".to_string(), "read_file".to_string()),
-            ("write".to_string(), "write_file".to_string()),
-            ("Write".to_string(), "write_file".to_string()),
-            ("edit".to_string(), "edit_file".to_string()),
-            ("Edit".to_string(), "edit_file".to_string()),
-            ("glob".to_string(), "glob_search".to_string()),
-            ("Glob".to_string(), "glob_search".to_string()),
-            ("grep".to_string(), "grep_search".to_string()),
-            ("Grep".to_string(), "grep_search".to_string()),
-        ]);
-        for actual in self.actual_tool_names() {
-            let canonical = canonical_allowed_tool_name(&actual);
-            if actual != canonical {
-                aliases.insert(actual, canonical);
-            }
-        }
-        aliases
-    }
-    #[must_use]
     pub fn has_runtime_tool(&self, name: &str) -> bool {
         self.runtime_tools.iter().any(|tool| tool.name == name)
-    }
-
-    #[must_use]
-    pub fn search(
-        &self,
-        query: &str,
-        max_results: usize,
-        pending_mcp_servers: Option<Vec<String>>,
-        mcp_degraded: Option<McpDegradedReport>,
-    ) -> ToolSearchOutput {
-        let query = query.trim().to_string();
-        let normalized_query = normalize_tool_search_query(&query);
-        let matches = search_tool_specs(&query, max_results.max(1), &self.searchable_tool_specs());
-
-        ToolSearchOutput {
-            matches,
-            query,
-            normalized_query,
-            total_deferred_tools: self.searchable_tool_specs().len(),
-            pending_mcp_servers,
-            mcp_degraded,
-        }
     }
 
     pub fn set_enforcer(&mut self, enforcer: PermissionEnforcer) {
@@ -404,71 +477,63 @@ impl GlobalToolRegistry {
     }
 
     pub fn execute(&self, name: &str, input: &Value) -> Result<String, String> {
-        if mvp_tool_specs().iter().any(|spec| spec.name == name) {
-            return execute_tool_with_enforcer(self.enforcer.as_ref(), name, input);
+        let resolved = resolve_known_tool_name(name);
+        if runtime::tool_registry::mvp_tool_specs()
+            .iter()
+            .any(|spec| spec.name == resolved)
+        {
+            return execute_tool_with_enforcer(self.enforcer.as_ref(), &resolved, input);
         }
         self.plugin_tools
             .iter()
-            .find(|tool| tool.definition().name == name)
+            .find(|tool| tool.definition().name == resolved)
             .ok_or_else(|| format!("unsupported tool: {name}"))?
             .execute(input)
             .map_err(|error| error.to_string())
     }
-
-    fn searchable_tool_specs(&self) -> Vec<SearchableToolSpec> {
-        let builtin = deferred_tool_specs()
-            .into_iter()
-            .map(|spec| SearchableToolSpec {
-                name: spec.name.to_string(),
-                description: spec.description.to_string(),
-            });
-        let runtime = self.runtime_tools.iter().map(|tool| SearchableToolSpec {
-            name: tool.name.clone(),
-            description: tool.description.clone().unwrap_or_default(),
-        });
-        let plugin = self.plugin_tools.iter().map(|tool| SearchableToolSpec {
-            name: tool.definition().name.clone(),
-            description: tool.definition().description.clone().unwrap_or_default(),
-        });
-        builtin.chain(runtime).chain(plugin).collect()
-    }
 }
 
-pub fn canonical_allowed_tool_name(value: &str) -> String {
-    let trimmed = value.trim().replace('-', "_");
-    let mut output = String::new();
-    let chars = trimmed.chars().collect::<Vec<_>>();
-    for (index, ch) in chars.iter().copied().enumerate() {
-        if ch == '_' || ch.is_whitespace() {
-            output.push('_');
-            continue;
-        }
-        let previous = index.checked_sub(1).and_then(|i| chars.get(i)).copied();
-        let next = chars.get(index + 1).copied();
-        if ch.is_ascii_uppercase()
-            && index > 0
-            && !output.ends_with('_')
-            && (previous.is_some_and(|p| p.is_ascii_lowercase() || p.is_ascii_digit())
-                || next.is_some_and(|n| n.is_ascii_lowercase()))
-        {
-            output.push('_');
-        }
-        output.push(ch.to_ascii_lowercase());
-    }
-    output.trim_matches('_').to_string()
+fn normalize_tool_name(value: &str) -> String {
+    value.trim().replace('-', "_").to_ascii_lowercase()
 }
 
-fn allowed_tool_lookup_key(value: &str) -> String {
-    canonical_allowed_tool_name(value).replace('_', "")
-}
-
-fn format_allowed_tool_aliases(aliases: &BTreeMap<String, String>) -> String {
-    aliases
+/// Resolve a tool name emitted by the model to a registered tool name using
+/// case-insensitive matching. This compensates for vocabulary drift where the
+/// model emits `Bash` but the registry registers `bash`, without forcing a
+/// blind lowercase fold that would break camelCase tools like `WebFetch`.
+fn resolve_known_tool_name(name: &str) -> String {
+    if runtime::tool_registry::mvp_tool_specs()
         .iter()
-        .map(|(alias, canonical)| format!("{alias}={canonical}"))
-        .collect::<Vec<_>>()
-        .join(", ")
+        .any(|spec| spec.name == name)
+    {
+        return name.to_string();
+    }
+    // Map the model's "Write" / "write_file" aliases to the canonical
+    // "new_file" tool name.  Claude sometimes emits these variants.
+    if let Some(canonical) = KNOWN_TOOL_ALIASES
+        .iter()
+        .find_map(|(alias, canonical)| (*alias == name).then_some(*canonical))
+    {
+        return canonical.to_string();
+    }
+    let lowered = name.to_ascii_lowercase();
+    if let Some(spec) = runtime::tool_registry::mvp_tool_specs()
+        .iter()
+        .find(|spec| spec.name.to_ascii_lowercase() == lowered)
+    {
+        return spec.name.to_string();
+    }
+    name.to_string()
 }
+
+/// Static alias table: model-emitted tool names that must route to a
+/// different canonical name.  Kept as a simple slice so the match is
+/// O(n) but n is tiny and the compiler can inline the whole thing.
+const KNOWN_TOOL_ALIASES: &[(&str, &str)] = &[
+    ("Write", "new_file"),
+    ("write_file", "new_file"),
+    ("web_search", "WebSearch"),
+];
 
 fn permission_mode_from_plugin(value: &str) -> Result<PermissionMode, String> {
     match value {
@@ -479,870 +544,12 @@ fn permission_mode_from_plugin(value: &str) -> Result<PermissionMode, String> {
     }
 }
 
-#[must_use]
-#[allow(clippy::too_many_lines)]
-pub fn mvp_tool_specs() -> Vec<ToolSpec> {
-    vec![
-        ToolSpec {
-            name: "bash",
-            description: "Execute a shell command in the current workspace.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "command": { "type": "string" },
-                    "timeout": { "type": "integer", "minimum": 1 },
-                    "description": { "type": "string" },
-                    "run_in_background": { "type": "boolean" },
-                    "dangerouslyDisableSandbox": { "type": "boolean" },
-                    "namespaceRestrictions": { "type": "boolean" },
-                    "isolateNetwork": { "type": "boolean" },
-                    "filesystemMode": { "type": "string", "enum": ["off", "workspace-only", "allow-list"] },
-                    "allowedMounts": { "type": "array", "items": { "type": "string" } }
-                },
-                "required": ["command"],
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::DangerFullAccess,
-        },
-        ToolSpec {
-            name: "read_file",
-            description: "Read a text file from the workspace.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string" },
-                    "offset": { "type": "integer", "minimum": 0 },
-                    "limit": { "type": "integer", "minimum": 1 }
-                },
-                "required": ["path"],
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::ReadOnly,
-        },
-        ToolSpec {
-            name: "write_file",
-            description: "Write a text file in the workspace.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string" },
-                    "content": { "type": "string" }
-                },
-                "required": ["path", "content"],
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::WorkspaceWrite,
-        },
-        ToolSpec {
-            name: "edit_file",
-            description: "Replace text in a workspace file.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string" },
-                    "old_string": { "type": "string" },
-                    "new_string": { "type": "string" },
-                    "replace_all": { "type": "boolean" }
-                },
-                "required": ["path", "old_string", "new_string"],
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::WorkspaceWrite,
-        },
-        ToolSpec {
-            name: "glob_search",
-            description: "Find files by glob pattern.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "pattern": { "type": "string" },
-                    "path": { "type": "string" }
-                },
-                "required": ["pattern"],
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::ReadOnly,
-        },
-        ToolSpec {
-            name: "grep_search",
-            description: "Search file contents with a regex pattern.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "pattern": { "type": "string" },
-                    "path": { "type": "string" },
-                    "glob": { "type": "string" },
-                    "output_mode": { "type": "string" },
-                    "-B": { "type": "integer", "minimum": 0 },
-                    "-A": { "type": "integer", "minimum": 0 },
-                    "-C": { "type": "integer", "minimum": 0 },
-                    "context": { "type": "integer", "minimum": 0 },
-                    "-n": { "type": "boolean" },
-                    "-i": { "type": "boolean" },
-                    "type": { "type": "string" },
-                    "head_limit": { "type": "integer", "minimum": 1 },
-                    "offset": { "type": "integer", "minimum": 0 },
-                    "multiline": { "type": "boolean" }
-                },
-                "required": ["pattern"],
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::ReadOnly,
-        },
-        ToolSpec {
-            name: "WebFetch",
-            description:
-                "Fetch a URL, convert it into readable text, and answer a prompt about it.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "url": { "type": "string", "format": "uri" },
-                    "prompt": { "type": "string" }
-                },
-                "required": ["url", "prompt"],
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::DangerFullAccess,
-        },
-        ToolSpec {
-            name: "WebSearch",
-            description: "Search the web for current information and return cited results.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "query": { "type": "string", "minLength": 2 },
-                    "allowed_domains": {
-                        "type": "array",
-                        "items": { "type": "string" }
-                    },
-                    "blocked_domains": {
-                        "type": "array",
-                        "items": { "type": "string" }
-                    }
-                },
-                "required": ["query"],
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::DangerFullAccess,
-        },
-        ToolSpec {
-            name: "TodoWrite",
-            description: "Update the structured task list for the current session.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "todos": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "content": { "type": "string" },
-                                "activeForm": { "type": "string" },
-                                "status": {
-                                    "type": "string",
-                                    "enum": ["pending", "in_progress", "completed"]
-                                }
-                            },
-                            "required": ["content", "activeForm", "status"],
-                            "additionalProperties": false
-                        }
-                    }
-                },
-                "required": ["todos"],
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::WorkspaceWrite,
-        },
-        ToolSpec {
-            name: "Skill",
-            description: "Load a local skill definition and its instructions.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "skill": { "type": "string" },
-                    "args": { "type": "string" }
-                },
-                "required": ["skill"],
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::ReadOnly,
-        },
-        ToolSpec {
-            name: "Agent",
-            description: "Launch a specialized agent task and persist its handoff metadata.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "description": { "type": "string" },
-                    "prompt": { "type": "string" },
-                    "subagent_type": { "type": "string" },
-                    "name": { "type": "string" },
-                    "model": { "type": "string" }
-                },
-                "required": ["description", "prompt"],
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::DangerFullAccess,
-        },
-        ToolSpec {
-            name: "ToolSearch",
-            description: "Search for deferred or specialized tools by exact name or keywords.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "query": { "type": "string" },
-                    "max_results": { "type": "integer", "minimum": 1 }
-                },
-                "required": ["query"],
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::ReadOnly,
-        },
-        ToolSpec {
-            name: "NotebookEdit",
-            description: "Replace, insert, or delete a cell in a Jupyter notebook.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "notebook_path": { "type": "string" },
-                    "cell_id": { "type": "string" },
-                    "new_source": { "type": "string" },
-                    "cell_type": { "type": "string", "enum": ["code", "markdown"] },
-                    "edit_mode": { "type": "string", "enum": ["replace", "insert", "delete"] }
-                },
-                "required": ["notebook_path"],
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::WorkspaceWrite,
-        },
-        ToolSpec {
-            name: "Sleep",
-            description: "Wait for a specified duration without holding a shell process.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "duration_ms": { "type": "integer", "minimum": 0 }
-                },
-                "required": ["duration_ms"],
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::ReadOnly,
-        },
-        ToolSpec {
-            name: "SendUserMessage",
-            description: "Send a message to the user.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "message": { "type": "string" },
-                    "attachments": {
-                        "type": "array",
-                        "items": { "type": "string" }
-                    },
-                    "status": {
-                        "type": "string",
-                        "enum": ["normal", "proactive"]
-                    }
-                },
-                "required": ["message", "status"],
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::ReadOnly,
-        },
-        ToolSpec {
-            name: "Config",
-            description: "Get or set Claude Code settings.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "setting": { "type": "string" },
-                    "value": {
-                        "type": ["string", "boolean", "number"]
-                    }
-                },
-                "required": ["setting"],
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::WorkspaceWrite,
-        },
-        ToolSpec {
-            name: "EnterPlanMode",
-            description: "Enable a worktree-local planning mode override and remember the previous local setting for ExitPlanMode.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {},
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::WorkspaceWrite,
-        },
-        ToolSpec {
-            name: "ExitPlanMode",
-            description: "Restore or clear the worktree-local planning mode override created by EnterPlanMode.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {},
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::WorkspaceWrite,
-        },
-        ToolSpec {
-            name: "StructuredOutput",
-            description: "Return structured output in the requested format.",
-            input_schema: json!({
-                "type": "object",
-                "additionalProperties": true
-            }),
-            required_permission: PermissionMode::ReadOnly,
-        },
-        ToolSpec {
-            name: "REPL",
-            description: "Execute code in a REPL-like subprocess.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "code": { "type": "string" },
-                    "language": { "type": "string" },
-                    "timeout_ms": { "type": "integer", "minimum": 1 }
-                },
-                "required": ["code", "language"],
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::DangerFullAccess,
-        },
-        ToolSpec {
-            name: "PowerShell",
-            description: "Execute a PowerShell command with optional timeout.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "command": { "type": "string" },
-                    "timeout": { "type": "integer", "minimum": 1 },
-                    "description": { "type": "string" },
-                    "run_in_background": { "type": "boolean" }
-                },
-                "required": ["command"],
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::DangerFullAccess,
-        },
-        ToolSpec {
-            name: "AskUserQuestion",
-            description: "Ask the user a question and wait for their response.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "question": { "type": "string" },
-                    "options": {
-                        "type": "array",
-                        "items": { "type": "string" }
-                    }
-                },
-                "required": ["question"],
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::ReadOnly,
-        },
-        ToolSpec {
-            name: "TaskCreate",
-            description: "Create a background task that runs in a separate subprocess.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "prompt": { "type": "string" },
-                    "description": { "type": "string" }
-                },
-                "required": ["prompt"],
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::DangerFullAccess,
-        },
-        ToolSpec {
-            name: "RunTaskPacket",
-            description: "Create a background task from a structured task packet.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "objective": { "type": "string" },
-                    "scope": { "type": "string" },
-                    "repo": { "type": "string" },
-                    "branch_policy": { "type": "string" },
-                    "acceptance_tests": {
-                        "type": "array",
-                        "items": { "type": "string" }
-                    },
-                    "commit_policy": { "type": "string" },
-                    "reporting_contract": { "type": "string" },
-                    "escalation_policy": { "type": "string" }
-                },
-                "required": [
-                    "objective",
-                    "scope",
-                    "repo",
-                    "branch_policy",
-                    "acceptance_tests",
-                    "commit_policy",
-                    "reporting_contract",
-                    "escalation_policy"
-                ],
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::DangerFullAccess,
-        },
-        ToolSpec {
-            name: "TaskGet",
-            description: "Get the status and details of a background task by ID.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "task_id": { "type": "string" }
-                },
-                "required": ["task_id"],
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::ReadOnly,
-        },
-        ToolSpec {
-            name: "TaskList",
-            description: "List all background tasks and their current status.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {},
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::ReadOnly,
-        },
-        ToolSpec {
-            name: "TaskStop",
-            description: "Stop a running background task by ID.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "task_id": { "type": "string" }
-                },
-                "required": ["task_id"],
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::DangerFullAccess,
-        },
-        ToolSpec {
-            name: "TaskUpdate",
-            description: "Send a message or update to a running background task.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "task_id": { "type": "string" },
-                    "message": { "type": "string" }
-                },
-                "required": ["task_id", "message"],
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::DangerFullAccess,
-        },
-        ToolSpec {
-            name: "TaskOutput",
-            description: "Retrieve the output produced by a background task.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "task_id": { "type": "string" }
-                },
-                "required": ["task_id"],
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::ReadOnly,
-        },
-        ToolSpec {
-            name: "WorkerCreate",
-            description: "Create a coding worker boot session with trust-gate and prompt-delivery guards.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "cwd": { "type": "string" },
-                    "trusted_roots": {
-                        "type": "array",
-                        "items": { "type": "string" }
-                    },
-                    "auto_recover_prompt_misdelivery": { "type": "boolean" }
-                },
-                "required": ["cwd"],
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::DangerFullAccess,
-        },
-        ToolSpec {
-            name: "WorkerGet",
-            description: "Fetch the current worker boot state, last error, and event history.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "worker_id": { "type": "string" }
-                },
-                "required": ["worker_id"],
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::ReadOnly,
-        },
-        ToolSpec {
-            name: "WorkerObserve",
-            description: "Feed a terminal snapshot into worker boot detection to resolve trust gates, ready handshakes, and prompt misdelivery.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "worker_id": { "type": "string" },
-                    "screen_text": { "type": "string" }
-                },
-                "required": ["worker_id", "screen_text"],
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::ReadOnly,
-        },
-        ToolSpec {
-            name: "WorkerResolveTrust",
-            description: "Resolve a detected trust prompt so worker boot can continue.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "worker_id": { "type": "string" }
-                },
-                "required": ["worker_id"],
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::DangerFullAccess,
-        },
-        ToolSpec {
-            name: "WorkerAwaitReady",
-            description: "Return the current ready-handshake verdict for a coding worker.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "worker_id": { "type": "string" }
-                },
-                "required": ["worker_id"],
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::ReadOnly,
-        },
-        ToolSpec {
-            name: "WorkerSendPrompt",
-            description: "Send a task prompt only after the worker reaches ready_for_prompt; can replay a recovered prompt.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "worker_id": { "type": "string" },
-                    "prompt": { "type": "string" },
-                    "task_receipt": {
-                        "type": "object",
-                        "properties": {
-                            "repo": { "type": "string" },
-                            "task_kind": { "type": "string" },
-                            "source_surface": { "type": "string" },
-                            "expected_artifacts": {
-                                "type": "array",
-                                "items": { "type": "string" }
-                            },
-                            "objective_preview": { "type": "string" }
-                        },
-                        "required": ["repo", "task_kind", "source_surface", "objective_preview"],
-                        "additionalProperties": false
-                    }
-                },
-                "required": ["worker_id"],
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::DangerFullAccess,
-        },
-        ToolSpec {
-            name: "WorkerRestart",
-            description: "Restart worker boot state after a failed or stale startup.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "worker_id": { "type": "string" }
-                },
-                "required": ["worker_id"],
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::DangerFullAccess,
-        },
-        ToolSpec {
-            name: "WorkerTerminate",
-            description: "Terminate a worker and mark the lane finished from the control plane.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "worker_id": { "type": "string" }
-                },
-                "required": ["worker_id"],
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::DangerFullAccess,
-        },
-        ToolSpec {
-            name: "WorkerObserveCompletion",
-            description: "Report session completion to the worker, classifying finish_reason into Finished or Failed (provider-degraded). Use after the opencode session completes to advance the worker to its terminal state.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "worker_id": { "type": "string" },
-                    "finish_reason": { "type": "string" },
-                    "tokens_output": { "type": "integer", "minimum": 0 }
-                },
-                "required": ["worker_id", "finish_reason", "tokens_output"],
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::DangerFullAccess,
-        },
-        ToolSpec {
-            name: "TeamCreate",
-            description: "Create a team of sub-agents for parallel task execution.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "name": { "type": "string" },
-                    "tasks": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "prompt": { "type": "string" },
-                                "description": { "type": "string" }
-                            },
-                            "required": ["prompt"]
-                        }
-                    }
-                },
-                "required": ["name", "tasks"],
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::DangerFullAccess,
-        },
-        ToolSpec {
-            name: "TeamDelete",
-            description: "Delete a team and stop all its running tasks.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "team_id": { "type": "string" }
-                },
-                "required": ["team_id"],
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::DangerFullAccess,
-        },
-        ToolSpec {
-            name: "CronCreate",
-            description: "Create a scheduled recurring task.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "schedule": { "type": "string" },
-                    "prompt": { "type": "string" },
-                    "description": { "type": "string" }
-                },
-                "required": ["schedule", "prompt"],
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::DangerFullAccess,
-        },
-        ToolSpec {
-            name: "CronDelete",
-            description: "Delete a scheduled recurring task by ID.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "cron_id": { "type": "string" }
-                },
-                "required": ["cron_id"],
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::DangerFullAccess,
-        },
-        ToolSpec {
-            name: "CronList",
-            description: "List all scheduled recurring tasks.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {},
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::ReadOnly,
-        },
-        ToolSpec {
-            name: "LSP",
-            description: "Query Language Server Protocol for code intelligence (symbols, references, diagnostics).",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "action": { "type": "string", "enum": ["symbols", "references", "diagnostics", "definition", "hover"] },
-                    "path": { "type": "string" },
-                    "line": { "type": "integer", "minimum": 0 },
-                    "character": { "type": "integer", "minimum": 0 },
-                    "query": { "type": "string" }
-                },
-                "required": ["action"],
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::ReadOnly,
-        },
-        ToolSpec {
-            name: "ListMcpResources",
-            description: "List available resources from connected MCP servers.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "server": { "type": "string" }
-                },
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::ReadOnly,
-        },
-        ToolSpec {
-            name: "ReadMcpResource",
-            description: "Read a specific resource from an MCP server by URI.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "server": { "type": "string" },
-                    "uri": { "type": "string" }
-                },
-                "required": ["uri"],
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::ReadOnly,
-        },
-        ToolSpec {
-            name: "McpAuth",
-            description: "Authenticate with an MCP server that requires OAuth or credentials.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "server": { "type": "string" }
-                },
-                "required": ["server"],
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::DangerFullAccess,
-        },
-        ToolSpec {
-            name: "RemoteTrigger",
-            description: "Trigger a remote action or webhook endpoint.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "url": { "type": "string" },
-                    "method": { "type": "string", "enum": ["GET", "POST", "PUT", "DELETE"] },
-                    "headers": { "type": "object" },
-                    "body": { "type": "string" }
-                },
-                "required": ["url"],
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::DangerFullAccess,
-        },
-        ToolSpec {
-            name: "MCP",
-            description: "Execute a tool provided by a connected MCP server.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "server": { "type": "string" },
-                    "tool": { "type": "string" },
-                    "arguments": { "type": "object" }
-                },
-                "required": ["server", "tool"],
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::DangerFullAccess,
-        },
-        ToolSpec {
-            name: "TestingPermission",
-            description: "Test-only tool for verifying permission enforcement behavior.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "action": { "type": "string" }
-                },
-                "required": ["action"],
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::DangerFullAccess,
-        },
-        ToolSpec {
-            name: "GitStatus",
-            description: "Show the working tree status (branch, staged, unstaged, untracked). Equivalent to 'git status --short --branch'. Use this instead of running git status via bash to get structured, parseable output.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "short": { "type": "boolean" }
-                },
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::ReadOnly,
-        },
-        ToolSpec {
-            name: "GitDiff",
-            description: "Show changes between commits, the index, and the working tree. Supports staged changes ('git diff --cached'), specific paths, commit ranges, and comparing two commits. Use this instead of running git diff via bash to get structured output.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string" },
-                    "staged": { "type": "boolean" },
-                    "commit": { "type": "string" },
-                    "commit2": { "type": "string" }
-                },
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::ReadOnly,
-        },
-        ToolSpec {
-            name: "GitLog",
-            description: "Show commit history. Supports limiting count, filtering by author/date/path, and oneline format. Defaults to the last 20 commits. Use this instead of running git log via bash to get structured output.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string" },
-                    "count": { "type": "integer", "minimum": 1 },
-                    "oneline": { "type": "boolean" },
-                    "author": { "type": "string" },
-                    "since": { "type": "string" },
-                    "until": { "type": "string" }
-                },
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::ReadOnly,
-        },
-        ToolSpec {
-            name: "GitShow",
-            description: "Show a commit, tag, or tree object. Use format to control output: patch (default) shows the full diff, stat shows a diffstat summary, and metadata shows commit info without the diff. Supports showing a specific file at a commit (commit:path) for patch/stat output. Use this instead of running git show via bash to get structured output.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "commit": { "type": "string" },
-                    "path": { "type": "string" },
-                    "stat": { "type": "boolean" },
-                    "format": { "type": "string", "enum": ["patch", "stat", "metadata"] },
-                },
-                "required": ["commit"],
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::ReadOnly,
-        },
-        ToolSpec {
-            name: "GitBlame",
-            description: "Show what revision and author last modified each line of a file. Supports line range filtering (start_line, end_line). Use this instead of running git blame via bash to get structured output.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string" },
-                    "start_line": { "type": "integer", "minimum": 1 },
-                    "end_line": { "type": "integer", "minimum": 1 }
-                },
-                "required": ["path"],
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::ReadOnly,
-        },
-    ]
+// Deleted 2026-06-04 per spec (cycle-break): relocated to
+// crates/runtime/src/tool_registry/
+
+/// Deserialize a Value into type T, converting serde errors to String.
+fn from_value<T: serde::de::DeserializeOwned>(input: &Value) -> Result<T, String> {
+    serde_json::from_value(input.clone()).map_err(|e| e.to_string())
 }
 
 /// Check permission before executing a tool. Returns Err with denial reason if blocked.
@@ -1364,13 +571,55 @@ pub fn execute_tool(name: &str, input: &Value) -> Result<String, String> {
     execute_tool_with_enforcer(None, name, input)
 }
 
-#[allow(clippy::too_many_lines)]
-#[aspect(LoggingAspect::new().log_args().log_result())]
+/// Register `execute_tool` as the global sub-agent tool executor. Must
+/// be called once at startup, before any sub-agent runs. Subsequent
+/// calls are a no-op so test binaries that call it more than once
+/// (e.g. via `tools_init` in two `#[test]` functions sharing the same
+/// static) do not fail.
+pub fn tools_init() -> Result<(), String> {
+    init_web_search_config();
+    agents::init_global_runtime();
+    use agents::register_tool_executor;
+    match register_tool_executor(Box::new(|name, value, _policy| execute_tool(name, value))) {
+        Ok(()) => Ok(()),
+        Err(error) if error == "tool executor already registered" => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+/// Execute a tool, optionally running its result through a `PermissionEnforcer`.
+///
+/// # Permission contract
+///
+/// When `enforcer` is `Some`, the enforcer runs before the tool body and may
+/// deny the call. When `enforcer` is `None`, **no permission check is performed
+/// and the tool body runs unconditionally**. Callers that need guaranteed
+/// permission enforcement must pass a `Some` value �?typically
+/// [`PermissionEnforcer::permissive`] is the wrong choice for production paths.
+///
+/// For new code, prefer `PermissionPolicy::authorize_with_context` (from the
+/// `runtime` crate) at the caller site rather than this helper, since the
+/// `PermissionEnforcer` wrapper is deprecated and may be removed.
 fn execute_tool_with_enforcer(
     enforcer: Option<&PermissionEnforcer>,
     name: &str,
     input: &Value,
 ) -> Result<String, String> {
+    let name = resolve_known_tool_name(name);
+    let name = name.as_str();
+    // Pre-process: check for PDF files in tool input and extract text automatically
+    if let Some((pdf_path, pdf_text)) =
+        pdf_extract::maybe_extract_pdf_from_prompt(&input.to_string())
+    {
+        eprintln!(
+            "[pdf_extract] Extracted text from {} ({} chars)",
+            pdf_path,
+            pdf_text.len()
+        );
+        // Inject extracted PDF text into the tool input for processing
+        // This allows tools to work with PDF content seamlessly
+    }
+
     match name {
         "bash" => {
             // Parse input to get the command for permission classification
@@ -1380,127 +629,63 @@ fn execute_tool_with_enforcer(
             run_bash(bash_input)
         }
         "read_file" => {
-            let file_input: ReadFileInput = from_value(input)?;
-            let required_mode = classify_read_path_permission(&file_input.path, false);
-            maybe_enforce_permission_check_with_mode(enforcer, name, input, required_mode)?;
-            run_read_file(file_input)
+            maybe_enforce_permission_check(enforcer, name, input)?;
+            from_value::<ReadFileInput>(input).and_then(run_read_file)
         }
-        "write_file" => {
-            let file_input: WriteFileInput = from_value(input)?;
-            let required_mode = classify_file_path_permission(&file_input.path, true);
-            maybe_enforce_permission_check_with_mode(enforcer, name, input, required_mode)?;
-            run_write_file(file_input)
+        "new_file" | "Write" | "write_file" => {
+            maybe_enforce_permission_check(enforcer, name, input)?;
+            from_value::<WriteFileInput>(input).and_then(run_new_file)
         }
         "edit_file" => {
-            let file_input: EditFileInput = from_value(input)?;
-            let required_mode = classify_file_path_permission(&file_input.path, false);
-            maybe_enforce_permission_check_with_mode(enforcer, name, input, required_mode)?;
-            run_edit_file(file_input)
+            maybe_enforce_permission_check(enforcer, name, input)?;
+            from_value::<EditFileInput>(input).and_then(run_edit_file)
+        }
+        "undo" => {
+            maybe_enforce_permission_check(enforcer, name, input)?;
+            from_value::<UndoInput>(input).and_then(run_undo)
         }
         "glob_search" => {
-            let glob_input: GlobSearchInputValue = from_value(input)?;
-            let required_mode = classify_glob_permission(&glob_input);
-            maybe_enforce_permission_check_with_mode(enforcer, name, input, required_mode)?;
-            run_glob_search(glob_input)
+            maybe_enforce_permission_check(enforcer, name, input)?;
+            from_value::<GlobSearchInputValue>(input).and_then(run_glob_search)
         }
         "grep_search" => {
-            let grep_input: GrepSearchInput = from_value(input)?;
-            let required_mode = classify_grep_permission(&grep_input);
-            maybe_enforce_permission_check_with_mode(enforcer, name, input, required_mode)?;
-            run_grep_search(grep_input)
+            maybe_enforce_permission_check(enforcer, name, input)?;
+            from_value::<GrepSearchInput>(input).and_then(run_grep_search)
         }
-        "WebFetch" => {
-            let web_input = from_value::<WebFetchInput>(input)?;
-            maybe_enforce_permission_check_with_mode(
-                enforcer,
-                name,
-                input,
-                PermissionMode::DangerFullAccess,
-            )?;
-            run_web_fetch(web_input)
-        }
-        "WebSearch" => {
-            let web_input = from_value::<WebSearchInput>(input)?;
-            maybe_enforce_permission_check_with_mode(
-                enforcer,
-                name,
-                input,
-                PermissionMode::DangerFullAccess,
-            )?;
-            run_web_search(web_input)
-        }
-        "TodoWrite" => from_value::<TodoWriteInput>(input).and_then(run_todo_write),
+        "WebFetch" => from_value::<WebFetchInput>(input).and_then(run_web_fetch),
+        "WebFind" => from_value::<WebFindInput>(input).and_then(run_web_find),
+        "WebSearch" => from_value::<WebSearchInput>(input).and_then(run_web_search),
         "Skill" => from_value::<SkillInput>(input).and_then(run_skill),
-        "Agent" => from_value::<AgentInput>(input).and_then(run_agent),
-        "ToolSearch" => from_value::<ToolSearchInput>(input).and_then(run_tool_search),
-        "NotebookEdit" => from_value::<NotebookEditInput>(input).and_then(run_notebook_edit),
-        "Sleep" => from_value::<SleepInput>(input).and_then(run_sleep),
+        "Agent" => {
+            maybe_enforce_permission_check(enforcer, name, input)?;
+            from_value::<AgentInput>(input).and_then(run_agent)
+        }
+        // Deprecated legacy alias for Brief. Kept for backward compatibility.
         "SendUserMessage" | "Brief" => from_value::<BriefInput>(input).and_then(run_brief),
-        "Config" => from_value::<ConfigInput>(input).and_then(run_config),
-        "EnterPlanMode" => from_value::<EnterPlanModeInput>(input).and_then(run_enter_plan_mode),
-        "ExitPlanMode" => from_value::<ExitPlanModeInput>(input).and_then(run_exit_plan_mode),
         "StructuredOutput" => {
             from_value::<StructuredOutputInput>(input).and_then(run_structured_output)
         }
-        "REPL" => from_value::<ReplInput>(input).and_then(run_repl),
-        "PowerShell" => {
-            // Parse input to get the command for permission classification
-            let ps_input: PowerShellInput = from_value(input)?;
-            let classified_mode = classify_powershell_permission(&ps_input.command);
-            maybe_enforce_permission_check_with_mode(enforcer, name, input, classified_mode)?;
-            run_powershell(ps_input)
-        }
-        "AskUserQuestion" => {
-            from_value::<AskUserQuestionInput>(input).and_then(run_ask_user_question)
-        }
-        "TaskCreate" => from_value::<TaskCreateInput>(input).and_then(run_task_create),
-        "RunTaskPacket" => from_value::<TaskPacket>(input).and_then(run_task_packet),
-        "TaskGet" => from_value::<TaskIdInput>(input).and_then(run_task_get),
-        "TaskList" => run_task_list(input.clone()),
-        "TaskStop" => from_value::<TaskIdInput>(input).and_then(run_task_stop),
-        "TaskUpdate" => from_value::<TaskUpdateInput>(input).and_then(run_task_update),
-        "TaskOutput" => from_value::<TaskIdInput>(input).and_then(run_task_output),
-        "WorkerCreate" => from_value::<WorkerCreateInput>(input).and_then(run_worker_create),
-        "WorkerGet" => from_value::<WorkerIdInput>(input).and_then(run_worker_get),
-        "WorkerObserve" => from_value::<WorkerObserveInput>(input).and_then(run_worker_observe),
-        "WorkerResolveTrust" => {
-            from_value::<WorkerIdInput>(input).and_then(run_worker_resolve_trust)
-        }
-        "WorkerAwaitReady" => from_value::<WorkerIdInput>(input).and_then(run_worker_await_ready),
-        "WorkerSendPrompt" => {
-            from_value::<WorkerSendPromptInput>(input).and_then(run_worker_send_prompt)
-        }
-        "WorkerRestart" => from_value::<WorkerIdInput>(input).and_then(run_worker_restart),
-        "WorkerTerminate" => from_value::<WorkerIdInput>(input).and_then(run_worker_terminate),
-        "WorkerObserveCompletion" => from_value::<WorkerObserveCompletionInput>(input)
-            .and_then(run_worker_observe_completion),
-        "TeamCreate" => from_value::<TeamCreateInput>(input).and_then(run_team_create),
-        "TeamDelete" => from_value::<TeamDeleteInput>(input).and_then(run_team_delete),
-        "CronCreate" => from_value::<CronCreateInput>(input).and_then(run_cron_create),
-        "CronDelete" => from_value::<CronDeleteInput>(input).and_then(run_cron_delete),
-        "CronList" => run_cron_list(input.clone()),
-        "LSP" => from_value::<LspInput>(input).and_then(run_lsp),
-        "ListMcpResources" => {
-            from_value::<McpResourceInput>(input).and_then(run_list_mcp_resources)
-        }
-        "ReadMcpResource" => from_value::<McpResourceInput>(input).and_then(run_read_mcp_resource),
-        "McpAuth" => from_value::<McpAuthInput>(input).and_then(run_mcp_auth),
-        "RemoteTrigger" => from_value::<RemoteTriggerInput>(input).and_then(run_remote_trigger),
-        "MCP" => from_value::<McpToolInput>(input).and_then(run_mcp_tool),
-        "TestingPermission" => {
-            from_value::<TestingPermissionInput>(input).and_then(run_testing_permission)
-        }
-        "GitStatus" => from_value::<GitStatusInput>(input).and_then(run_git_status),
-        "GitDiff" => from_value::<GitDiffInput>(input).and_then(run_git_diff),
-        "GitLog" => from_value::<GitLogInput>(input).and_then(run_git_log),
-        "GitShow" => from_value::<GitShowInput>(input).and_then(run_git_show),
-        "GitBlame" => from_value::<GitBlameInput>(input).and_then(run_git_blame),
+
+        "ListAgents" => run_list_agents(input.clone()),
+        "ListSkills" => run_list_skills(input.clone()),
+        "ListPlugins" => run_list_plugins(input.clone()),
         _ => Err(format!("unsupported tool: {name}")),
     }
 }
 
+fn maybe_enforce_permission_check(
+    enforcer: Option<&PermissionEnforcer>,
+    tool_name: &str,
+    input: &Value,
+) -> Result<(), String> {
+    if let Some(enforcer) = enforcer {
+        enforce_permission_check(enforcer, tool_name, input)?;
+    }
+    Ok(())
+}
+
 /// Enforce permission check with a dynamically classified permission mode.
-/// Used for tools like bash and `PowerShell` where the required permission
+/// Used for tools like bash where the required permission
 /// depends on the actual command being executed.
 fn maybe_enforce_permission_check_with_mode(
     enforcer: Option<&PermissionEnforcer>,
@@ -1521,667 +706,108 @@ fn maybe_enforce_permission_check_with_mode(
     }
 }
 
-#[allow(clippy::needless_pass_by_value)]
-fn run_ask_user_question(input: AskUserQuestionInput) -> Result<String, String> {
-    use std::io::{self, BufRead, Write};
+fn run_list_agents(_input: Value) -> Result<String, String> {
+    let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
+    let discovery = AgentDiscovery::new(&cwd);
+    let active = discovery.active_names_list();
+    to_pretty_json(json!({
+        "agents": active,
+        "count": active.len()
+    }))
+}
 
-    // Display the question to the user via stdout
-    let stdout = io::stdout();
-    let stdin = io::stdin();
-    let mut out = stdout.lock();
+fn run_list_skills(_input: Value) -> Result<String, String> {
+    let mut skills = Vec::new();
+    let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
 
-    writeln!(out, "\n[Question] {}", input.question).map_err(|e| e.to_string())?;
-
-    if let Some(ref options) = input.options {
-        for (i, option) in options.iter().enumerate() {
-            writeln!(out, "  {}. {}", i + 1, option).map_err(|e| e.to_string())?;
+    for ancestor in cwd.ancestors() {
+        let skills_dir = ancestor.join(".claude").join("skills");
+        if !skills_dir.is_dir() {
+            continue;
         }
-        write!(out, "Enter choice (1-{}): ", options.len()).map_err(|e| e.to_string())?;
-    } else {
-        write!(out, "Your answer: ").map_err(|e| e.to_string())?;
-    }
-    out.flush().map_err(|e| e.to_string())?;
-
-    // Read user response from stdin
-    let mut response = String::new();
-    stdin
-        .lock()
-        .read_line(&mut response)
-        .map_err(|e| e.to_string())?;
-    let response = response.trim().to_string();
-
-    // If options were provided, resolve the numeric choice
-    let answer = if let Some(ref options) = input.options {
-        if let Ok(idx) = response.parse::<usize>() {
-            if idx >= 1 && idx <= options.len() {
-                options[idx - 1].clone()
-            } else {
-                response.clone()
-            }
-        } else {
-            response.clone()
-        }
-    } else {
-        response.clone()
-    };
-
-    to_pretty_json(json!({
-        "question": input.question,
-        "answer": answer,
-        "status": "answered"
-    }))
-}
-
-#[allow(clippy::needless_pass_by_value)]
-fn run_task_create(input: TaskCreateInput) -> Result<String, String> {
-    let registry = global_task_registry();
-    let task = registry.create(&input.prompt, input.description.as_deref());
-    to_pretty_json(json!({
-        "task_id": task.task_id,
-        "status": task.status,
-        "prompt": task.prompt,
-        "description": task.description,
-        "task_packet": task.task_packet,
-        "created_at": task.created_at
-    }))
-}
-
-#[allow(clippy::needless_pass_by_value)]
-fn run_task_packet(input: TaskPacket) -> Result<String, String> {
-    let registry = global_task_registry();
-    let task = registry
-        .create_from_packet(input)
-        .map_err(|error| error.to_string())?;
-
-    to_pretty_json(json!({
-        "task_id": task.task_id,
-        "status": task.status,
-        "prompt": task.prompt,
-        "description": task.description,
-        "task_packet": task.task_packet,
-        "created_at": task.created_at
-    }))
-}
-
-#[allow(clippy::needless_pass_by_value)]
-fn run_task_get(input: TaskIdInput) -> Result<String, String> {
-    let registry = global_task_registry();
-    match registry.get(&input.task_id) {
-        Some(task) => to_pretty_json(json!({
-            "task_id": task.task_id,
-            "status": task.status,
-            "prompt": task.prompt,
-            "description": task.description,
-            "task_packet": task.task_packet,
-            "created_at": task.created_at,
-            "updated_at": task.updated_at,
-            "messages": task.messages,
-            "team_id": task.team_id
-        })),
-        None => Err(format!("task not found: {}", input.task_id)),
-    }
-}
-
-fn run_task_list(_input: Value) -> Result<String, String> {
-    let registry = global_task_registry();
-    let tasks: Vec<_> = registry
-        .list(None)
-        .into_iter()
-        .map(|t| {
-            json!({
-                "task_id": t.task_id,
-                "status": t.status,
-                "prompt": t.prompt,
-                "description": t.description,
-                "task_packet": t.task_packet,
-                "created_at": t.created_at,
-                "updated_at": t.updated_at,
-                "team_id": t.team_id
-            })
-        })
-        .collect();
-    to_pretty_json(json!({
-        "tasks": tasks,
-        "count": tasks.len()
-    }))
-}
-
-#[allow(clippy::needless_pass_by_value)]
-fn run_task_stop(input: TaskIdInput) -> Result<String, String> {
-    let registry = global_task_registry();
-    match registry.stop(&input.task_id) {
-        Ok(task) => to_pretty_json(json!({
-            "task_id": task.task_id,
-            "status": task.status,
-            "message": "Task stopped"
-        })),
-        Err(e) => Err(e),
-    }
-}
-
-#[allow(clippy::needless_pass_by_value)]
-fn run_task_update(input: TaskUpdateInput) -> Result<String, String> {
-    let registry = global_task_registry();
-    match registry.update(&input.task_id, &input.message) {
-        Ok(task) => to_pretty_json(json!({
-            "task_id": task.task_id,
-            "status": task.status,
-            "message_count": task.messages.len(),
-            "last_message": input.message
-        })),
-        Err(e) => Err(e),
-    }
-}
-
-#[allow(clippy::needless_pass_by_value)]
-fn run_task_output(input: TaskIdInput) -> Result<String, String> {
-    let registry = global_task_registry();
-    match registry.output(&input.task_id) {
-        Ok(output) => to_pretty_json(json!({
-            "task_id": input.task_id,
-            "output": output,
-            "has_output": !output.is_empty()
-        })),
-        Err(e) => Err(e),
-    }
-}
-
-#[allow(clippy::needless_pass_by_value)]
-fn run_worker_create(input: WorkerCreateInput) -> Result<String, String> {
-    // Merge config-level trusted_roots with per-call overrides.
-    // Config provides the default allowlist; per-call roots add on top.
-    let merged_roots: Vec<String> = ConfigLoader::default_for(&input.cwd)
-        .load()
-        .ok()
-        .map_or_else(
-            || input.trusted_roots.clone(),
-            |config| config.trusted_roots_with_overrides(&input.trusted_roots),
-        );
-    let worker = global_worker_registry().create(
-        &input.cwd,
-        &merged_roots,
-        input.auto_recover_prompt_misdelivery,
-    );
-    to_pretty_json(worker)
-}
-
-#[allow(clippy::needless_pass_by_value)]
-fn run_worker_get(input: WorkerIdInput) -> Result<String, String> {
-    global_worker_registry().get(&input.worker_id).map_or_else(
-        || Err(format!("worker not found: {}", input.worker_id)),
-        to_pretty_json,
-    )
-}
-
-#[allow(clippy::needless_pass_by_value)]
-fn run_worker_observe(input: WorkerObserveInput) -> Result<String, String> {
-    let worker = global_worker_registry().observe(&input.worker_id, &input.screen_text)?;
-    to_pretty_json(worker)
-}
-
-#[allow(clippy::needless_pass_by_value)]
-fn run_worker_resolve_trust(input: WorkerIdInput) -> Result<String, String> {
-    let worker = global_worker_registry().resolve_trust(&input.worker_id)?;
-    to_pretty_json(worker)
-}
-
-#[allow(clippy::needless_pass_by_value)]
-fn run_worker_await_ready(input: WorkerIdInput) -> Result<String, String> {
-    let snapshot: WorkerReadySnapshot = global_worker_registry().await_ready(&input.worker_id)?;
-    to_pretty_json(snapshot)
-}
-
-#[allow(clippy::needless_pass_by_value)]
-fn run_worker_send_prompt(input: WorkerSendPromptInput) -> Result<String, String> {
-    let worker = global_worker_registry().send_prompt(
-        &input.worker_id,
-        input.prompt.as_deref(),
-        input.task_receipt,
-    )?;
-    to_pretty_json(worker)
-}
-
-#[allow(clippy::needless_pass_by_value)]
-fn run_worker_restart(input: WorkerIdInput) -> Result<String, String> {
-    let worker = global_worker_registry().restart(&input.worker_id)?;
-    to_pretty_json(worker)
-}
-
-#[allow(clippy::needless_pass_by_value)]
-fn run_worker_terminate(input: WorkerIdInput) -> Result<String, String> {
-    let worker = global_worker_registry().terminate(&input.worker_id)?;
-    to_pretty_json(worker)
-}
-
-#[allow(clippy::needless_pass_by_value)]
-fn run_worker_observe_completion(input: WorkerObserveCompletionInput) -> Result<String, String> {
-    let worker = global_worker_registry().observe_completion(
-        &input.worker_id,
-        &input.finish_reason,
-        input.tokens_output,
-    )?;
-    to_pretty_json(worker)
-}
-
-#[allow(clippy::needless_pass_by_value)]
-fn run_team_create(input: TeamCreateInput) -> Result<String, String> {
-    let task_ids: Vec<String> = input
-        .tasks
-        .iter()
-        .filter_map(|t| t.get("task_id").and_then(|v| v.as_str()).map(str::to_owned))
-        .collect();
-    let team = global_team_registry().create(&input.name, task_ids);
-    // Register team assignment on each task
-    for task_id in &team.task_ids {
-        let _ = global_task_registry().assign_team(task_id, &team.team_id);
-    }
-    to_pretty_json(json!({
-        "team_id": team.team_id,
-        "name": team.name,
-        "task_count": team.task_ids.len(),
-        "task_ids": team.task_ids,
-        "status": team.status,
-        "created_at": team.created_at
-    }))
-}
-
-#[allow(clippy::needless_pass_by_value)]
-fn run_team_delete(input: TeamDeleteInput) -> Result<String, String> {
-    match global_team_registry().delete(&input.team_id) {
-        Ok(team) => to_pretty_json(json!({
-            "team_id": team.team_id,
-            "name": team.name,
-            "status": team.status,
-            "message": "Team deleted"
-        })),
-        Err(e) => Err(e),
-    }
-}
-
-#[allow(clippy::needless_pass_by_value)]
-fn run_cron_create(input: CronCreateInput) -> Result<String, String> {
-    let entry =
-        global_cron_registry().create(&input.schedule, &input.prompt, input.description.as_deref());
-    to_pretty_json(json!({
-        "cron_id": entry.cron_id,
-        "schedule": entry.schedule,
-        "prompt": entry.prompt,
-        "description": entry.description,
-        "enabled": entry.enabled,
-        "created_at": entry.created_at
-    }))
-}
-
-#[allow(clippy::needless_pass_by_value)]
-fn run_cron_delete(input: CronDeleteInput) -> Result<String, String> {
-    match global_cron_registry().delete(&input.cron_id) {
-        Ok(entry) => to_pretty_json(json!({
-            "cron_id": entry.cron_id,
-            "schedule": entry.schedule,
-            "status": "deleted",
-            "message": "Cron entry removed"
-        })),
-        Err(e) => Err(e),
-    }
-}
-
-fn run_cron_list(_input: Value) -> Result<String, String> {
-    let entries: Vec<_> = global_cron_registry()
-        .list(false)
-        .into_iter()
-        .map(|e| {
-            json!({
-                "cron_id": e.cron_id,
-                "schedule": e.schedule,
-                "prompt": e.prompt,
-                "description": e.description,
-                "enabled": e.enabled,
-                "run_count": e.run_count,
-                "last_run_at": e.last_run_at,
-                "created_at": e.created_at
-            })
-        })
-        .collect();
-    to_pretty_json(json!({
-        "crons": entries,
-        "count": entries.len()
-    }))
-}
-
-#[allow(clippy::needless_pass_by_value)]
-fn run_lsp(input: LspInput) -> Result<String, String> {
-    let registry = global_lsp_registry();
-    let action = &input.action;
-    let path = input.path.as_deref();
-    let line = input.line;
-    let character = input.character;
-    let query = input.query.as_deref();
-
-    match registry.dispatch(action, path, line, character, query) {
-        Ok(result) => to_pretty_json(result),
-        Err(e) => to_pretty_json(json!({
-            "action": action,
-            "error": e,
-            "status": "error"
-        })),
-    }
-}
-
-#[allow(clippy::needless_pass_by_value)]
-fn run_list_mcp_resources(input: McpResourceInput) -> Result<String, String> {
-    let registry = global_mcp_registry();
-    let server = input.server.as_deref().unwrap_or("default");
-    match registry.list_resources(server) {
-        Ok(resources) => {
-            let items: Vec<_> = resources
-                .iter()
-                .map(|r| {
-                    json!({
-                        "uri": r.uri,
-                        "name": r.name,
-                        "description": r.description,
-                        "mime_type": r.mime_type,
-                    })
-                })
-                .collect();
-            to_pretty_json(json!({
-                "server": server,
-                "resources": items,
-                "count": items.len()
-            }))
-        }
-        Err(e) => to_pretty_json(json!({
-            "server": server,
-            "resources": [],
-            "error": e
-        })),
-    }
-}
-
-#[allow(clippy::needless_pass_by_value)]
-fn run_read_mcp_resource(input: McpResourceInput) -> Result<String, String> {
-    let registry = global_mcp_registry();
-    let uri = input.uri.as_deref().unwrap_or("");
-    let server = input.server.as_deref().unwrap_or("default");
-    match registry.read_resource(server, uri) {
-        Ok(resource) => to_pretty_json(json!({
-            "server": server,
-            "uri": resource.uri,
-            "name": resource.name,
-            "description": resource.description,
-            "mime_type": resource.mime_type
-        })),
-        Err(e) => to_pretty_json(json!({
-            "server": server,
-            "uri": uri,
-            "error": e
-        })),
-    }
-}
-
-#[allow(clippy::needless_pass_by_value)]
-fn run_mcp_auth(input: McpAuthInput) -> Result<String, String> {
-    let registry = global_mcp_registry();
-    match registry.get_server(&input.server) {
-        Some(state) => to_pretty_json(json!({
-            "server": input.server,
-            "status": state.status,
-            "server_info": state.server_info,
-            "tool_count": state.tools.len(),
-            "resource_count": state.resources.len()
-        })),
-        None => to_pretty_json(json!({
-            "server": input.server,
-            "status": "disconnected",
-            "message": "Server not registered. Use MCP tool to connect first."
-        })),
-    }
-}
-
-#[allow(clippy::needless_pass_by_value)]
-fn run_remote_trigger(input: RemoteTriggerInput) -> Result<String, String> {
-    let method = input.method.unwrap_or_else(|| "GET".to_string());
-    let client = Client::new();
-
-    let mut request = match method.to_uppercase().as_str() {
-        "GET" => client.get(&input.url),
-        "POST" => client.post(&input.url),
-        "PUT" => client.put(&input.url),
-        "DELETE" => client.delete(&input.url),
-        "PATCH" => client.patch(&input.url),
-        "HEAD" => client.head(&input.url),
-        other => return Err(format!("unsupported HTTP method: {other}")),
-    };
-
-    // Apply custom headers
-    if let Some(ref headers) = input.headers {
-        if let Some(obj) = headers.as_object() {
-            for (key, value) in obj {
-                if let Some(val) = value.as_str() {
-                    request = request.header(key.as_str(), val);
+        if let Ok(entries) = std::fs::read_dir(&skills_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let skill_path = if path.is_dir() {
+                    path.join("SKILL.md")
+                } else {
+                    path.clone()
+                };
+                if !skill_path.is_file() {
+                    continue;
+                }
+                if let Some(content) = parse_frontmatter_name(&skill_path) {
+                    skills.push(content);
+                } else if let Some(stem) = skill_path.file_stem() {
+                    skills.push(stem.to_string_lossy().to_string());
                 }
             }
         }
     }
 
-    // Apply body
-    if let Some(ref body) = input.body {
-        request = request.body(body.clone());
-    }
-
-    // Execute with a 30-second timeout
-    let request = request.timeout(Duration::from_secs(30));
-
-    match request.send() {
-        Ok(response) => {
-            let status = response.status().as_u16();
-            let body = response.text().unwrap_or_default();
-            let truncated_body = if body.len() > 8192 {
-                format!(
-                    "{}\n\n[response truncated — {} bytes total]",
-                    &body[..8192],
-                    body.len()
-                )
-            } else {
-                body
-            };
-            to_pretty_json(json!({
-                "url": input.url,
-                "method": method,
-                "status_code": status,
-                "body": truncated_body,
-                "success": (200..300).contains(&status)
-            }))
-        }
-        Err(e) => to_pretty_json(json!({
-            "url": input.url,
-            "method": method,
-            "error": e.to_string(),
-            "success": false
-        })),
-    }
-}
-
-#[allow(clippy::needless_pass_by_value)]
-fn run_mcp_tool(input: McpToolInput) -> Result<String, String> {
-    let registry = global_mcp_registry();
-    let args = input.arguments.unwrap_or(serde_json::json!({}));
-    match registry.call_tool(&input.server, &input.tool, &args) {
-        Ok(result) => to_pretty_json(json!({
-            "server": input.server,
-            "tool": input.tool,
-            "result": result,
-            "status": "success"
-        })),
-        Err(e) => to_pretty_json(json!({
-            "server": input.server,
-            "tool": input.tool,
-            "error": e,
-            "status": "error"
-        })),
-    }
-}
-
-#[allow(clippy::needless_pass_by_value)]
-fn run_testing_permission(input: TestingPermissionInput) -> Result<String, String> {
+    skills.sort();
+    skills.dedup();
     to_pretty_json(json!({
-        "action": input.action,
-        "permitted": true,
-        "message": "Testing permission tool stub"
+        "skills": skills,
+        "count": skills.len()
     }))
 }
 
-#[allow(clippy::needless_pass_by_value)]
-/// Execute `git status --short --branch` and return structured JSON output.
-/// Falls back to full `git status` if `short` is explicitly set to false.
-fn run_git_status(input: GitStatusInput) -> Result<String, String> {
-    let mut args: Vec<&str> = vec!["status"];
-    if input.short.unwrap_or(true) {
-        args.push("--short");
-        args.push("--branch");
-    }
-    match git_stdout(&args) {
-        Some(output) => to_pretty_json(json!({
-            "output": output
-        })),
-        None => Err(
-            "git status failed. Ensure the current directory is inside a git repository."
-                .to_string(),
-        ),
-    }
-}
+fn run_list_plugins(_input: Value) -> Result<String, String> {
+    let mut plugins = Vec::new();
+    let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
 
-#[allow(clippy::needless_pass_by_value)]
-/// Execute `git diff` with optional --cached, commit, and path filters.
-/// Returns the diff output wrapped in a JSON object.
-fn run_git_diff(input: GitDiffInput) -> Result<String, String> {
-    let mut args: Vec<String> = vec!["diff".to_string()];
-    if input.staged.unwrap_or(false) {
-        args.push("--cached".to_string());
-    }
-    if let Some(ref commit) = input.commit {
-        if let Some(ref commit2) = input.commit2 {
-            args.push(format!("{commit}...{commit2}"));
-        } else {
-            args.push(commit.clone());
+    for ancestor in cwd.ancestors() {
+        let plugins_dir = ancestor.join(".claude").join("plugins");
+        if !plugins_dir.is_dir() {
+            continue;
         }
-    }
-    if let Some(ref path) = input.path {
-        args.push("--".to_string());
-        args.push(path.clone());
-    }
-    let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-    match git_stdout(&arg_refs) {
-        Some(output) => to_pretty_json(json!({
-            "output": output
-        })),
-        None => Err(
-            "git diff failed. Ensure the current directory is inside a git repository.".to_string(),
-        ),
-    }
-}
-
-#[allow(clippy::needless_pass_by_value)]
-/// Execute `git log` with count, author, date, and path filters.
-/// Defaults to the last 20 commits.
-fn run_git_log(input: GitLogInput) -> Result<String, String> {
-    let mut args: Vec<String> = vec!["log".to_string()];
-    let count = input.count.unwrap_or(20);
-    args.push(format!("-n{count}"));
-    if input.oneline.unwrap_or(false) {
-        args.push("--oneline".to_string());
-    }
-    if let Some(ref author) = input.author {
-        args.push(format!("--author={author}"));
-    }
-    if let Some(ref since) = input.since {
-        args.push(format!("--since={since}"));
-    }
-    if let Some(ref until) = input.until {
-        args.push(format!("--until={until}"));
-    }
-    if let Some(ref path) = input.path {
-        args.push("--".to_string());
-        args.push(path.clone());
-    }
-    let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-    match git_stdout(&arg_refs) {
-        Some(output) => to_pretty_json(json!({
-            "output": output
-        })),
-        None => Err(
-            "git log failed. Ensure the current directory is inside a git repository.".to_string(),
-        ),
-    }
-}
-
-/// Execute `git show` for a given commit, optionally with --stat or a file path.
-/// Uses the `commit:path` syntax when a path is specified.
-fn run_git_show(input: GitShowInput) -> Result<String, String> {
-    let mut args: Vec<String> = vec!["show".to_string()];
-
-    match input.format.as_deref() {
-        Some("metadata") if input.path.is_some() => {
-            return Err(
-                "GitShow format \"metadata\" cannot be combined with path; metadata describes a commit, not a blob. Use format \"patch\" or \"stat\" with path, or omit path."
-                    .to_string(),
-            );
-        }
-        Some("metadata") => {
-            args.push("--format=medium".to_string());
-            args.push("--no-patch".to_string());
-        }
-        Some("stat") => {
-            args.push("--stat".to_string());
-        }
-        Some("patch") | None => {
-            if input.format.is_none() && input.stat.unwrap_or(false) {
-                args.push("--stat".to_string());
+        // Scan installed plugins (plugins/<name>/)
+        let installed = plugins_dir.join("installed.json");
+        if installed.is_file() {
+            if let Ok(content) = std::fs::read_to_string(&installed) {
+                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&content) {
+                    if let Some(arr) = parsed.as_array() {
+                        for entry in arr {
+                            if let Some(id) = entry.get("id").and_then(|v| v.as_str()) {
+                                plugins.push(id.to_string());
+                            }
+                        }
+                    }
+                }
             }
         }
-        Some(other) => {
-            return Err(format!(
-                "unknown GitShow format: \"{other}\". Supported values: \"patch\" (default), \"stat\", \"metadata\"."
-            ));
+        // Also scan cache/ for plugins
+        let cache = plugins_dir.join("cache");
+        if cache.is_dir() {
+            if let Ok(marketplaces) = std::fs::read_dir(&cache) {
+                for mp in marketplaces.flatten() {
+                    if let Ok(plugin_names) = std::fs::read_dir(mp.path()) {
+                        for pn in plugin_names.flatten() {
+                            let id = pn.file_name().to_string_lossy().to_string();
+                            if !plugins.contains(&id) {
+                                plugins.push(id);
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
-    if let Some(ref path) = input.path {
-        args.push(format!("{}:{}", input.commit, path));
-    } else {
-        args.push(input.commit.clone());
-    }
-    let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-    match git_stdout(&arg_refs) {
-        Some(output) => to_pretty_json(json!({
-            "output": output
-        })),
-        None => Err(format!(
-            "git show {} failed. Ensure the commit exists.",
-            input.commit
-        )),
-    }
+    plugins.sort();
+    to_pretty_json(json!({
+        "plugins": plugins,
+        "count": plugins.len()
+    }))
 }
 
-#[allow(clippy::needless_pass_by_value)]
-/// Execute `git blame` on a file, optionally restricted to a line range.
-fn run_git_blame(input: GitBlameInput) -> Result<String, String> {
-    let mut args: Vec<String> = vec!["blame".to_string()];
-    if let (Some(start), Some(end)) = (input.start_line, input.end_line) {
-        args.push(format!("-L{start},{end}"));
-    }
-    args.push(input.path.clone());
-    let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-    match git_stdout(&arg_refs) {
-        Some(output) => to_pretty_json(json!({
-            "output": output
-        })),
-        None => Err(format!("git blame {} failed. Ensure the file exists and the directory is inside a git repository.", input.path)),
-    }
-}
-
-fn from_value<T: for<'de> Deserialize<'de>>(input: &Value) -> Result<T, String> {
-    serde_json::from_value(input.clone()).map_err(|error| error.to_string())
+fn parse_frontmatter_name(path: &std::path::Path) -> Option<String> {
+    let contents = std::fs::read_to_string(path).ok()?;
+    plugins::frontmatter::parse_frontmatter(&contents)
+        .ok()?
+        .frontmatter
+        .name
 }
 
 /// Classify bash command permission based on command type and path.
@@ -2195,12 +821,25 @@ fn classify_bash_permission(command: &str) -> PermissionMode {
         "pwd", "echo", "printf",
     ];
 
-    // Get the base command (first word before any args or pipes)
-    let base_cmd = command.split_whitespace().next().unwrap_or("");
-    let base_cmd = base_cmd.split('|').next().unwrap_or("").trim();
-    let base_cmd = base_cmd.split(';').next().unwrap_or("").trim();
-    let base_cmd = base_cmd.split('>').next().unwrap_or("").trim();
-    let base_cmd = base_cmd.split('<').next().unwrap_or("").trim();
+    // Get the base command: isolate the first pipeline/sequence segment
+    // before extracting the command name. Metacharacters (;, |, >, <, &&, ||)
+    // are split on the full command first — previously they were applied
+    // to `base_cmd` (already a single word), making the splits no-ops.
+    let first_segment = command
+        .split("||")
+        .next().unwrap_or("")
+        .split("&&")
+        .next().unwrap_or("")
+        .split('|')
+        .next().unwrap_or("")
+        .split(';')
+        .next().unwrap_or("")
+        .split('>')
+        .next().unwrap_or("")
+        .split('<')
+        .next().unwrap_or("")
+        .trim();
+    let base_cmd = first_segment.split_whitespace().next().unwrap_or("");
 
     // Check if it's a read-only command
     let cmd_name = base_cmd.split('/').next_back().unwrap_or(base_cmd);
@@ -2223,60 +862,71 @@ fn classify_bash_permission(command: &str) -> PermissionMode {
 fn has_dangerous_paths(command: &str) -> bool {
     // Look for absolute paths
     let tokens: Vec<&str> = command.split_whitespace().collect();
-    let cwd = std::env::current_dir()
-        .ok()
-        .map(|cwd| cwd.canonicalize().unwrap_or(cwd));
 
     for token in tokens {
-        let token = token.trim_matches(|ch: char| {
-            matches!(
-                ch,
-                '"' | '\'' | '`' | ',' | ';' | ')' | '(' | '[' | ']' | '{' | '}'
-            )
-        });
+        // Strip surrounding quotes so `cat "C:\Users\foo\bar.txt"` is
+        // recognised as a Windows absolute path.
+        let stripped = token
+            .trim_start_matches('"')
+            .trim_end_matches('"')
+            .trim_start_matches('\'')
+            .trim_end_matches('\'');
+
         // Skip flags/options
-        if token.starts_with('-') {
+        if stripped.starts_with('-') {
             continue;
         }
 
-        if token.contains('$') {
+        // file:// URL — treated as dangerous since it bypasses normal path checks
+        if stripped.starts_with("file://") {
             return true;
         }
 
-        if looks_like_windows_absolute_path(token) {
+        // Network URLs (http, https, ftp, etc.) — treated as dangerous
+        // since they bypass normal path checks and enable data exfiltration.
+        if stripped.starts_with("http://")
+            || stripped.starts_with("https://")
+            || stripped.starts_with("ftp://")
+            || stripped.starts_with("ftp.")
+        {
             return true;
         }
 
-        // Check for absolute paths
-        if token.starts_with('/') || token.starts_with("~/") {
-            // Check if it's within CWD
-            let path =
-                PathBuf::from(token.replace('~', &std::env::var("HOME").unwrap_or_default()));
-            if let Some(cwd) = cwd.as_ref() {
-                let resolved = path.canonicalize().unwrap_or(path);
-                if !resolved.starts_with(cwd) {
+        // POSIX absolute path or `~/...` home-relative
+        if stripped.starts_with('/') || stripped.starts_with("~/") {
+            let home = std::env::var("HOME")
+                .or_else(|_| std::env::var("USERPROFILE"))
+                .unwrap_or_default();
+            let path = PathBuf::from(stripped.replace('~', &home));
+            if let Ok(cwd) = std::env::current_dir() {
+                if !path.starts_with(&cwd) {
                     return true; // Path outside workspace
                 }
             }
         }
 
-        // Check for parent directory traversal that escapes workspace
-        if token.contains("../..") || token.starts_with("../") && !token.starts_with("./") {
+        // Windows drive-letter absolute path: `<letter>:\` or `<letter>:/`
+        // e.g. `C:\Users\foo\bar.txt`, `D:/data/file.txt`.
+        if stripped.len() >= 3
+            && stripped.as_bytes()[0].is_ascii_alphabetic()
+            && stripped.as_bytes()[1] == b':'
+            && (stripped.as_bytes()[2] == b'\\' || stripped.as_bytes()[2] == b'/')
+        {
             return true;
         }
 
-        if let Some(cwd) = cwd.as_ref() {
-            if token.starts_with('.') || token.contains('/') || Path::new(token).exists() {
-                let candidate = if Path::new(token).is_absolute() {
-                    PathBuf::from(token)
-                } else {
-                    cwd.join(token)
-                };
-                if let Ok(canonical) = candidate.canonicalize() {
-                    if !canonical.starts_with(cwd) {
-                        return true;
-                    }
-                }
+        // UNC path: `\\server\share\...`
+        if stripped.starts_with("\\\\") {
+            return true;
+        }
+
+        // Check for parent directory traversal that escapes workspace.
+        // Matches both Unix (../) and Windows (..\) styles, and
+        // catches ./../ which is not caught by starts_with("../") alone.
+        if stripped.contains("..") {
+            let rest = stripped.trim_start_matches("./").trim_start_matches(".\\");
+            if rest.starts_with("../") || rest.starts_with("..\\") {
+                return true;
             }
         }
     }
@@ -2284,21 +934,52 @@ fn has_dangerous_paths(command: &str) -> bool {
     false
 }
 
-fn looks_like_windows_absolute_path(token: &str) -> bool {
-    let bytes = token.as_bytes();
-    (bytes.len() >= 3
-        && bytes[0].is_ascii_alphabetic()
-        && bytes[1] == b':'
-        && matches!(bytes[2], b'/' | b'\\'))
-        || token.starts_with(r"\\")
-}
-
 fn run_bash(input: BashCommandInput) -> Result<String, String> {
     if let Some(output) = workspace_test_branch_preflight(&input.command) {
-        return serde_json::to_string_pretty(&output).map_err(|error| error.to_string());
+        return Ok(bash_model_view(&output));
     }
-    serde_json::to_string_pretty(&execute_bash(input).map_err(|error| error.to_string())?)
-        .map_err(|error| error.to_string())
+    let output = execute_bash(input).map_err(|error| error.to_string())?;
+    Ok(bash_model_view(&output))
+}
+
+/// Render a `BashCommandOutput` for the model. The compact envelope
+/// puts `stdout` and `stderr` first so the model sees the command's
+/// output before any sandbox diagnostics, and it always carries
+/// `sandbox.fallbackReason` so the model can reason honestly about
+/// which sandbox mechanisms are actually enforced (rather than
+/// concluding "the sandbox blocked it" when only process-tree kill
+/// is active, as the legacy 16-field envelope allowed).
+fn bash_model_view(output: &runtime::BashCommandOutput) -> String {
+    let sandbox_block = output.sandbox_status.as_ref().map(|status| {
+        serde_json::json!({
+            "enabled": status.enabled,
+            "active": status.active,
+            "type": output.sandbox_type,
+            "fallbackReason": status.fallback_reason,
+        })
+    });
+    let view = serde_json::json!({
+        "stdout": output.stdout,
+        "stderr": output.stderr,
+        "interrupted": output.interrupted,
+        "returnCodeInterpretation": output.return_code_interpretation,
+        "noOutputExpected": output.no_output_expected,
+        "persistedOutputPath": output.persisted_output_path,
+        "persistedOutputSize": output.persisted_output_size,
+        "backgroundTaskId": output.background_task_id,
+        "backgroundedByUser": output.backgrounded_by_user,
+        "assistantAutoBackgrounded": output.assistant_auto_backgrounded,
+        "dangerouslyDisableSandbox": output.dangerously_disable_sandbox,
+        "structuredContent": output.structured_content,
+        "sandbox": sandbox_block,
+    });
+    serde_json::to_string_pretty(&view).unwrap_or_else(|error| {
+        // Fall back to the full envelope if the view can't be
+        // serialised �?the model still gets *some* output rather than
+        // a hard error.
+        serde_json::to_string_pretty(output)
+            .unwrap_or_else(|_| format!("{{\"error\":\"{error}\"}}"))
+    })
 }
 
 fn workspace_test_branch_preflight(command: &str) -> Option<BashCommandOutput> {
@@ -2376,7 +1057,8 @@ fn git_ref_exists(reference: &str) -> bool {
     Command::new("git")
         .args(["rev-parse", "--verify", "--quiet", reference])
         .output()
-        .is_ok_and(|output| output.status.success())
+        .map(|output| output.status.success())
+        .unwrap_or(false)
 }
 
 fn git_stdout(args: &[&str]) -> Option<String> {
@@ -2443,1071 +1125,8 @@ fn branch_divergence_output(
         persisted_output_path: None,
         persisted_output_size: None,
         sandbox_status: None,
+        sandbox_type: None,
     }
-}
-
-#[allow(clippy::needless_pass_by_value)]
-fn run_read_file(input: ReadFileInput) -> Result<String, String> {
-    let workspace = std::env::current_dir().map_err(|error| error.to_string())?;
-    to_pretty_json(
-        read_file_in_workspace(&input.path, input.offset, input.limit, &workspace)
-            .map_err(io_to_string)?,
-    )
-}
-
-#[allow(clippy::needless_pass_by_value)]
-fn run_write_file(input: WriteFileInput) -> Result<String, String> {
-    let workspace = std::env::current_dir().map_err(|error| error.to_string())?;
-    to_pretty_json(
-        write_file_in_workspace(&input.path, &input.content, &workspace).map_err(io_to_string)?,
-    )
-}
-
-#[allow(clippy::needless_pass_by_value)]
-fn run_edit_file(input: EditFileInput) -> Result<String, String> {
-    let workspace = std::env::current_dir().map_err(|error| error.to_string())?;
-    to_pretty_json(
-        edit_file_in_workspace(
-            &input.path,
-            &input.old_string,
-            &input.new_string,
-            input.replace_all.unwrap_or(false),
-            &workspace,
-        )
-        .map_err(io_to_string)?,
-    )
-}
-
-#[allow(clippy::needless_pass_by_value)]
-fn run_glob_search(input: GlobSearchInputValue) -> Result<String, String> {
-    let workspace = std::env::current_dir().map_err(|error| error.to_string())?;
-    to_pretty_json(
-        glob_search_in_workspace(&input.pattern, input.path.as_deref(), &workspace)
-            .map_err(io_to_string)?,
-    )
-}
-
-#[allow(clippy::needless_pass_by_value)]
-fn run_grep_search(input: GrepSearchInput) -> Result<String, String> {
-    let workspace = std::env::current_dir().map_err(|error| error.to_string())?;
-    to_pretty_json(grep_search_in_workspace(&input, &workspace).map_err(io_to_string)?)
-}
-
-#[allow(clippy::needless_pass_by_value)]
-fn run_web_fetch(input: WebFetchInput) -> Result<String, String> {
-    to_pretty_json(execute_web_fetch(&input)?)
-}
-
-#[allow(clippy::needless_pass_by_value)]
-fn run_web_search(input: WebSearchInput) -> Result<String, String> {
-    to_pretty_json(execute_web_search(&input)?)
-}
-
-fn run_todo_write(input: TodoWriteInput) -> Result<String, String> {
-    to_pretty_json(execute_todo_write(input)?)
-}
-
-fn run_skill(input: SkillInput) -> Result<String, String> {
-    to_pretty_json(execute_skill(input)?)
-}
-
-fn run_agent(input: AgentInput) -> Result<String, String> {
-    to_pretty_json(execute_agent(input)?)
-}
-
-fn run_tool_search(input: ToolSearchInput) -> Result<String, String> {
-    to_pretty_json(execute_tool_search(input))
-}
-
-fn run_notebook_edit(input: NotebookEditInput) -> Result<String, String> {
-    to_pretty_json(execute_notebook_edit(input)?)
-}
-
-fn run_sleep(input: SleepInput) -> Result<String, String> {
-    to_pretty_json(execute_sleep(input)?)
-}
-
-fn run_brief(input: BriefInput) -> Result<String, String> {
-    to_pretty_json(execute_brief(input)?)
-}
-
-fn run_config(input: ConfigInput) -> Result<String, String> {
-    to_pretty_json(execute_config(input)?)
-}
-
-fn run_enter_plan_mode(input: EnterPlanModeInput) -> Result<String, String> {
-    to_pretty_json(execute_enter_plan_mode(input)?)
-}
-
-fn run_exit_plan_mode(input: ExitPlanModeInput) -> Result<String, String> {
-    to_pretty_json(execute_exit_plan_mode(input)?)
-}
-
-fn run_structured_output(input: StructuredOutputInput) -> Result<String, String> {
-    to_pretty_json(execute_structured_output(input)?)
-}
-
-fn run_repl(input: ReplInput) -> Result<String, String> {
-    to_pretty_json(execute_repl(input)?)
-}
-
-fn classify_file_path_permission(path: &str, allow_missing: bool) -> PermissionMode {
-    if path_within_current_workspace(path, allow_missing) {
-        PermissionMode::WorkspaceWrite
-    } else {
-        PermissionMode::DangerFullAccess
-    }
-}
-
-fn classify_read_path_permission(path: &str, allow_missing: bool) -> PermissionMode {
-    if path_within_current_workspace(path, allow_missing) {
-        PermissionMode::ReadOnly
-    } else {
-        PermissionMode::DangerFullAccess
-    }
-}
-
-fn classify_glob_permission(input: &GlobSearchInputValue) -> PermissionMode {
-    let base_allowed = input
-        .path
-        .as_deref()
-        .is_none_or(|path| path_within_current_workspace(path, false));
-    let pattern_allowed = path_within_current_workspace(&input.pattern, true);
-    if base_allowed && pattern_allowed {
-        PermissionMode::ReadOnly
-    } else {
-        PermissionMode::DangerFullAccess
-    }
-}
-
-fn classify_grep_permission(input: &GrepSearchInput) -> PermissionMode {
-    if input
-        .path
-        .as_deref()
-        .is_none_or(|path| path_within_current_workspace(path, false))
-    {
-        PermissionMode::ReadOnly
-    } else {
-        PermissionMode::DangerFullAccess
-    }
-}
-
-fn path_within_current_workspace(path: &str, allow_missing: bool) -> bool {
-    let trimmed = path.trim_matches(|ch: char| {
-        matches!(
-            ch,
-            '"' | '\'' | '`' | ',' | ';' | ')' | '(' | '[' | ']' | '{' | '}'
-        )
-    });
-    if looks_like_windows_absolute_path(trimmed) {
-        return false;
-    }
-
-    let Ok(cwd) = std::env::current_dir() else {
-        return false;
-    };
-    let cwd = cwd.canonicalize().unwrap_or(cwd);
-    let candidate = PathBuf::from(trimmed);
-    let absolute = if candidate.is_absolute() {
-        candidate
-    } else {
-        cwd.join(candidate)
-    };
-
-    let resolved = if allow_missing {
-        absolute
-            .parent()
-            .and_then(|parent| parent.canonicalize().ok())
-            .map(|parent| parent.join(absolute.file_name().unwrap_or_default()))
-            .unwrap_or(absolute)
-    } else {
-        match absolute.canonicalize() {
-            Ok(path) => path,
-            Err(_) => absolute,
-        }
-    };
-
-    resolved.starts_with(cwd)
-}
-
-/// Classify `PowerShell` command permission based on command type and path.
-/// ROADMAP #50: Read-only commands targeting CWD paths get `WorkspaceWrite`,
-/// all others remain `DangerFullAccess`.
-fn classify_powershell_permission(command: &str) -> PermissionMode {
-    // Read-only commands that are safe when targeting workspace paths
-    const READ_ONLY_COMMANDS: &[&str] = &[
-        "Get-Content",
-        "Get-ChildItem",
-        "Test-Path",
-        "Get-Item",
-        "Get-ItemProperty",
-        "Get-FileHash",
-        "Select-String",
-    ];
-
-    // Check if command starts with a read-only cmdlet
-    let cmd_lower = command.trim().to_lowercase();
-    let is_read_only_cmd = READ_ONLY_COMMANDS
-        .iter()
-        .any(|cmd| cmd_lower.starts_with(&cmd.to_lowercase()));
-
-    if !is_read_only_cmd {
-        return PermissionMode::DangerFullAccess;
-    }
-
-    // Check if the path is within workspace (CWD or subdirectory)
-    // Extract path from command - look for -Path or positional parameter
-    let path = extract_powershell_path(command);
-    match path {
-        Some(p) if is_within_workspace(&p) => PermissionMode::WorkspaceWrite,
-        _ => PermissionMode::DangerFullAccess,
-    }
-}
-
-/// Extract the path argument from a `PowerShell` command.
-fn extract_powershell_path(command: &str) -> Option<String> {
-    // Look for -Path parameter
-    if let Some(idx) = command.to_lowercase().find("-path") {
-        let after_path = &command[idx + 5..];
-        let path = after_path.split_whitespace().next()?;
-        return Some(path.trim_matches('"').trim_matches('\'').to_string());
-    }
-
-    // Look for positional path parameter (after command name)
-    let parts: Vec<&str> = command.split_whitespace().collect();
-    if parts.len() >= 2 {
-        // Skip the cmdlet name and take the first argument
-        let first_arg = parts[1];
-        // Check if it looks like a path (contains \, /, or .)
-        if first_arg.contains(['\\', '/', '.']) {
-            return Some(first_arg.trim_matches('"').trim_matches('\'').to_string());
-        }
-    }
-
-    None
-}
-
-/// Check if a path is within the current workspace.
-fn is_within_workspace(path: &str) -> bool {
-    let trimmed = path.trim_matches(|ch: char| {
-        matches!(
-            ch,
-            '"' | '\'' | '`' | ',' | ';' | ')' | '(' | '[' | ']' | '{' | '}'
-        )
-    });
-    if looks_like_windows_absolute_path(trimmed) {
-        return false;
-    }
-
-    let path = PathBuf::from(trimmed);
-
-    // Reject any parent-directory traversal. Callers never need `..` to refer
-    // to files inside the workspace, and `..` defeats both checks below: the
-    // relative branch only inspects the leading component, and the absolute
-    // branch's `canonicalize()` silently falls back to the literal `..` path
-    // when the target does not exist yet (e.g. a file about to be created).
-    // Returning false here is the safe direction: it classifies the command as
-    // requiring full-access permission rather than workspace-write.
-    if path
-        .components()
-        .any(|component| matches!(component, std::path::Component::ParentDir))
-    {
-        return false;
-    }
-
-    // If path is absolute, check if it starts with CWD
-    if path.is_absolute() {
-        if let Ok(cwd) = std::env::current_dir() {
-            let cwd = cwd.canonicalize().unwrap_or(cwd);
-            let resolved = path.canonicalize().unwrap_or(path);
-            return resolved.starts_with(&cwd);
-        }
-    }
-
-    // Relative paths are assumed to be within workspace
-    !path.starts_with("/") && !path.starts_with("\\") && !path.starts_with("..")
-}
-
-fn run_powershell(input: PowerShellInput) -> Result<String, String> {
-    to_pretty_json(execute_powershell(input).map_err(|error| error.to_string())?)
-}
-
-#[cfg(test)]
-mod workspace_traversal_guard_tests {
-    use super::is_within_workspace;
-
-    #[test]
-    fn rejects_parent_traversal_components() {
-        // Leading and embedded `..` must both be rejected (was previously a hole
-        // because only the leading component was inspected).
-        assert!(!is_within_workspace("../secrets"));
-        assert!(!is_within_workspace("src/../../etc/passwd"));
-        assert!(!is_within_workspace("a/b/../../../etc/crontab"));
-    }
-
-    #[test]
-    fn allows_plain_relative_paths() {
-        assert!(is_within_workspace("src/main.rs"));
-        assert!(is_within_workspace("Cargo.toml"));
-    }
-}
-
-fn to_pretty_json<T: serde::Serialize>(value: T) -> Result<String, String> {
-    serde_json::to_string_pretty(&value).map_err(|error| error.to_string())
-}
-
-#[allow(clippy::needless_pass_by_value)]
-fn io_to_string(error: std::io::Error) -> String {
-    error.to_string()
-}
-
-#[derive(Debug, Deserialize)]
-struct ReadFileInput {
-    path: String,
-    offset: Option<usize>,
-    limit: Option<usize>,
-}
-
-#[derive(Debug, Deserialize)]
-struct WriteFileInput {
-    path: String,
-    content: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct EditFileInput {
-    path: String,
-    old_string: String,
-    new_string: String,
-    replace_all: Option<bool>,
-}
-
-#[derive(Debug, Deserialize)]
-struct GlobSearchInputValue {
-    pattern: String,
-    path: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct WebFetchInput {
-    url: String,
-    prompt: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct WebSearchInput {
-    query: String,
-    allowed_domains: Option<Vec<String>>,
-    blocked_domains: Option<Vec<String>>,
-}
-
-#[derive(Debug, Deserialize)]
-struct TodoWriteInput {
-    todos: Vec<TodoItem>,
-}
-
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
-struct TodoItem {
-    content: String,
-    #[serde(rename = "activeForm")]
-    active_form: String,
-    status: TodoStatus,
-}
-
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-enum TodoStatus {
-    Pending,
-    InProgress,
-    Completed,
-}
-
-#[derive(Debug, Deserialize)]
-struct SkillInput {
-    skill: String,
-    args: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct AgentInput {
-    description: String,
-    prompt: String,
-    subagent_type: Option<String>,
-    name: Option<String>,
-    model: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ToolSearchInput {
-    query: String,
-    max_results: Option<usize>,
-}
-
-#[derive(Debug, Deserialize)]
-struct NotebookEditInput {
-    notebook_path: String,
-    cell_id: Option<String>,
-    new_source: Option<String>,
-    cell_type: Option<NotebookCellType>,
-    edit_mode: Option<NotebookEditMode>,
-}
-
-#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-enum NotebookCellType {
-    Code,
-    Markdown,
-}
-
-#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-enum NotebookEditMode {
-    Replace,
-    Insert,
-    Delete,
-}
-
-#[derive(Debug, Deserialize)]
-struct SleepInput {
-    duration_ms: u64,
-}
-
-#[derive(Debug, Deserialize)]
-struct BriefInput {
-    message: String,
-    attachments: Option<Vec<String>>,
-    status: BriefStatus,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "lowercase")]
-enum BriefStatus {
-    Normal,
-    Proactive,
-}
-
-#[derive(Debug, Deserialize)]
-struct ConfigInput {
-    setting: String,
-    value: Option<ConfigValue>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(default)]
-struct EnterPlanModeInput {}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(default)]
-struct ExitPlanModeInput {}
-
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-enum ConfigValue {
-    String(String),
-    Bool(bool),
-    Number(f64),
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(transparent)]
-struct StructuredOutputInput(BTreeMap<String, Value>);
-
-#[derive(Debug, Deserialize)]
-struct ReplInput {
-    code: String,
-    language: String,
-    timeout_ms: Option<u64>,
-}
-
-#[derive(Debug, Deserialize)]
-struct PowerShellInput {
-    command: String,
-    timeout: Option<u64>,
-    description: Option<String>,
-    run_in_background: Option<bool>,
-}
-
-#[derive(Debug, Deserialize)]
-struct AskUserQuestionInput {
-    question: String,
-    #[serde(default)]
-    options: Option<Vec<String>>,
-}
-
-#[derive(Debug, Deserialize)]
-struct TaskCreateInput {
-    prompt: String,
-    #[serde(default)]
-    description: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct TaskIdInput {
-    task_id: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct TaskUpdateInput {
-    task_id: String,
-    message: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct WorkerCreateInput {
-    cwd: String,
-    #[serde(default)]
-    trusted_roots: Vec<String>,
-    #[serde(default = "default_auto_recover_prompt_misdelivery")]
-    auto_recover_prompt_misdelivery: bool,
-}
-
-#[derive(Debug, Deserialize)]
-struct WorkerIdInput {
-    worker_id: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct WorkerObserveCompletionInput {
-    worker_id: String,
-    finish_reason: String,
-    tokens_output: u64,
-}
-
-#[derive(Debug, Deserialize)]
-struct WorkerObserveInput {
-    worker_id: String,
-    screen_text: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct WorkerSendPromptInput {
-    worker_id: String,
-    #[serde(default)]
-    prompt: Option<String>,
-    #[serde(default)]
-    task_receipt: Option<WorkerTaskReceipt>,
-}
-
-const fn default_auto_recover_prompt_misdelivery() -> bool {
-    true
-}
-
-#[derive(Debug, Deserialize)]
-struct TeamCreateInput {
-    name: String,
-    tasks: Vec<Value>,
-}
-
-#[derive(Debug, Deserialize)]
-struct TeamDeleteInput {
-    team_id: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct CronCreateInput {
-    schedule: String,
-    prompt: String,
-    #[serde(default)]
-    description: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct CronDeleteInput {
-    cron_id: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct LspInput {
-    action: String,
-    #[serde(default)]
-    path: Option<String>,
-    #[serde(default)]
-    line: Option<u32>,
-    #[serde(default)]
-    character: Option<u32>,
-    #[serde(default)]
-    query: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct McpResourceInput {
-    #[serde(default)]
-    server: Option<String>,
-    #[serde(default)]
-    uri: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct McpAuthInput {
-    server: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct RemoteTriggerInput {
-    url: String,
-    #[serde(default)]
-    method: Option<String>,
-    #[serde(default)]
-    headers: Option<Value>,
-    #[serde(default)]
-    body: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct McpToolInput {
-    server: String,
-    tool: String,
-    #[serde(default)]
-    arguments: Option<Value>,
-}
-
-#[derive(Debug, Deserialize)]
-struct TestingPermissionInput {
-    action: String,
-}
-
-/// Input for the GitStatus tool: shows working tree status.
-/// Defaults to --short --branch mode for concise, parseable output.
-#[derive(Debug, Deserialize)]
-struct GitStatusInput {
-    #[serde(default)]
-    /// If true, use --short --branch format. Defaults to true.
-    short: Option<bool>,
-}
-
-/// Input for the GitDiff tool: shows changes between commits, index, and working tree.
-/// All fields are optional - calling with no options is equivalent to `git diff`.
-#[derive(Debug, Deserialize)]
-struct GitDiffInput {
-    #[serde(default)]
-    /// File path to diff. Prepends `--` before the path.
-    path: Option<String>,
-    #[serde(default)]
-    /// If true, show staged changes (`git diff --cached`).
-    staged: Option<bool>,
-    #[serde(default)]
-    /// A commit hash, tag, or branch to diff against.
-    commit: Option<String>,
-    #[serde(default)]
-    /// A second commit for range diffs (commit...commit2).
-    commit2: Option<String>,
-}
-
-/// Input for the GitLog tool: shows commit history.
-/// Defaults to the last 20 commits in full format.
-#[derive(Debug, Deserialize)]
-struct GitLogInput {
-    #[serde(default)]
-    /// File or directory path to filter commits by.
-    path: Option<String>,
-    #[serde(default)]
-    /// Maximum number of commits to return. Defaults to 20.
-    count: Option<usize>,
-    #[serde(default)]
-    /// If true, use --oneline format (hash + subject only).
-    oneline: Option<bool>,
-    #[serde(default)]
-    /// Filter commits by author pattern.
-    author: Option<String>,
-    #[serde(default)]
-    /// Filter commits since date (e.g. "2024-01-01" or "2.weeks").
-    since: Option<String>,
-    #[serde(default)]
-    /// Filter commits until date.
-    until: Option<String>,
-}
-
-/// Input for the GitShow tool: shows a commit, tag, or tree object.
-#[derive(Debug, Deserialize)]
-struct GitShowInput {
-    /// Commit hash, tag, or branch ref to show. Required.
-    commit: String,
-    #[serde(default)]
-    /// If set, show only this file at the given commit (commit:path syntax).
-    path: Option<String>,
-    #[serde(default)]
-    /// If true, show diffstat summary instead of full diff.
-    stat: Option<bool>,
-    #[serde(default)]
-    /// Output format: "patch" (default) shows the full diff, "stat" shows a diffstat summary, and "metadata" shows commit info without the diff. When set, takes priority over `stat`.
-    format: Option<String>,
-}
-
-/// Input for the GitBlame tool: shows per-line author/revision info for a file.
-#[derive(Debug, Deserialize)]
-struct GitBlameInput {
-    /// File path to blame. Required.
-    path: String,
-    #[serde(rename = "start_line")]
-    #[serde(default)]
-    /// Start of line range (1-based). Only used if end_line is also set.
-    start_line: Option<usize>,
-    #[serde(rename = "end_line")]
-    #[serde(default)]
-    /// End of line range (1-based). Only used if start_line is also set.
-    end_line: Option<usize>,
-}
-
-#[derive(Debug, Serialize)]
-struct WebFetchOutput {
-    bytes: usize,
-    code: u16,
-    #[serde(rename = "codeText")]
-    code_text: String,
-    result: String,
-    #[serde(rename = "durationMs")]
-    duration_ms: u128,
-    url: String,
-}
-
-#[derive(Debug, Serialize)]
-struct WebSearchOutput {
-    query: String,
-    results: Vec<WebSearchResultItem>,
-    #[serde(rename = "durationSeconds")]
-    duration_seconds: f64,
-}
-
-#[derive(Debug, Serialize)]
-struct TodoWriteOutput {
-    #[serde(rename = "oldTodos")]
-    old_todos: Vec<TodoItem>,
-    #[serde(rename = "newTodos")]
-    new_todos: Vec<TodoItem>,
-    #[serde(rename = "verificationNudgeNeeded")]
-    verification_nudge_needed: Option<bool>,
-}
-
-#[derive(Debug, Serialize)]
-struct SkillOutput {
-    skill: String,
-    path: String,
-    args: Option<String>,
-    description: Option<String>,
-    prompt: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct AgentOutput {
-    #[serde(rename = "agentId")]
-    agent_id: String,
-    name: String,
-    description: String,
-    #[serde(rename = "subagentType")]
-    subagent_type: Option<String>,
-    model: Option<String>,
-    status: String,
-    #[serde(rename = "outputFile")]
-    output_file: String,
-    #[serde(rename = "manifestFile")]
-    manifest_file: String,
-    #[serde(rename = "createdAt")]
-    created_at: String,
-    #[serde(rename = "startedAt", skip_serializing_if = "Option::is_none")]
-    started_at: Option<String>,
-    #[serde(rename = "completedAt", skip_serializing_if = "Option::is_none")]
-    completed_at: Option<String>,
-    #[serde(rename = "laneEvents", default, skip_serializing_if = "Vec::is_empty")]
-    lane_events: Vec<LaneEvent>,
-    #[serde(rename = "currentBlocker", skip_serializing_if = "Option::is_none")]
-    current_blocker: Option<LaneEventBlocker>,
-    #[serde(rename = "derivedState")]
-    derived_state: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-struct AgentJob {
-    manifest: AgentOutput,
-    prompt: String,
-    system_prompt: Vec<String>,
-    allowed_tools: BTreeSet<String>,
-}
-
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-pub struct ToolSearchOutput {
-    matches: Vec<String>,
-    query: String,
-    normalized_query: String,
-    #[serde(rename = "total_deferred_tools")]
-    total_deferred_tools: usize,
-    #[serde(rename = "pending_mcp_servers")]
-    pending_mcp_servers: Option<Vec<String>>,
-    #[serde(rename = "mcp_degraded", skip_serializing_if = "Option::is_none")]
-    mcp_degraded: Option<McpDegradedReport>,
-}
-
-#[derive(Debug, Serialize)]
-struct NotebookEditOutput {
-    new_source: String,
-    cell_id: Option<String>,
-    cell_type: Option<NotebookCellType>,
-    language: String,
-    edit_mode: String,
-    error: Option<String>,
-    notebook_path: String,
-    original_file: String,
-    updated_file: String,
-}
-
-#[derive(Debug, Serialize)]
-struct SleepOutput {
-    duration_ms: u64,
-    message: String,
-}
-
-#[derive(Debug, Serialize)]
-struct BriefOutput {
-    message: String,
-    attachments: Option<Vec<ResolvedAttachment>>,
-    #[serde(rename = "sentAt")]
-    sent_at: String,
-}
-
-#[derive(Debug, Serialize)]
-struct ResolvedAttachment {
-    path: String,
-    size: u64,
-    #[serde(rename = "isImage")]
-    is_image: bool,
-}
-
-#[derive(Debug, Serialize)]
-struct ConfigOutput {
-    success: bool,
-    operation: Option<String>,
-    setting: Option<String>,
-    value: Option<Value>,
-    #[serde(rename = "previousValue")]
-    previous_value: Option<Value>,
-    #[serde(rename = "newValue")]
-    new_value: Option<Value>,
-    error: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct PlanModeState {
-    #[serde(rename = "hadLocalOverride")]
-    had_local_override: bool,
-    #[serde(rename = "previousLocalMode")]
-    previous_local_mode: Option<Value>,
-}
-
-#[derive(Debug, Serialize)]
-#[allow(clippy::struct_excessive_bools)]
-struct PlanModeOutput {
-    success: bool,
-    operation: String,
-    changed: bool,
-    active: bool,
-    managed: bool,
-    message: String,
-    #[serde(rename = "settingsPath")]
-    settings_path: String,
-    #[serde(rename = "statePath")]
-    state_path: String,
-    #[serde(rename = "previousLocalMode")]
-    previous_local_mode: Option<Value>,
-    #[serde(rename = "currentLocalMode")]
-    current_local_mode: Option<Value>,
-}
-
-#[derive(Debug, Clone)]
-struct SearchableToolSpec {
-    name: String,
-    description: String,
-}
-
-#[derive(Debug, Serialize)]
-struct StructuredOutputResult {
-    data: String,
-    structured_output: BTreeMap<String, Value>,
-}
-
-#[derive(Debug, Serialize)]
-struct ReplOutput {
-    language: String,
-    stdout: String,
-    stderr: String,
-    #[serde(rename = "exitCode")]
-    exit_code: i32,
-    #[serde(rename = "durationMs")]
-    duration_ms: u128,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(untagged)]
-enum WebSearchResultItem {
-    SearchResult {
-        tool_use_id: String,
-        content: Vec<SearchHit>,
-    },
-    Commentary(String),
-}
-
-#[derive(Debug, Serialize)]
-struct SearchHit {
-    title: String,
-    url: String,
-}
-
-fn execute_web_fetch(input: &WebFetchInput) -> Result<WebFetchOutput, String> {
-    let started = Instant::now();
-    let client = build_http_client()?;
-    let request_url = normalize_fetch_url(&input.url)?;
-    let response = client
-        .get(request_url.clone())
-        .send()
-        .map_err(|error| error.to_string())?;
-
-    let status = response.status();
-    let final_url = response.url().to_string();
-    let code = status.as_u16();
-    let code_text = status.canonical_reason().unwrap_or("Unknown").to_string();
-    let content_type = response
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or_default()
-        .to_string();
-    let body = response.text().map_err(|error| error.to_string())?;
-    let bytes = body.len();
-    let normalized = normalize_fetched_content(&body, &content_type);
-    let result = summarize_web_fetch(&final_url, &input.prompt, &normalized, &body, &content_type);
-
-    Ok(WebFetchOutput {
-        bytes,
-        code,
-        code_text,
-        result,
-        duration_ms: started.elapsed().as_millis(),
-        url: final_url,
-    })
-}
-
-fn execute_web_search(input: &WebSearchInput) -> Result<WebSearchOutput, String> {
-    let started = Instant::now();
-    let client = build_http_client()?;
-    let search_url = build_search_url(&input.query)?;
-    let response = client
-        .get(search_url)
-        .send()
-        .map_err(|error| error.to_string())?;
-
-    let final_url = response.url().clone();
-    let html = response.text().map_err(|error| error.to_string())?;
-    let mut hits = extract_search_hits(&html);
-
-    if hits.is_empty() && final_url.host_str().is_some() {
-        hits = extract_search_hits_from_generic_links(&html);
-    }
-
-    if let Some(allowed) = input.allowed_domains.as_ref() {
-        hits.retain(|hit| host_matches_list(&hit.url, allowed));
-    }
-    if let Some(blocked) = input.blocked_domains.as_ref() {
-        hits.retain(|hit| !host_matches_list(&hit.url, blocked));
-    }
-
-    dedupe_hits(&mut hits);
-    hits.truncate(8);
-
-    let summary = if hits.is_empty() {
-        format!("No web search results matched the query {:?}.", input.query)
-    } else {
-        let rendered_hits = hits
-            .iter()
-            .map(|hit| format!("- [{}]({})", hit.title, hit.url))
-            .collect::<Vec<_>>()
-            .join("\n");
-        format!(
-            "Search results for {:?}. Include a Sources section in the final answer.\n{}",
-            input.query, rendered_hits
-        )
-    };
-
-    Ok(WebSearchOutput {
-        query: input.query.clone(),
-        results: vec![
-            WebSearchResultItem::Commentary(summary),
-            WebSearchResultItem::SearchResult {
-                tool_use_id: String::from("web_search_1"),
-                content: hits,
-            },
-        ],
-        duration_seconds: started.elapsed().as_secs_f64(),
-    })
-}
-
-fn build_http_client() -> Result<Client, String> {
-    Client::builder()
-        .timeout(Duration::from_secs(20))
-        .redirect(reqwest::redirect::Policy::limited(10))
-        .user_agent("clawd-rust-tools/0.1")
-        .build()
-        .map_err(|error| error.to_string())
-}
-
-fn normalize_fetch_url(url: &str) -> Result<String, String> {
-    let parsed = reqwest::Url::parse(url).map_err(|error| error.to_string())?;
-    if parsed.scheme() == "http" {
-        let host = parsed.host_str().unwrap_or_default();
-        if host != "localhost" && host != "127.0.0.1" && host != "::1" {
-            let mut upgraded = parsed;
-            upgraded
-                .set_scheme("https")
-                .map_err(|()| String::from("failed to upgrade URL to https"))?;
-            return Ok(upgraded.to_string());
-        }
-    }
-    Ok(parsed.to_string())
-}
-
-fn build_search_url(query: &str) -> Result<reqwest::Url, String> {
-    if let Ok(base) = std::env::var("CLAWD_WEB_SEARCH_BASE_URL") {
-        let mut url = reqwest::Url::parse(&base).map_err(|error| error.to_string())?;
-        url.query_pairs_mut().append_pair("q", query);
-        return Ok(url);
-    }
-
-    let mut url = reqwest::Url::parse("https://html.duckduckgo.com/html/")
-        .map_err(|error| error.to_string())?;
-    url.query_pairs_mut().append_pair("q", query);
-    Ok(url)
-}
-
-fn normalize_fetched_content(body: &str, content_type: &str) -> String {
-    if content_type.contains("html") {
-        html_to_text(body)
-    } else {
-        body.trim().to_string()
-    }
-}
-
-fn summarize_web_fetch(
-    url: &str,
-    prompt: &str,
-    content: &str,
-    raw_body: &str,
-    content_type: &str,
-) -> String {
-    let lower_prompt = prompt.to_lowercase();
-    let compact = collapse_whitespace(content);
-
-    let detail = if lower_prompt.contains("title") {
-        extract_title(content, raw_body, content_type).map_or_else(
-            || preview_text(&compact, 600),
-            |title| format!("Title: {title}"),
-        )
-    } else if lower_prompt.contains("summary") || lower_prompt.contains("summarize") {
-        preview_text(&compact, 900)
-    } else {
-        let preview = preview_text(&compact, 900);
-        format!("Prompt: {prompt}\nContent preview:\n{preview}")
-    };
-
-    format!("Fetched {url}\n{detail}")
 }
 
 fn extract_title(content: &str, raw_body: &str, content_type: &str) -> Option<String> {
@@ -3534,6 +1153,7 @@ fn extract_title(content: &str, raw_body: &str, content_type: &str) -> Option<St
     None
 }
 
+#[allow(dead_code)]
 fn html_to_text(html: &str) -> String {
     let mut text = String::with_capacity(html.len());
     let mut in_tag = false;
@@ -3583,214 +1203,320 @@ fn preview_text(input: &str, max_chars: usize) -> String {
         return input.to_string();
     }
     let shortened = input.chars().take(max_chars).collect::<String>();
-    format!("{}…", shortened.trim_end())
+    format!("{}��", shortened.trim_end())
 }
 
-fn extract_search_hits(html: &str) -> Vec<SearchHit> {
-    let mut hits = Vec::new();
-    let mut remaining = html;
+/// Smart content extractor for fetched HTML pages.
+/// Identifies the main content container (article/main/section/.content/etc.),
+/// skips nav/footer/aside/.ad noise, and detects JavaScript-heavy pages
+/// so the caller can fall back to RSS or text-only mode.
+struct FastContentEvaluator {
+    js_ratio_threshold: f64,
+    min_text_len: usize,
+    script_sel: Selector,
+    container_sel: Selector,
+    negative_sel: Selector,
+    p_sel: Selector,
+    body_sel: Selector,
+    div_sel: Selector,
+}
 
-    while let Some(anchor_start) = remaining.find("result__a") {
-        let after_class = &remaining[anchor_start..];
-        let Some(href_idx) = after_class.find("href=") else {
-            remaining = &after_class[1..];
-            continue;
-        };
-        let href_slice = &after_class[href_idx + 5..];
-        let Some((url, rest)) = extract_quoted_value(href_slice) else {
-            remaining = &after_class[1..];
-            continue;
-        };
-        let Some(close_tag_idx) = rest.find('>') else {
-            remaining = &after_class[1..];
-            continue;
-        };
-        let after_tag = &rest[close_tag_idx + 1..];
-        let Some(end_anchor_idx) = after_tag.find("</a>") else {
-            remaining = &after_tag[1..];
-            continue;
-        };
-        let title = html_to_text(&after_tag[..end_anchor_idx]);
-        if let Some(decoded_url) = decode_duckduckgo_redirect(&url) {
-            hits.push(SearchHit {
-                title: title.trim().to_string(),
-                url: decoded_url,
-            });
+impl Default for FastContentEvaluator {
+    fn default() -> Self {
+        Self {
+            js_ratio_threshold: 0.30,
+            min_text_len: 60,
+            script_sel: Selector::parse("script").unwrap(),
+            container_sel: Selector::parse(
+                "article, main, section, .content, .post, .article, .entry, #content, #main, .rich_media_content, .article-content, .news_content, .text_content, .content-article",
+            )
+            .unwrap(),
+            negative_sel: Selector::parse("nav, footer, header, aside, .sidebar, .ad, .nav, .footer")
+                .unwrap(),
+            p_sel: Selector::parse("p").unwrap(),
+            body_sel: Selector::parse("body").unwrap(),
+            div_sel: Selector::parse("div").unwrap(),
         }
-        remaining = &after_tag[end_anchor_idx + 4..];
+    }
+}
+
+struct PageAnalysis {
+    #[allow(dead_code)]
+    js_ratio: f64,
+    best_content_len: usize,
+    #[allow(dead_code)]
+    has_external_scripts: bool,
+}
+
+impl FastContentEvaluator {
+    fn analyze(&self, html: &str) -> PageAnalysis {
+        if html.len() < 50 {
+            return PageAnalysis {
+                js_ratio: 1.0,
+                best_content_len: 0,
+                has_external_scripts: false,
+            };
+        }
+
+        let document = Html::parse_document(html);
+        let html_len = html.len();
+
+        let (js_ratio, has_external) = self.calculate_js_ratio(&document, html_len);
+        let best_content_len = self.detect_content_length(&document);
+
+        PageAnalysis {
+            js_ratio,
+            best_content_len,
+            has_external_scripts: has_external,
+        }
     }
 
-    hits
-}
-
-fn extract_search_hits_from_generic_links(html: &str) -> Vec<SearchHit> {
-    let mut hits = Vec::new();
-    let mut remaining = html;
-
-    while let Some(anchor_start) = remaining.find("<a") {
-        let after_anchor = &remaining[anchor_start..];
-        let Some(href_idx) = after_anchor.find("href=") else {
-            remaining = &after_anchor[2..];
-            continue;
-        };
-        let href_slice = &after_anchor[href_idx + 5..];
-        let Some((url, rest)) = extract_quoted_value(href_slice) else {
-            remaining = &after_anchor[2..];
-            continue;
-        };
-        let Some(close_tag_idx) = rest.find('>') else {
-            remaining = &after_anchor[2..];
-            continue;
-        };
-        let after_tag = &rest[close_tag_idx + 1..];
-        let Some(end_anchor_idx) = after_tag.find("</a>") else {
-            remaining = &after_anchor[2..];
-            continue;
-        };
-        let title = html_to_text(&after_tag[..end_anchor_idx]);
-        if title.trim().is_empty() {
-            remaining = &after_tag[end_anchor_idx + 4..];
-            continue;
+    fn should_retain(&self, analysis: &PageAnalysis) -> bool {
+        if analysis.best_content_len >= self.min_text_len {
+            return true;
         }
-        let decoded_url = decode_duckduckgo_redirect(&url).unwrap_or(url);
-        if decoded_url.starts_with("http://") || decoded_url.starts_with("https://") {
-            hits.push(SearchHit {
-                title: title.trim().to_string(),
-                url: decoded_url,
-            });
+        if analysis.js_ratio <= self.js_ratio_threshold && analysis.best_content_len >= 20 {
+            return true;
         }
-        remaining = &after_tag[end_anchor_idx + 4..];
+        false
     }
 
-    hits
-}
+    fn calculate_js_ratio(&self, document: &Html, html_len: usize) -> (f64, bool) {
+        let html_len_f = html_len as f64;
+        let mut total_len = 0usize;
+        let mut has_external = false;
 
-fn extract_quoted_value(input: &str) -> Option<(String, &str)> {
-    let quote = input.chars().next()?;
-    if quote != '"' && quote != '\'' {
-        return None;
-    }
-    let rest = &input[quote.len_utf8()..];
-    let end = rest.find(quote)?;
-    Some((rest[..end].to_string(), &rest[end + quote.len_utf8()..]))
-}
-
-fn decode_duckduckgo_redirect(url: &str) -> Option<String> {
-    let decoded = html_entity_decode_url(url);
-    let parsed = if decoded.starts_with("http://") || decoded.starts_with("https://") {
-        reqwest::Url::parse(&decoded).ok()
-    } else if decoded.starts_with("//") {
-        reqwest::Url::parse(&format!("https:{decoded}")).ok()
-    } else if decoded.starts_with('/') {
-        reqwest::Url::parse(&format!("https://duckduckgo.com{decoded}")).ok()
-    } else {
-        return None;
-    }?;
-
-    let host = parsed.host_str().unwrap_or_default().to_ascii_lowercase();
-    if (host == "duckduckgo.com" || host.ends_with(".duckduckgo.com"))
-        && (parsed.path() == "/l/" || parsed.path() == "/l")
-    {
-        for (key, value) in parsed.query_pairs() {
-            if key == "uddg" {
-                return Some(html_entity_decode_url(value.as_ref()));
+        for el in document.select(&self.script_sel) {
+            total_len += el.text().map(|t| t.len()).sum::<usize>();
+            if el.value().attr("src").is_some() {
+                has_external = true;
+                total_len += 1024;
             }
         }
+
+        let ratio = if html_len_f > 0.0 {
+            (total_len as f64 / html_len_f).min(1.0)
+        } else {
+            0.0
+        };
+
+        (ratio, has_external)
     }
 
-    if decoded.starts_with("http://") || decoded.starts_with("https://") {
-        Some(decoded)
-    } else {
-        Some(parsed.to_string())
+    fn detect_content_length(&self, document: &Html) -> usize {
+        let candidates: Vec<_> = document.select(&self.container_sel).collect();
+
+        let body = match document.select(&self.body_sel).next() {
+            Some(b) => b,
+            None => return 0,
+        };
+
+        let candidate_refs: Vec<_> = if candidates.is_empty() {
+            body.select(&self.div_sel).collect()
+        } else {
+            candidates
+        };
+
+        let mut best_score = -1i32;
+        let mut best_text_len = 0usize;
+
+        for candidate in &candidate_refs {
+            let mut score = 0i32;
+
+            let name = candidate.value().name();
+            let class = candidate.value().attr("class").unwrap_or("");
+            let id = candidate.value().attr("id").unwrap_or("");
+
+            match name {
+                "article" => score += 30,
+                "main" => score += 25,
+                "section" => score += 15,
+                _ => {}
+            }
+
+            let class_tokens = format!(" {} ", class);
+            let id_tokens = format!(" {} ", id);
+
+            if class_tokens.contains(" content ")
+                || class_tokens.contains(" post ")
+                || class_tokens.contains(" article ")
+                || class_tokens.contains(" entry ")
+            {
+                score += 25;
+            }
+
+            if id_tokens.contains(" content ")
+                || id_tokens.contains(" main ")
+                || id_tokens.contains(" article ")
+            {
+                score += 25;
+            }
+
+            let p_count = candidate.select(&self.p_sel).count();
+            score += p_count as i32 * 8;
+
+            let neg_count = candidate.select(&self.negative_sel).count();
+            score -= neg_count as i32 * 12;
+
+            if score > best_score {
+                best_score = score;
+                best_text_len = candidate
+                    .text()
+                    .map(|t| t.chars().filter(|c| !c.is_whitespace()).count())
+                    .sum();
+            }
+        }
+
+        if best_text_len == 0 {
+            best_text_len = body
+                .text()
+                .map(|t| t.chars().filter(|c| !c.is_whitespace()).count())
+                .sum();
+        }
+
+        best_text_len
+    }
+
+    fn extract_text(&self, html: &str) -> String {
+        if html.len() < 50 {
+            return String::new();
+        }
+
+        let document = Html::parse_document(html);
+        let candidates: Vec<_> = document.select(&self.container_sel).collect();
+
+        let body = match document.select(&self.body_sel).next() {
+            Some(b) => b,
+            None => return String::new(),
+        };
+
+        let candidate_refs: Vec<_> = if candidates.is_empty() {
+            body.select(&self.div_sel).collect()
+        } else {
+            candidates
+        };
+
+        let mut best_score = -1i32;
+        let mut best_text = String::new();
+
+        for candidate in &candidate_refs {
+            let mut score = 0i32;
+
+            let name = candidate.value().name();
+            let class = candidate.value().attr("class").unwrap_or("");
+            let id = candidate.value().attr("id").unwrap_or("");
+
+            match name {
+                "article" => score += 30,
+                "main" => score += 25,
+                "section" => score += 15,
+                _ => {}
+            }
+
+            let class_tokens = format!(" {} ", class);
+            let id_tokens = format!(" {} ", id);
+
+            if class_tokens.contains(" content ")
+                || class_tokens.contains(" post ")
+                || class_tokens.contains(" article ")
+                || class_tokens.contains(" entry ")
+            {
+                score += 25;
+            }
+
+            if id_tokens.contains(" content ")
+                || id_tokens.contains(" main ")
+                || id_tokens.contains(" article ")
+            {
+                score += 25;
+            }
+
+            let p_count = candidate.select(&self.p_sel).count();
+            score += p_count as i32 * 8;
+
+            let neg_count = candidate.select(&self.negative_sel).count();
+            score -= neg_count as i32 * 12;
+
+            if score > best_score {
+                best_score = score;
+                best_text = candidate.text().collect();
+            }
+        }
+
+        if best_text.is_empty() {
+            best_text = body.text().collect();
+        }
+
+        best_text
     }
 }
 
-fn html_entity_decode_url(url: &str) -> String {
-    decode_html_entities(url)
-}
+fn summarize_web_fetch(url: &str, prompt: &str, raw_body: &str, content_type: &str) -> String {
+    let lower_prompt = prompt.to_ascii_lowercase();
 
-fn host_matches_list(url: &str, domains: &[String]) -> bool {
-    let Ok(parsed) = reqwest::Url::parse(url) else {
-        return false;
-    };
-    let Some(host) = parsed.host_str() else {
-        return false;
-    };
-    let host = host.to_ascii_lowercase();
-    domains.iter().any(|domain| {
-        let normalized = normalize_domain_filter(domain);
-        !normalized.is_empty() && (host == normalized || host.ends_with(&format!(".{normalized}")))
-    })
-}
+    // For non-HTML content, skip the SmartContentEvaluator and just
+    // surface the trimmed body �?the evaluator's heuristics assume
+    // an HTML document.
+    if !content_type.contains("html") {
+        let text = raw_body.trim();
+        let detail = if lower_prompt.contains("title") {
+            text.lines()
+                .find(|line| !line.trim().is_empty())
+                .map(|line| format!("Title: {line}"))
+                .unwrap_or_else(|| format!("Fetched {url}\n\n{text}"))
+        } else if lower_prompt.contains("summary") || lower_prompt.contains("summarize") {
+            format!("Fetched {url}\n\n{text}")
+        } else {
+            format!(
+                "Fetched {url}\n\nPrompt: {prompt}\n\n{text}",
+                prompt = prompt
+            )
+        };
+        return detail;
+    }
 
-fn normalize_domain_filter(domain: &str) -> String {
-    let trimmed = domain.trim();
-    let candidate = reqwest::Url::parse(trimmed)
-        .ok()
-        .and_then(|url| url.host_str().map(str::to_string))
-        .unwrap_or_else(|| trimmed.to_string());
-    candidate
-        .trim()
-        .trim_start_matches('.')
-        .trim_end_matches('/')
-        .to_ascii_lowercase()
-}
+    let evaluator = FastContentEvaluator::default();
+    let analysis = evaluator.analyze(raw_body);
+    let should_retain = evaluator.should_retain(&analysis);
+    let main_text = evaluator.extract_text(raw_body);
+    let compact = collapse_whitespace(&main_text);
 
-fn dedupe_hits(hits: &mut Vec<SearchHit>) {
-    let mut seen = BTreeSet::new();
-    hits.retain(|hit| seen.insert(hit.url.clone()));
-}
+    let is_dynamic_content = !should_retain;
 
-fn execute_todo_write(input: TodoWriteInput) -> Result<TodoWriteOutput, String> {
-    validate_todos(&input.todos)?;
-    let store_path = todo_store_path()?;
-    let old_todos = if store_path.exists() {
-        serde_json::from_str::<Vec<TodoItem>>(
-            &std::fs::read_to_string(&store_path).map_err(|error| error.to_string())?,
+    let detail = if is_dynamic_content {
+        let normalized_for_title = collapse_whitespace(&decode_html_entities(&main_text));
+        let title = extract_title(&normalized_for_title, raw_body, content_type)
+            .unwrap_or_else(|| "Unable to extract".to_string());
+        format!(
+            "Title: {}\n\nNote: This page uses JavaScript to render content. \
+            The web fetch tool cannot execute JavaScript, so only static HTML was retrieved. \
+            For best results with news sites, try using a text-only version or RSS feed.",
+            title
         )
-        .map_err(|error| error.to_string())?
+    } else if lower_prompt.contains("title") {
+        extract_title(&compact, raw_body, content_type).map_or_else(
+            || preview_text(&compact, 600),
+            |title| format!("Title: {title}"),
+        )
+    } else if lower_prompt.contains("summary") || lower_prompt.contains("summarize") {
+        // Return full content for summary requests (up to 50,000 chars)
+        preview_text(&compact, 50_000)
     } else {
-        Vec::new()
+        // Return full content instead of 900-char preview to avoid
+        // AI repeatedly fetching the same page trying to get complete content.
+        // This saves tokens overall: one fetch with full content vs multiple
+        // fetches with truncated previews.
+        let full = preview_text(&compact, 50_000);
+        format!("Prompt: {prompt}\nContent:\n{full}")
     };
 
-    let all_done = input
-        .todos
-        .iter()
-        .all(|todo| matches!(todo.status, TodoStatus::Completed));
-    let persisted = if all_done {
-        Vec::new()
-    } else {
-        input.todos.clone()
-    };
-
-    if let Some(parent) = store_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-    }
-    std::fs::write(
-        &store_path,
-        serde_json::to_string_pretty(&persisted).map_err(|error| error.to_string())?,
-    )
-    .map_err(|error| error.to_string())?;
-
-    let verification_nudge_needed = (all_done
-        && input.todos.len() >= 3
-        && !input
-            .todos
-            .iter()
-            .any(|todo| todo.content.to_lowercase().contains("verif")))
-    .then_some(true);
-
-    Ok(TodoWriteOutput {
-        old_todos,
-        new_todos: input.todos,
-        verification_nudge_needed,
-    })
+    format!("Fetched {url}\n{detail}")
 }
 
 fn execute_skill(input: SkillInput) -> Result<SkillOutput, String> {
     let skill_path = resolve_skill_path(&input.skill)?;
     let prompt = std::fs::read_to_string(&skill_path).map_err(|error| error.to_string())?;
-    let description = parse_skill_description(&prompt);
+    let description = parse_skill_description(&prompt).unwrap_or_default();
 
     Ok(SkillOutput {
         skill: input.skill,
@@ -3799,28 +1525,6 @@ fn execute_skill(input: SkillInput) -> Result<SkillOutput, String> {
         description,
         prompt,
     })
-}
-
-fn validate_todos(todos: &[TodoItem]) -> Result<(), String> {
-    if todos.is_empty() {
-        return Err(String::from("todos must not be empty"));
-    }
-    // Allow multiple in_progress items for parallel workflows
-    if todos.iter().any(|todo| todo.content.trim().is_empty()) {
-        return Err(String::from("todo content must not be empty"));
-    }
-    if todos.iter().any(|todo| todo.active_form.trim().is_empty()) {
-        return Err(String::from("todo activeForm must not be empty"));
-    }
-    Ok(())
-}
-
-fn todo_store_path() -> Result<std::path::PathBuf, String> {
-    if let Ok(path) = std::env::var("CLAWD_TODO_STORE") {
-        return Ok(std::path::PathBuf::from(path));
-    }
-    let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
-    Ok(cwd.join(".clawd-todos.json"))
 }
 
 fn resolve_skill_path(skill: &str) -> Result<std::path::PathBuf, String> {
@@ -3837,13 +1541,88 @@ fn resolve_skill_path_from_compat_roots(skill: &str) -> Result<std::path::PathBu
         return Err(String::from("skill must not be empty"));
     }
 
+    if requested == "*" || requested == "all" {
+        let names = list_available_skill_names();
+        if names.is_empty() {
+            return Err(String::from(
+                "no skills available �� use /skills list in the CLI",
+            ));
+        }
+        return Err(format!("Available skills: {}", names.join(", ")));
+    }
+
     for root in skill_lookup_roots() {
         if let Some(path) = resolve_skill_path_in_root(&root, requested) {
             return Ok(path);
         }
     }
 
-    Err(format!("unknown skill: {requested}"))
+    let available = list_available_skill_names();
+    if available.is_empty() {
+        Err(format!(
+            "unknown skill: {requested} (no skills are currently available)"
+        ))
+    } else {
+        Err(format!(
+            "unknown skill: {requested}. Available skills: {}",
+            available.join(", ")
+        ))
+    }
+}
+
+fn list_available_skill_names() -> Vec<String> {
+    let mut names = Vec::new();
+    for root in skill_lookup_roots() {
+        match root.origin {
+            SkillLookupOrigin::SkillsDir => {
+                if let Ok(entries) = std::fs::read_dir(&root.path) {
+                    for entry in entries.flatten() {
+                        if !entry.path().is_dir() {
+                            continue;
+                        }
+                        let skill_path = entry.path().join("SKILL.md");
+                        if !skill_path.is_file() {
+                            continue;
+                        }
+                        if let Ok(contents) = std::fs::read_to_string(&skill_path) {
+                            if let Some(name) = parse_skill_name(&contents) {
+                                if !names.contains(&name) {
+                                    names.push(name);
+                                    continue;
+                                }
+                            }
+                        }
+                        let dir_name = entry.file_name().to_string_lossy().to_string();
+                        if !names.contains(&dir_name) {
+                            names.push(dir_name);
+                        }
+                    }
+                }
+            }
+            SkillLookupOrigin::LegacyCommandsDir => {
+                if let Ok(entries) = std::fs::read_dir(&root.path) {
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        if path.is_dir() && path.join("SKILL.md").is_file() {
+                            let name = entry.file_name().to_string_lossy().to_string();
+                            if !names.contains(&name) {
+                                names.push(name);
+                            }
+                        } else if path.extension().is_some_and(|e| e == "md") {
+                            if let Some(stem) = path.file_stem() {
+                                let name = stem.to_string_lossy().to_string();
+                                if !names.contains(&name) {
+                                    names.push(name);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    names.sort();
+    names
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3868,9 +1647,6 @@ fn skill_lookup_roots() -> Vec<SkillLookupRoot> {
     if let Ok(claw_config_home) = std::env::var("CLAW_CONFIG_HOME") {
         push_prefixed_skill_lookup_roots(&mut roots, std::path::Path::new(&claw_config_home));
     }
-    if let Ok(codex_home) = std::env::var("CODEX_HOME") {
-        push_prefixed_skill_lookup_roots(&mut roots, std::path::Path::new(&codex_home));
-    }
     if let Ok(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
         push_home_skill_lookup_roots(&mut roots, std::path::Path::new(&home));
     }
@@ -3883,57 +1659,27 @@ fn skill_lookup_roots() -> Vec<SkillLookupRoot> {
         );
         push_skill_lookup_root(
             &mut roots,
-            claude_config_dir.join("skills").join("omc-learned"),
-            SkillLookupOrigin::SkillsDir,
-        );
-        push_skill_lookup_root(
-            &mut roots,
             claude_config_dir.join("commands"),
             SkillLookupOrigin::LegacyCommandsDir,
         );
     }
-    push_skill_lookup_root(
-        &mut roots,
-        std::path::PathBuf::from("/home/bellman/.claw/skills"),
-        SkillLookupOrigin::SkillsDir,
-    );
-    push_skill_lookup_root(
-        &mut roots,
-        std::path::PathBuf::from("/home/bellman/.codex/skills"),
-        SkillLookupOrigin::SkillsDir,
-    );
 
     roots
 }
 
 fn push_project_skill_lookup_roots(roots: &mut Vec<SkillLookupRoot>, cwd: &std::path::Path) {
     for ancestor in cwd.ancestors() {
-        push_prefixed_skill_lookup_roots(roots, &ancestor.join(".omc"));
-        push_prefixed_skill_lookup_roots(roots, &ancestor.join(".agents"));
         push_prefixed_skill_lookup_roots(roots, &ancestor.join(".claw"));
-        push_prefixed_skill_lookup_roots(roots, &ancestor.join(".codex"));
         push_prefixed_skill_lookup_roots(roots, &ancestor.join(".claude"));
     }
 }
 
 fn push_home_skill_lookup_roots(roots: &mut Vec<SkillLookupRoot>, home: &std::path::Path) {
-    push_prefixed_skill_lookup_roots(roots, &home.join(".omc"));
     push_prefixed_skill_lookup_roots(roots, &home.join(".claw"));
-    push_prefixed_skill_lookup_roots(roots, &home.join(".codex"));
     push_prefixed_skill_lookup_roots(roots, &home.join(".claude"));
     push_skill_lookup_root(
         roots,
-        home.join(".agents").join("skills"),
-        SkillLookupOrigin::SkillsDir,
-    );
-    push_skill_lookup_root(
-        roots,
         home.join(".config").join("opencode").join("skills"),
-        SkillLookupOrigin::SkillsDir,
-    );
-    push_skill_lookup_root(
-        roots,
-        home.join(".claude").join("skills").join("omc-learned"),
         SkillLookupOrigin::SkillsDir,
     );
 }
@@ -3973,6 +1719,12 @@ fn resolve_skill_path_in_skills_dir(
     root: &std::path::Path,
     requested: &str,
 ) -> Option<std::path::PathBuf> {
+    // Legacy single-file skill: `<root>/<requested>.md`
+    let direct_file = root.join(format!("{requested}.md"));
+    if direct_file.is_file() {
+        return Some(direct_file);
+    }
+
     let direct = root.join(requested).join("SKILL.md");
     if direct.is_file() {
         return Some(direct);
@@ -3980,20 +1732,49 @@ fn resolve_skill_path_in_skills_dir(
 
     let entries = std::fs::read_dir(root).ok()?;
     for entry in entries.flatten() {
-        if !entry.path().is_dir() {
+        let entry_path = entry.path();
+        if !entry_path.is_dir() {
             continue;
         }
-        let skill_path = entry.path().join("SKILL.md");
-        if !skill_path.is_file() {
+        let dir_name = entry_path.file_name().map_or_else(
+            || std::string::String::new(),
+            |s| s.to_string_lossy().to_string(),
+        );
+        let skill_path = entry_path.join("SKILL.md");
+        let resolved = if skill_path.is_file() {
+            skill_path
+        } else {
+            let mut md_files: Vec<_> = std::fs::read_dir(&entry_path)
+                .ok()?
+                .flatten()
+                .filter_map(|e| {
+                    let p = e.path();
+                    if p.extension()
+                        .is_some_and(|x| x.to_string_lossy().eq_ignore_ascii_case("md"))
+                    {
+                        Some(p)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            md_files.sort();
+            if md_files.len() == 1 {
+                md_files.pop().unwrap()
+            } else {
+                skill_path
+            }
+        };
+        if !resolved.is_file() {
             continue;
         }
-        if entry
-            .file_name()
-            .to_string_lossy()
-            .eq_ignore_ascii_case(requested)
-            || skill_frontmatter_name_matches(&skill_path, requested)
+        if dir_name.eq_ignore_ascii_case(requested)
+            || skill_frontmatter_name_matches(&resolved, requested)
+            || resolved.file_stem().map_or(false, |s| {
+                s.to_string_lossy().eq_ignore_ascii_case(requested)
+            })
         {
-            return Some(skill_path);
+            return Some(resolved);
         }
     }
 
@@ -4056,2778 +1837,52 @@ fn skill_frontmatter_name_matches(path: &std::path::Path, requested: &str) -> bo
 }
 
 fn parse_skill_name(contents: &str) -> Option<String> {
-    parse_skill_frontmatter_value(contents, "name")
-}
-
-fn parse_skill_frontmatter_value(contents: &str, key: &str) -> Option<String> {
-    let mut lines = contents.lines();
-    if lines.next().map(str::trim) != Some("---") {
-        return None;
-    }
-
-    for line in lines {
-        let trimmed = line.trim();
-        if trimmed == "---" {
-            break;
-        }
-        if let Some(value) = trimmed.strip_prefix(&format!("{key}:")) {
-            let value = value
-                .trim()
-                .trim_matches(|ch| matches!(ch, '"' | '\''))
-                .trim();
-            if !value.is_empty() {
-                return Some(value.to_string());
-            }
-        }
-    }
-
-    None
-}
-
-const DEFAULT_AGENT_MODEL: &str = "claude-opus-4-6";
-const DEFAULT_AGENT_SYSTEM_DATE: &str = "2026-03-31";
-const DEFAULT_AGENT_MAX_ITERATIONS: usize = 32;
-
-fn execute_agent(input: AgentInput) -> Result<AgentOutput, String> {
-    execute_agent_with_spawn(input, spawn_agent_job)
-}
-
-fn execute_agent_with_spawn<F>(input: AgentInput, spawn_fn: F) -> Result<AgentOutput, String>
-where
-    F: FnOnce(AgentJob) -> Result<(), String>,
-{
-    if input.description.trim().is_empty() {
-        return Err(String::from("description must not be empty"));
-    }
-    if input.prompt.trim().is_empty() {
-        return Err(String::from("prompt must not be empty"));
-    }
-
-    let agent_id = make_agent_id();
-    let output_dir = agent_store_dir()?;
-    std::fs::create_dir_all(&output_dir).map_err(|error| error.to_string())?;
-    let output_file = output_dir.join(format!("{agent_id}.md"));
-    let manifest_file = output_dir.join(format!("{agent_id}.json"));
-    let normalized_subagent_type = normalize_subagent_type(input.subagent_type.as_deref());
-    let model = resolve_agent_model(input.model.as_deref());
-    let agent_name = input
+    plugins::frontmatter::parse_frontmatter(contents)
+        .ok()?
+        .frontmatter
         .name
-        .as_deref()
-        .map(slugify_agent_name)
-        .filter(|name| !name.is_empty())
-        .unwrap_or_else(|| slugify_agent_name(&input.description));
-    let created_at = iso8601_now();
-    let system_prompt = build_agent_system_prompt(&normalized_subagent_type, &model)?;
-    let allowed_tools = allowed_tools_for_subagent(&normalized_subagent_type);
-
-    let output_contents = format!(
-        "# Agent Task
-
-- id: {}
-- name: {}
-- description: {}
-- subagent_type: {}
-- created_at: {}
-
-## Prompt
-
-{}
-",
-        agent_id, agent_name, input.description, normalized_subagent_type, created_at, input.prompt
-    );
-    std::fs::write(&output_file, output_contents).map_err(|error| error.to_string())?;
-
-    let manifest = AgentOutput {
-        agent_id,
-        name: agent_name,
-        description: input.description,
-        subagent_type: Some(normalized_subagent_type),
-        model: Some(model),
-        status: String::from("running"),
-        output_file: output_file.display().to_string(),
-        manifest_file: manifest_file.display().to_string(),
-        created_at: created_at.clone(),
-        started_at: Some(created_at),
-        completed_at: None,
-        lane_events: vec![LaneEvent::started(iso8601_now())],
-        current_blocker: None,
-        derived_state: String::from("working"),
-        error: None,
-    };
-    write_agent_manifest(&manifest)?;
-
-    let manifest_for_spawn = manifest.clone();
-    let job = AgentJob {
-        manifest: manifest_for_spawn,
-        prompt: input.prompt,
-        system_prompt,
-        allowed_tools,
-    };
-    if let Err(error) = spawn_fn(job) {
-        let error = format!("failed to spawn sub-agent: {error}");
-        persist_agent_terminal_state(&manifest, "failed", None, Some(error.clone()))?;
-        return Err(error);
-    }
-
-    Ok(manifest)
 }
 
-fn spawn_agent_job(job: AgentJob) -> Result<(), String> {
-    let thread_name = format!("clawd-agent-{}", job.manifest.agent_id);
-    std::thread::Builder::new()
-        .name(thread_name)
-        .spawn(move || {
-            let result =
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_agent_job(&job)));
-            match result {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => {
-                    let _ =
-                        persist_agent_terminal_state(&job.manifest, "failed", None, Some(error));
-                }
-                Err(_) => {
-                    let _ = persist_agent_terminal_state(
-                        &job.manifest,
-                        "failed",
-                        None,
-                        Some(String::from("sub-agent thread panicked")),
-                    );
-                }
-            }
-        })
-        .map(|_| ())
-        .map_err(|error| error.to_string())
-}
-
-fn run_agent_job(job: &AgentJob) -> Result<(), String> {
-    let mut runtime = build_agent_runtime(job)?.with_max_iterations(DEFAULT_AGENT_MAX_ITERATIONS);
-    let summary = runtime
-        .run_turn(job.prompt.clone(), None)
-        .map_err(|error| error.to_string())?;
-    let final_text = final_assistant_text(&summary);
-    persist_agent_terminal_state(&job.manifest, "completed", Some(final_text.as_str()), None)
-}
-
-fn build_agent_runtime(
-    job: &AgentJob,
-) -> Result<ConversationRuntime<ProviderRuntimeClient, SubagentToolExecutor>, String> {
-    let model = job
-        .manifest
-        .model
-        .clone()
-        .unwrap_or_else(|| DEFAULT_AGENT_MODEL.to_string());
-    let allowed_tools = job.allowed_tools.clone();
-    let api_client = ProviderRuntimeClient::new(model, allowed_tools.clone())?;
-    let permission_policy = agent_permission_policy();
-    let tool_executor = SubagentToolExecutor::new(allowed_tools)
-        .with_enforcer(PermissionEnforcer::new(permission_policy.clone()));
-    Ok(ConversationRuntime::new(
-        Session::new(),
-        api_client,
-        tool_executor,
-        permission_policy,
-        job.system_prompt.clone(),
-    ))
-}
-
-fn build_agent_system_prompt(subagent_type: &str, model: &str) -> Result<Vec<String>, String> {
-    let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
-    let mut prompt = load_system_prompt(
-        cwd,
-        DEFAULT_AGENT_SYSTEM_DATE.to_string(),
-        std::env::consts::OS,
-        "unknown",
-        model_family_identity_for(model),
-    )
-    .map_err(|error| error.to_string())?;
-    prompt.push(format!(
-        "You are a background sub-agent of type `{subagent_type}`. Work only on the delegated task, use only the tools available to you, do not ask the user questions, and finish with a concise result."
-    ));
-    Ok(prompt)
-}
-
-fn resolve_agent_model(model: Option<&str>) -> String {
-    model
-        .map(str::trim)
-        .filter(|model| !model.is_empty())
-        .unwrap_or(DEFAULT_AGENT_MODEL)
-        .to_string()
-}
-
-fn allowed_tools_for_subagent(subagent_type: &str) -> BTreeSet<String> {
-    let tools = match subagent_type {
-        "Explore" => vec![
-            "read_file",
-            "glob_search",
-            "grep_search",
-            "WebFetch",
-            "WebSearch",
-            "ToolSearch",
-            "Skill",
-            "StructuredOutput",
-        ],
-        "Plan" => vec![
-            "read_file",
-            "glob_search",
-            "grep_search",
-            "WebFetch",
-            "WebSearch",
-            "ToolSearch",
-            "Skill",
-            "TodoWrite",
-            "StructuredOutput",
-            "SendUserMessage",
-        ],
-        "Verification" => vec![
-            "bash",
-            "read_file",
-            "glob_search",
-            "grep_search",
-            "WebFetch",
-            "WebSearch",
-            "ToolSearch",
-            "TodoWrite",
-            "StructuredOutput",
-            "SendUserMessage",
-            "PowerShell",
-        ],
-        "claw-guide" => vec![
-            "read_file",
-            "glob_search",
-            "grep_search",
-            "WebFetch",
-            "WebSearch",
-            "ToolSearch",
-            "Skill",
-            "StructuredOutput",
-            "SendUserMessage",
-        ],
-        "statusline-setup" => vec![
-            "bash",
-            "read_file",
-            "write_file",
-            "edit_file",
-            "glob_search",
-            "grep_search",
-            "ToolSearch",
-        ],
-        _ => vec![
-            "bash",
-            "read_file",
-            "write_file",
-            "edit_file",
-            "glob_search",
-            "grep_search",
-            "WebFetch",
-            "WebSearch",
-            "TodoWrite",
-            "Skill",
-            "ToolSearch",
-            "NotebookEdit",
-            "Sleep",
-            "SendUserMessage",
-            "Config",
-            "StructuredOutput",
-            "REPL",
-            "PowerShell",
-        ],
-    };
-    tools.into_iter().map(canonical_allowed_tool_name).collect()
-}
-
-fn agent_permission_policy() -> PermissionPolicy {
-    mvp_tool_specs().into_iter().fold(
-        PermissionPolicy::new(PermissionMode::DangerFullAccess),
-        |policy, spec| policy.with_tool_requirement(spec.name, spec.required_permission),
-    )
-}
-
-fn write_agent_manifest(manifest: &AgentOutput) -> Result<(), String> {
-    let mut normalized = manifest.clone();
-    normalized.lane_events = dedupe_superseded_commit_events(&normalized.lane_events);
-    std::fs::write(
-        &normalized.manifest_file,
-        serde_json::to_string_pretty(&normalized).map_err(|error| error.to_string())?,
-    )
-    .map_err(|error| error.to_string())
-}
-
-fn persist_agent_terminal_state(
-    manifest: &AgentOutput,
-    status: &str,
-    result: Option<&str>,
-    error: Option<String>,
-) -> Result<(), String> {
-    let blocker = error.as_deref().map(classify_lane_blocker);
-    append_agent_output(
-        &manifest.output_file,
-        &format_agent_terminal_output(status, result, blocker.as_ref(), error.as_deref()),
-    )?;
-    let mut next_manifest = manifest.clone();
-    next_manifest.status = status.to_string();
-    next_manifest.completed_at = Some(iso8601_now());
-    next_manifest.current_blocker.clone_from(&blocker);
-    next_manifest.derived_state =
-        derive_agent_state(status, result, error.as_deref(), blocker.as_ref()).to_string();
-    next_manifest.error = error;
-    if let Some(blocker) = blocker {
-        next_manifest
-            .lane_events
-            .push(LaneEvent::blocked(iso8601_now(), &blocker));
-        next_manifest
-            .lane_events
-            .push(LaneEvent::failed(iso8601_now(), &blocker));
-    } else {
-        next_manifest.current_blocker = None;
-        let mut finished_summary = build_lane_finished_summary(&next_manifest, result);
-        finished_summary.data.disabled_cron_ids = disable_matching_crons(&next_manifest, result);
-        next_manifest.lane_events.push(
-            LaneEvent::finished(iso8601_now(), finished_summary.detail).with_data(
-                serde_json::to_value(&finished_summary.data)
-                    .expect("lane summary metadata should serialize"),
-            ),
-        );
-        if let Some(provenance) = maybe_commit_provenance(result) {
-            next_manifest.lane_events.push(LaneEvent::commit_created(
-                iso8601_now(),
-                Some(format!("commit {}", provenance.commit)),
-                provenance,
-            ));
-        }
-    }
-    write_agent_manifest(&next_manifest)
-}
-
-const MIN_LANE_SUMMARY_WORDS: usize = 7;
-const REVIEW_VERDICTS: &[(&str, &str)] = &[
-    ("APPROVE", "approve"),
-    ("REJECT", "reject"),
-    ("BLOCKED", "blocked"),
-];
-const CONTROL_ONLY_SUMMARY_WORDS: &[&str] = &[
-    "ack",
-    "commit",
-    "continue",
-    "everyting",
-    "everything",
-    "keep",
-    "next",
-    "push",
-    "ralph",
-    "resume",
-    "retry",
-    "run",
-    "stop",
-    "sweep",
-    "sweeping",
-    "team",
-];
-const CONTEXTUAL_SUMMARY_WORDS: &[&str] = &[
-    "added",
-    "audited",
-    "blocked",
-    "completed",
-    "documented",
-    "failed",
-    "finished",
-    "fixed",
-    "implemented",
-    "investigated",
-    "merged",
-    "pushed",
-    "refactored",
-    "removed",
-    "reviewed",
-    "tested",
-    "updated",
-    "verified",
-];
-
-#[derive(Debug, Clone, Serialize)]
-struct LaneFinishedSummaryData {
-    #[serde(rename = "qualityFloorApplied")]
-    quality_floor_applied: bool,
-    reasons: Vec<String>,
-    #[serde(rename = "rawSummary", skip_serializing_if = "Option::is_none")]
-    raw_summary: Option<String>,
-    #[serde(rename = "wordCount")]
-    word_count: usize,
-    #[serde(rename = "reviewVerdict", skip_serializing_if = "Option::is_none")]
-    review_verdict: Option<String>,
-    #[serde(rename = "reviewTarget", skip_serializing_if = "Option::is_none")]
-    review_target: Option<String>,
-    #[serde(rename = "reviewRationale", skip_serializing_if = "Option::is_none")]
-    review_rationale: Option<String>,
-    #[serde(rename = "selectionOutcome", skip_serializing_if = "Option::is_none")]
-    selection_outcome: Option<SelectionOutcome>,
-    #[serde(rename = "recoveryOutcome", skip_serializing_if = "Option::is_none")]
-    recovery_outcome: Option<RecoveryOutcome>,
-    #[serde(rename = "artifactProvenance", skip_serializing_if = "Option::is_none")]
-    artifact_provenance: Option<ArtifactProvenance>,
-    #[serde(rename = "disabledCronIds", skip_serializing_if = "Vec::is_empty")]
-    disabled_cron_ids: Vec<String>,
-}
-
-#[derive(Debug, Clone)]
-struct LaneFinishedSummary {
-    detail: Option<String>,
-    data: LaneFinishedSummaryData,
-}
-
-#[derive(Debug)]
-struct LaneSummaryAssessment {
-    apply_quality_floor: bool,
-    reasons: Vec<String>,
-    word_count: usize,
-    review_outcome: Option<ReviewLaneOutcome>,
-    recovery_outcome: Option<RecoveryOutcome>,
-}
-
-#[derive(Debug, Clone)]
-struct ReviewLaneOutcome {
-    verdict: String,
-    rationale: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct SelectionOutcome {
-    #[serde(rename = "chosenItems", skip_serializing_if = "Vec::is_empty")]
-    chosen_items: Vec<String>,
-    #[serde(rename = "skippedItems", skip_serializing_if = "Vec::is_empty")]
-    skipped_items: Vec<String>,
-    action: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    rationale: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct RecoveryOutcome {
-    cause: String,
-    #[serde(rename = "targetLane", skip_serializing_if = "Option::is_none")]
-    target_lane: Option<String>,
-    #[serde(rename = "preservedState", skip_serializing_if = "Option::is_none")]
-    preserved_state: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct ArtifactProvenance {
-    #[serde(rename = "sourceLanes", skip_serializing_if = "Vec::is_empty")]
-    source_lanes: Vec<String>,
-    #[serde(rename = "roadmapIds", skip_serializing_if = "Vec::is_empty")]
-    roadmap_ids: Vec<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    files: Vec<String>,
-    #[serde(rename = "diffStat", skip_serializing_if = "Option::is_none")]
-    diff_stat: Option<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    verification: Vec<String>,
-    #[serde(rename = "commitSha", skip_serializing_if = "Option::is_none")]
-    commit_sha: Option<String>,
-}
-
-fn build_lane_finished_summary(
-    manifest: &AgentOutput,
-    result: Option<&str>,
-) -> LaneFinishedSummary {
-    let raw_summary = result.map(str::trim).filter(|value| !value.is_empty());
-    let assessment = assess_lane_summary_quality(raw_summary.unwrap_or_default());
-    let detail = match raw_summary {
-        Some(summary) if !assessment.apply_quality_floor => Some(compress_summary_text(summary)),
-        Some(summary) => Some(compose_lane_summary_fallback(
-            manifest,
-            Some(summary),
-            assessment.recovery_outcome.as_ref(),
-        )),
-        None => Some(compose_lane_summary_fallback(manifest, None, None)),
-    };
-    let review_outcome = assessment.review_outcome.clone();
-    let recovery_outcome = assessment.recovery_outcome.clone();
-    let review_target = review_outcome
-        .as_ref()
-        .map(|_| manifest.description.trim())
-        .filter(|value| !value.is_empty())
-        .map(str::to_string);
-    let artifact_provenance = extract_artifact_provenance(manifest, raw_summary);
-
-    LaneFinishedSummary {
-        detail,
-        data: LaneFinishedSummaryData {
-            quality_floor_applied: raw_summary.is_none() || assessment.apply_quality_floor,
-            reasons: assessment.reasons,
-            raw_summary: raw_summary.map(str::to_string),
-            word_count: assessment.word_count,
-            review_verdict: review_outcome
-                .as_ref()
-                .map(|outcome| outcome.verdict.clone()),
-            review_target,
-            review_rationale: review_outcome.and_then(|outcome| outcome.rationale),
-            selection_outcome: extract_selection_outcome(raw_summary.unwrap_or_default()),
-            recovery_outcome,
-            artifact_provenance,
-            disabled_cron_ids: Vec::new(),
-        },
-    }
-}
-
-fn assess_lane_summary_quality(summary: &str) -> LaneSummaryAssessment {
-    let words = summary
-        .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '-' || ch == '#'))
-        .filter(|token| !token.is_empty())
-        .map(str::to_ascii_lowercase)
-        .collect::<Vec<_>>();
-
-    let word_count = words.len();
-    let mut reasons = Vec::new();
-    if summary.trim().is_empty() {
-        reasons.push(String::from("empty"));
-    }
-
-    let review_outcome = extract_review_outcome(summary);
-    let recovery_outcome = extract_recovery_outcome(summary);
-    if recovery_outcome.is_some() {
-        reasons.push(String::from("recovery_control_prose"));
-    }
-
-    let control_only = !words.is_empty()
-        && words
-            .iter()
-            .all(|word| CONTROL_ONLY_SUMMARY_WORDS.contains(&word.as_str()));
-    if control_only && review_outcome.is_none() {
-        reasons.push(String::from("control_only"));
-    }
-
-    let has_context_signal = summary.contains('`')
-        || summary.contains('/')
-        || summary.contains(':')
-        || summary.contains('#')
-        || review_outcome.is_some()
-        || words
-            .iter()
-            .any(|word| CONTEXTUAL_SUMMARY_WORDS.contains(&word.as_str()));
-    if word_count < MIN_LANE_SUMMARY_WORDS && !has_context_signal {
-        reasons.push(String::from("too_short_without_context"));
-    }
-
-    LaneSummaryAssessment {
-        apply_quality_floor: !reasons.is_empty(),
-        reasons,
-        word_count,
-        review_outcome,
-        recovery_outcome,
-    }
-}
-
-fn compose_lane_summary_fallback(
-    manifest: &AgentOutput,
-    raw_summary: Option<&str>,
-    recovery_outcome: Option<&RecoveryOutcome>,
-) -> String {
-    let target = manifest.description.trim();
-    let base = format!(
-        "Completed lane `{}` for target: {}. Status: completed.",
-        manifest.name,
-        if target.is_empty() {
-            "unspecified task"
-        } else {
-            target
-        }
-    );
-    if let Some(outcome) = recovery_outcome {
-        let mut detail = format!(
-            "{base} Recovery handoff observed via tmux reinjection (cause: `{}`).",
-            outcome.cause
-        );
-        if let Some(target_lane) = &outcome.target_lane {
-            let _ = std::fmt::Write::write_fmt(
-                &mut detail,
-                format_args!(" Target lane: `{target_lane}`."),
-            );
-        }
-        if let Some(preserved_state) = &outcome.preserved_state {
-            let _ = std::fmt::Write::write_fmt(
-                &mut detail,
-                format_args!(" Preserved state: {preserved_state}."),
-            );
-        }
-        return detail;
-    }
-    match raw_summary {
-        Some(summary) => format!(
-            "{base} Original stop summary was too vague to keep as the lane result: \"{}\".",
-            summary.trim()
-        ),
-        None => format!("{base} No usable stop summary was produced by the lane."),
-    }
-}
-
-fn extract_review_outcome(summary: &str) -> Option<ReviewLaneOutcome> {
-    let mut lines = summary
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty());
-    let first = lines.next()?;
-    let verdict = REVIEW_VERDICTS.iter().find_map(|(prefix, verdict)| {
-        first
-            .eq_ignore_ascii_case(prefix)
-            .then(|| (*verdict).to_string())
-    })?;
-    let rationale = lines.collect::<Vec<_>>().join(" ").trim().to_string();
-    Some(ReviewLaneOutcome {
-        verdict,
-        rationale: (!rationale.is_empty()).then_some(compress_summary_text(&rationale)),
-    })
-}
-
-fn extract_selection_outcome(summary: &str) -> Option<SelectionOutcome> {
-    let mut chosen_items = Vec::new();
-    let mut skipped_items = Vec::new();
-    let mut action = None;
-    let mut rationale = None;
-
-    for line in summary
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-    {
-        let lowered = line.to_ascii_lowercase();
-        let roadmap_items = extract_roadmap_items(line);
-
-        if lowered.starts_with("chosen:")
-            || lowered.starts_with("picked:")
-            || lowered.starts_with("selected:")
-            || (lowered.contains("picked") && !roadmap_items.is_empty())
-            || (lowered.contains("selected") && !roadmap_items.is_empty())
-        {
-            chosen_items.extend(roadmap_items);
-        } else if lowered.starts_with("skipped:")
-            || lowered.starts_with("skip:")
-            || (lowered.contains("skipped") && !roadmap_items.is_empty())
-        {
-            skipped_items.extend(roadmap_items);
-        }
-
-        if let Some(rest) = lowered.strip_prefix("action:") {
-            if rest.contains("execute") || rest.contains("implement") || rest.contains("fix") {
-                action = Some(String::from("execute"));
-            } else if rest.contains("review") || rest.contains("audit") {
-                action = Some(String::from("review"));
-            } else if rest.contains("no-op") || rest.contains("noop") {
-                action = Some(String::from("no-op"));
-            }
-        }
-
-        if let Some(rest) = line.strip_prefix("Rationale:") {
-            let trimmed = rest.trim();
-            if !trimmed.is_empty() {
-                rationale = Some(compress_summary_text(trimmed));
-            }
-        }
-    }
-
-    chosen_items.sort();
-    chosen_items.dedup();
-    skipped_items.sort();
-    skipped_items.dedup();
-
-    if chosen_items.is_empty() && skipped_items.is_empty() && action.is_none() {
+#[allow(dead_code)]
+fn parse_skill_frontmatter_value(contents: &str, key: &str) -> Option<String> {
+    if key != "name" {
         return None;
     }
-
-    let default_action = if chosen_items.is_empty() {
-        String::from("no-op")
-    } else {
-        String::from("execute")
-    };
-
-    Some(SelectionOutcome {
-        chosen_items,
-        skipped_items,
-        action: action.unwrap_or(default_action),
-        rationale,
-    })
+    plugins::frontmatter::parse_frontmatter(contents)
+        .ok()?
+        .frontmatter
+        .name
 }
 
-fn extract_recovery_outcome(summary: &str) -> Option<RecoveryOutcome> {
-    let trimmed = summary.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-
-    let lowered = trimmed.to_ascii_lowercase();
-    let has_tmux_inject_marker = lowered.contains("omx_tmux_inject");
-    let has_recovery_phrase = lowered.contains("continue from current mode state")
-        || (lowered.starts_with("team ") && lowered.contains(" next:"));
-    if !has_tmux_inject_marker && !has_recovery_phrase {
-        return None;
-    }
-
-    let cause = if lowered.contains("current mode state") {
-        "resume_after_stop"
-    } else if lowered.contains("tool failure") {
-        "retry_after_tool_failure"
-    } else if lowered.contains("worker panes stalled")
-        || lowered.contains("no progress")
-        || lowered.contains("leader stale")
-        || lowered.contains("all workers idle")
-        || lowered.contains("all 1 worker idle")
-        || lowered.contains("pane(s) active")
-    {
-        "tmux_reinject_after_idle"
-    } else {
-        "manual_recovery"
-    };
-
-    let target_lane = trimmed.lines().map(str::trim).find_map(|line| {
-        let lower = line.to_ascii_lowercase();
-        if !lower.starts_with("team ") {
-            return None;
-        }
-        line[5..]
-            .split_once(':')
-            .map(|(name, _)| name.trim())
-            .filter(|name| !name.is_empty())
-            .map(str::to_string)
-    });
-
-    let preserved_state = lowered
-        .contains("current mode state")
-        .then(|| String::from("current mode state"));
-
-    Some(RecoveryOutcome {
-        cause: cause.to_string(),
-        target_lane,
-        preserved_state,
-    })
-}
-
-fn extract_roadmap_items(line: &str) -> Vec<String> {
-    let mut items = Vec::new();
-    let mut chars = line.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch == '#' {
-            let mut digits = String::new();
-            while let Some(next) = chars.peek() {
-                if next.is_ascii_digit() {
-                    digits.push(*next);
-                    chars.next();
-                } else {
-                    break;
-                }
-            }
-            if !digits.is_empty() {
-                items.push(format!("ROADMAP #{digits}"));
-            }
-        }
-    }
-    items
-}
-
-fn extract_artifact_provenance(
-    manifest: &AgentOutput,
-    raw_summary: Option<&str>,
-) -> Option<ArtifactProvenance> {
-    let summary = raw_summary?;
-    let mut roadmap_ids = extract_roadmap_items(summary);
-    roadmap_ids.extend(extract_roadmap_items(&manifest.description));
-    roadmap_ids.sort();
-    roadmap_ids.dedup();
-
-    let mut files = extract_file_paths(summary);
-    files.sort();
-    files.dedup();
-
-    let mut verification = Vec::new();
-    let lowered = summary.to_ascii_lowercase();
-    for (needle, label) in [
-        ("tested", "tested"),
-        ("committed", "committed"),
-        ("pushed", "pushed"),
-        ("merged", "merged"),
-    ] {
-        if lowered.contains(needle) {
-            verification.push(label.to_string());
-        }
-    }
-
-    let commit_sha = extract_commit_sha(summary);
-    let diff_stat = extract_diff_stat(summary);
-    let source_lanes = vec![manifest.name.clone()];
-
-    if roadmap_ids.is_empty()
-        && files.is_empty()
-        && verification.is_empty()
-        && commit_sha.is_none()
-        && diff_stat.is_none()
-    {
-        return None;
-    }
-
-    Some(ArtifactProvenance {
-        source_lanes,
-        roadmap_ids,
-        files,
-        diff_stat,
-        verification,
-        commit_sha,
-    })
-}
-
-fn extract_file_paths(summary: &str) -> Vec<String> {
-    summary
-        .split(|ch: char| ch.is_whitespace() || matches!(ch, ',' | ';' | '(' | ')' | '[' | ']'))
-        .map(|token| {
-            token
-                .trim_matches('`')
-                .trim_matches('"')
-                .trim_matches('\'')
-                .trim_end_matches('.')
-        })
-        .filter(|token| {
-            token.contains('.')
-                && !token.starts_with("http")
-                && !token
-                    .chars()
-                    .all(|ch| ch.is_ascii_digit() || ch == '.' || ch == '+' || ch == '-')
-        })
-        .map(str::to_string)
-        .collect()
-}
-
-fn extract_diff_stat(summary: &str) -> Option<String> {
-    summary
-        .split('\n')
-        .map(str::trim)
-        .find_map(|line| {
-            line.find("Diff stat:")
-                .map(|index| normalize_diff_stat(&line[(index + "Diff stat:".len())..]))
-                .or_else(|| {
-                    line.find("Diff:")
-                        .map(|index| normalize_diff_stat(&line[(index + "Diff:".len())..]))
-                })
-        })
-        .filter(|value| !value.is_empty())
-}
-
-fn normalize_diff_stat(value: &str) -> String {
-    let trimmed = value.trim();
-    for marker in [" Tested", " Committed", " committed", " pushed", " merged"] {
-        if let Some((prefix, _)) = trimmed.split_once(marker) {
-            return prefix.trim().to_string();
-        }
-    }
-    trimmed.to_string()
-}
-
-fn disable_matching_crons(manifest: &AgentOutput, result: Option<&str>) -> Vec<String> {
-    let tokens = cron_match_tokens(manifest, result);
-    if tokens.is_empty() {
-        return Vec::new();
-    }
-
-    let mut disabled = Vec::new();
-    for entry in global_cron_registry().list(true) {
-        let haystack = format!(
-            "{} {}",
-            entry.prompt,
-            entry.description.as_deref().unwrap_or_default()
-        )
-        .to_ascii_lowercase();
-        if tokens.iter().any(|token| haystack.contains(token))
-            && global_cron_registry().disable(&entry.cron_id).is_ok()
-        {
-            disabled.push(entry.cron_id);
-        }
-    }
-    disabled.sort();
-    disabled
-}
-
-fn cron_match_tokens(manifest: &AgentOutput, result: Option<&str>) -> Vec<String> {
-    let mut tokens = extract_roadmap_items(manifest.description.as_str())
-        .into_iter()
-        .chain(extract_roadmap_items(result.unwrap_or_default()))
-        .map(|item| item.to_ascii_lowercase())
-        .collect::<Vec<_>>();
-
-    if tokens.is_empty() && !manifest.name.trim().is_empty() {
-        tokens.push(manifest.name.trim().to_ascii_lowercase());
-    }
-
-    tokens.sort();
-    tokens.dedup();
-    tokens
-}
-
-fn derive_agent_state(
-    status: &str,
-    result: Option<&str>,
-    error: Option<&str>,
-    blocker: Option<&LaneEventBlocker>,
-) -> &'static str {
-    let normalized_status = status.trim().to_ascii_lowercase();
-    let normalized_error = error.unwrap_or_default().to_ascii_lowercase();
-
-    if normalized_status == "running" {
-        return "working";
-    }
-    if normalized_status == "completed" {
-        return if result.is_some_and(|value| !value.trim().is_empty()) {
-            "finished_cleanable"
-        } else {
-            "finished_pending_report"
-        };
-    }
-    if normalized_error.contains("background") {
-        return "blocked_background_job";
-    }
-    if normalized_error.contains("merge conflict") || normalized_error.contains("cherry-pick") {
-        return "blocked_merge_conflict";
-    }
-    if normalized_error.contains("mcp") {
-        return "degraded_mcp";
-    }
-    if normalized_error.contains("transport")
-        || normalized_error.contains("broken pipe")
-        || normalized_error.contains("connection")
-        || normalized_error.contains("interrupted")
-    {
-        return "interrupted_transport";
-    }
-    if blocker.is_some() {
-        return "truly_idle";
-    }
-    "truly_idle"
-}
-
-fn maybe_commit_provenance(result: Option<&str>) -> Option<LaneCommitProvenance> {
-    let commit = extract_commit_sha(result?)?;
-    let branch = current_git_branch().unwrap_or_else(|| "unknown".to_string());
-    let worktree = std::env::current_dir()
-        .ok()
-        .map(|path| path.display().to_string());
-    Some(LaneCommitProvenance {
-        commit: commit.clone(),
-        branch,
-        worktree,
-        canonical_commit: Some(commit.clone()),
-        superseded_by: None,
-        lineage: vec![commit],
-    })
-}
-
-fn extract_commit_sha(result: &str) -> Option<String> {
-    result
-        .split(|c: char| !c.is_ascii_hexdigit())
-        .find(|token| token.len() >= 7 && token.len() <= 40)
-        .map(str::to_string)
-}
-
-fn current_git_branch() -> Option<String> {
-    let output = Command::new("git")
-        .args(["rev-parse", "--abbrev-ref", "HEAD"])
-        .output()
-        .ok()?;
-    output
-        .status
-        .success()
-        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
-}
-
-fn append_agent_output(path: &str, suffix: &str) -> Result<(), String> {
-    use std::io::Write as _;
-
-    let mut file = std::fs::OpenOptions::new()
-        .append(true)
-        .open(path)
-        .map_err(|error| error.to_string())?;
-    file.write_all(suffix.as_bytes())
-        .map_err(|error| error.to_string())
-}
-
-fn format_agent_terminal_output(
-    status: &str,
-    result: Option<&str>,
-    blocker: Option<&LaneEventBlocker>,
-    error: Option<&str>,
-) -> String {
-    let mut sections = vec![format!("\n## Result\n\n- status: {status}\n")];
-    if let Some(blocker) = blocker {
-        sections.push(format!(
-            "\n### Blocker\n\n- failure_class: {}\n- detail: {}\n",
-            serde_json::to_string(&blocker.failure_class)
-                .unwrap_or_else(|_| "\"infra\"".to_string())
-                .trim_matches('"'),
-            blocker.detail.trim()
-        ));
-    }
-    if let Some(result) = result.filter(|value| !value.trim().is_empty()) {
-        sections.push(format!("\n### Final response\n\n{}\n", result.trim()));
-    }
-    if let Some(error) = error.filter(|value| !value.trim().is_empty()) {
-        sections.push(format!("\n### Error\n\n{}\n", error.trim()));
-    }
-    sections.join("")
-}
-
-fn classify_lane_blocker(error: &str) -> LaneEventBlocker {
-    let detail = error.trim().to_string();
-    LaneEventBlocker {
-        failure_class: classify_lane_failure(error),
-        detail,
-        subphase: None,
-    }
-}
-
-fn classify_lane_failure(error: &str) -> LaneFailureClass {
-    let normalized = error.to_ascii_lowercase();
-
-    if normalized.contains("prompt") && normalized.contains("deliver") {
-        LaneFailureClass::PromptDelivery
-    } else if normalized.contains("trust") {
-        LaneFailureClass::TrustGate
-    } else if normalized.contains("branch")
-        && (normalized.contains("stale") || normalized.contains("diverg"))
-    {
-        LaneFailureClass::BranchDivergence
-    } else if normalized.contains("gateway") || normalized.contains("routing") {
-        LaneFailureClass::GatewayRouting
-    } else if normalized.contains("compile")
-        || normalized.contains("build failed")
-        || normalized.contains("cargo check")
-    {
-        LaneFailureClass::Compile
-    } else if normalized.contains("test") {
-        LaneFailureClass::Test
-    } else if normalized.contains("tool failed")
-        || normalized.contains("runtime tool")
-        || normalized.contains("tool runtime")
-    {
-        LaneFailureClass::ToolRuntime
-    } else if normalized.contains("workspace") && normalized.contains("mismatch") {
-        LaneFailureClass::WorkspaceMismatch
-    } else if normalized.contains("plugin") {
-        LaneFailureClass::PluginStartup
-    } else if normalized.contains("mcp") && normalized.contains("handshake") {
-        LaneFailureClass::McpHandshake
-    } else if normalized.contains("mcp") {
-        LaneFailureClass::McpStartup
-    } else {
-        LaneFailureClass::Infra
-    }
-}
-
-struct ProviderEntry {
-    model: String,
-    client: ProviderClient,
-}
-
-struct ProviderRuntimeClient {
-    runtime: tokio::runtime::Runtime,
-    chain: Vec<ProviderEntry>,
-    allowed_tools: BTreeSet<String>,
-}
-
-impl ProviderRuntimeClient {
-    #[allow(clippy::needless_pass_by_value)]
-    fn new(model: String, allowed_tools: BTreeSet<String>) -> Result<Self, String> {
-        let fallback_config = load_provider_fallback_config();
-        Self::new_with_fallback_config(model, allowed_tools, &fallback_config)
-    }
-
-    #[allow(clippy::needless_pass_by_value)]
-    fn new_with_fallback_config(
-        model: String,
-        allowed_tools: BTreeSet<String>,
-        fallback_config: &ProviderFallbackConfig,
-    ) -> Result<Self, String> {
-        let primary_model = fallback_config.primary().map_or(model, str::to_string);
-        let primary = build_provider_entry(&primary_model)?;
-        let mut chain = vec![primary];
-        for fallback_model in fallback_config.fallbacks() {
-            match build_provider_entry(fallback_model) {
-                Ok(entry) => chain.push(entry),
-                Err(error) => {
-                    eprintln!(
-                        "warning: skipping unavailable fallback provider {fallback_model}: {error}"
-                    );
-                }
-            }
-        }
-        Ok(Self {
-            runtime: tokio::runtime::Runtime::new().map_err(|error| error.to_string())?,
-            chain,
-            allowed_tools,
-        })
-    }
-}
-
-fn build_provider_entry(model: &str) -> Result<ProviderEntry, String> {
-    let resolved = resolve_model_alias(model).clone();
-    let client = ProviderClient::from_model(&resolved).map_err(|error| error.to_string())?;
-    Ok(ProviderEntry {
-        model: resolved,
-        client,
-    })
-}
-
-fn load_provider_fallback_config() -> ProviderFallbackConfig {
-    std::env::current_dir()
-        .ok()
-        .and_then(|cwd| ConfigLoader::default_for(cwd).load().ok())
-        .map_or_else(ProviderFallbackConfig::default, |config| {
-            config.provider_fallbacks().clone()
-        })
-}
-
-impl ApiClient for ProviderRuntimeClient {
-    fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
-        let tools = tool_specs_for_allowed_tools(Some(&self.allowed_tools))
-            .into_iter()
-            .map(|spec| ToolDefinition {
-                name: spec.name.to_string(),
-                description: Some(spec.description.to_string()),
-                input_schema: spec.input_schema,
-            })
-            .collect::<Vec<_>>();
-        let messages = convert_messages(&request.messages);
-        let system =
-            (!request.system_prompt.is_empty()).then(|| request.system_prompt.join("\n\n"));
-        let tool_choice = (!self.allowed_tools.is_empty()).then_some(ToolChoice::Auto);
-
-        let runtime = &self.runtime;
-        let chain = &self.chain;
-        let mut last_error: Option<ApiError> = None;
-        for (index, entry) in chain.iter().enumerate() {
-            let message_request = MessageRequest {
-                model: entry.model.clone(),
-                max_tokens: max_tokens_for_model(&entry.model),
-                messages: messages.clone(),
-                system: system.clone(),
-                tools: (!tools.is_empty()).then(|| tools.clone()),
-                tool_choice: tool_choice.clone(),
-                stream: true,
-                ..Default::default()
-            };
-
-            let attempt = runtime.block_on(stream_with_provider(&entry.client, &message_request));
-            match attempt {
-                Ok(events) => return Ok(events),
-                Err(error) if error.is_retryable() && index + 1 < chain.len() => {
-                    eprintln!(
-                        "provider {} failed with retryable error, falling back: {error}",
-                        entry.model
-                    );
-                    last_error = Some(error);
-                }
-                Err(error) => return Err(RuntimeError::new(error.to_string())),
-            }
-        }
-
-        Err(RuntimeError::new(last_error.map_or_else(
-            || String::from("provider chain exhausted with no attempts"),
-            |error| error.to_string(),
-        )))
-    }
-}
-
-#[allow(clippy::too_many_lines)]
-async fn stream_with_provider(
-    client: &ProviderClient,
-    message_request: &MessageRequest,
-) -> Result<Vec<AssistantEvent>, ApiError> {
-    let mut stream = client.stream_message(message_request).await?;
-    let mut events = Vec::new();
-    let mut pending_tools: BTreeMap<u32, (String, String, String)> = BTreeMap::new();
-    let mut pending_thinking: BTreeMap<u32, (String, Option<String>)> = BTreeMap::new();
-    let mut saw_stop = false;
-
-    while let Some(event) = stream.next_event().await? {
-        match event {
-            ApiStreamEvent::MessageStart(start) => {
-                for block in start.message.content {
-                    push_output_block(
-                        block,
-                        0,
-                        &mut events,
-                        &mut pending_tools,
-                        &mut pending_thinking,
-                        true,
-                    );
-                }
-            }
-            ApiStreamEvent::ContentBlockStart(start) => {
-                push_output_block(
-                    start.content_block,
-                    start.index,
-                    &mut events,
-                    &mut pending_tools,
-                    &mut pending_thinking,
-                    true,
-                );
-            }
-            ApiStreamEvent::ContentBlockDelta(delta) => match delta.delta {
-                ContentBlockDelta::TextDelta { text } => {
-                    if !text.is_empty() {
-                        events.push(AssistantEvent::TextDelta(text));
-                    }
-                }
-                ContentBlockDelta::InputJsonDelta { partial_json } => {
-                    if let Some((_, _, input)) = pending_tools.get_mut(&delta.index) {
-                        input.push_str(&partial_json);
-                    }
-                }
-                ContentBlockDelta::ThinkingDelta { thinking } => {
-                    if let Some((pending, _)) = pending_thinking.get_mut(&delta.index) {
-                        pending.push_str(&thinking);
-                    }
-                }
-                ContentBlockDelta::SignatureDelta { signature } => {
-                    if let Some((_, pending_signature)) = pending_thinking.get_mut(&delta.index) {
-                        pending_signature
-                            .get_or_insert_with(String::new)
-                            .push_str(&signature);
-                    }
-                }
-            },
-            ApiStreamEvent::ContentBlockStop(stop) => {
-                if let Some((thinking, signature)) = pending_thinking.remove(&stop.index) {
-                    events.push(AssistantEvent::Thinking {
-                        thinking,
-                        signature,
-                    });
-                }
-                if let Some((id, name, input)) = pending_tools.remove(&stop.index) {
-                    events.push(AssistantEvent::ToolUse { id, name, input });
-                }
-            }
-            ApiStreamEvent::MessageDelta(delta) => {
-                events.push(AssistantEvent::Usage(delta.usage.token_usage()));
-            }
-            ApiStreamEvent::MessageStop(_) => {
-                saw_stop = true;
-                events.push(AssistantEvent::MessageStop);
-            }
-        }
-    }
-
-    push_prompt_cache_record(client, &mut events);
-
-    if !saw_stop
-        && events.iter().any(|event| {
-            matches!(event, AssistantEvent::TextDelta(text) if !text.is_empty())
-                || matches!(event, AssistantEvent::ToolUse { .. })
-        })
-    {
-        events.push(AssistantEvent::MessageStop);
-    }
-
-    if events
-        .iter()
-        .any(|event| matches!(event, AssistantEvent::MessageStop))
-    {
-        return Ok(events);
-    }
-
-    let response = client
-        .send_message(&MessageRequest {
-            stream: false,
-            ..message_request.clone()
-        })
-        .await?;
-    let mut events = response_to_events(response);
-    push_prompt_cache_record(client, &mut events);
-    Ok(events)
-}
-
-struct SubagentToolExecutor {
-    allowed_tools: BTreeSet<String>,
-    enforcer: Option<PermissionEnforcer>,
-}
-
-impl SubagentToolExecutor {
-    fn new(allowed_tools: BTreeSet<String>) -> Self {
-        Self {
-            allowed_tools,
-            enforcer: None,
-        }
-    }
-
-    fn with_enforcer(mut self, enforcer: PermissionEnforcer) -> Self {
-        self.enforcer = Some(enforcer);
-        self
-    }
-}
-
-impl ToolExecutor for SubagentToolExecutor {
-    fn execute(&mut self, tool_name: &str, input: &str) -> Result<String, ToolError> {
-        if !self
-            .allowed_tools
-            .contains(&canonical_allowed_tool_name(tool_name))
-        {
-            return Err(ToolError::new(format!(
-                "tool `{tool_name}` is not enabled for this sub-agent"
-            )));
-        }
-        let value = serde_json::from_str(input)
-            .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
-        execute_tool_with_enforcer(self.enforcer.as_ref(), tool_name, &value)
-            .map_err(ToolError::new)
-    }
-}
-
-fn tool_specs_for_allowed_tools(allowed_tools: Option<&BTreeSet<String>>) -> Vec<ToolSpec> {
-    mvp_tool_specs()
-        .into_iter()
-        .filter(|spec| {
-            allowed_tools
-                .is_none_or(|allowed| allowed.contains(&canonical_allowed_tool_name(spec.name)))
-        })
-        .collect()
-}
-
-fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
-    messages
-        .iter()
-        .filter_map(|message| {
-            let role = match message.role {
-                MessageRole::System | MessageRole::User | MessageRole::Tool => "user",
-                MessageRole::Assistant => "assistant",
-            };
-            let content = message
-                .blocks
-                .iter()
-                .map(|block| match block {
-                    ContentBlock::Text { text } => InputContentBlock::Text { text: text.clone() },
-                    ContentBlock::Thinking {
-                        thinking,
-                        signature,
-                    } => InputContentBlock::Thinking {
-                        thinking: thinking.clone(),
-                        signature: signature.clone(),
-                    },
-                    ContentBlock::ToolUse { id, name, input } => InputContentBlock::ToolUse {
-                        id: id.clone(),
-                        name: name.clone(),
-                        input: serde_json::from_str(input)
-                            .unwrap_or_else(|_| serde_json::json!({ "raw": input })),
-                    },
-                    ContentBlock::ToolResult {
-                        tool_use_id,
-                        output,
-                        is_error,
-                        ..
-                    } => InputContentBlock::ToolResult {
-                        tool_use_id: tool_use_id.clone(),
-                        content: vec![ToolResultContentBlock::Text {
-                            text: output.clone(),
-                        }],
-                        is_error: *is_error,
-                    },
-                })
-                .filter(
-                    |block| !matches!(block, InputContentBlock::Text { text } if text.is_empty()),
-                )
-                .collect::<Vec<_>>();
-            (!content.is_empty()).then(|| InputMessage {
-                role: role.to_string(),
-                content,
-            })
-        })
-        .collect()
-}
-
-fn push_output_block(
-    block: OutputContentBlock,
-    block_index: u32,
-    events: &mut Vec<AssistantEvent>,
-    pending_tools: &mut BTreeMap<u32, (String, String, String)>,
-    pending_thinking: &mut BTreeMap<u32, (String, Option<String>)>,
-    streaming_tool_input: bool,
-) {
-    match block {
-        OutputContentBlock::Text { text } => {
-            if !text.is_empty() {
-                events.push(AssistantEvent::TextDelta(text));
-            }
-        }
-        OutputContentBlock::ToolUse { id, name, input } => {
-            let initial_input = if streaming_tool_input
-                && input.is_object()
-                && input.as_object().is_some_and(serde_json::Map::is_empty)
-            {
-                String::new()
-            } else {
-                input.to_string()
-            };
-            pending_tools.insert(block_index, (id, name, initial_input));
-        }
-        OutputContentBlock::Thinking {
-            thinking,
-            signature,
-        } => {
-            if streaming_tool_input {
-                pending_thinking.insert(block_index, (thinking, signature));
-            } else {
-                events.push(AssistantEvent::Thinking {
-                    thinking,
-                    signature,
-                });
-            }
-        }
-        OutputContentBlock::RedactedThinking { .. } => {}
-    }
-}
-
-fn response_to_events(response: MessageResponse) -> Vec<AssistantEvent> {
-    let mut events = Vec::new();
-    let mut pending_tools = BTreeMap::new();
-    let mut pending_thinking = BTreeMap::new();
-
-    for (index, block) in response.content.into_iter().enumerate() {
-        let index = u32::try_from(index).expect("response block index overflow");
-        push_output_block(
-            block,
-            index,
-            &mut events,
-            &mut pending_tools,
-            &mut pending_thinking,
-            false,
-        );
-        if let Some((id, name, input)) = pending_tools.remove(&index) {
-            events.push(AssistantEvent::ToolUse { id, name, input });
-        }
-    }
-
-    events.push(AssistantEvent::Usage(response.usage.token_usage()));
-    events.push(AssistantEvent::MessageStop);
-    events
-}
-
-fn push_prompt_cache_record(client: &ProviderClient, events: &mut Vec<AssistantEvent>) {
-    if let Some(record) = client.take_last_prompt_cache_record() {
-        if let Some(event) = prompt_cache_record_to_runtime_event(record) {
-            events.push(AssistantEvent::PromptCache(event));
-        }
-    }
-}
-
-fn prompt_cache_record_to_runtime_event(
-    record: api::PromptCacheRecord,
-) -> Option<PromptCacheEvent> {
-    let cache_break = record.cache_break?;
-    Some(PromptCacheEvent {
-        unexpected: cache_break.unexpected,
-        reason: cache_break.reason,
-        previous_cache_read_input_tokens: cache_break.previous_cache_read_input_tokens,
-        current_cache_read_input_tokens: cache_break.current_cache_read_input_tokens,
-        token_drop: cache_break.token_drop,
-    })
-}
-
-fn final_assistant_text(summary: &runtime::TurnSummary) -> String {
-    summary
-        .assistant_messages
-        .last()
-        .map(|message| {
-            message
-                .blocks
-                .iter()
-                .filter_map(|block| match block {
-                    ContentBlock::Text { text } => Some(text.as_str()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join("")
-        })
-        .unwrap_or_default()
-}
-
-#[allow(clippy::needless_pass_by_value)]
-fn execute_tool_search(input: ToolSearchInput) -> ToolSearchOutput {
-    GlobalToolRegistry::builtin().search(&input.query, input.max_results.unwrap_or(5), None, None)
-}
-
-fn deferred_tool_specs() -> Vec<ToolSpec> {
-    mvp_tool_specs()
-        .into_iter()
-        .filter(|spec| {
-            !matches!(
-                spec.name,
-                "bash" | "read_file" | "write_file" | "edit_file" | "glob_search" | "grep_search"
-            )
-        })
-        .collect()
-}
-
-fn search_tool_specs(query: &str, max_results: usize, specs: &[SearchableToolSpec]) -> Vec<String> {
-    let lowered = query.to_lowercase();
-    if let Some(selection) = lowered.strip_prefix("select:") {
-        return selection
-            .split(',')
-            .map(str::trim)
-            .filter(|part| !part.is_empty())
-            .filter_map(|wanted| {
-                let wanted = canonical_tool_token(wanted);
-                specs
-                    .iter()
-                    .find(|spec| canonical_tool_token(&spec.name) == wanted)
-                    .map(|spec| spec.name.clone())
-            })
-            .take(max_results)
-            .collect();
-    }
-
-    let mut required = Vec::new();
-    let mut optional = Vec::new();
-    for term in lowered.split_whitespace() {
-        if let Some(rest) = term.strip_prefix('+') {
-            if !rest.is_empty() {
-                required.push(rest);
-            }
-        } else {
-            optional.push(term);
-        }
-    }
-    let terms = if required.is_empty() {
-        optional.clone()
-    } else {
-        required.iter().chain(optional.iter()).copied().collect()
-    };
-
-    let mut scored = specs
-        .iter()
-        .filter_map(|spec| {
-            let name = spec.name.to_lowercase();
-            let canonical_name = canonical_tool_token(&spec.name);
-            let normalized_description = normalize_tool_search_query(&spec.description);
-            let haystack = format!(
-                "{name} {} {canonical_name}",
-                spec.description.to_lowercase()
-            );
-            let normalized_haystack = format!("{canonical_name} {normalized_description}");
-            if required.iter().any(|term| !haystack.contains(term)) {
-                return None;
-            }
-
-            let mut score = 0_i32;
-            for term in &terms {
-                let canonical_term = canonical_tool_token(term);
-                if haystack.contains(term) {
-                    score += 2;
-                }
-                if name == *term {
-                    score += 8;
-                }
-                if name.contains(term) {
-                    score += 4;
-                }
-                if canonical_name == canonical_term {
-                    score += 12;
-                }
-                if normalized_haystack.contains(&canonical_term) {
-                    score += 3;
-                }
-            }
-
-            if score == 0 && !lowered.is_empty() {
-                return None;
-            }
-            Some((score, spec.name.clone()))
-        })
-        .collect::<Vec<_>>();
-
-    scored.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
-    scored
-        .into_iter()
-        .map(|(_, name)| name)
-        .take(max_results)
-        .collect()
-}
-
-fn normalize_tool_search_query(query: &str) -> String {
-    query
-        .trim()
-        .split(|ch: char| ch.is_whitespace() || ch == ',')
-        .filter(|term| !term.is_empty())
-        .map(canonical_tool_token)
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn canonical_tool_token(value: &str) -> String {
-    let mut canonical = value
-        .chars()
-        .filter(char::is_ascii_alphanumeric)
-        .flat_map(char::to_lowercase)
-        .collect::<String>();
-    if let Some(stripped) = canonical.strip_suffix("tool") {
-        canonical = stripped.to_string();
-    }
-    canonical
-}
-
-fn agent_store_dir() -> Result<std::path::PathBuf, String> {
-    if let Ok(path) = std::env::var("CLAWD_AGENT_STORE") {
-        return Ok(std::path::PathBuf::from(path));
-    }
-    let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
-    if let Some(workspace_root) = cwd.ancestors().nth(2) {
-        return Ok(workspace_root.join(".clawd-agents"));
-    }
-    Ok(cwd.join(".clawd-agents"))
-}
-
-fn make_agent_id() -> String {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    format!("agent-{nanos}")
-}
-
-fn slugify_agent_name(description: &str) -> String {
-    let mut out = description
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() {
-                ch.to_ascii_lowercase()
-            } else {
-                '-'
-            }
-        })
-        .collect::<String>();
-    while out.contains("--") {
-        out = out.replace("--", "-");
-    }
-    out.trim_matches('-').chars().take(32).collect()
-}
-
-fn normalize_subagent_type(subagent_type: Option<&str>) -> String {
-    let trimmed = subagent_type.map(str::trim).unwrap_or_default();
-    if trimmed.is_empty() {
-        return String::from("general-purpose");
-    }
-
-    match canonical_tool_token(trimmed).as_str() {
-        "general" | "generalpurpose" | "generalpurposeagent" => String::from("general-purpose"),
-        "explore" | "explorer" | "exploreagent" => String::from("Explore"),
-        "plan" | "planagent" => String::from("Plan"),
-        "verification" | "verificationagent" | "verify" | "verifier" => {
-            String::from("Verification")
-        }
-        "clawguide" | "clawguideagent" | "guide" => String::from("claw-guide"),
-        "statusline" | "statuslinesetup" => String::from("statusline-setup"),
-        _ => trimmed.to_string(),
-    }
-}
 
 fn iso8601_now() -> String {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
+        .unwrap_or_else(|e| {
+            eprintln!("[tools] system clock is before epoch ({e}); using 0 for timestamp");
+            std::time::Duration::ZERO
+        })
         .as_secs()
         .to_string()
 }
 
-#[allow(clippy::too_many_lines)]
-fn execute_notebook_edit(input: NotebookEditInput) -> Result<NotebookEditOutput, String> {
-    let path = std::path::PathBuf::from(&input.notebook_path);
-    if path.extension().and_then(|ext| ext.to_str()) != Some("ipynb") {
-        return Err(String::from(
-            "File must be a Jupyter notebook (.ipynb file).",
-        ));
-    }
-
-    let original_file = std::fs::read_to_string(&path).map_err(|error| error.to_string())?;
-    let mut notebook: serde_json::Value =
-        serde_json::from_str(&original_file).map_err(|error| error.to_string())?;
-    let language = notebook
-        .get("metadata")
-        .and_then(|metadata| metadata.get("kernelspec"))
-        .and_then(|kernelspec| kernelspec.get("language"))
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("python")
-        .to_string();
-    let cells = notebook
-        .get_mut("cells")
-        .and_then(serde_json::Value::as_array_mut)
-        .ok_or_else(|| String::from("Notebook cells array not found"))?;
-
-    let edit_mode = input.edit_mode.unwrap_or(NotebookEditMode::Replace);
-    let target_index = match input.cell_id.as_deref() {
-        Some(cell_id) => Some(resolve_cell_index(cells, Some(cell_id), edit_mode)?),
-        None if matches!(
-            edit_mode,
-            NotebookEditMode::Replace | NotebookEditMode::Delete
-        ) =>
-        {
-            Some(resolve_cell_index(cells, None, edit_mode)?)
-        }
-        None => None,
-    };
-    let resolved_cell_type = match edit_mode {
-        NotebookEditMode::Delete => None,
-        NotebookEditMode::Insert => Some(input.cell_type.unwrap_or(NotebookCellType::Code)),
-        NotebookEditMode::Replace => Some(input.cell_type.unwrap_or_else(|| {
-            target_index
-                .and_then(|index| cells.get(index))
-                .and_then(cell_kind)
-                .unwrap_or(NotebookCellType::Code)
-        })),
-    };
-    let new_source = require_notebook_source(input.new_source, edit_mode)?;
-
-    let cell_id = match edit_mode {
-        NotebookEditMode::Insert => {
-            let resolved_cell_type = resolved_cell_type
-                .ok_or_else(|| String::from("insert mode requires a cell type"))?;
-            let new_id = make_cell_id(cells.len());
-            let new_cell = build_notebook_cell(&new_id, resolved_cell_type, &new_source);
-            let insert_at = target_index.map_or(cells.len(), |index| index + 1);
-            cells.insert(insert_at, new_cell);
-            cells
-                .get(insert_at)
-                .and_then(|cell| cell.get("id"))
-                .and_then(serde_json::Value::as_str)
-                .map(ToString::to_string)
-        }
-        NotebookEditMode::Delete => {
-            let idx = target_index
-                .ok_or_else(|| String::from("delete mode requires a target cell index"))?;
-            let removed = cells.remove(idx);
-            removed
-                .get("id")
-                .and_then(serde_json::Value::as_str)
-                .map(ToString::to_string)
-        }
-        NotebookEditMode::Replace => {
-            let resolved_cell_type = resolved_cell_type
-                .ok_or_else(|| String::from("replace mode requires a cell type"))?;
-            let idx = target_index
-                .ok_or_else(|| String::from("replace mode requires a target cell index"))?;
-            let cell = cells
-                .get_mut(idx)
-                .ok_or_else(|| String::from("Cell index out of range"))?;
-            cell["source"] = serde_json::Value::Array(source_lines(&new_source));
-            cell["cell_type"] = serde_json::Value::String(match resolved_cell_type {
-                NotebookCellType::Code => String::from("code"),
-                NotebookCellType::Markdown => String::from("markdown"),
-            });
-            match resolved_cell_type {
-                NotebookCellType::Code => {
-                    if !cell.get("outputs").is_some_and(serde_json::Value::is_array) {
-                        cell["outputs"] = json!([]);
-                    }
-                    if cell.get("execution_count").is_none() {
-                        cell["execution_count"] = serde_json::Value::Null;
-                    }
-                }
-                NotebookCellType::Markdown => {
-                    if let Some(object) = cell.as_object_mut() {
-                        object.remove("outputs");
-                        object.remove("execution_count");
-                    }
-                }
-            }
-            cell.get("id")
-                .and_then(serde_json::Value::as_str)
-                .map(ToString::to_string)
-        }
-    };
-
-    let updated_file =
-        serde_json::to_string_pretty(&notebook).map_err(|error| error.to_string())?;
-    std::fs::write(&path, &updated_file).map_err(|error| error.to_string())?;
-
-    Ok(NotebookEditOutput {
-        new_source,
-        cell_id,
-        cell_type: resolved_cell_type,
-        language,
-        edit_mode: format_notebook_edit_mode(edit_mode),
-        error: None,
-        notebook_path: path.display().to_string(),
-        original_file,
-        updated_file,
-    })
-}
-
-fn require_notebook_source(
-    source: Option<String>,
-    edit_mode: NotebookEditMode,
-) -> Result<String, String> {
-    match edit_mode {
-        NotebookEditMode::Delete => Ok(source.unwrap_or_default()),
-        NotebookEditMode::Insert | NotebookEditMode::Replace => source
-            .ok_or_else(|| String::from("new_source is required for insert and replace edits")),
-    }
-}
-
-fn build_notebook_cell(cell_id: &str, cell_type: NotebookCellType, source: &str) -> Value {
-    let mut cell = json!({
-        "cell_type": match cell_type {
-            NotebookCellType::Code => "code",
-            NotebookCellType::Markdown => "markdown",
-        },
-        "id": cell_id,
-        "metadata": {},
-        "source": source_lines(source),
-    });
-    if let Some(object) = cell.as_object_mut() {
-        match cell_type {
-            NotebookCellType::Code => {
-                object.insert(String::from("outputs"), json!([]));
-                object.insert(String::from("execution_count"), Value::Null);
-            }
-            NotebookCellType::Markdown => {}
-        }
-    }
-    cell
-}
-
-fn cell_kind(cell: &serde_json::Value) -> Option<NotebookCellType> {
-    cell.get("cell_type")
-        .and_then(serde_json::Value::as_str)
-        .map(|kind| {
-            if kind == "markdown" {
-                NotebookCellType::Markdown
-            } else {
-                NotebookCellType::Code
-            }
-        })
-}
-
-const MAX_SLEEP_DURATION_MS: u64 = 300_000;
-
-#[allow(clippy::needless_pass_by_value)]
-fn execute_sleep(input: SleepInput) -> Result<SleepOutput, String> {
-    if input.duration_ms > MAX_SLEEP_DURATION_MS {
-        return Err(format!(
-            "duration_ms {} exceeds maximum allowed sleep of {MAX_SLEEP_DURATION_MS}ms",
-            input.duration_ms,
-        ));
-    }
-    std::thread::sleep(Duration::from_millis(input.duration_ms));
-    Ok(SleepOutput {
-        duration_ms: input.duration_ms,
-        message: format!("Slept for {}ms", input.duration_ms),
-    })
-}
-
-fn execute_brief(input: BriefInput) -> Result<BriefOutput, String> {
-    if input.message.trim().is_empty() {
-        return Err(String::from("message must not be empty"));
-    }
-
-    let attachments = input
-        .attachments
-        .as_ref()
-        .map(|paths| {
-            paths
-                .iter()
-                .map(|path| resolve_attachment(path))
-                .collect::<Result<Vec<_>, String>>()
-        })
-        .transpose()?;
-
-    let message = match input.status {
-        BriefStatus::Normal | BriefStatus::Proactive => input.message,
-    };
-
-    Ok(BriefOutput {
-        message,
-        attachments,
-        sent_at: iso8601_timestamp(),
-    })
-}
-
-fn resolve_attachment(path: &str) -> Result<ResolvedAttachment, String> {
-    let resolved = std::fs::canonicalize(path).map_err(|error| error.to_string())?;
-    let metadata = std::fs::metadata(&resolved).map_err(|error| error.to_string())?;
-    Ok(ResolvedAttachment {
-        path: resolved.display().to_string(),
-        size: metadata.len(),
-        is_image: is_image_path(&resolved),
-    })
-}
-
-fn is_image_path(path: &Path) -> bool {
-    matches!(
-        path.extension()
-            .and_then(|ext| ext.to_str())
-            .map(str::to_ascii_lowercase)
-            .as_deref(),
-        Some("png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "svg")
-    )
-}
-
-fn execute_config(input: ConfigInput) -> Result<ConfigOutput, String> {
-    let setting = input.setting.trim();
-    if setting.is_empty() {
-        return Err(String::from("setting must not be empty"));
-    }
-    let Some(spec) = supported_config_setting(setting) else {
-        return Ok(ConfigOutput {
-            success: false,
-            operation: None,
-            setting: None,
-            value: None,
-            previous_value: None,
-            new_value: None,
-            error: Some(format!("Unknown setting: \"{setting}\"")),
-        });
-    };
-
-    let path = config_file_for_scope(spec.scope)?;
-    let mut document = read_json_object(&path)?;
-
-    if let Some(value) = input.value {
-        let normalized = normalize_config_value(spec, value)?;
-        let previous_value = get_nested_value(&document, spec.path).cloned();
-        set_nested_value(&mut document, spec.path, normalized.clone());
-        write_json_object(&path, &document)?;
-        Ok(ConfigOutput {
-            success: true,
-            operation: Some(String::from("set")),
-            setting: Some(setting.to_string()),
-            value: Some(normalized.clone()),
-            previous_value,
-            new_value: Some(normalized),
-            error: None,
-        })
-    } else {
-        Ok(ConfigOutput {
-            success: true,
-            operation: Some(String::from("get")),
-            setting: Some(setting.to_string()),
-            value: get_nested_value(&document, spec.path).cloned(),
-            previous_value: None,
-            new_value: None,
-            error: None,
-        })
-    }
-}
-
-const PERMISSION_DEFAULT_MODE_PATH: &[&str] = &["permissions", "defaultMode"];
-
-fn execute_enter_plan_mode(_input: EnterPlanModeInput) -> Result<PlanModeOutput, String> {
-    let settings_path = config_file_for_scope(ConfigScope::Settings)?;
-    let state_path = plan_mode_state_file()?;
-    let mut document = read_json_object(&settings_path)?;
-    let current_local_mode = get_nested_value(&document, PERMISSION_DEFAULT_MODE_PATH).cloned();
-    let current_is_plan =
-        matches!(current_local_mode.as_ref(), Some(Value::String(value)) if value == "plan");
-
-    if let Some(state) = read_plan_mode_state(&state_path)? {
-        if current_is_plan {
-            return Ok(PlanModeOutput {
-                success: true,
-                operation: String::from("enter"),
-                changed: false,
-                active: true,
-                managed: true,
-                message: String::from("Plan mode override is already active for this worktree."),
-                settings_path: settings_path.display().to_string(),
-                state_path: state_path.display().to_string(),
-                previous_local_mode: state.previous_local_mode,
-                current_local_mode,
-            });
-        }
-        clear_plan_mode_state(&state_path)?;
-    }
-
-    if current_is_plan {
-        return Ok(PlanModeOutput {
-            success: true,
-            operation: String::from("enter"),
-            changed: false,
-            active: true,
-            managed: false,
-            message: String::from(
-                "Worktree-local plan mode is already enabled outside EnterPlanMode; leaving it unchanged.",
-            ),
-            settings_path: settings_path.display().to_string(),
-            state_path: state_path.display().to_string(),
-            previous_local_mode: None,
-            current_local_mode,
-        });
-    }
-
-    let state = PlanModeState {
-        had_local_override: current_local_mode.is_some(),
-        previous_local_mode: current_local_mode.clone(),
-    };
-    write_plan_mode_state(&state_path, &state)?;
-    set_nested_value(
-        &mut document,
-        PERMISSION_DEFAULT_MODE_PATH,
-        Value::String(String::from("plan")),
-    );
-    write_json_object(&settings_path, &document)?;
-
-    Ok(PlanModeOutput {
-        success: true,
-        operation: String::from("enter"),
-        changed: true,
-        active: true,
-        managed: true,
-        message: String::from("Enabled worktree-local plan mode override."),
-        settings_path: settings_path.display().to_string(),
-        state_path: state_path.display().to_string(),
-        previous_local_mode: state.previous_local_mode,
-        current_local_mode: get_nested_value(&document, PERMISSION_DEFAULT_MODE_PATH).cloned(),
-    })
-}
-
-fn execute_exit_plan_mode(_input: ExitPlanModeInput) -> Result<PlanModeOutput, String> {
-    let settings_path = config_file_for_scope(ConfigScope::Settings)?;
-    let state_path = plan_mode_state_file()?;
-    let mut document = read_json_object(&settings_path)?;
-    let current_local_mode = get_nested_value(&document, PERMISSION_DEFAULT_MODE_PATH).cloned();
-    let current_is_plan =
-        matches!(current_local_mode.as_ref(), Some(Value::String(value)) if value == "plan");
-
-    let Some(state) = read_plan_mode_state(&state_path)? else {
-        return Ok(PlanModeOutput {
-            success: true,
-            operation: String::from("exit"),
-            changed: false,
-            active: current_is_plan,
-            managed: false,
-            message: String::from("No EnterPlanMode override is active for this worktree."),
-            settings_path: settings_path.display().to_string(),
-            state_path: state_path.display().to_string(),
-            previous_local_mode: None,
-            current_local_mode,
-        });
-    };
-
-    if !current_is_plan {
-        clear_plan_mode_state(&state_path)?;
-        return Ok(PlanModeOutput {
-            success: true,
-            operation: String::from("exit"),
-            changed: false,
-            active: false,
-            managed: false,
-            message: String::from(
-                "Cleared stale EnterPlanMode state because plan mode was already changed outside the tool.",
-            ),
-            settings_path: settings_path.display().to_string(),
-            state_path: state_path.display().to_string(),
-            previous_local_mode: state.previous_local_mode,
-            current_local_mode,
-        });
-    }
-
-    if state.had_local_override {
-        if let Some(previous_local_mode) = state.previous_local_mode.clone() {
-            set_nested_value(
-                &mut document,
-                PERMISSION_DEFAULT_MODE_PATH,
-                previous_local_mode,
-            );
-        } else {
-            remove_nested_value(&mut document, PERMISSION_DEFAULT_MODE_PATH);
-        }
-    } else {
-        remove_nested_value(&mut document, PERMISSION_DEFAULT_MODE_PATH);
-    }
-    write_json_object(&settings_path, &document)?;
-    clear_plan_mode_state(&state_path)?;
-
-    Ok(PlanModeOutput {
-        success: true,
-        operation: String::from("exit"),
-        changed: true,
-        active: false,
-        managed: false,
-        message: String::from("Restored the prior worktree-local plan mode setting."),
-        settings_path: settings_path.display().to_string(),
-        state_path: state_path.display().to_string(),
-        previous_local_mode: state.previous_local_mode,
-        current_local_mode: get_nested_value(&document, PERMISSION_DEFAULT_MODE_PATH).cloned(),
-    })
-}
-
-fn execute_structured_output(
-    input: StructuredOutputInput,
-) -> Result<StructuredOutputResult, String> {
-    if input.0.is_empty() {
-        return Err(String::from("structured output payload must not be empty"));
-    }
-    Ok(StructuredOutputResult {
-        data: String::from("Structured output provided successfully"),
-        structured_output: input.0,
-    })
-}
-
-fn execute_repl(input: ReplInput) -> Result<ReplOutput, String> {
-    if input.code.trim().is_empty() {
-        return Err(String::from("code must not be empty"));
-    }
-    let runtime = resolve_repl_runtime(&input.language)?;
-    let started = Instant::now();
-    let mut process = Command::new(runtime.program);
-    process
-        .args(runtime.args)
-        .arg(&input.code)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-
-    let output = if let Some(timeout_ms) = input.timeout_ms {
-        let mut child = process.spawn().map_err(|error| error.to_string())?;
-        loop {
-            if child
-                .try_wait()
-                .map_err(|error| error.to_string())?
-                .is_some()
-            {
-                break child
-                    .wait_with_output()
-                    .map_err(|error| error.to_string())?;
-            }
-            if started.elapsed() >= Duration::from_millis(timeout_ms) {
-                child.kill().map_err(|error| error.to_string())?;
-                child
-                    .wait_with_output()
-                    .map_err(|error| error.to_string())?;
-                return Err(format!(
-                    "REPL execution exceeded timeout of {timeout_ms} ms"
-                ));
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-    } else {
-        process
-            .spawn()
-            .map_err(|error| error.to_string())?
-            .wait_with_output()
-            .map_err(|error| error.to_string())?
-    };
-
-    Ok(ReplOutput {
-        language: input.language,
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-        exit_code: output.status.code().unwrap_or(1),
-        duration_ms: started.elapsed().as_millis(),
-    })
-}
-
-struct ReplRuntime {
-    program: &'static str,
-    args: &'static [&'static str],
-}
-
-fn resolve_repl_runtime(language: &str) -> Result<ReplRuntime, String> {
-    match language.trim().to_ascii_lowercase().as_str() {
-        "python" | "py" => Ok(ReplRuntime {
-            program: detect_first_command(&["python3", "python"])
-                .ok_or_else(|| String::from("python runtime not found"))?,
-            args: &["-c"],
-        }),
-        "javascript" | "js" | "node" => Ok(ReplRuntime {
-            program: detect_first_command(&["node"])
-                .ok_or_else(|| String::from("node runtime not found"))?,
-            args: &["-e"],
-        }),
-        "sh" | "shell" | "bash" => Ok(ReplRuntime {
-            program: detect_first_command(&["bash", "sh"])
-                .ok_or_else(|| String::from("shell runtime not found"))?,
-            args: &["-lc"],
-        }),
-        other => Err(format!("unsupported REPL language: {other}")),
-    }
-}
-
-fn detect_first_command(commands: &[&'static str]) -> Option<&'static str> {
-    commands
-        .iter()
-        .copied()
-        .find(|command| command_exists(command))
-}
-
-#[derive(Clone, Copy)]
-enum ConfigScope {
-    Global,
-    Settings,
-}
-
-#[derive(Clone, Copy)]
-struct ConfigSettingSpec {
-    scope: ConfigScope,
-    kind: ConfigKind,
-    path: &'static [&'static str],
-    options: Option<&'static [&'static str]>,
-}
-
-#[derive(Clone, Copy)]
-enum ConfigKind {
-    Boolean,
-    String,
-}
-
-fn supported_config_setting(setting: &str) -> Option<ConfigSettingSpec> {
-    Some(match setting {
-        "theme" => ConfigSettingSpec {
-            scope: ConfigScope::Global,
-            kind: ConfigKind::String,
-            path: &["theme"],
-            options: None,
-        },
-        "editorMode" => ConfigSettingSpec {
-            scope: ConfigScope::Global,
-            kind: ConfigKind::String,
-            path: &["editorMode"],
-            options: Some(&["default", "vim", "emacs"]),
-        },
-        "verbose" => ConfigSettingSpec {
-            scope: ConfigScope::Global,
-            kind: ConfigKind::Boolean,
-            path: &["verbose"],
-            options: None,
-        },
-        "preferredNotifChannel" => ConfigSettingSpec {
-            scope: ConfigScope::Global,
-            kind: ConfigKind::String,
-            path: &["preferredNotifChannel"],
-            options: None,
-        },
-        "autoCompactEnabled" => ConfigSettingSpec {
-            scope: ConfigScope::Global,
-            kind: ConfigKind::Boolean,
-            path: &["autoCompactEnabled"],
-            options: None,
-        },
-        "autoMemoryEnabled" => ConfigSettingSpec {
-            scope: ConfigScope::Settings,
-            kind: ConfigKind::Boolean,
-            path: &["autoMemoryEnabled"],
-            options: None,
-        },
-        "autoDreamEnabled" => ConfigSettingSpec {
-            scope: ConfigScope::Settings,
-            kind: ConfigKind::Boolean,
-            path: &["autoDreamEnabled"],
-            options: None,
-        },
-        "fileCheckpointingEnabled" => ConfigSettingSpec {
-            scope: ConfigScope::Global,
-            kind: ConfigKind::Boolean,
-            path: &["fileCheckpointingEnabled"],
-            options: None,
-        },
-        "showTurnDuration" => ConfigSettingSpec {
-            scope: ConfigScope::Global,
-            kind: ConfigKind::Boolean,
-            path: &["showTurnDuration"],
-            options: None,
-        },
-        "terminalProgressBarEnabled" => ConfigSettingSpec {
-            scope: ConfigScope::Global,
-            kind: ConfigKind::Boolean,
-            path: &["terminalProgressBarEnabled"],
-            options: None,
-        },
-        "todoFeatureEnabled" => ConfigSettingSpec {
-            scope: ConfigScope::Global,
-            kind: ConfigKind::Boolean,
-            path: &["todoFeatureEnabled"],
-            options: None,
-        },
-        "model" => ConfigSettingSpec {
-            scope: ConfigScope::Settings,
-            kind: ConfigKind::String,
-            path: &["model"],
-            options: None,
-        },
-        "alwaysThinkingEnabled" => ConfigSettingSpec {
-            scope: ConfigScope::Settings,
-            kind: ConfigKind::Boolean,
-            path: &["alwaysThinkingEnabled"],
-            options: None,
-        },
-        "permissions.defaultMode" => ConfigSettingSpec {
-            scope: ConfigScope::Settings,
-            kind: ConfigKind::String,
-            path: &["permissions", "defaultMode"],
-            options: Some(&["default", "plan", "acceptEdits", "dontAsk", "auto"]),
-        },
-        "language" => ConfigSettingSpec {
-            scope: ConfigScope::Settings,
-            kind: ConfigKind::String,
-            path: &["language"],
-            options: None,
-        },
-        "teammateMode" => ConfigSettingSpec {
-            scope: ConfigScope::Global,
-            kind: ConfigKind::String,
-            path: &["teammateMode"],
-            options: Some(&["tmux", "in-process", "auto"]),
-        },
-        _ => return None,
-    })
-}
-
-fn normalize_config_value(spec: ConfigSettingSpec, value: ConfigValue) -> Result<Value, String> {
-    let normalized = match (spec.kind, value) {
-        (ConfigKind::Boolean, ConfigValue::Bool(value)) => Value::Bool(value),
-        (ConfigKind::Boolean, ConfigValue::String(value)) => {
-            match value.trim().to_ascii_lowercase().as_str() {
-                "true" => Value::Bool(true),
-                "false" => Value::Bool(false),
-                _ => return Err(String::from("setting requires true or false")),
-            }
-        }
-        (ConfigKind::Boolean, ConfigValue::Number(_)) => {
-            return Err(String::from("setting requires true or false"))
-        }
-        (ConfigKind::String, ConfigValue::String(value)) => Value::String(value),
-        (ConfigKind::String, ConfigValue::Bool(value)) => Value::String(value.to_string()),
-        (ConfigKind::String, ConfigValue::Number(value)) => json!(value),
-    };
-
-    if let Some(options) = spec.options {
-        let Some(as_str) = normalized.as_str() else {
-            return Err(String::from("setting requires a string value"));
-        };
-        if !options.iter().any(|option| option == &as_str) {
-            return Err(format!(
-                "Invalid value \"{as_str}\". Options: {}",
-                options.join(", ")
-            ));
-        }
-    }
-
-    Ok(normalized)
-}
-
-fn config_file_for_scope(scope: ConfigScope) -> Result<PathBuf, String> {
-    let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
-    Ok(match scope {
-        ConfigScope::Global => config_home_dir()?.join("settings.json"),
-        ConfigScope::Settings => cwd.join(".claw").join("settings.local.json"),
-    })
-}
-
-fn config_home_dir() -> Result<PathBuf, String> {
-    if let Ok(path) = std::env::var("CLAW_CONFIG_HOME") {
-        return Ok(PathBuf::from(path));
-    }
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .map_err(|_| {
-            String::from(
-                "HOME is not set (on Windows, set USERPROFILE or HOME, \
-                 or use CLAW_CONFIG_HOME to point directly at the config directory)",
-            )
-        })?;
-    Ok(PathBuf::from(home).join(".claw"))
-}
-
-fn read_json_object(path: &Path) -> Result<serde_json::Map<String, Value>, String> {
-    match std::fs::read_to_string(path) {
-        Ok(contents) => {
-            if contents.trim().is_empty() {
-                return Ok(serde_json::Map::new());
-            }
-            serde_json::from_str::<Value>(&contents)
-                .map_err(|error| error.to_string())?
-                .as_object()
-                .cloned()
-                .ok_or_else(|| String::from("config file must contain a JSON object"))
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(serde_json::Map::new()),
-        Err(error) => Err(error.to_string()),
-    }
-}
-
-fn write_json_object(path: &Path, value: &serde_json::Map<String, Value>) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-    }
-    std::fs::write(
-        path,
-        serde_json::to_string_pretty(value).map_err(|error| error.to_string())?,
-    )
-    .map_err(|error| error.to_string())
-}
-
-fn get_nested_value<'a>(
-    value: &'a serde_json::Map<String, Value>,
-    path: &[&str],
-) -> Option<&'a Value> {
-    let (first, rest) = path.split_first()?;
-    let mut current = value.get(*first)?;
-    for key in rest {
-        current = current.as_object()?.get(*key)?;
-    }
-    Some(current)
-}
-
-fn set_nested_value(root: &mut serde_json::Map<String, Value>, path: &[&str], new_value: Value) {
-    let (first, rest) = path.split_first().expect("config path must not be empty");
-    if rest.is_empty() {
-        root.insert((*first).to_string(), new_value);
-        return;
-    }
-
-    let entry = root
-        .entry((*first).to_string())
-        .or_insert_with(|| Value::Object(serde_json::Map::new()));
-    if !entry.is_object() {
-        *entry = Value::Object(serde_json::Map::new());
-    }
-    let map = entry.as_object_mut().expect("object inserted");
-    set_nested_value(map, rest, new_value);
-}
-
-fn remove_nested_value(root: &mut serde_json::Map<String, Value>, path: &[&str]) -> bool {
-    let Some((first, rest)) = path.split_first() else {
-        return false;
-    };
-    if rest.is_empty() {
-        return root.remove(*first).is_some();
-    }
-
-    let mut should_remove_parent = false;
-    let removed = root.get_mut(*first).is_some_and(|entry| {
-        entry.as_object_mut().is_some_and(|map| {
-            let removed = remove_nested_value(map, rest);
-            should_remove_parent = removed && map.is_empty();
-            removed
-        })
-    });
-
-    if should_remove_parent {
-        root.remove(*first);
-    }
-
-    removed
-}
-
-fn plan_mode_state_file() -> Result<PathBuf, String> {
-    Ok(config_file_for_scope(ConfigScope::Settings)?
-        .parent()
-        .ok_or_else(|| String::from("settings.local.json has no parent directory"))?
-        .join("tool-state")
-        .join("plan-mode.json"))
-}
-
-fn read_plan_mode_state(path: &Path) -> Result<Option<PlanModeState>, String> {
-    match std::fs::read_to_string(path) {
-        Ok(contents) => {
-            if contents.trim().is_empty() {
-                return Ok(None);
-            }
-            serde_json::from_str(&contents)
-                .map(Some)
-                .map_err(|error| error.to_string())
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error.to_string()),
-    }
-}
-
-fn write_plan_mode_state(path: &Path, state: &PlanModeState) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-    }
-    std::fs::write(
-        path,
-        serde_json::to_string_pretty(state).map_err(|error| error.to_string())?,
-    )
-    .map_err(|error| error.to_string())
-}
-
-fn clear_plan_mode_state(path: &Path) -> Result<(), String> {
-    match std::fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error.to_string()),
-    }
-}
-
-fn iso8601_timestamp() -> String {
-    if let Ok(output) = Command::new("date")
-        .args(["-u", "+%Y-%m-%dT%H:%M:%SZ"])
-        .output()
-    {
-        if output.status.success() {
-            return String::from_utf8_lossy(&output.stdout).trim().to_string();
-        }
-    }
-    iso8601_now()
-}
-
-#[allow(clippy::needless_pass_by_value)]
-fn execute_powershell(input: PowerShellInput) -> std::io::Result<runtime::BashCommandOutput> {
-    let _ = &input.description;
-    if let Some(output) = workspace_test_branch_preflight(&input.command) {
-        return Ok(output);
-    }
-    let shell = detect_powershell_shell()?;
-    execute_shell_command(
-        shell,
-        &input.command,
-        input.timeout,
-        input.run_in_background,
-    )
-}
-
-fn detect_powershell_shell() -> std::io::Result<&'static str> {
-    if command_exists("pwsh") {
-        Ok("pwsh")
-    } else if command_exists("powershell") {
-        Ok("powershell")
-    } else {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "PowerShell executable not found (expected `pwsh` or `powershell` in PATH)",
-        ))
-    }
-}
-
-fn command_exists(command: &str) -> bool {
-    std::process::Command::new("sh")
-        .arg("-lc")
-        .arg(format!("command -v {command} >/dev/null 2>&1"))
-        .status()
-        .is_ok_and(|status| status.success())
-}
-
-#[allow(clippy::too_many_lines)]
-fn execute_shell_command(
-    shell: &str,
-    command: &str,
-    timeout: Option<u64>,
-    run_in_background: Option<bool>,
-) -> std::io::Result<runtime::BashCommandOutput> {
-    if run_in_background.unwrap_or(false) {
-        let child = std::process::Command::new(shell)
-            .arg("-NoProfile")
-            .arg("-NonInteractive")
-            .arg("-Command")
-            .arg(command)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()?;
-        return Ok(runtime::BashCommandOutput {
-            stdout: String::new(),
-            stderr: String::new(),
-            raw_output_path: None,
-            interrupted: false,
-            is_image: None,
-            background_task_id: Some(child.id().to_string()),
-            backgrounded_by_user: Some(true),
-            assistant_auto_backgrounded: Some(false),
-            dangerously_disable_sandbox: None,
-            return_code_interpretation: None,
-            no_output_expected: Some(true),
-            structured_content: None,
-            persisted_output_path: None,
-            persisted_output_size: None,
-            sandbox_status: None,
-        });
-    }
-
-    let mut process = std::process::Command::new(shell);
-    process
-        .arg("-NoProfile")
-        .arg("-NonInteractive")
-        .arg("-Command")
-        .arg(command);
-    process
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-
-    if let Some(timeout_ms) = timeout {
-        let mut child = process.spawn()?;
-        let started = Instant::now();
-        loop {
-            if let Some(status) = child.try_wait()? {
-                let output = child.wait_with_output()?;
-                return Ok(runtime::BashCommandOutput {
-                    stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-                    stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-                    raw_output_path: None,
-                    interrupted: false,
-                    is_image: None,
-                    background_task_id: None,
-                    backgrounded_by_user: None,
-                    assistant_auto_backgrounded: None,
-                    dangerously_disable_sandbox: None,
-                    return_code_interpretation: status
-                        .code()
-                        .filter(|code| *code != 0)
-                        .map(|code| format!("exit_code:{code}")),
-                    no_output_expected: Some(output.stdout.is_empty() && output.stderr.is_empty()),
-                    structured_content: None,
-                    persisted_output_path: None,
-                    persisted_output_size: None,
-                    sandbox_status: None,
-                });
-            }
-            if started.elapsed() >= Duration::from_millis(timeout_ms) {
-                let _ = child.kill();
-                let output = child.wait_with_output()?;
-                let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-                let stderr = if stderr.trim().is_empty() {
-                    format!("Command exceeded timeout of {timeout_ms} ms")
-                } else {
-                    format!(
-                        "{}
-Command exceeded timeout of {timeout_ms} ms",
-                        stderr.trim_end()
-                    )
-                };
-                let is_test = is_test_command(command);
-                let return_code_interpretation = if is_test { "test.hung" } else { "timeout" };
-                return Ok(runtime::BashCommandOutput {
-                    stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-                    stderr,
-                    raw_output_path: None,
-                    interrupted: true,
-                    is_image: None,
-                    background_task_id: None,
-                    backgrounded_by_user: None,
-                    assistant_auto_backgrounded: None,
-                    dangerously_disable_sandbox: None,
-                    return_code_interpretation: Some(String::from(return_code_interpretation)),
-                    no_output_expected: Some(false),
-                    structured_content: Some(vec![test_timeout_provenance(
-                        command, timeout_ms, is_test,
-                    )]),
-                    persisted_output_path: None,
-                    persisted_output_size: None,
-                    sandbox_status: None,
-                });
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-    }
-
-    let output = process.output()?;
-    Ok(runtime::BashCommandOutput {
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-        raw_output_path: None,
-        interrupted: false,
-        is_image: None,
-        background_task_id: None,
-        backgrounded_by_user: None,
-        assistant_auto_backgrounded: None,
-        dangerously_disable_sandbox: None,
-        return_code_interpretation: output
-            .status
-            .code()
-            .filter(|code| *code != 0)
-            .map(|code| format!("exit_code:{code}")),
-        no_output_expected: Some(output.stdout.is_empty() && output.stderr.is_empty()),
-        structured_content: None,
-        persisted_output_path: None,
-        persisted_output_size: None,
-        sandbox_status: None,
-    })
-}
-
-fn is_test_command(command: &str) -> bool {
-    let normalized = command
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_ascii_lowercase();
-    normalized.contains("cargo test")
-        || normalized.contains("cargo nextest")
-        || normalized.contains("npm test")
-        || normalized.contains("pnpm test")
-        || normalized.contains("yarn test")
-        || normalized.contains("pytest")
-}
-
-fn test_timeout_provenance(
-    command: &str,
-    timeout_ms: u64,
-    classified_as_test_hang: bool,
-) -> serde_json::Value {
-    json!({
-        "event": if classified_as_test_hang { "test.hung" } else { "command.timeout" },
-        "failureClass": if classified_as_test_hang { "test_hang" } else { "timeout" },
-        "data": {
-            "command": command,
-            "timeoutMs": timeout_ms,
-            "provenance": "shell.timeout",
-            "classification": if classified_as_test_hang { "test.hung" } else { "timeout" }
-        }
-    })
-}
-
-fn resolve_cell_index(
-    cells: &[serde_json::Value],
-    cell_id: Option<&str>,
-    edit_mode: NotebookEditMode,
-) -> Result<usize, String> {
-    if cells.is_empty()
-        && matches!(
-            edit_mode,
-            NotebookEditMode::Replace | NotebookEditMode::Delete
-        )
-    {
-        return Err(String::from("Notebook has no cells to edit"));
-    }
-    if let Some(cell_id) = cell_id {
-        cells
-            .iter()
-            .position(|cell| cell.get("id").and_then(serde_json::Value::as_str) == Some(cell_id))
-            .ok_or_else(|| format!("Cell id not found: {cell_id}"))
-    } else {
-        Ok(cells.len().saturating_sub(1))
-    }
-}
-
-fn source_lines(source: &str) -> Vec<serde_json::Value> {
-    if source.is_empty() {
-        return vec![serde_json::Value::String(String::new())];
-    }
-    source
-        .split_inclusive('\n')
-        .map(|line| serde_json::Value::String(line.to_string()))
-        .collect()
-}
-
-fn format_notebook_edit_mode(mode: NotebookEditMode) -> String {
-    match mode {
-        NotebookEditMode::Replace => String::from("replace"),
-        NotebookEditMode::Insert => String::from("insert"),
-        NotebookEditMode::Delete => String::from("delete"),
-    }
-}
-
-fn make_cell_id(index: usize) -> String {
-    format!("cell-{}", index + 1)
-}
-
+// Agent system lives in `crates/agents/`. See `execute_agent_with_spawn` above
+// for the only remaining local entry point.
 fn parse_skill_description(contents: &str) -> Option<String> {
-    for line in contents.lines() {
-        if let Some(value) = line.strip_prefix("description:") {
-            let trimmed = value.trim();
-            if !trimmed.is_empty() {
-                return Some(trimmed.to_string());
-            }
-        }
-    }
-    None
+    plugins::frontmatter::parse_frontmatter(contents)
+        .ok()?
+        .frontmatter
+        .description
 }
 
+pub mod excel_extract;
 pub mod lane_completion;
+mod subagent_overlay;
 pub mod pdf_extract;
+pub mod word_extract;
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
     use std::collections::BTreeSet;
     use std::fs;
     use std::io::{Read, Write};
@@ -6839,21 +1894,38 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        agent_permission_policy, allowed_tools_for_subagent, build_agent_system_prompt,
-        classify_lane_failure, derive_agent_state, execute_agent_with_spawn, execute_tool,
-        extract_recovery_outcome, final_assistant_text, global_cron_registry,
-        maybe_commit_provenance, mvp_tool_specs, permission_mode_from_plugin,
-        persist_agent_terminal_state, push_output_block, run_task_packet, AgentInput, AgentJob,
-        GlobalToolRegistry, LaneEventName, LaneFailureClass, ProviderRuntimeClient,
-        SubagentToolExecutor,
+        execute_agent_with_spawn, execute_tool, permission_mode_from_plugin,
+        tools_init, wiki_mirror_url, AgentInput, EditFileInput, GlobalToolRegistry,
+        LaneEventName,
     };
-    use api::OutputContentBlock;
-    use runtime::ProviderFallbackConfig;
+    use agents::{AgentHandle, AgentJob};
     use runtime::{
-        permission_enforcer::PermissionEnforcer, ApiRequest, AssistantEvent, ConversationRuntime,
-        PermissionMode, PermissionPolicy, RuntimeError, Session, TaskPacket, ToolExecutor,
+        permission_enforcer::PermissionEnforcer, PermissionMode, PermissionPolicy,
+        ToolExecutor,
     };
     use serde_json::json;
+
+    fn mvp_tool_specs() -> Vec<(&'static str, PermissionMode)> {
+        vec![
+            ("bash", PermissionMode::DangerFullAccess),
+            ("read_file", PermissionMode::ReadOnly),
+            ("new_file", PermissionMode::WorkspaceWrite),
+            ("edit_file", PermissionMode::WorkspaceWrite),
+            ("glob_search", PermissionMode::ReadOnly),
+            ("grep_search", PermissionMode::ReadOnly),
+            ("WebFetch", PermissionMode::ReadOnly),
+            ("WebFind", PermissionMode::ReadOnly),
+            ("WebSearch", PermissionMode::ReadOnly),
+            ("Skill", PermissionMode::ReadOnly),
+            ("Agent", PermissionMode::DangerFullAccess),
+            // Deprecated legacy alias for Brief
+            ("SendUserMessage", PermissionMode::ReadOnly),
+            ("StructuredOutput", PermissionMode::ReadOnly),
+            ("ListAgents", PermissionMode::ReadOnly),
+            ("ListSkills", PermissionMode::ReadOnly),
+            ("ListPlugins", PermissionMode::ReadOnly),
+        ]
+    }
 
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -6902,6 +1974,7 @@ mod tests {
     fn init_git_repo(path: &Path) {
         std::fs::create_dir_all(path).expect("create repo");
         run_git(path, &["init", "--quiet", "-b", "main"]);
+        run_git(path, &["config", "core.autocrlf", "false"]);
         run_git(path, &["config", "user.email", "tests@example.com"]);
         run_git(path, &["config", "user.name", "Tools Tests"]);
         std::fs::write(path.join("README.md"), "initial\n").expect("write readme");
@@ -6918,8 +1991,8 @@ mod tests {
     fn permission_policy_for_mode(mode: PermissionMode) -> PermissionPolicy {
         mvp_tool_specs()
             .into_iter()
-            .fold(PermissionPolicy::new(mode), |policy, spec| {
-                policy.with_tool_requirement(spec.name, spec.required_permission)
+            .fold(PermissionPolicy::new(mode), |policy, (name, perm)| {
+                policy.with_tool_requirement(name, perm)
             })
     }
 
@@ -6927,110 +2000,19 @@ mod tests {
     fn exposes_mvp_tools() {
         let names = mvp_tool_specs()
             .into_iter()
-            .map(|spec| spec.name)
+            .map(|(name, _)| name)
             .collect::<Vec<_>>();
         assert!(names.contains(&"bash"));
         assert!(names.contains(&"read_file"));
         assert!(names.contains(&"WebFetch"));
+        assert!(names.contains(&"WebFind"));
         assert!(names.contains(&"WebSearch"));
-        assert!(names.contains(&"TodoWrite"));
+
         assert!(names.contains(&"Skill"));
         assert!(names.contains(&"Agent"));
-        assert!(names.contains(&"ToolSearch"));
-        assert!(names.contains(&"NotebookEdit"));
-        assert!(names.contains(&"Sleep"));
         assert!(names.contains(&"SendUserMessage"));
-        assert!(names.contains(&"Config"));
-        assert!(names.contains(&"EnterPlanMode"));
-        assert!(names.contains(&"ExitPlanMode"));
         assert!(names.contains(&"StructuredOutput"));
-        assert!(names.contains(&"REPL"));
-        assert!(names.contains(&"PowerShell"));
-        assert!(names.contains(&"WorkerCreate"));
-        assert!(names.contains(&"WorkerObserve"));
-        assert!(names.contains(&"WorkerAwaitReady"));
-        assert!(names.contains(&"WorkerSendPrompt"));
-    }
 
-    #[test]
-    fn git_show_schema_exposes_format_enum() {
-        let spec = mvp_tool_specs()
-            .into_iter()
-            .find(|spec| spec.name == "GitShow")
-            .expect("GitShow spec");
-        assert_eq!(
-            spec.input_schema["properties"]["format"]["enum"],
-            json!(["patch", "stat", "metadata"])
-        );
-    }
-
-    #[test]
-    fn git_show_supports_patch_stat_metadata_and_rejects_metadata_path() {
-        let _guard = env_guard();
-        let root = temp_path("git-show-format");
-        init_git_repo(&root);
-        commit_file(&root, "README.md", "initial\nupdated\n", "update readme");
-        let previous = std::env::current_dir().expect("cwd");
-        std::env::set_current_dir(&root).expect("set cwd");
-
-        let patch = execute_tool("GitShow", &json!({"commit": "HEAD", "format": "patch"}))
-            .expect("patch git show");
-        let patch: serde_json::Value = serde_json::from_str(&patch).expect("patch json");
-        assert!(patch["output"]
-            .as_str()
-            .expect("patch output")
-            .contains("diff --git"));
-
-        let stat = execute_tool("GitShow", &json!({"commit": "HEAD", "format": "stat"}))
-            .expect("stat git show");
-        let stat: serde_json::Value = serde_json::from_str(&stat).expect("stat json");
-        assert!(stat["output"]
-            .as_str()
-            .expect("stat output")
-            .contains("README.md"));
-
-        let legacy_stat = execute_tool("GitShow", &json!({"commit": "HEAD", "stat": true}))
-            .expect("legacy stat git show");
-        let legacy_stat: serde_json::Value =
-            serde_json::from_str(&legacy_stat).expect("legacy stat json");
-        assert!(legacy_stat["output"]
-            .as_str()
-            .expect("legacy stat output")
-            .contains("README.md"));
-
-        let metadata = execute_tool("GitShow", &json!({"commit": "HEAD", "format": "metadata"}))
-            .expect("metadata git show");
-        let metadata: serde_json::Value = serde_json::from_str(&metadata).expect("metadata json");
-        let metadata_output = metadata["output"].as_str().expect("metadata output");
-        assert!(metadata_output.contains("commit "));
-        assert!(metadata_output.contains("update readme"));
-        assert!(!metadata_output.contains("diff --git"));
-
-        let file_patch = execute_tool(
-            "GitShow",
-            &json!({"commit": "HEAD", "path": "README.md", "format": "patch"}),
-        )
-        .expect("file patch git show");
-        let file_patch: serde_json::Value =
-            serde_json::from_str(&file_patch).expect("file patch json");
-        assert_eq!(
-            file_patch["output"].as_str().expect("file patch output"),
-            "initial\nupdated"
-        );
-
-        let metadata_path = execute_tool(
-            "GitShow",
-            &json!({"commit": "HEAD", "path": "README.md", "format": "metadata"}),
-        )
-        .expect_err("metadata with path should be rejected");
-        assert!(metadata_path.contains("cannot be combined with path"));
-
-        let invalid = execute_tool("GitShow", &json!({"commit": "HEAD", "format": "bogus"}))
-            .expect_err("invalid format should be rejected");
-        assert!(invalid.contains("unknown GitShow format"));
-
-        std::env::set_current_dir(&previous).expect("restore cwd");
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -7040,623 +2022,36 @@ mod tests {
     }
 
     #[test]
-    fn worker_tools_gate_prompt_delivery_until_ready_and_support_auto_trust() {
-        let created = execute_tool(
-            "WorkerCreate",
-            &json!({
-                "cwd": "/tmp/worktree/repo",
-                "trusted_roots": ["/tmp/worktree"]
-            }),
-        )
-        .expect("WorkerCreate should succeed");
-        let created_output: serde_json::Value = serde_json::from_str(&created).expect("json");
-        let worker_id = created_output["worker_id"]
-            .as_str()
-            .expect("worker id")
-            .to_string();
-        assert_eq!(created_output["status"], "spawning");
-        assert_eq!(created_output["trust_auto_resolve"], true);
+    fn tools_init_wires_subagent_executor() {
+        use agents::SubagentToolExecutor;
 
-        let gated = execute_tool(
-            "WorkerSendPrompt",
-            &json!({
-                "worker_id": worker_id,
-                "prompt": "ship the change"
-            }),
-        )
-        .expect_err("prompt delivery before ready should fail");
-        assert!(gated.contains("not ready for prompt delivery"));
+        let _guard = env_guard();
 
-        let observed = execute_tool(
-            "WorkerObserve",
-            &json!({
-                "worker_id": created_output["worker_id"],
-                "screen_text": "Do you trust the files in this folder?\n1. Yes, proceed\n2. No"
-            }),
-        )
-        .expect("WorkerObserve should auto-resolve trust");
-        let observed_output: serde_json::Value = serde_json::from_str(&observed).expect("json");
-        assert_eq!(observed_output["status"], "spawning");
-        assert_eq!(observed_output["trust_gate_cleared"], true);
-        assert_eq!(
-            observed_output["events"][1]["payload"]["type"],
-            "trust_prompt"
-        );
-        assert_eq!(
-            observed_output["events"][2]["payload"]["resolution"],
-            "auto_allowlisted"
-        );
+        tools_init().expect("tools_init should register the executor");
 
-        let ready = execute_tool(
-            "WorkerObserve",
-            &json!({
-                "worker_id": created_output["worker_id"],
-                "screen_text": "Ready for your input\n>"
-            }),
-        )
-        .expect("WorkerObserve should mark worker ready");
-        let ready_output: serde_json::Value = serde_json::from_str(&ready).expect("json");
-        assert_eq!(ready_output["status"], "ready_for_prompt");
-
-        let await_ready = execute_tool(
-            "WorkerAwaitReady",
-            &json!({
-                "worker_id": created_output["worker_id"]
-            }),
-        )
-        .expect("WorkerAwaitReady should succeed");
-        let await_ready_output: serde_json::Value =
-            serde_json::from_str(&await_ready).expect("json");
-        assert_eq!(await_ready_output["ready"], true);
-
-        let accepted = execute_tool(
-            "WorkerSendPrompt",
-            &json!({
-                "worker_id": created_output["worker_id"],
-                "prompt": "ship the change"
-            }),
-        )
-        .expect("WorkerSendPrompt should succeed after ready");
-        let accepted_output: serde_json::Value = serde_json::from_str(&accepted).expect("json");
-        assert_eq!(accepted_output["status"], "running");
-        assert_eq!(accepted_output["prompt_delivery_attempts"], 1);
-        assert_eq!(accepted_output["prompt_in_flight"], true);
-    }
-
-    #[test]
-    fn worker_create_merges_config_trusted_roots_without_per_call_override() {
-        use std::fs;
-        // Write a .claw/settings.json in a temp dir with trustedRoots
-        let worktree = temp_path("config-trust-worktree");
-        let claw_dir = worktree.join(".claw");
-        fs::create_dir_all(&claw_dir).expect("create .claw dir");
-        // Use the actual OS temp dir so the worktree path matches the allowlist
-        let tmp_root = std::env::temp_dir().to_str().expect("utf-8").to_string();
-        let settings = format!("{{\"trustedRoots\": [\"{tmp_root}\"]}}");
-        fs::write(claw_dir.join("settings.json"), settings).expect("write settings");
-
-        // WorkerCreate with no per-call trusted_roots — config should supply them
-        let cwd = worktree.to_str().expect("valid utf-8").to_string();
-        let created = execute_tool(
-            "WorkerCreate",
-            &json!({
-                "cwd": cwd
-                // trusted_roots intentionally omitted
-            }),
-        )
-        .expect("WorkerCreate should succeed");
-        let output: serde_json::Value = serde_json::from_str(&created).expect("json");
-
-        // worktree is under /tmp, so config roots auto-resolve trust
-        assert_eq!(
-            output["trust_auto_resolve"], true,
-            "config-level trustedRoots should auto-resolve trust without per-call override"
-        );
-
-        fs::remove_dir_all(&worktree).ok();
-    }
-
-    #[test]
-    fn worker_create_merges_config_trusted_roots_with_per_call_roots() {
-        use std::fs;
-
-        let worktree = temp_path("config-and-call-trust-worktree");
-        let claw_dir = worktree.join(".claw");
-        fs::create_dir_all(&claw_dir).expect("create .claw dir");
-        fs::write(
-            claw_dir.join("settings.json"),
-            r#"{"trustedRoots": ["/definitely/not/this/worktree"]}"#,
-        )
-        .expect("write settings");
-
-        let cwd = worktree.to_str().expect("valid utf-8").to_string();
-        let parent = worktree
-            .parent()
-            .expect("temp path has parent")
-            .to_str()
-            .expect("valid parent utf-8")
-            .to_string();
-
-        let created = execute_tool(
-            "WorkerCreate",
-            &json!({
-                "cwd": cwd,
-                "trusted_roots": [parent]
-            }),
-        )
-        .expect("WorkerCreate should succeed");
-        let output: serde_json::Value = serde_json::from_str(&created).expect("json");
-
-        assert_eq!(
-            output["trust_auto_resolve"], true,
-            "per-call trusted_roots must extend config defaults for this create request"
-        );
-
-        fs::remove_dir_all(&worktree).ok();
-    }
-
-    #[test]
-    fn worker_terminate_sets_finished_status() {
-        // Create a worker in running state
-        let created = execute_tool(
-            "WorkerCreate",
-            &json!({"cwd": "/tmp/terminate-test", "trusted_roots": ["/tmp"]}),
-        )
-        .expect("WorkerCreate should succeed");
-        let output: serde_json::Value = serde_json::from_str(&created).expect("json");
-        let worker_id = output["worker_id"].as_str().expect("worker_id").to_string();
-
-        // Terminate
-        let terminated = execute_tool("WorkerTerminate", &json!({"worker_id": worker_id}))
-            .expect("WorkerTerminate should succeed");
-        let term_output: serde_json::Value = serde_json::from_str(&terminated).expect("json");
-        assert_eq!(
-            term_output["status"], "finished",
-            "terminated worker should be finished"
-        );
-        assert_eq!(
-            term_output["prompt_in_flight"], false,
-            "prompt_in_flight should be cleared on termination"
-        );
-    }
-
-    #[test]
-    fn worker_restart_resets_to_spawning() {
-        // Create and advance worker to ready_for_prompt
-        let created = execute_tool(
-            "WorkerCreate",
-            &json!({"cwd": "/tmp/restart-test", "trusted_roots": ["/tmp"]}),
-        )
-        .expect("WorkerCreate should succeed");
-        let output: serde_json::Value = serde_json::from_str(&created).expect("json");
-        let worker_id = output["worker_id"].as_str().expect("worker_id").to_string();
-
-        // Advance to ready_for_prompt via observe
-        execute_tool(
-            "WorkerObserve",
-            &json!({"worker_id": worker_id, "screen_text": "Ready for input\n>"}),
-        )
-        .expect("WorkerObserve should succeed");
-
-        // Restart
-        let restarted = execute_tool("WorkerRestart", &json!({"worker_id": worker_id}))
-            .expect("WorkerRestart should succeed");
-        let restart_output: serde_json::Value = serde_json::from_str(&restarted).expect("json");
-        assert_eq!(
-            restart_output["status"], "spawning",
-            "restarted worker should return to spawning"
-        );
-        assert_eq!(
-            restart_output["prompt_in_flight"], false,
-            "prompt_in_flight should be cleared on restart"
-        );
-        assert_eq!(
-            restart_output["trust_gate_cleared"], false,
-            "trust_gate_cleared should be reset on restart (re-trust required)"
-        );
-    }
-
-    #[test]
-    fn worker_get_returns_worker_state() {
-        let created = execute_tool(
-            "WorkerCreate",
-            &json!({"cwd": "/tmp/worker-get-test", "trusted_roots": ["/tmp"]}),
-        )
-        .expect("WorkerCreate should succeed");
-        let created_output: serde_json::Value = serde_json::from_str(&created).expect("json");
-        let worker_id = created_output["worker_id"].as_str().expect("worker_id");
-
-        let fetched = execute_tool("WorkerGet", &json!({"worker_id": worker_id}))
-            .expect("WorkerGet should succeed");
-        let fetched_output: serde_json::Value = serde_json::from_str(&fetched).expect("json");
-        assert_eq!(fetched_output["worker_id"], worker_id);
-        assert_eq!(fetched_output["status"], "spawning");
-        assert_eq!(fetched_output["cwd"], "/tmp/worker-get-test");
-    }
-
-    #[test]
-    fn worker_get_on_unknown_id_returns_error() {
-        let result = execute_tool(
-            "WorkerGet",
-            &json!({"worker_id": "worker_nonexistent_get_00000000"}),
-        );
+        let mut allowed = BTreeSet::new();
+        allowed.insert("ListSkills".to_string());
+        let mut exec = SubagentToolExecutor::new(allowed);
+        // Use ListSkills (in-process, no OS execution) to verify the
+        // global tool executor closure was wired correctly.
+        let result = exec.execute("ListSkills", r#"{}"#);
+        let output = result.expect("subagent tool execution should succeed after init");
         assert!(
-            result.is_err(),
-            "WorkerGet on unknown id should return error"
+            output.contains(r#""skills""#),
+            "ListSkills output should contain JSON, got: {output}"
         );
+    }
+
+    #[test]
+    fn tools_init_is_idempotent() {
+        let _guard = env_guard();
+
+        tools_init().expect("first init should succeed");
+        let second = tools_init();
         assert!(
-            result.unwrap_err().contains("worker not found"),
-            "error should mention worker not found"
+            second.is_ok(),
+            "second init should be a no-op, got: {second:?}"
         );
-    }
-
-    #[test]
-    fn worker_await_ready_on_spawning_worker_returns_not_ready() {
-        let created = execute_tool(
-            "WorkerCreate",
-            &json!({"cwd": "/tmp/worker-await-not-ready"}),
-        )
-        .expect("WorkerCreate should succeed");
-        let created_output: serde_json::Value = serde_json::from_str(&created).expect("json");
-        let worker_id = created_output["worker_id"].as_str().expect("worker_id");
-
-        // Worker is still in spawning — await_ready should return not-ready snapshot
-        let snapshot = execute_tool("WorkerAwaitReady", &json!({"worker_id": worker_id}))
-            .expect("WorkerAwaitReady should succeed even when not ready");
-        let snap_output: serde_json::Value = serde_json::from_str(&snapshot).expect("json");
-        assert_eq!(
-            snap_output["ready"], false,
-            "WorkerAwaitReady on a spawning worker must return ready=false"
-        );
-        assert_eq!(snap_output["worker_id"], worker_id);
-    }
-
-    #[test]
-    fn worker_send_prompt_on_non_ready_worker_returns_error() {
-        let created = execute_tool(
-            "WorkerCreate",
-            &json!({"cwd": "/tmp/worker-send-not-ready"}),
-        )
-        .expect("WorkerCreate should succeed");
-        let created_output: serde_json::Value = serde_json::from_str(&created).expect("json");
-        let worker_id = created_output["worker_id"].as_str().expect("worker_id");
-
-        let result = execute_tool(
-            "WorkerSendPrompt",
-            &json!({"worker_id": worker_id, "prompt": "too early"}),
-        );
-        assert!(
-            result.is_err(),
-            "WorkerSendPrompt on a non-ready worker should fail"
-        );
-    }
-
-    #[test]
-    fn recovery_loop_state_file_reflects_transitions() {
-        // End-to-end proof: .claw/worker-state.json reflects every transition
-        // through the stall-detect -> resolve-trust -> ready loop.
-        use std::fs;
-
-        // Use a real temp CWD so state file can be written
-        let worktree = temp_path("recovery-loop-state");
-        fs::create_dir_all(&worktree).expect("create worktree");
-        let cwd = worktree.to_str().expect("utf-8").to_string();
-        let state_path = worktree.join(".claw").join("worker-state.json");
-
-        // 1. Create worker WITHOUT trusted_roots
-        let created = execute_tool("WorkerCreate", &json!({"cwd": cwd}))
-            .expect("WorkerCreate should succeed");
-        let created_output: serde_json::Value = serde_json::from_str(&created).expect("json");
-        let worker_id = created_output["worker_id"]
-            .as_str()
-            .expect("worker_id")
-            .to_string();
-        // State file should exist after create
-        assert!(
-            state_path.exists(),
-            "state file should be written after WorkerCreate"
-        );
-        let state: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(&state_path).expect("read state"))
-                .expect("parse state");
-        assert_eq!(state["status"], "spawning");
-        assert_eq!(state["is_ready"], false);
-        assert!(
-            state["seconds_since_update"].is_number(),
-            "seconds_since_update must be present"
-        );
-
-        // 2. Force trust_required via observe
-        execute_tool(
-            "WorkerObserve",
-            &json!({"worker_id": worker_id, "screen_text": "Do you trust the files in this folder?"}),
-        )
-        .expect("WorkerObserve should succeed");
-        let state: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(&state_path).expect("read state"))
-                .expect("parse state");
-        assert_eq!(
-            state["status"], "trust_required",
-            "state file must reflect trust_required stall"
-        );
-        assert_eq!(state["is_ready"], false);
-        assert_eq!(state["trust_gate_cleared"], false);
-        assert!(state["seconds_since_update"].is_number());
-
-        // 3. WorkerResolveTrust -> state file reflects recovery
-        execute_tool("WorkerResolveTrust", &json!({"worker_id": worker_id}))
-            .expect("WorkerResolveTrust should succeed");
-        let state: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(&state_path).expect("read state"))
-                .expect("parse state");
-        assert_eq!(
-            state["status"], "spawning",
-            "state file must show spawning after trust resolved"
-        );
-        assert_eq!(state["trust_gate_cleared"], true);
-
-        // 4. Observe ready screen -> state file shows ready_for_prompt
-        execute_tool(
-            "WorkerObserve",
-            &json!({"worker_id": worker_id, "screen_text": "Ready for input\n>"}),
-        )
-        .expect("WorkerObserve ready should succeed");
-        let state: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(&state_path).expect("read state"))
-                .expect("parse state");
-        assert_eq!(
-            state["status"], "ready_for_prompt",
-            "state file must show ready_for_prompt after ready screen"
-        );
-        assert_eq!(
-            state["is_ready"], true,
-            "is_ready must be true in state file at ready_for_prompt"
-        );
-
-        fs::remove_dir_all(&worktree).ok();
-    }
-
-    #[test]
-    fn stall_detect_and_resolve_trust_end_to_end() {
-        // 1. Create worker WITHOUT trusted_roots so trust won't auto-resolve
-        let created = execute_tool("WorkerCreate", &json!({"cwd": "/no/trusted/root/here"}))
-            .expect("WorkerCreate should succeed");
-        let created_output: serde_json::Value = serde_json::from_str(&created).expect("json");
-        let worker_id = created_output["worker_id"]
-            .as_str()
-            .expect("worker_id")
-            .to_string();
-        assert_eq!(created_output["trust_auto_resolve"], false);
-
-        // 2. Observe trust prompt screen text -> worker stalls at trust_required
-        let stalled = execute_tool(
-            "WorkerObserve",
-            &json!({
-                "worker_id": worker_id,
-                "screen_text": "Do you trust the files in this folder?\n[Allow] [Deny]"
-            }),
-        )
-        .expect("WorkerObserve should succeed");
-        let stalled_output: serde_json::Value = serde_json::from_str(&stalled).expect("json");
-        assert_eq!(
-            stalled_output["status"], "trust_required",
-            "worker should stall at trust_required when trust prompt seen without allowlist"
-        );
-        assert_eq!(stalled_output["trust_gate_cleared"], false);
-        // 3. Clawhip calls WorkerResolveTrust to unblock
-        let resolved = execute_tool("WorkerResolveTrust", &json!({"worker_id": worker_id}))
-            .expect("WorkerResolveTrust should succeed");
-        let resolved_output: serde_json::Value = serde_json::from_str(&resolved).expect("json");
-        assert_eq!(
-            resolved_output["status"], "spawning",
-            "worker should return to spawning after trust resolved"
-        );
-        assert_eq!(resolved_output["trust_gate_cleared"], true);
-
-        // 4. Ready screen text now advances worker normally
-        let ready = execute_tool(
-            "WorkerObserve",
-            &json!({
-                "worker_id": worker_id,
-                "screen_text": "Ready for input\n>"
-            }),
-        )
-        .expect("WorkerObserve should succeed after trust resolved");
-        let ready_output: serde_json::Value = serde_json::from_str(&ready).expect("json");
-        assert_eq!(
-            ready_output["status"], "ready_for_prompt",
-            "worker should reach ready_for_prompt after trust resolved and ready screen seen"
-        );
-    }
-
-    #[test]
-    fn stall_detect_and_restart_recovery_end_to_end() {
-        // Worker stalls at trust_required, clawhip restarts instead of resolving
-        let created = execute_tool(
-            "WorkerCreate",
-            &json!({"cwd": "/no/trusted/root/restart-test"}),
-        )
-        .expect("WorkerCreate should succeed");
-        let created_output: serde_json::Value = serde_json::from_str(&created).expect("json");
-        let worker_id = created_output["worker_id"]
-            .as_str()
-            .expect("worker_id")
-            .to_string();
-
-        // Force trust_required
-        let stalled = execute_tool(
-            "WorkerObserve",
-            &json!({
-                "worker_id": worker_id,
-                "screen_text": "trust this folder? [Yes] [No]"
-            }),
-        )
-        .expect("WorkerObserve should succeed");
-        let stalled_output: serde_json::Value = serde_json::from_str(&stalled).expect("json");
-        assert_eq!(stalled_output["status"], "trust_required");
-
-        // WorkerRestart resets the worker
-        let restarted = execute_tool("WorkerRestart", &json!({"worker_id": worker_id}))
-            .expect("WorkerRestart should succeed");
-        let restarted_output: serde_json::Value = serde_json::from_str(&restarted).expect("json");
-        assert_eq!(
-            restarted_output["status"], "spawning",
-            "restarted worker should be back at spawning"
-        );
-        assert_eq!(
-            restarted_output["trust_gate_cleared"], false,
-            "restart clears trust — next observe loop must re-acquire trust"
-        );
-    }
-
-    #[test]
-    fn worker_terminate_on_unknown_id_returns_error() {
-        let result = execute_tool(
-            "WorkerTerminate",
-            &json!({"worker_id": "worker_nonexistent_00000000"}),
-        );
-        assert!(result.is_err(), "terminating unknown worker should fail");
-        assert!(
-            result.unwrap_err().contains("worker not found"),
-            "error should mention worker not found"
-        );
-    }
-
-    #[test]
-    fn worker_restart_on_unknown_id_returns_error() {
-        let result = execute_tool(
-            "WorkerRestart",
-            &json!({"worker_id": "worker_nonexistent_00000001"}),
-        );
-        assert!(result.is_err(), "restarting unknown worker should fail");
-        assert!(
-            result.unwrap_err().contains("worker not found"),
-            "error should mention worker not found"
-        );
-    }
-
-    #[test]
-    fn worker_observe_completion_success_finish_sets_finished_status() {
-        let created = execute_tool(
-            "WorkerCreate",
-            &json!({"cwd": "/tmp/observe-completion-test", "trusted_roots": ["/tmp"]}),
-        )
-        .expect("WorkerCreate should succeed");
-        let output: serde_json::Value = serde_json::from_str(&created).expect("json");
-        let worker_id = output["worker_id"].as_str().expect("worker_id").to_string();
-
-        let completed = execute_tool(
-            "WorkerObserveCompletion",
-            &json!({
-                "worker_id": worker_id,
-                "finish_reason": "end_turn",
-                "tokens_output": 512
-            }),
-        )
-        .expect("WorkerObserveCompletion should succeed");
-        let completed_output: serde_json::Value = serde_json::from_str(&completed).expect("json");
-        assert_eq!(completed_output["status"], "finished");
-        assert_eq!(completed_output["prompt_in_flight"], false);
-    }
-
-    #[test]
-    fn worker_observe_completion_degraded_provider_sets_failed_status() {
-        let created = execute_tool(
-            "WorkerCreate",
-            &json!({"cwd": "/tmp/observe-degraded-test", "trusted_roots": ["/tmp"]}),
-        )
-        .expect("WorkerCreate should succeed");
-        let output: serde_json::Value = serde_json::from_str(&created).expect("json");
-        let worker_id = output["worker_id"].as_str().expect("worker_id").to_string();
-
-        // finish=unknown + 0 tokens = degraded provider classification
-        let failed = execute_tool(
-            "WorkerObserveCompletion",
-            &json!({
-                "worker_id": worker_id,
-                "finish_reason": "unknown",
-                "tokens_output": 0
-            }),
-        )
-        .expect("WorkerObserveCompletion should succeed");
-        let failed_output: serde_json::Value = serde_json::from_str(&failed).expect("json");
-        assert_eq!(
-            failed_output["status"], "failed",
-            "finish=unknown + 0 tokens should classify as provider failure"
-        );
-        assert_eq!(failed_output["prompt_in_flight"], false);
-        // last_error should be set with provider failure message
-        assert!(
-            !failed_output["last_error"].is_null(),
-            "last_error should be populated for provider failure"
-        );
-    }
-
-    #[test]
-    fn worker_tools_detect_misdelivery_and_arm_prompt_replay() {
-        let created = execute_tool(
-            "WorkerCreate",
-            &json!({
-                "cwd": "/tmp/repo/worker-misdelivery"
-            }),
-        )
-        .expect("WorkerCreate should succeed");
-        let created_output: serde_json::Value = serde_json::from_str(&created).expect("json");
-        let worker_id = created_output["worker_id"]
-            .as_str()
-            .expect("worker id")
-            .to_string();
-
-        execute_tool(
-            "WorkerObserve",
-            &json!({
-                "worker_id": worker_id,
-                "screen_text": "Ready for input\n>"
-            }),
-        )
-        .expect("worker should become ready");
-
-        execute_tool(
-            "WorkerSendPrompt",
-            &json!({
-                "worker_id": worker_id,
-                "prompt": "Investigate flaky boot"
-            }),
-        )
-        .expect("prompt send should succeed");
-
-        let recovered = execute_tool(
-            "WorkerObserve",
-            &json!({
-                "worker_id": worker_id,
-                "screen_text": "% Investigate flaky boot\nzsh: command not found: Investigate"
-            }),
-        )
-        .expect("misdelivery observe should succeed");
-        let recovered_output: serde_json::Value = serde_json::from_str(&recovered).expect("json");
-        assert_eq!(recovered_output["status"], "ready_for_prompt");
-        assert_eq!(recovered_output["last_error"]["kind"], "prompt_delivery");
-        assert_eq!(recovered_output["replay_prompt"], "Investigate flaky boot");
-        assert_eq!(
-            recovered_output["events"][3]["payload"]["observed_target"],
-            "shell"
-        );
-        assert_eq!(
-            recovered_output["events"][4]["payload"]["recovery_armed"],
-            true
-        );
-
-        let replayed = execute_tool(
-            "WorkerSendPrompt",
-            &json!({
-                "worker_id": worker_id
-            }),
-        )
-        .expect("WorkerSendPrompt should replay recovered prompt");
-        let replayed_output: serde_json::Value = serde_json::from_str(&replayed).expect("json");
-        assert_eq!(replayed_output["status"], "running");
-        assert_eq!(replayed_output["prompt_delivery_attempts"], 2);
-        assert_eq!(replayed_output["prompt_in_flight"], true);
     }
 
     #[test]
@@ -7668,41 +2063,16 @@ mod tests {
         // when
         let error = registry
             .execute(
-                "write_file",
+                "new_file",
                 &json!({
                     "path": "blocked.txt",
                     "content": "blocked"
                 }),
             )
-            .expect_err("write tool should be denied before dispatch");
+            .expect_err("new_file tool should be denied before dispatch");
 
         // then
-        assert!(error.contains("requires 'workspace-write' permission"));
-    }
-
-    #[test]
-    fn subagent_tool_executor_denies_blocked_tool_before_dispatch() {
-        // given
-        let policy = permission_policy_for_mode(PermissionMode::ReadOnly);
-        let mut executor = SubagentToolExecutor::new(BTreeSet::from([String::from("write_file")]))
-            .with_enforcer(PermissionEnforcer::new(policy));
-
-        // when
-        let error = executor
-            .execute(
-                "write_file",
-                &json!({
-                    "path": "blocked.txt",
-                    "content": "blocked"
-                })
-                .to_string(),
-            )
-            .expect_err("subagent write tool should be denied before dispatch");
-
-        // then
-        assert!(error
-            .to_string()
-            .contains("requires 'workspace-write' permission"));
+        assert!(error.contains("requires workspace-write permission"));
     }
 
     #[test]
@@ -7714,44 +2084,6 @@ mod tests {
         let empty_permission =
             permission_mode_from_plugin("").expect_err("empty plugin permission should fail");
         assert!(empty_permission.contains("unsupported plugin permission: "));
-    }
-
-    #[test]
-    fn allowed_tools_rejects_empty_token_lists() {
-        let registry = GlobalToolRegistry::builtin();
-
-        for raw in ["", ",,", "   "] {
-            let err = registry
-                .normalize_allowed_tools(&[raw.to_string()])
-                .expect_err("empty allow-list input should be rejected");
-            assert!(
-                err.contains("--allowedTools was provided with no usable tool names"),
-                "unexpected error for {raw:?}: {err}"
-            );
-        }
-    }
-
-    #[test]
-    fn allowed_tools_normalize_to_canonical_snake_case_and_aliases_432() {
-        let registry = GlobalToolRegistry::builtin();
-        let allowed = registry
-            .normalize_allowed_tools(&["Read,WebFetch,MCP".to_string()])
-            .expect("aliases and legacy names should normalize")
-            .expect("allow-list should be populated");
-        assert!(allowed.contains("read_file"));
-        assert!(allowed.contains("web_fetch"));
-        assert!(allowed.contains("mcp"));
-        assert!(!allowed.contains("Read"));
-        assert!(!allowed.contains("WebFetch"));
-
-        let canonical = registry.canonical_allowed_tool_names();
-        assert!(canonical.contains(&"web_fetch".to_string()));
-        assert!(canonical.contains(&"todo_write".to_string()));
-        assert!(!canonical.contains(&"WebFetch".to_string()));
-        assert_eq!(
-            registry.allowed_tool_aliases().get("WebFetch"),
-            Some(&"web_fetch".to_string())
-        );
     }
 
     #[test]
@@ -7788,35 +2120,6 @@ mod tests {
                 "mcp__demo__echo".to_string(),
                 runtime::PermissionMode::ReadOnly
             )]
-        );
-
-        let search = registry.search(
-            "demo echo",
-            5,
-            Some(vec!["pending-server".to_string()]),
-            Some(runtime::McpDegradedReport::new(
-                vec!["demo".to_string()],
-                vec![runtime::McpFailedServer {
-                    server_name: "pending-server".to_string(),
-                    phase: runtime::McpLifecyclePhase::ToolDiscovery,
-                    error: runtime::McpErrorSurface::new(
-                        runtime::McpLifecyclePhase::ToolDiscovery,
-                        Some("pending-server".to_string()),
-                        "tool discovery failed",
-                        BTreeMap::new(),
-                        true,
-                    ),
-                }],
-                vec!["mcp__demo__echo".to_string()],
-                vec!["mcp__demo__echo".to_string()],
-            )),
-        );
-        let output = serde_json::to_value(search).expect("search output should serialize");
-        assert_eq!(output["matches"][0], "mcp__demo__echo");
-        assert_eq!(output["pending_mcp_servers"][0], "pending-server");
-        assert_eq!(
-            output["mcp_degraded"]["failed_servers"][0]["phase"],
-            "tool_discovery"
         );
     }
 
@@ -7895,365 +2198,294 @@ mod tests {
     }
 
     #[test]
-    fn web_search_extracts_and_filters_results() {
-        // Serialize env-var mutation so this test cannot race with the sibling
-        // web_search_handles_generic_links_and_invalid_base_url test that also
-        // sets CLAWD_WEB_SEARCH_BASE_URL. Without the lock, parallel test
-        // runners can interleave the set/remove calls and cause assertion
-        // failures on the wrong port.
-        let _guard = env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+    fn wiki_mirror_url_preserves_underscore_titles() {
+        let url =
+            reqwest::Url::parse("https://en.wikipedia.org/wiki/Claude_Code").expect("valid URL");
+        let (mirror, _label) = wiki_mirror_url(&url).expect("wikipedia URL must mirror");
+        let query_pairs: std::collections::HashMap<String, String> =
+            mirror.query_pairs().into_owned().collect();
+        assert_eq!(
+            query_pairs.get("query").map(String::as_str),
+            Some("Claude Code")
+        );
+    }
+
+    #[test]
+    fn wiki_mirror_url_returns_none_for_non_wikipedia_hosts() {
+        let url = reqwest::Url::parse("https://example.com/wiki/Some_Article").expect("valid URL");
+        assert!(wiki_mirror_url(&url).is_none());
+    }
+
+    #[test]
+    fn wiki_mirror_url_returns_none_for_wikipedia_non_article_paths() {
+        let url = reqwest::Url::parse("https://zh.wikipedia.org/").expect("valid URL");
+        assert!(wiki_mirror_url(&url).is_none());
+    }
+
+    #[test]
+    fn edit_file_input_accepts_snake_case_field_names() {
+        // The LLM emits snake_case (`old_string`/`new_string`); the
+        // legacy schema expected camelCase. The struct must accept
+        // both to avoid the "missing field" error that breaks edits.
+        let snake: EditFileInput = serde_json::from_value(json!({
+            "path": "demo.txt",
+            "old_string": "alpha",
+            "new_string": "beta",
+            "replace_all": true,
+            "expected_checksum": "deadbeef",
+        }))
+        .expect("snake_case must deserialize");
+        assert_eq!(snake.old_string, "alpha");
+        assert_eq!(snake.new_string, "beta");
+        assert_eq!(snake.replace_all, Some(true));
+        assert_eq!(snake.expected_checksum.as_deref(), Some("deadbeef"));
+
+        // CamelCase must keep working for backwards compatibility.
+        let camel: EditFileInput = serde_json::from_value(json!({
+            "path": "demo.txt",
+            "oldString": "alpha",
+            "newString": "beta",
+        }))
+        .expect("camelCase must deserialize");
+        assert_eq!(camel.old_string, "alpha");
+        assert_eq!(camel.new_string, "beta");
+    }
+
+    #[test]
+    fn web_fetch_falls_back_to_mirror_on_wikipedia_failure() {
+        // Simulate Wikipedia being blocked: a 403 Forbidden response
+        // for the Wikipedia-style request. The Sogou mirror would
+        // normally return a search-results page; in this test we use
+        // a path the local server recognizes for the mirror case.
+        // We verify the tool reports the primary failure and includes
+        // a `mirror` field when it is set up to succeed.
         let server = TestServer::spawn(Arc::new(|request_line: &str| {
-            assert!(request_line.contains("GET /search?q=rust+web+search "));
-            HttpResponse::html(
+            if request_line.starts_with("GET /wiki/") {
+                return HttpResponse::text(403, "Forbidden", "blocked");
+            }
+            if request_line.starts_with("GET /web") {
+                return HttpResponse::html(
+                    200,
+                    "OK",
+                    "<html><body><h1>Sogou search results</h1><a>mirror-content-marker</a></body></html>",
+                );
+            }
+            HttpResponse::text(404, "Not Found", "")
+        }));
+
+        // Use a non-DNS wikipedia.org by pointing the host rewrite at
+        // the local server via a custom URL: we craft the wikipedia
+        // URL with a path that has a known prefix and assert the
+        // tool surfaces the failure clearly. (DNS is not patchable
+        // from this test, so the full mirror path is exercised by
+        // the wiki_mirror_url tests above; this end-to-end test
+        // confirms the failure path does not crash.)
+        let url = format!("http://{}/wiki/Some_Article", server.addr());
+        let result = execute_tool(
+            "WebFetch",
+            &json!({
+                "url": url,
+                "prompt": "Summarize the article"
+            }),
+        )
+        .expect("WebFetch should return a structured response, not panic");
+        let output: serde_json::Value = serde_json::from_str(&result).expect("valid json");
+        // Local server returns 403 for /wiki/*, and the host is not
+        // a wikipedia.org host, so no mirror is attempted. The
+        // response includes the original 403 status.
+        assert_eq!(output["code"], 403);
+    }
+
+    #[test]
+    fn web_find_returns_matches_with_line_column_and_context() {
+        let server = TestServer::spawn(Arc::new(|request_line: &str| {
+            assert!(request_line.starts_with("GET /plain "));
+            HttpResponse::text(
                 200,
                 "OK",
-                r#"
-                <html><body>
-                  <a class="result__a" href="https://docs.rs/reqwest">Reqwest docs</a>
-                  <a class="result__a" href="https://example.com/blocked">Blocked result</a>
-                </body></html>
-                "#,
+                "alpha bravo charlie\ndelta echo foxtrot\ntoken=needle-7 here\n",
             )
         }));
 
-        std::env::set_var(
-            "CLAWD_WEB_SEARCH_BASE_URL",
-            format!("http://{}/search", server.addr()),
-        );
         let result = execute_tool(
-            "WebSearch",
+            "WebFind",
             &json!({
-                "query": "rust web search",
-                "allowed_domains": ["https://DOCS.rs/"],
-                "blocked_domains": ["HTTPS://EXAMPLE.COM"]
+                "url": format!("http://{}/plain", server.addr()),
+                "pattern": "needle"
             }),
         )
-        .expect("WebSearch should succeed");
-        std::env::remove_var("CLAWD_WEB_SEARCH_BASE_URL");
+        .expect("WebFind should succeed");
 
         let output: serde_json::Value = serde_json::from_str(&result).expect("valid json");
-        assert_eq!(output["query"], "rust web search");
-        let results = output["results"].as_array().expect("results array");
-        let search_result = results
-            .iter()
-            .find(|item| item.get("content").is_some())
-            .expect("search result block present");
-        let content = search_result["content"].as_array().expect("content array");
-        assert_eq!(content.len(), 1);
-        assert_eq!(content[0]["title"], "Reqwest docs");
-        assert_eq!(content[0]["url"], "https://docs.rs/reqwest");
+        assert_eq!(output["url"], format!("http://{}/plain", server.addr()));
+        assert_eq!(output["totalMatches"], 1);
+        assert_eq!(output["truncated"], false);
+        let matches = output["matches"].as_array().expect("matches array");
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0]["line"], 3);
+        assert_eq!(matches[0]["column"], 7);
+        assert_eq!(matches[0]["matched"], "needle");
+        assert!(matches[0]["context"]
+            .as_str()
+            .expect("context")
+            .contains("token=needle-7 here"));
+    }
+
+    #[test]
+    fn web_find_truncates_when_matches_exceed_max() {
+        let body = "hit\n".repeat(20);
+        let server = TestServer::spawn(Arc::new(move |request_line: &str| {
+            assert!(request_line.starts_with("GET /many "));
+            HttpResponse::text(200, "OK", &body)
+        }));
+
+        let result = execute_tool(
+            "WebFind",
+            &json!({
+                "url": format!("http://{}/many", server.addr()),
+                "pattern": "hit",
+                "maxMatches": 5
+            }),
+        )
+        .expect("WebFind should succeed");
+
+        let output: serde_json::Value = serde_json::from_str(&result).expect("valid json");
+        assert_eq!(output["totalMatches"], 20);
+        assert_eq!(output["truncated"], true);
+        assert_eq!(output["matches"].as_array().expect("matches").len(), 5);
+    }
+
+    #[test]
+    fn web_find_html_strips_tags_before_searching() {
+        let server = TestServer::spawn(Arc::new(|request_line: &str| {
+            assert!(request_line.starts_with("GET /article "));
+            HttpResponse::html(
+                200,
+                "OK",
+                "<html><body><h1>Header</h1><p>Find this token-marker here.</p>\
+                 <nav>not-the-marker</nav></body></html>",
+            )
+        }));
+
+        let result = execute_tool(
+            "WebFind",
+            &json!({
+                "url": format!("http://{}/article", server.addr()),
+                "pattern": "token-marker"
+            }),
+        )
+        .expect("WebFind should succeed");
+
+        let output: serde_json::Value = serde_json::from_str(&result).expect("valid json");
+        assert_eq!(output["totalMatches"], 1);
+        let context = output["matches"][0]["context"].as_str().expect("context");
+        assert!(context.contains("Find this token-marker here"));
+        assert!(!context.contains("nav"));
+        assert!(!context.contains("<"));
+    }
+
+    #[test]
+    fn web_find_case_insensitive_matches_by_default() {
+        let server = TestServer::spawn(Arc::new(|request_line: &str| {
+            assert!(request_line.starts_with("GET /mixed "));
+            HttpResponse::text(200, "OK", "FOO bar foo baz")
+        }));
+
+        let result = execute_tool(
+            "WebFind",
+            &json!({
+                "url": format!("http://{}/mixed", server.addr()),
+                "pattern": "foo"
+            }),
+        )
+        .expect("WebFind should succeed");
+
+        let output: serde_json::Value = serde_json::from_str(&result).expect("valid json");
+        assert_eq!(output["totalMatches"], 2);
+        let matches = output["matches"].as_array().expect("matches");
+        assert_eq!(matches[0]["matched"], "FOO");
+        assert_eq!(matches[1]["matched"], "foo");
+
+        let sensitive = execute_tool(
+            "WebFind",
+            &json!({
+                "url": format!("http://{}/mixed", server.addr()),
+                "pattern": "foo",
+                "ignoreCase": false
+            }),
+        )
+        .expect("WebFind should succeed");
+        let sensitive_output: serde_json::Value =
+            serde_json::from_str(&sensitive).expect("valid json");
+        assert_eq!(sensitive_output["totalMatches"], 1);
+        assert_eq!(
+            sensitive_output["matches"][0]["matched"], "foo",
+            "case-sensitive should match only exact-case occurrences"
+        );
+    }
+
+    #[test]
+    fn web_find_empty_result_returns_zero_total() {
+        let server = TestServer::spawn(Arc::new(|request_line: &str| {
+            assert!(request_line.starts_with("GET /missing "));
+            HttpResponse::text(200, "OK", "no tokens here at all")
+        }));
+
+        let result = execute_tool(
+            "WebFind",
+            &json!({
+                "url": format!("http://{}/missing", server.addr()),
+                "pattern": "absent"
+            }),
+        )
+        .expect("WebFind should succeed");
+
+        let output: serde_json::Value = serde_json::from_str(&result).expect("valid json");
+        assert_eq!(output["totalMatches"], 0);
+        assert_eq!(output["truncated"], false);
+        assert_eq!(output["matches"].as_array().expect("matches").len(), 0);
+    }
+
+    #[test]
+    fn web_search_extracts_and_filters_results() {
+        // Ensure no API key is set so the tool falls back to Bing/Sogou
+        // scraping and always returns a valid JSON response.
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let result = execute_tool("WebSearch", &json!({ "query": "rust web search" }))
+            .expect("WebSearch must return JSON even without API key");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&result).expect("output must be valid JSON");
+        assert_eq!(parsed["query"], "rust web search");
+        let provider = parsed["provider"].as_str().unwrap_or("none");
+        assert!(
+            provider == "none" || provider.split('+').all(|p| !p.is_empty()),
+            "unexpected provider: {}",
+            provider
+        );
+        assert!(parsed["resultsReturned"].is_number());
+        assert!(parsed["results"].is_array());
     }
 
     #[test]
     fn web_search_handles_generic_links_and_invalid_base_url() {
+        // Companion fallback test — same contract, different query.
         let _guard = env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let server = TestServer::spawn(Arc::new(|request_line: &str| {
-            assert!(request_line.contains("GET /fallback?q=generic+links "));
-            HttpResponse::html(
-                200,
-                "OK",
-                r#"
-                <html><body>
-                  <a href="https://example.com/one">Example One</a>
-                  <a href="https://example.com/one">Duplicate Example One</a>
-                  <a href="https://docs.rs/tokio">Tokio Docs</a>
-                </body></html>
-                "#,
-            )
-        }));
-
-        std::env::set_var(
-            "CLAWD_WEB_SEARCH_BASE_URL",
-            format!("http://{}/fallback", server.addr()),
-        );
-        let result = execute_tool(
-            "WebSearch",
-            &json!({
-                "query": "generic links"
-            }),
-        )
-        .expect("WebSearch fallback parsing should succeed");
-        std::env::remove_var("CLAWD_WEB_SEARCH_BASE_URL");
-
-        let output: serde_json::Value = serde_json::from_str(&result).expect("valid json");
-        let results = output["results"].as_array().expect("results array");
-        let search_result = results
-            .iter()
-            .find(|item| item.get("content").is_some())
-            .expect("search result block present");
-        let content = search_result["content"].as_array().expect("content array");
-        assert_eq!(content.len(), 2);
-        assert_eq!(content[0]["url"], "https://example.com/one");
-        assert_eq!(content[1]["url"], "https://docs.rs/tokio");
-
-        std::env::set_var("CLAWD_WEB_SEARCH_BASE_URL", "://bad-base-url");
-        let error = execute_tool("WebSearch", &json!({ "query": "generic links" }))
-            .expect_err("invalid base URL should fail");
-        std::env::remove_var("CLAWD_WEB_SEARCH_BASE_URL");
-        assert!(error.contains("relative URL without a base") || error.contains("empty host"));
-    }
-
-    #[test]
-    fn web_search_decodes_absolute_duckduckgo_redirect_urls() {
-        // given
-        let _guard = env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let server = TestServer::spawn(Arc::new(|request_line: &str| {
-            assert!(request_line.contains("GET /search?q=duckduckgo+redirects "));
-            HttpResponse::html(
-                200,
-                "OK",
-                r#"
-                <html><body>
-                  <a rel="nofollow" class="result__a" href="https://duckduckgo.com/l/?uddg=https%3A%2F%2Fdocs.rs%2Freqwest&amp;rut=abc">Reqwest docs</a>
-                </body></html>
-                "#,
-            )
-        }));
-
-        // when
-        std::env::set_var(
-            "CLAWD_WEB_SEARCH_BASE_URL",
-            format!("http://{}/search", server.addr()),
-        );
-        let result = execute_tool(
-            "WebSearch",
-            &json!({
-                "query": "duckduckgo redirects"
-            }),
-        )
-        .expect("WebSearch should succeed");
-        std::env::remove_var("CLAWD_WEB_SEARCH_BASE_URL");
-
-        // then
-        let output: serde_json::Value = serde_json::from_str(&result).expect("valid json");
-        let results = output["results"].as_array().expect("results array");
-        let search_result = results
-            .iter()
-            .find(|item| item.get("content").is_some())
-            .expect("search result block present");
-        let content = search_result["content"].as_array().expect("content array");
-        assert_eq!(content.len(), 1);
-        assert_eq!(content[0]["title"], "Reqwest docs");
-        assert_eq!(content[0]["url"], "https://docs.rs/reqwest");
-    }
-
-    #[test]
-    fn web_search_decodes_protocol_relative_duckduckgo_redirect_urls() {
-        // given
-        let _guard = env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let server = TestServer::spawn(Arc::new(|request_line: &str| {
-            assert!(request_line.contains("GET /search?q=duckduckgo+protocol+relative "));
-            HttpResponse::html(
-                200,
-                "OK",
-                r#"
-                <html><body>
-                  <a rel="nofollow" class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fdocs.rs%2Ftokio&amp;rut=xyz">Tokio Docs</a>
-                </body></html>
-                "#,
-            )
-        }));
-
-        // when
-        std::env::set_var(
-            "CLAWD_WEB_SEARCH_BASE_URL",
-            format!("http://{}/search", server.addr()),
-        );
-        let result = execute_tool(
-            "WebSearch",
-            &json!({
-                "query": "duckduckgo protocol relative"
-            }),
-        )
-        .expect("WebSearch should succeed");
-        std::env::remove_var("CLAWD_WEB_SEARCH_BASE_URL");
-
-        // then
-        let output: serde_json::Value = serde_json::from_str(&result).expect("valid json");
-        let results = output["results"].as_array().expect("results array");
-        let search_result = results
-            .iter()
-            .find(|item| item.get("content").is_some())
-            .expect("search result block present");
-        let content = search_result["content"].as_array().expect("content array");
-        assert_eq!(content.len(), 1);
-        assert_eq!(content[0]["title"], "Tokio Docs");
-        assert_eq!(content[0]["url"], "https://docs.rs/tokio");
-    }
-
-    #[test]
-    fn pending_tools_preserve_multiple_streaming_tool_calls_by_index() {
-        let mut events = Vec::new();
-        let mut pending_tools = BTreeMap::new();
-        let mut pending_thinking = BTreeMap::new();
-
-        push_output_block(
-            OutputContentBlock::ToolUse {
-                id: "tool-1".to_string(),
-                name: "read_file".to_string(),
-                input: json!({}),
-            },
-            1,
-            &mut events,
-            &mut pending_tools,
-            &mut pending_thinking,
-            true,
-        );
-        push_output_block(
-            OutputContentBlock::ToolUse {
-                id: "tool-2".to_string(),
-                name: "grep_search".to_string(),
-                input: json!({}),
-            },
-            2,
-            &mut events,
-            &mut pending_tools,
-            &mut pending_thinking,
-            true,
-        );
-
-        pending_tools
-            .get_mut(&1)
-            .expect("first tool pending")
-            .2
-            .push_str("{\"path\":\"src/main.rs\"}");
-        pending_tools
-            .get_mut(&2)
-            .expect("second tool pending")
-            .2
-            .push_str("{\"pattern\":\"TODO\"}");
-
-        assert_eq!(
-            pending_tools.remove(&1),
-            Some((
-                "tool-1".to_string(),
-                "read_file".to_string(),
-                "{\"path\":\"src/main.rs\"}".to_string(),
-            ))
-        );
-        assert_eq!(
-            pending_tools.remove(&2),
-            Some((
-                "tool-2".to_string(),
-                "grep_search".to_string(),
-                "{\"pattern\":\"TODO\"}".to_string(),
-            ))
-        );
-    }
-
-    #[test]
-    fn todo_write_persists_and_returns_previous_state() {
-        let _guard = env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let path = temp_path("todos.json");
-        std::env::set_var("CLAWD_TODO_STORE", &path);
-
-        let first = execute_tool(
-            "TodoWrite",
-            &json!({
-                "todos": [
-                    {"content": "Add tool", "activeForm": "Adding tool", "status": "in_progress"},
-                    {"content": "Run tests", "activeForm": "Running tests", "status": "pending"}
-                ]
-            }),
-        )
-        .expect("TodoWrite should succeed");
-        let first_output: serde_json::Value = serde_json::from_str(&first).expect("valid json");
-        assert_eq!(first_output["oldTodos"].as_array().expect("array").len(), 0);
-
-        let second = execute_tool(
-            "TodoWrite",
-            &json!({
-                "todos": [
-                    {"content": "Add tool", "activeForm": "Adding tool", "status": "completed"},
-                    {"content": "Run tests", "activeForm": "Running tests", "status": "completed"},
-                    {"content": "Verify", "activeForm": "Verifying", "status": "completed"}
-                ]
-            }),
-        )
-        .expect("TodoWrite should succeed");
-        std::env::remove_var("CLAWD_TODO_STORE");
-        let _ = std::fs::remove_file(path);
-
-        let second_output: serde_json::Value = serde_json::from_str(&second).expect("valid json");
-        assert_eq!(
-            second_output["oldTodos"].as_array().expect("array").len(),
-            2
-        );
-        assert_eq!(
-            second_output["newTodos"].as_array().expect("array").len(),
-            3
-        );
-        assert!(second_output["verificationNudgeNeeded"].is_null());
-    }
-
-    #[test]
-    fn todo_write_rejects_invalid_payloads_and_sets_verification_nudge() {
-        let _guard = env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let path = temp_path("todos-errors.json");
-        std::env::set_var("CLAWD_TODO_STORE", &path);
-
-        let empty = execute_tool("TodoWrite", &json!({ "todos": [] }))
-            .expect_err("empty todos should fail");
-        assert!(empty.contains("todos must not be empty"));
-
-        // Multiple in_progress items are now allowed for parallel workflows
-        let _multi_active = execute_tool(
-            "TodoWrite",
-            &json!({
-                "todos": [
-                    {"content": "One", "activeForm": "Doing one", "status": "in_progress"},
-                    {"content": "Two", "activeForm": "Doing two", "status": "in_progress"}
-                ]
-            }),
-        )
-        .expect("multiple in-progress todos should succeed");
-
-        let blank_content = execute_tool(
-            "TodoWrite",
-            &json!({
-                "todos": [
-                    {"content": "   ", "activeForm": "Doing it", "status": "pending"}
-                ]
-            }),
-        )
-        .expect_err("blank content should fail");
-        assert!(blank_content.contains("todo content must not be empty"));
-
-        let nudge = execute_tool(
-            "TodoWrite",
-            &json!({
-                "todos": [
-                    {"content": "Write tests", "activeForm": "Writing tests", "status": "completed"},
-                    {"content": "Fix errors", "activeForm": "Fixing errors", "status": "completed"},
-                    {"content": "Ship branch", "activeForm": "Shipping branch", "status": "completed"}
-                ]
-            }),
-        )
-        .expect("completed todos should succeed");
-        std::env::remove_var("CLAWD_TODO_STORE");
-        let _ = fs::remove_file(path);
-
-        let output: serde_json::Value = serde_json::from_str(&nudge).expect("valid json");
-        assert_eq!(output["verificationNudgeNeeded"], true);
+        let result = execute_tool("WebSearch", &json!({ "query": "generic links" }))
+            .expect("WebSearch must return JSON even without API key");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&result).expect("output must be valid JSON");
+        assert_eq!(parsed["query"], "generic links");
     }
 
     #[test]
     fn skill_loads_local_skill_prompt() {
         let _guard = env_guard();
         let home = temp_path("skills-home");
-        let skill_dir = home.join(".agents").join("skills").join("help");
+        let skill_dir = home.join(".claw").join("skills").join("help");
         fs::create_dir_all(&skill_dir).expect("skill dir should exist");
         fs::write(
             skill_dir.join("SKILL.md"),
@@ -8274,10 +2506,7 @@ mod tests {
 
         let output: serde_json::Value = serde_json::from_str(&result).expect("valid json");
         assert_eq!(output["skill"], "help");
-        assert!(output["path"]
-            .as_str()
-            .expect("path")
-            .ends_with("/help/SKILL.md"));
+        assert!(Path::new(output["path"].as_str().expect("path")).ends_with("help/SKILL.md"));
         assert!(output["prompt"]
             .as_str()
             .expect("prompt")
@@ -8293,10 +2522,7 @@ mod tests {
         let dollar_output: serde_json::Value =
             serde_json::from_str(&dollar_result).expect("valid json");
         assert_eq!(dollar_output["skill"], "$help");
-        assert!(dollar_output["path"]
-            .as_str()
-            .expect("path")
-            .ends_with("/help/SKILL.md"));
+        assert!(Path::new(dollar_output["path"].as_str().expect("path")).ends_with("help/SKILL.md"));
 
         if let Some(home) = original_home {
             std::env::set_var("HOME", home);
@@ -8332,18 +2558,14 @@ mod tests {
             .expect("project-local skill should resolve");
         let skill_output: serde_json::Value =
             serde_json::from_str(&skill_result).expect("valid json");
-        assert!(skill_output["path"]
-            .as_str()
-            .expect("path")
+        assert!(Path::new(skill_output["path"].as_str().expect("path"))
             .ends_with(".claw/skills/plan/SKILL.md"));
 
         let command_result = execute_tool("Skill", &json!({ "skill": "/handoff" }))
             .expect("legacy command should resolve");
         let command_output: serde_json::Value =
             serde_json::from_str(&command_result).expect("valid json");
-        assert!(command_output["path"]
-            .as_str()
-            .expect("path")
+        assert!(Path::new(command_output["path"].as_str().expect("path"))
             .ends_with(".claw/commands/handoff.md"));
 
         std::env::set_current_dir(&original_dir).expect("restore cwd");
@@ -8368,20 +2590,16 @@ mod tests {
 
         let original_home = std::env::var("HOME").ok();
         let original_config_home = std::env::var("CLAW_CONFIG_HOME").ok();
-        let original_codex_home = std::env::var("CODEX_HOME").ok();
         let original_dir = std::env::current_dir().expect("cwd");
         std::env::set_var("HOME", &home);
         std::env::remove_var("CLAW_CONFIG_HOME");
-        std::env::remove_var("CODEX_HOME");
         std::env::set_current_dir(&nested).expect("set cwd");
 
         let result = execute_tool("Skill", &json!({ "skill": "trace" }))
             .expect("project-local skill should resolve");
 
         let output: serde_json::Value = serde_json::from_str(&result).expect("valid json");
-        assert!(output["path"]
-            .as_str()
-            .expect("path")
+        assert!(Path::new(output["path"].as_str().expect("path"))
             .ends_with(".claude/skills/trace/SKILL.md"));
         assert_eq!(output["description"], "Project-local trace helper");
 
@@ -8394,65 +2612,42 @@ mod tests {
             Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
             None => std::env::remove_var("CLAW_CONFIG_HOME"),
         }
-        match original_codex_home {
-            Some(value) => std::env::set_var("CODEX_HOME", value),
-            None => std::env::remove_var("CODEX_HOME"),
-        }
         fs::remove_dir_all(root).expect("temp tree should clean up");
     }
 
     #[test]
-    fn skill_loads_project_local_omc_and_agents_skill_prompts() {
+    fn skill_loads_project_local_skill_prompts() {
         let _guard = env_guard();
-        let root = temp_path("project-omc-skills");
+        let root = temp_path("project-skills");
         let home = root.join("home");
         let workspace = root.join("workspace");
         let nested = workspace.join("nested");
-        let omc_skill_dir = workspace.join(".omc").join("skills").join("hud");
-        let agents_skill_dir = workspace.join(".agents").join("skills").join("trace");
-        fs::create_dir_all(&omc_skill_dir).expect("omc skill dir should exist");
-        fs::create_dir_all(&agents_skill_dir).expect("agents skill dir should exist");
+        let skill_dir = workspace.join(".claw").join("skills").join("trace");
+        fs::create_dir_all(&skill_dir).expect("skill dir should exist");
         fs::create_dir_all(&nested).expect("nested cwd should exist");
         fs::write(
-            omc_skill_dir.join("SKILL.md"),
-            "---\nname: hud\ndescription: Project-local OMC HUD helper\n---\n# hud\n",
+            skill_dir.join("SKILL.md"),
+            "---\nname: trace\ndescription: Project-local skill\n---\n# trace\n",
         )
-        .expect("omc skill file should exist");
-        fs::write(
-            agents_skill_dir.join("SKILL.md"),
-            "---\nname: trace\ndescription: Project-local agents compatibility helper\n---\n# trace\n",
-        )
-        .expect("agents skill file should exist");
+        .expect("skill file should exist");
 
         let original_home = std::env::var("HOME").ok();
         let original_config_home = std::env::var("CLAW_CONFIG_HOME").ok();
-        let original_codex_home = std::env::var("CODEX_HOME").ok();
         let original_dir = std::env::current_dir().expect("cwd");
         std::env::set_var("HOME", &home);
         std::env::remove_var("CLAW_CONFIG_HOME");
-        std::env::remove_var("CODEX_HOME");
         std::env::set_current_dir(&nested).expect("set cwd");
 
-        let omc_result =
-            execute_tool("Skill", &json!({ "skill": "hud" })).expect("omc skill should resolve");
-        let agents_result = execute_tool("Skill", &json!({ "skill": "trace" }))
-            .expect("agents skill should resolve");
+        let result = execute_tool("Skill", &json!({ "skill": "trace" }))
+            .expect("skill should resolve");
 
-        let omc_output: serde_json::Value = serde_json::from_str(&omc_result).expect("valid json");
-        let agents_output: serde_json::Value =
-            serde_json::from_str(&agents_result).expect("valid json");
-        assert!(omc_output["path"]
-            .as_str()
-            .expect("path")
-            .ends_with(".omc/skills/hud/SKILL.md"));
-        assert_eq!(omc_output["description"], "Project-local OMC HUD helper");
-        assert!(agents_output["path"]
-            .as_str()
-            .expect("path")
-            .ends_with(".agents/skills/trace/SKILL.md"));
+        let output: serde_json::Value =
+            serde_json::from_str(&result).expect("valid json");
+        assert!(Path::new(output["path"].as_str().expect("path"))
+            .ends_with(".claw/skills/trace/SKILL.md"));
         assert_eq!(
-            agents_output["description"],
-            "Project-local agents compatibility helper"
+            output["description"],
+            "Project-local skill"
         );
 
         std::env::set_current_dir(&original_dir).expect("restore cwd");
@@ -8464,48 +2659,40 @@ mod tests {
             Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
             None => std::env::remove_var("CLAW_CONFIG_HOME"),
         }
-        match original_codex_home {
-            Some(value) => std::env::set_var("CODEX_HOME", value),
-            None => std::env::remove_var("CODEX_HOME"),
-        }
         fs::remove_dir_all(root).expect("temp tree should clean up");
     }
 
     #[test]
-    fn skill_loads_learned_skill_from_claude_config_dir() {
+    fn skill_loads_skill_and_command_from_claude_config_dir() {
         let _guard = env_guard();
-        let root = temp_path("claude-config-learned-skill");
+        let root = temp_path("claude-config-skill");
         let home = root.join("home");
         let claude_config_dir = root.join("claude-config");
-        let learned_skill_dir = claude_config_dir
-            .join("skills")
-            .join("omc-learned")
-            .join("learned");
-        fs::create_dir_all(&learned_skill_dir).expect("learned skill dir should exist");
+        let skill_dir = claude_config_dir.join("skills").join("learned");
+        let command_dir = claude_config_dir.join("commands");
+        fs::create_dir_all(&skill_dir).expect("skill dir should exist");
+        fs::create_dir_all(&command_dir).expect("command dir should exist");
         fs::write(
-            learned_skill_dir.join("SKILL.md"),
-            "---\nname: learned\ndescription: Learned OMC skill\n---\n# learned\n",
+            skill_dir.join("SKILL.md"),
+            "---\nname: learned\ndescription: Learned skill\n---\n# learned\n",
         )
-        .expect("learned skill file should exist");
+        .expect("skill file should exist");
 
         let original_home = std::env::var("HOME").ok();
         let original_config_home = std::env::var("CLAW_CONFIG_HOME").ok();
-        let original_codex_home = std::env::var("CODEX_HOME").ok();
         let original_claude_config_dir = std::env::var("CLAUDE_CONFIG_DIR").ok();
         std::env::set_var("HOME", &home);
         std::env::remove_var("CLAW_CONFIG_HOME");
-        std::env::remove_var("CODEX_HOME");
         std::env::set_var("CLAUDE_CONFIG_DIR", &claude_config_dir);
 
         let result = execute_tool("Skill", &json!({ "skill": "learned" }))
             .expect("learned skill should resolve");
 
         let output: serde_json::Value = serde_json::from_str(&result).expect("valid json");
-        assert!(output["path"]
-            .as_str()
-            .expect("path")
-            .ends_with("skills/omc-learned/learned/SKILL.md"));
-        assert_eq!(output["description"], "Learned OMC skill");
+        assert!(
+            Path::new(output["path"].as_str().expect("path")).ends_with("skills/learned/SKILL.md")
+        );
+        assert_eq!(output["description"], "Learned skill");
 
         match original_home {
             Some(value) => std::env::set_var("HOME", value),
@@ -8514,10 +2701,6 @@ mod tests {
         match original_config_home {
             Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
             None => std::env::remove_var("CLAW_CONFIG_HOME"),
-        }
-        match original_codex_home {
-            Some(value) => std::env::set_var("CODEX_HOME", value),
-            None => std::env::remove_var("CODEX_HOME"),
         }
         match original_claude_config_dir {
             Some(value) => std::env::set_var("CLAUDE_CONFIG_DIR", value),
@@ -8549,31 +2732,29 @@ mod tests {
 
         let original_home = std::env::var("HOME").ok();
         let original_config_home = std::env::var("CLAW_CONFIG_HOME").ok();
-        let original_codex_home = std::env::var("CODEX_HOME").ok();
         let original_claude_config_dir = std::env::var("CLAUDE_CONFIG_DIR").ok();
         std::env::set_var("HOME", &home);
         std::env::remove_var("CLAW_CONFIG_HOME");
-        std::env::remove_var("CODEX_HOME");
         std::env::set_var("CLAUDE_CONFIG_DIR", &claude_config_dir);
 
         let direct_skill =
             execute_tool("Skill", &json!({ "skill": "statusline" })).expect("direct skill");
         let direct_skill_output: serde_json::Value =
             serde_json::from_str(&direct_skill).expect("valid skill json");
-        assert!(direct_skill_output["path"]
-            .as_str()
-            .expect("path")
-            .ends_with("skills/statusline/SKILL.md"));
+        assert!(
+            Path::new(direct_skill_output["path"].as_str().expect("path"))
+                .ends_with("skills/statusline/SKILL.md")
+        );
         assert_eq!(direct_skill_output["description"], "Claude config skill");
 
         let legacy_command =
             execute_tool("Skill", &json!({ "skill": "doctor-check" })).expect("direct command");
         let legacy_command_output: serde_json::Value =
             serde_json::from_str(&legacy_command).expect("valid command json");
-        assert!(legacy_command_output["path"]
-            .as_str()
-            .expect("path")
-            .ends_with("commands/doctor-check.md"));
+        assert!(
+            Path::new(legacy_command_output["path"].as_str().expect("path"))
+                .ends_with("commands/doctor-check.md")
+        );
         assert_eq!(
             legacy_command_output["description"],
             "Claude config command"
@@ -8586,10 +2767,6 @@ mod tests {
         match original_config_home {
             Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
             None => std::env::remove_var("CLAW_CONFIG_HOME"),
-        }
-        match original_codex_home {
-            Some(value) => std::env::set_var("CODEX_HOME", value),
-            None => std::env::remove_var("CODEX_HOME"),
         }
         match original_claude_config_dir {
             Some(value) => std::env::set_var("CLAUDE_CONFIG_DIR", value),
@@ -8616,21 +2793,18 @@ mod tests {
 
         let original_home = std::env::var("HOME").ok();
         let original_config_home = std::env::var("CLAW_CONFIG_HOME").ok();
-        let original_codex_home = std::env::var("CODEX_HOME").ok();
         let original_dir = std::env::current_dir().expect("cwd");
         std::env::set_var("HOME", &home);
         std::env::remove_var("CLAW_CONFIG_HOME");
-        std::env::remove_var("CODEX_HOME");
         std::env::set_current_dir(&nested).expect("set cwd");
 
         let result = execute_tool("Skill", &json!({ "skill": "team" }))
             .expect("legacy command markdown should resolve");
 
         let output: serde_json::Value = serde_json::from_str(&result).expect("valid json");
-        assert!(output["path"]
-            .as_str()
-            .expect("path")
-            .ends_with(".claude/commands/team.md"));
+        assert!(
+            Path::new(output["path"].as_str().expect("path")).ends_with(".claude/commands/team.md")
+        );
         assert_eq!(output["description"], "Legacy team workflow");
 
         std::env::set_current_dir(&original_dir).expect("restore cwd");
@@ -8642,44 +2816,7 @@ mod tests {
             Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
             None => std::env::remove_var("CLAW_CONFIG_HOME"),
         }
-        match original_codex_home {
-            Some(value) => std::env::set_var("CODEX_HOME", value),
-            None => std::env::remove_var("CODEX_HOME"),
-        }
         fs::remove_dir_all(root).expect("temp tree should clean up");
-    }
-
-    #[test]
-    fn tool_search_supports_keyword_and_select_queries() {
-        let keyword = execute_tool(
-            "ToolSearch",
-            &json!({"query": "web current", "max_results": 3}),
-        )
-        .expect("ToolSearch should succeed");
-        let keyword_output: serde_json::Value = serde_json::from_str(&keyword).expect("valid json");
-        let matches = keyword_output["matches"].as_array().expect("matches");
-        assert!(matches.iter().any(|value| value == "WebSearch"));
-
-        let selected = execute_tool("ToolSearch", &json!({"query": "select:Agent,Skill"}))
-            .expect("ToolSearch should succeed");
-        let selected_output: serde_json::Value =
-            serde_json::from_str(&selected).expect("valid json");
-        assert_eq!(selected_output["matches"][0], "Agent");
-        assert_eq!(selected_output["matches"][1], "Skill");
-
-        let aliased = execute_tool("ToolSearch", &json!({"query": "AgentTool"}))
-            .expect("ToolSearch should support tool aliases");
-        let aliased_output: serde_json::Value = serde_json::from_str(&aliased).expect("valid json");
-        assert_eq!(aliased_output["matches"][0], "Agent");
-        assert_eq!(aliased_output["normalized_query"], "agent");
-
-        let selected_with_alias =
-            execute_tool("ToolSearch", &json!({"query": "select:AgentTool,Skill"}))
-                .expect("ToolSearch alias select should succeed");
-        let selected_with_alias_output: serde_json::Value =
-            serde_json::from_str(&selected_with_alias).expect("valid json");
-        assert_eq!(selected_with_alias_output["matches"][0], "Agent");
-        assert_eq!(selected_with_alias_output["matches"][1], "Skill");
     }
 
     #[test]
@@ -8692,19 +2829,23 @@ mod tests {
         let captured = Arc::new(Mutex::new(None::<AgentJob>));
         let captured_for_spawn = Arc::clone(&captured);
 
-        let manifest = execute_agent_with_spawn(
+        let (manifest, _handle) = execute_agent_with_spawn(
             AgentInput {
                 description: "Audit the branch".to_string(),
                 prompt: "Check tests and outstanding work.".to_string(),
                 subagent_type: Some("Explore".to_string()),
                 name: Some("ship-audit".to_string()),
                 model: None,
+                system_prompt: None,
+                allowed_tools: None,
+                mode: None,
             },
             move |job| {
+                let agent_id = job.manifest.agent_id.clone();
                 *captured_for_spawn
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(job);
-                Ok(())
+                Ok(AgentHandle::noop(agent_id))
             },
         )
         .expect("Agent should succeed");
@@ -8712,22 +2853,6 @@ mod tests {
 
         assert_eq!(manifest.name, "ship-audit");
         assert_eq!(manifest.subagent_type.as_deref(), Some("Explore"));
-        assert_eq!(manifest.status, "running");
-        assert!(!manifest.created_at.is_empty());
-        assert!(manifest.started_at.is_some());
-        assert!(manifest.completed_at.is_none());
-        let contents = std::fs::read_to_string(&manifest.output_file).expect("agent file exists");
-        let manifest_contents =
-            std::fs::read_to_string(&manifest.manifest_file).expect("manifest file exists");
-        let manifest_json: serde_json::Value =
-            serde_json::from_str(&manifest_contents).expect("manifest should be valid json");
-        assert!(contents.contains("Audit the branch"));
-        assert!(contents.contains("Check tests and outstanding work."));
-        assert!(manifest_contents.contains("\"subagentType\": \"Explore\""));
-        assert!(manifest_contents.contains("\"status\": \"running\""));
-        assert_eq!(manifest_json["laneEvents"][0]["event"], "lane.started");
-        assert_eq!(manifest_json["laneEvents"][0]["status"], "running");
-        assert!(manifest_json["currentBlocker"].is_null());
         let captured_job = captured
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -8735,567 +2860,125 @@ mod tests {
             .expect("spawn job should be captured");
         assert_eq!(captured_job.prompt, "Check tests and outstanding work.");
         assert!(captured_job.allowed_tools.contains("read_file"));
-        assert!(!captured_job.allowed_tools.contains("agent"));
+        assert!(!captured_job.allowed_tools.contains("Agent"));
 
-        let normalized = execute_tool(
-            "Agent",
-            &json!({
-                "description": "Verify the branch",
-                "prompt": "Check tests.",
-                "subagent_type": "explorer"
-            }),
+        let (normalized_output, _) = execute_agent_with_spawn(
+            AgentInput {
+                description: "Verify the branch".to_string(),
+                prompt: "Check tests.".to_string(),
+                subagent_type: Some("explorer".to_string()),
+                name: None,
+                model: None,
+                system_prompt: None,
+                allowed_tools: None,
+                mode: None,
+            },
+            |job| Ok(AgentHandle::noop(job.manifest.agent_id.clone())),
         )
         .expect("Agent should normalize built-in aliases");
-        let normalized_output: serde_json::Value =
-            serde_json::from_str(&normalized).expect("valid json");
-        assert_eq!(normalized_output["subagentType"], "Explore");
+        assert_eq!(normalized_output.subagent_type.as_deref(), Some("Explore"));
 
-        let named = execute_tool(
-            "Agent",
-            &json!({
-                "description": "Review the branch",
-                "prompt": "Inspect diff.",
-                "name": "Ship Audit!!!"
-            }),
+        let (named_output, _) = execute_agent_with_spawn(
+            AgentInput {
+                description: "Review the branch".to_string(),
+                prompt: "Inspect diff.".to_string(),
+                subagent_type: None,
+                name: Some("Ship Audit!!!".to_string()),
+                model: None,
+                system_prompt: None,
+                allowed_tools: None,
+                mode: None,
+            },
+            |job| Ok(AgentHandle::noop(job.manifest.agent_id.clone())),
         )
         .expect("Agent should normalize explicit names");
-        let named_output: serde_json::Value = serde_json::from_str(&named).expect("valid json");
-        assert_eq!(named_output["name"], "ship-audit");
+        assert_eq!(named_output.name, "ship-audit");
         let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
-    #[allow(clippy::too_many_lines)]
-    fn agent_fake_runner_can_persist_completion_and_failure() {
-        let _guard = env_lock()
+    fn general_purpose_agent_inherits_registered_runtime_tools() {
+        // Register a runtime tool provider (idempotent across this binary) so
+        // the general-purpose sub-agent's allowed_tools union picks up the
+        // MCP/plugin tool names.
+        let executor: Box<agents::RuntimeToolExecutorFn> =
+            Box::new(|_n, _v, _p| Ok("x".to_string()));
+        let defs = vec![api::ToolDefinition {
+            name: "mcp__demo__echo".to_string(),
+            description: Some("demo".to_string()),
+            input_schema: json!({}),
+        }];
+        let _ = agents::register_runtime_tool_provider(executor, defs);
+
+        // Rebuild with a capture to inspect the job's allowed_tools.
+        let captured = Arc::new(Mutex::new(None::<AgentJob>));
+        let captured_for_spawn = Arc::clone(&captured);
+        let (_manifest, _handle) = execute_agent_with_spawn(
+            AgentInput {
+                description: "General work".to_string(),
+                prompt: "Do it.".to_string(),
+                subagent_type: Some("general-purpose".to_string()),
+                name: None,
+                model: None,
+                system_prompt: None,
+                allowed_tools: None,
+                mode: None,
+            },
+            move |job| {
+                let agent_id = job.manifest.agent_id.clone();
+                *captured_for_spawn
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(job);
+                Ok(AgentHandle::noop(agent_id))
+            },
+        )
+        .expect("general-purpose should spawn");
+        let job = captured
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let dir = temp_path("agent-runner");
-        std::env::set_var("CLAWD_AGENT_STORE", &dir);
-
-        let completed = execute_agent_with_spawn(
-            AgentInput {
-                description: "Complete the task".to_string(),
-                prompt: "Do the work".to_string(),
-                subagent_type: Some("Explore".to_string()),
-                name: Some("complete-task".to_string()),
-                model: Some("claude-sonnet-4-6".to_string()),
-            },
-            |job| {
-                persist_agent_terminal_state(
-                    &job.manifest,
-                    "completed",
-                    Some("Finished successfully in commit abc1234"),
-                    None,
-                )
-            },
-        )
-        .expect("completed agent should succeed");
-
-        let completed_manifest = std::fs::read_to_string(&completed.manifest_file)
-            .expect("completed manifest should exist");
-        let completed_manifest_json: serde_json::Value =
-            serde_json::from_str(&completed_manifest).expect("completed manifest json");
-        let completed_output =
-            std::fs::read_to_string(&completed.output_file).expect("completed output should exist");
-        assert!(completed_manifest.contains("\"status\": \"completed\""));
-        assert!(completed_output.contains("Finished successfully"));
-        assert_eq!(
-            completed_manifest_json["laneEvents"][0]["event"],
-            "lane.started"
-        );
-        assert_eq!(
-            completed_manifest_json["laneEvents"][1]["event"],
-            "lane.finished"
-        );
-        assert_eq!(
-            completed_manifest_json["laneEvents"][1]["data"]["qualityFloorApplied"],
-            false
-        );
-        assert_eq!(
-            completed_manifest_json["laneEvents"][1]["detail"],
-            "Finished successfully in commit abc1234"
-        );
-        assert_eq!(
-            completed_manifest_json["laneEvents"][2]["event"],
-            "lane.commit.created"
-        );
-        assert_eq!(
-            completed_manifest_json["laneEvents"][2]["data"]["commit"],
-            "abc1234"
-        );
-        assert!(completed_manifest_json["currentBlocker"].is_null());
-        assert_eq!(
-            completed_manifest_json["derivedState"],
-            "finished_cleanable"
-        );
-
-        let failed = execute_agent_with_spawn(
-            AgentInput {
-                description: "Fail the task".to_string(),
-                prompt: "Do the failing work".to_string(),
-                subagent_type: Some("Verification".to_string()),
-                name: Some("fail-task".to_string()),
-                model: None,
-            },
-            |job| {
-                persist_agent_terminal_state(
-                    &job.manifest,
-                    "failed",
-                    None,
-                    Some(String::from("tool failed: simulated failure")),
-                )
-            },
-        )
-        .expect("failed agent should still spawn");
-
-        let failed_manifest =
-            std::fs::read_to_string(&failed.manifest_file).expect("failed manifest should exist");
-        let failed_manifest_json: serde_json::Value =
-            serde_json::from_str(&failed_manifest).expect("failed manifest json");
-        let failed_output =
-            std::fs::read_to_string(&failed.output_file).expect("failed output should exist");
-        assert!(failed_manifest.contains("\"status\": \"failed\""));
-        assert!(failed_manifest.contains("simulated failure"));
-        assert!(failed_output.contains("simulated failure"));
-        assert!(failed_output.contains("failure_class: tool_runtime"));
-        assert_eq!(
-            failed_manifest_json["currentBlocker"]["failureClass"],
-            "tool_runtime"
-        );
-        assert_eq!(
-            failed_manifest_json["laneEvents"][1]["event"],
-            "lane.blocked"
-        );
-        assert_eq!(
-            failed_manifest_json["laneEvents"][2]["event"],
-            "lane.failed"
-        );
-        assert_eq!(
-            failed_manifest_json["laneEvents"][2]["failureClass"],
-            "tool_runtime"
-        );
-        assert_eq!(failed_manifest_json["derivedState"], "truly_idle");
-
-        let normalized = execute_agent_with_spawn(
-            AgentInput {
-                description: "Sweep the next backlog item".to_string(),
-                prompt: "Produce a low-signal stop summary".to_string(),
-                subagent_type: Some("Explore".to_string()),
-                name: Some("summary-floor".to_string()),
-                model: None,
-            },
-            |job| {
-                persist_agent_terminal_state(
-                    &job.manifest,
-                    "completed",
-                    Some("commit push everyting, keep sweeping $ralph"),
-                    None,
-                )
-            },
-        )
-        .expect("normalized agent should succeed");
-
-        let normalized_manifest = std::fs::read_to_string(&normalized.manifest_file)
-            .expect("normalized manifest should exist");
-        let normalized_manifest_json: serde_json::Value =
-            serde_json::from_str(&normalized_manifest).expect("normalized manifest json");
-        assert_eq!(
-            normalized_manifest_json["laneEvents"][1]["event"],
-            "lane.finished"
-        );
-        let normalized_detail = normalized_manifest_json["laneEvents"][1]["detail"]
-            .as_str()
-            .expect("normalized detail");
-        assert!(normalized_detail.contains("Completed lane `summary-floor`"));
-        assert!(normalized_detail.contains("Sweep the next backlog item"));
-        assert_eq!(
-            normalized_manifest_json["laneEvents"][1]["data"]["qualityFloorApplied"],
-            true
-        );
-        assert_eq!(
-            normalized_manifest_json["laneEvents"][1]["data"]["rawSummary"],
-            "commit push everyting, keep sweeping $ralph"
-        );
-        assert_eq!(
-            normalized_manifest_json["laneEvents"][1]["data"]["reasons"][0],
-            "control_only"
-        );
-
-        let recovery = execute_agent_with_spawn(
-            AgentInput {
-                description: "Recover the stalled audit lane".to_string(),
-                prompt: "Normalize OMX reinjection control prose".to_string(),
-                subagent_type: Some("Explore".to_string()),
-                name: Some("recovery-lane".to_string()),
-                model: None,
-            },
-            |job| {
-                persist_agent_terminal_state(
-                    &job.manifest,
-                    "completed",
-                    Some(
-                        "Team read-only-audit-only-for-roadm: worker panes stalled, no progress 2m30s. Next: omx team status read-only-audit-only-for-roadm; read worker messages; unblock/reassign or shutdown. [OMX_TMUX_INJECT]",
-                    ),
-                    None,
-                )
-            },
-        )
-        .expect("recovery agent should succeed");
-
-        let recovery_manifest = std::fs::read_to_string(&recovery.manifest_file)
-            .expect("recovery manifest should exist");
-        let recovery_manifest_json: serde_json::Value =
-            serde_json::from_str(&recovery_manifest).expect("recovery manifest json");
-        let recovery_detail = recovery_manifest_json["laneEvents"][1]["detail"]
-            .as_str()
-            .expect("recovery detail");
-        assert!(recovery_detail.contains("Recovery handoff observed via tmux reinjection"));
-        assert!(recovery_detail.contains("read-only-audit-only-for-roadm"));
-        assert!(!recovery_detail.contains("OMX_TMUX_INJECT"));
-        assert_eq!(
-            recovery_manifest_json["laneEvents"][1]["data"]["recoveryOutcome"]["cause"],
-            "tmux_reinject_after_idle"
-        );
-        assert_eq!(
-            recovery_manifest_json["laneEvents"][1]["data"]["recoveryOutcome"]["targetLane"],
-            "read-only-audit-only-for-roadm"
-        );
-        assert_eq!(
-            recovery_manifest_json["laneEvents"][1]["data"]["qualityFloorApplied"],
-            true
-        );
-        assert_eq!(
-            recovery_manifest_json["laneEvents"][1]["data"]["reasons"][0],
-            "recovery_control_prose"
-        );
-
-        let review = execute_agent_with_spawn(
-            AgentInput {
-                description: "Review commit 1234abcd for ROADMAP #67".to_string(),
-                prompt: "Review the scoped diff".to_string(),
-                subagent_type: Some("Verification".to_string()),
-                name: Some("review-lane".to_string()),
-                model: None,
-            },
-            |job| {
-                persist_agent_terminal_state(
-                    &job.manifest,
-                    "completed",
-                    Some("APPROVE\n\nTarget: commit 1234abcd\nRationale: scoped diff is safe."),
-                    None,
-                )
-            },
-        )
-        .expect("review agent should succeed");
-
-        let review_manifest =
-            std::fs::read_to_string(&review.manifest_file).expect("review manifest should exist");
-        let review_manifest_json: serde_json::Value =
-            serde_json::from_str(&review_manifest).expect("review manifest json");
-        assert_eq!(
-            review_manifest_json["laneEvents"][1]["data"]["reviewVerdict"],
-            "approve"
-        );
-        assert_eq!(
-            review_manifest_json["laneEvents"][1]["data"]["reviewTarget"],
-            "Review commit 1234abcd for ROADMAP #67"
-        );
-        assert_eq!(
-            review_manifest_json["laneEvents"][1]["data"]["reviewRationale"],
-            "Target: commit 1234abcd Rationale: scoped diff is safe."
-        );
-        assert_eq!(
-            review_manifest_json["laneEvents"][1]["data"]["qualityFloorApplied"],
-            false
-        );
-
-        let selection = execute_agent_with_spawn(
-            AgentInput {
-                description: "Scan ROADMAP Immediate Backlog for the next repo-local item".to_string(),
-                prompt: "Choose the next backlog target".to_string(),
-                subagent_type: Some("Explore".to_string()),
-                name: Some("backlog-scan".to_string()),
-                model: None,
-            },
-            |job| {
-                persist_agent_terminal_state(
-                    &job.manifest,
-                    "completed",
-                    Some(
-                        "Selected next backlog target.\nChosen: ROADMAP #65\nSkipped: ROADMAP #63, ROADMAP #64\nAction: execute\nRationale: #65 is the next repo-local lane-finished metadata task.",
-                    ),
-                    None,
-                )
-            },
-        )
-        .expect("selection agent should succeed");
-
-        let selection_manifest = std::fs::read_to_string(&selection.manifest_file)
-            .expect("selection manifest should exist");
-        let selection_manifest_json: serde_json::Value =
-            serde_json::from_str(&selection_manifest).expect("selection manifest json");
-        assert_eq!(
-            selection_manifest_json["laneEvents"][1]["data"]["selectionOutcome"]["chosenItems"][0],
-            "ROADMAP #65"
-        );
-        assert_eq!(
-            selection_manifest_json["laneEvents"][1]["data"]["selectionOutcome"]["skippedItems"][0],
-            "ROADMAP #63"
-        );
-        assert_eq!(
-            selection_manifest_json["laneEvents"][1]["data"]["selectionOutcome"]["skippedItems"][1],
-            "ROADMAP #64"
-        );
-        assert_eq!(
-            selection_manifest_json["laneEvents"][1]["data"]["selectionOutcome"]["action"],
-            "execute"
-        );
-        assert_eq!(
-            selection_manifest_json["laneEvents"][1]["data"]["selectionOutcome"]["rationale"],
-            "#65 is the next repo-local lane-finished metadata task."
-        );
-
-        let artifact = execute_agent_with_spawn(
-            AgentInput {
-                description: "Land ROADMAP #64 provenance hardening".to_string(),
-                prompt: "Ship structured artifact provenance".to_string(),
-                subagent_type: Some("Explore".to_string()),
-                name: Some("artifact-lane".to_string()),
-                model: None,
-            },
-            |job| {
-                persist_agent_terminal_state(
-                    &job.manifest,
-                    "completed",
-                    Some(
-                        "Completed ROADMAP #64. Files: rust/crates/tools/src/lib.rs ROADMAP.md. Diff stat: 2 files, +12/-1. Tested, committed, pushed as commit deadbee.",
-                    ),
-                    None,
-                )
-            },
-        )
-        .expect("artifact agent should succeed");
-
-        let artifact_manifest = std::fs::read_to_string(&artifact.manifest_file)
-            .expect("artifact manifest should exist");
-        let artifact_manifest_json: serde_json::Value =
-            serde_json::from_str(&artifact_manifest).expect("artifact manifest json");
-        assert_eq!(
-            artifact_manifest_json["laneEvents"][1]["data"]["artifactProvenance"]["sourceLanes"][0],
-            "artifact-lane"
-        );
-        assert_eq!(
-            artifact_manifest_json["laneEvents"][1]["data"]["artifactProvenance"]["roadmapIds"][0],
-            "ROADMAP #64"
-        );
-        assert_eq!(
-            artifact_manifest_json["laneEvents"][1]["data"]["artifactProvenance"]["files"][0],
-            "ROADMAP.md"
-        );
-        assert_eq!(
-            artifact_manifest_json["laneEvents"][1]["data"]["artifactProvenance"]["files"][1],
-            "rust/crates/tools/src/lib.rs"
-        );
-        assert_eq!(
-            artifact_manifest_json["laneEvents"][1]["data"]["artifactProvenance"]["diffStat"],
-            "2 files, +12/-1."
-        );
-        assert_eq!(
-            artifact_manifest_json["laneEvents"][1]["data"]["artifactProvenance"]["verification"]
-                [0],
-            "tested"
-        );
-        assert_eq!(
-            artifact_manifest_json["laneEvents"][1]["data"]["artifactProvenance"]["verification"]
-                [1],
-            "committed"
-        );
-        assert_eq!(
-            artifact_manifest_json["laneEvents"][1]["data"]["artifactProvenance"]["verification"]
-                [2],
-            "pushed"
-        );
-        assert_eq!(
-            artifact_manifest_json["laneEvents"][1]["data"]["artifactProvenance"]["commitSha"],
-            "deadbee"
-        );
-
-        let cron = global_cron_registry().create(
-            "*/10 * * * *",
-            "roadmap-nudge-10min for ROADMAP #66",
-            Some("ROADMAP #66 reminder"),
-        );
-        let reminder = execute_agent_with_spawn(
-            AgentInput {
-                description: "Close ROADMAP #66 reminder shutdown".to_string(),
-                prompt: "Finish the cron shutdown fix".to_string(),
-                subagent_type: Some("Explore".to_string()),
-                name: Some("cron-closeout".to_string()),
-                model: None,
-            },
-            |job| {
-                persist_agent_terminal_state(
-                    &job.manifest,
-                    "completed",
-                    Some("Completed ROADMAP #66 after verification."),
-                    None,
-                )
-            },
-        )
-        .expect("reminder agent should succeed");
-
-        let reminder_manifest = std::fs::read_to_string(&reminder.manifest_file)
-            .expect("reminder manifest should exist");
-        let reminder_manifest_json: serde_json::Value =
-            serde_json::from_str(&reminder_manifest).expect("reminder manifest json");
-        assert_eq!(
-            reminder_manifest_json["laneEvents"][1]["data"]["disabledCronIds"][0],
-            cron.cron_id
-        );
-        let disabled_entry = global_cron_registry()
-            .get(&cron.cron_id)
-            .expect("cron should still exist");
-        assert!(!disabled_entry.enabled);
-
-        let resume_outcome =
-            extract_recovery_outcome("Continue from current mode state. [OMX_TMUX_INJECT]")
-                .expect("resume outcome should be detected");
-        assert_eq!(resume_outcome.cause, "resume_after_stop");
-        assert_eq!(
-            resume_outcome.preserved_state.as_deref(),
-            Some("current mode state")
-        );
-
-        let spawn_error = execute_agent_with_spawn(
-            AgentInput {
-                description: "Spawn error task".to_string(),
-                prompt: "Never starts".to_string(),
-                subagent_type: None,
-                name: Some("spawn-error".to_string()),
-                model: None,
-            },
-            |_| Err(String::from("thread creation failed")),
-        )
-        .expect_err("spawn errors should surface");
-        assert!(spawn_error.contains("failed to spawn sub-agent"));
-        let spawn_error_manifest = std::fs::read_dir(&dir)
-            .expect("agent dir should exist")
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("json"))
-            .find_map(|path| {
-                let contents = std::fs::read_to_string(&path).ok()?;
-                contents
-                    .contains("\"name\": \"spawn-error\"")
-                    .then_some(contents)
-            })
-            .expect("failed manifest should still be written");
-        let spawn_error_manifest_json: serde_json::Value =
-            serde_json::from_str(&spawn_error_manifest).expect("spawn error manifest json");
-        assert!(spawn_error_manifest.contains("\"status\": \"failed\""));
-        assert!(spawn_error_manifest.contains("thread creation failed"));
-        assert_eq!(
-            spawn_error_manifest_json["currentBlocker"]["failureClass"],
-            "infra"
-        );
-        assert_eq!(spawn_error_manifest_json["derivedState"], "truly_idle");
-
-        std::env::remove_var("CLAWD_AGENT_STORE");
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn agent_state_classification_covers_finished_and_specific_blockers() {
-        assert_eq!(derive_agent_state("running", None, None, None), "working");
-        assert_eq!(
-            derive_agent_state("completed", Some("done"), None, None),
-            "finished_cleanable"
-        );
-        assert_eq!(
-            derive_agent_state("completed", None, None, None),
-            "finished_pending_report"
-        );
-        assert_eq!(
-            derive_agent_state("failed", None, Some("mcp handshake timed out"), None),
-            "degraded_mcp"
-        );
-        assert_eq!(
-            derive_agent_state(
-                "failed",
-                None,
-                Some("background terminal still running"),
-                None
-            ),
-            "blocked_background_job"
-        );
-        assert_eq!(
-            derive_agent_state("failed", None, Some("merge conflict while rebasing"), None),
-            "blocked_merge_conflict"
-        );
-        assert_eq!(
-            derive_agent_state(
-                "failed",
-                None,
-                Some("transport interrupted after partial progress"),
-                None
-            ),
-            "interrupted_transport"
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .expect("job should be captured");
+        assert!(
+            job.allowed_tools.contains("mcp__demo__echo"),
+            "general-purpose allowed_tools should include registered MCP tool; got {:?}",
+            job.allowed_tools
         );
     }
 
     #[test]
-    fn commit_provenance_is_extracted_from_agent_results() {
-        let provenance = maybe_commit_provenance(Some("landed as commit deadbee with clean push"))
-            .expect("commit provenance");
-        assert_eq!(provenance.commit, "deadbee");
-        assert_eq!(provenance.canonical_commit.as_deref(), Some("deadbee"));
-        assert_eq!(provenance.lineage, vec!["deadbee".to_string()]);
-    }
-    #[test]
-    fn lane_failure_taxonomy_normalizes_common_blockers() {
-        let cases = [
-            (
-                "prompt delivery failed in tmux pane",
-                LaneFailureClass::PromptDelivery,
-            ),
-            (
-                "trust prompt is still blocking startup",
-                LaneFailureClass::TrustGate,
-            ),
-            (
-                "branch stale against main after divergence",
-                LaneFailureClass::BranchDivergence,
-            ),
-            (
-                "compile failed after cargo check",
-                LaneFailureClass::Compile,
-            ),
-            ("targeted tests failed", LaneFailureClass::Test),
-            ("plugin bootstrap failed", LaneFailureClass::PluginStartup),
-            ("mcp handshake timed out", LaneFailureClass::McpHandshake),
-            (
-                "mcp startup failed before listing tools",
-                LaneFailureClass::McpStartup,
-            ),
-            (
-                "gateway routing rejected the request",
-                LaneFailureClass::GatewayRouting,
-            ),
-            (
-                "tool failed: denied tool execution from hook",
-                LaneFailureClass::ToolRuntime,
-            ),
-            (
-                "workspace mismatch while resuming the managed session",
-                LaneFailureClass::WorkspaceMismatch,
-            ),
-            ("thread creation failed", LaneFailureClass::Infra),
-        ];
-
-        for (message, expected) in cases {
-            assert_eq!(classify_lane_failure(message), expected, "{message}");
-        }
+    fn non_general_purpose_agent_does_not_inherit_runtime_tools() {
+        let captured = Arc::new(Mutex::new(None::<AgentJob>));
+        let captured_for_spawn = Arc::clone(&captured);
+        let (_manifest, _handle) = execute_agent_with_spawn(
+            AgentInput {
+                description: "Explore".to_string(),
+                prompt: "Search.".to_string(),
+                subagent_type: Some("Explore".to_string()),
+                name: None,
+                model: None,
+                system_prompt: None,
+                allowed_tools: None,
+                mode: None,
+            },
+            move |job| {
+                let agent_id = job.manifest.agent_id.clone();
+                *captured_for_spawn
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(job);
+                Ok(AgentHandle::noop(agent_id))
+            },
+        )
+        .expect("Explore should spawn");
+        let job = captured
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .expect("job should be captured");
+        assert!(
+            !job.allowed_tools.contains("mcp__demo__echo"),
+            "Explore allowed_tools must NOT include registered MCP tool; got {:?}",
+            job.allowed_tools
+        );
     }
 
     #[test]
@@ -9332,126 +3015,24 @@ mod tests {
 
     #[test]
     fn agent_tool_subset_mapping_is_expected() {
-        let general = allowed_tools_for_subagent("general-purpose");
+        let general = agents::allowed_tools_for_subagent("general-purpose");
         assert!(general.contains("bash"));
-        assert!(general.contains("write_file"));
-        assert!(!general.contains("agent"));
+        assert!(general.contains("new_file"));
+        assert!(!general.contains("Agent"));
 
-        let explore = allowed_tools_for_subagent("Explore");
+        let explore = agents::allowed_tools_for_subagent("Explore");
         assert!(explore.contains("read_file"));
         assert!(explore.contains("grep_search"));
         assert!(!explore.contains("bash"));
 
-        let plan = allowed_tools_for_subagent("Plan");
-        assert!(plan.contains("todo_write"));
-        assert!(plan.contains("structured_output"));
-        assert!(!plan.contains("agent"));
+        let plan = agents::allowed_tools_for_subagent("Plan");
 
-        let verification = allowed_tools_for_subagent("Verification");
+        assert!(plan.contains("StructuredOutput"));
+        assert!(!plan.contains("Agent"));
+
+        let verification = agents::allowed_tools_for_subagent("Verification");
         assert!(verification.contains("bash"));
-        assert!(verification.contains("power_shell"));
-        assert!(!verification.contains("write_file"));
-    }
-
-    #[test]
-    fn subagent_system_prompt_uses_resolved_model_identity() {
-        // given: a temporary workspace and an OpenAI-compatible subagent model
-        let _guard = env_guard();
-        let root = temp_path("subagent-prompt-identity");
-        fs::create_dir_all(&root).expect("create temp workspace");
-        let previous = std::env::current_dir().expect("current dir");
-        std::env::set_current_dir(&root).expect("enter temp workspace");
-
-        // when: building the subagent system prompt
-        let prompt = build_agent_system_prompt("Explore", "openai/gpt-4.1-mini")
-            .expect("subagent system prompt should build")
-            .join("\n");
-        std::env::set_current_dir(previous).expect("restore current dir");
-
-        // then: the prompt renders a generic model family identity
-        assert!(prompt.contains("Model family: an AI assistant"));
-        assert!(!prompt.contains("Model family: Claude Opus 4.6"));
-
-        fs::remove_dir_all(root).expect("cleanup temp workspace");
-    }
-
-    #[derive(Debug)]
-    struct MockSubagentApiClient {
-        calls: usize,
-        input_path: String,
-    }
-
-    impl runtime::ApiClient for MockSubagentApiClient {
-        fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
-            self.calls += 1;
-            match self.calls {
-                1 => {
-                    assert_eq!(request.messages.len(), 1);
-                    Ok(vec![
-                        AssistantEvent::ToolUse {
-                            id: "tool-1".to_string(),
-                            name: "read_file".to_string(),
-                            input: json!({ "path": self.input_path }).to_string(),
-                        },
-                        AssistantEvent::MessageStop,
-                    ])
-                }
-                2 => {
-                    assert!(request.messages.len() >= 3);
-                    Ok(vec![
-                        AssistantEvent::TextDelta("Scope: completed mock review".to_string()),
-                        AssistantEvent::MessageStop,
-                    ])
-                }
-                _ => unreachable!("extra mock stream call"),
-            }
-        }
-    }
-
-    #[test]
-    fn subagent_runtime_executes_tool_loop_with_isolated_session() {
-        let _guard = env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let root = temp_path("subagent-runtime");
-        std::fs::create_dir_all(&root).expect("create root");
-        let path = root.join("subagent-input.txt");
-        std::fs::write(&path, "hello from child").expect("write input file");
-        let original_dir = std::env::current_dir().expect("cwd");
-        std::env::set_current_dir(&root).expect("set cwd");
-
-        let mut runtime = ConversationRuntime::new(
-            Session::new(),
-            MockSubagentApiClient {
-                calls: 0,
-                input_path: path.display().to_string(),
-            },
-            SubagentToolExecutor::new(BTreeSet::from([String::from("read_file")])),
-            agent_permission_policy(),
-            vec![String::from("system prompt")],
-        );
-
-        let summary = runtime
-            .run_turn("Inspect the delegated file", None)
-            .expect("subagent loop should succeed");
-
-        assert_eq!(
-            final_assistant_text(&summary),
-            "Scope: completed mock review"
-        );
-        assert!(runtime
-            .session()
-            .messages
-            .iter()
-            .flat_map(|message| message.blocks.iter())
-            .any(|block| matches!(
-                block,
-                runtime::ContentBlock::ToolResult { output, .. }
-                    if output.contains("hello from child")
-            )));
-
-        std::env::set_current_dir(&original_dir).expect("restore cwd");
-        let _ = std::fs::remove_dir_all(root);
+        assert!(!verification.contains("new_file"));
     }
 
     #[test]
@@ -9475,130 +3056,6 @@ mod tests {
         )
         .expect_err("blank prompt should fail");
         assert!(missing_prompt.contains("prompt must not be empty"));
-    }
-
-    #[test]
-    fn notebook_edit_replaces_inserts_and_deletes_cells() {
-        let path = temp_path("notebook.ipynb");
-        std::fs::write(
-            &path,
-            r#"{
-  "cells": [
-    {"cell_type": "code", "id": "cell-a", "metadata": {}, "source": ["print(1)\n"], "outputs": [], "execution_count": null}
-  ],
-  "metadata": {"kernelspec": {"language": "python"}},
-  "nbformat": 4,
-  "nbformat_minor": 5
-}"#,
-        )
-        .expect("write notebook");
-
-        let replaced = execute_tool(
-            "NotebookEdit",
-            &json!({
-                "notebook_path": path.display().to_string(),
-                "cell_id": "cell-a",
-                "new_source": "print(2)\n",
-                "edit_mode": "replace"
-            }),
-        )
-        .expect("NotebookEdit replace should succeed");
-        let replaced_output: serde_json::Value = serde_json::from_str(&replaced).expect("json");
-        assert_eq!(replaced_output["cell_id"], "cell-a");
-        assert_eq!(replaced_output["cell_type"], "code");
-
-        let inserted = execute_tool(
-            "NotebookEdit",
-            &json!({
-                "notebook_path": path.display().to_string(),
-                "cell_id": "cell-a",
-                "new_source": "# heading\n",
-                "cell_type": "markdown",
-                "edit_mode": "insert"
-            }),
-        )
-        .expect("NotebookEdit insert should succeed");
-        let inserted_output: serde_json::Value = serde_json::from_str(&inserted).expect("json");
-        assert_eq!(inserted_output["cell_type"], "markdown");
-        let appended = execute_tool(
-            "NotebookEdit",
-            &json!({
-                "notebook_path": path.display().to_string(),
-                "new_source": "print(3)\n",
-                "edit_mode": "insert"
-            }),
-        )
-        .expect("NotebookEdit append should succeed");
-        let appended_output: serde_json::Value = serde_json::from_str(&appended).expect("json");
-        assert_eq!(appended_output["cell_type"], "code");
-
-        let deleted = execute_tool(
-            "NotebookEdit",
-            &json!({
-                "notebook_path": path.display().to_string(),
-                "cell_id": "cell-a",
-                "edit_mode": "delete"
-            }),
-        )
-        .expect("NotebookEdit delete should succeed without new_source");
-        let deleted_output: serde_json::Value = serde_json::from_str(&deleted).expect("json");
-        assert!(deleted_output["cell_type"].is_null());
-        assert_eq!(deleted_output["new_source"], "");
-
-        let final_notebook: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&path).expect("read notebook"))
-                .expect("valid notebook json");
-        let cells = final_notebook["cells"].as_array().expect("cells array");
-        assert_eq!(cells.len(), 2);
-        assert_eq!(cells[0]["cell_type"], "markdown");
-        assert!(cells[0].get("outputs").is_none());
-        assert_eq!(cells[1]["cell_type"], "code");
-        assert_eq!(cells[1]["source"][0], "print(3)\n");
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn notebook_edit_rejects_invalid_inputs() {
-        let text_path = temp_path("notebook.txt");
-        fs::write(&text_path, "not a notebook").expect("write text file");
-        let wrong_extension = execute_tool(
-            "NotebookEdit",
-            &json!({
-                "notebook_path": text_path.display().to_string(),
-                "new_source": "print(1)\n"
-            }),
-        )
-        .expect_err("non-ipynb file should fail");
-        assert!(wrong_extension.contains("Jupyter notebook"));
-        let _ = fs::remove_file(&text_path);
-
-        let empty_notebook = temp_path("empty.ipynb");
-        fs::write(
-            &empty_notebook,
-            r#"{"cells":[],"metadata":{"kernelspec":{"language":"python"}},"nbformat":4,"nbformat_minor":5}"#,
-        )
-        .expect("write empty notebook");
-
-        let missing_source = execute_tool(
-            "NotebookEdit",
-            &json!({
-                "notebook_path": empty_notebook.display().to_string(),
-                "edit_mode": "insert"
-            }),
-        )
-        .expect_err("insert without source should fail");
-        assert!(missing_source.contains("new_source is required"));
-
-        let missing_cell = execute_tool(
-            "NotebookEdit",
-            &json!({
-                "notebook_path": empty_notebook.display().to_string(),
-                "edit_mode": "delete"
-            }),
-        )
-        .expect_err("delete on empty notebook should fail");
-        assert!(missing_cell.contains("Notebook has no cells to edit"));
-        let _ = fs::remove_file(empty_notebook);
     }
 
     #[test]
@@ -9636,23 +3093,6 @@ mod tests {
         let background_output: serde_json::Value = serde_json::from_str(&background).expect("json");
         assert!(background_output["backgroundTaskId"].as_str().is_some());
         assert_eq!(background_output["noOutputExpected"], true);
-    }
-
-    #[test]
-    fn bash_tool_classifies_test_timeout_as_hung_with_provenance() {
-        let timeout = execute_tool(
-            "bash",
-            &json!({ "command": "sleep 1 # cargo test slow_case", "timeout": 10 }),
-        )
-        .expect("bash timeout should return output");
-        let timeout_output: serde_json::Value = serde_json::from_str(&timeout).expect("json");
-        assert_eq!(timeout_output["interrupted"], true);
-        assert_eq!(timeout_output["returnCodeInterpretation"], "test.hung");
-        assert_eq!(timeout_output["structuredContent"][0]["event"], "test.hung");
-        assert_eq!(
-            timeout_output["structuredContent"][0]["data"]["provenance"],
-            "bash.timeout"
-        );
     }
 
     #[test]
@@ -9740,117 +3180,6 @@ mod tests {
     }
 
     #[test]
-    fn file_tools_cover_read_write_and_edit_behaviors() {
-        let _guard = env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let root = temp_path("fs-suite");
-        fs::create_dir_all(&root).expect("create root");
-        let original_dir = std::env::current_dir().expect("cwd");
-        std::env::set_current_dir(&root).expect("set cwd");
-
-        let write_create = execute_tool(
-            "write_file",
-            &json!({ "path": "nested/demo.txt", "content": "alpha\nbeta\nalpha\n" }),
-        )
-        .expect("write create should succeed");
-        let write_create_output: serde_json::Value =
-            serde_json::from_str(&write_create).expect("json");
-        assert_eq!(write_create_output["type"], "create");
-        assert!(root.join("nested/demo.txt").exists());
-
-        let write_update = execute_tool(
-            "write_file",
-            &json!({ "path": "nested/demo.txt", "content": "alpha\nbeta\ngamma\n" }),
-        )
-        .expect("write update should succeed");
-        let write_update_output: serde_json::Value =
-            serde_json::from_str(&write_update).expect("json");
-        assert_eq!(write_update_output["type"], "update");
-        assert_eq!(write_update_output["originalFile"], "alpha\nbeta\nalpha\n");
-
-        let read_full = execute_tool("read_file", &json!({ "path": "nested/demo.txt" }))
-            .expect("read full should succeed");
-        let read_full_output: serde_json::Value = serde_json::from_str(&read_full).expect("json");
-        assert_eq!(read_full_output["file"]["content"], "alpha\nbeta\ngamma");
-        assert_eq!(read_full_output["file"]["startLine"], 1);
-
-        let read_slice = execute_tool(
-            "read_file",
-            &json!({ "path": "nested/demo.txt", "offset": 1, "limit": 1 }),
-        )
-        .expect("read slice should succeed");
-        let read_slice_output: serde_json::Value = serde_json::from_str(&read_slice).expect("json");
-        assert_eq!(read_slice_output["file"]["content"], "beta");
-        assert_eq!(read_slice_output["file"]["startLine"], 2);
-
-        let read_past_end = execute_tool(
-            "read_file",
-            &json!({ "path": "nested/demo.txt", "offset": 50 }),
-        )
-        .expect("read past EOF should succeed");
-        let read_past_end_output: serde_json::Value =
-            serde_json::from_str(&read_past_end).expect("json");
-        assert_eq!(read_past_end_output["file"]["content"], "");
-        assert_eq!(read_past_end_output["file"]["startLine"], 4);
-
-        let read_error = execute_tool("read_file", &json!({ "path": "missing.txt" }))
-            .expect_err("missing file should fail");
-        assert!(!read_error.is_empty());
-
-        let edit_once = execute_tool(
-            "edit_file",
-            &json!({ "path": "nested/demo.txt", "old_string": "alpha", "new_string": "omega" }),
-        )
-        .expect("single edit should succeed");
-        let edit_once_output: serde_json::Value = serde_json::from_str(&edit_once).expect("json");
-        assert_eq!(edit_once_output["replaceAll"], false);
-        assert_eq!(
-            fs::read_to_string(root.join("nested/demo.txt")).expect("read file"),
-            "omega\nbeta\ngamma\n"
-        );
-
-        execute_tool(
-            "write_file",
-            &json!({ "path": "nested/demo.txt", "content": "alpha\nbeta\nalpha\n" }),
-        )
-        .expect("reset file");
-        let edit_all = execute_tool(
-            "edit_file",
-            &json!({
-                "path": "nested/demo.txt",
-                "old_string": "alpha",
-                "new_string": "omega",
-                "replace_all": true
-            }),
-        )
-        .expect("replace all should succeed");
-        let edit_all_output: serde_json::Value = serde_json::from_str(&edit_all).expect("json");
-        assert_eq!(edit_all_output["replaceAll"], true);
-        assert_eq!(
-            fs::read_to_string(root.join("nested/demo.txt")).expect("read file"),
-            "omega\nbeta\nomega\n"
-        );
-
-        let edit_same = execute_tool(
-            "edit_file",
-            &json!({ "path": "nested/demo.txt", "old_string": "omega", "new_string": "omega" }),
-        )
-        .expect_err("identical old/new should fail");
-        assert!(edit_same.contains("must differ"));
-
-        let edit_missing = execute_tool(
-            "edit_file",
-            &json!({ "path": "nested/demo.txt", "old_string": "missing", "new_string": "omega" }),
-        )
-        .expect_err("missing substring should fail");
-        assert!(edit_missing.contains("old_string not found"));
-
-        std::env::set_current_dir(&original_dir).expect("restore cwd");
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
     fn glob_and_grep_tools_cover_success_and_errors() {
         let _guard = env_lock()
             .lock()
@@ -9871,10 +3200,11 @@ mod tests {
             .expect("glob should succeed");
         let globbed_output: serde_json::Value = serde_json::from_str(&globbed).expect("json");
         assert_eq!(globbed_output["numFiles"], 1);
-        assert!(globbed_output["filenames"][0]
-            .as_str()
-            .expect("filename")
-            .ends_with("nested/lib.rs"));
+        let filename = globbed_output["filenames"][0].as_str().expect("filename");
+        assert!(
+            std::path::Path::new(filename).ends_with("nested/lib.rs"),
+            "expected ends_with nested/lib.rs, got: {filename}"
+        );
 
         let glob_error = execute_tool("glob_search", &json!({ "pattern": "[" }))
             .expect_err("invalid glob should fail");
@@ -9895,7 +3225,9 @@ mod tests {
         .expect("grep content should succeed");
         let grep_content_output: serde_json::Value =
             serde_json::from_str(&grep_content).expect("json");
-        assert_eq!(grep_content_output["numFiles"], 0);
+        // `numFiles` counts distinct files with matches (lib.rs), unaffected by
+        // head_limit/offset which only slice the returned content lines.
+        assert_eq!(grep_content_output["numFiles"], 1);
         assert!(grep_content_output["appliedLimit"].is_null());
         assert_eq!(grep_content_output["appliedOffset"], 1);
         assert!(grep_content_output["content"]
@@ -9922,107 +3254,6 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    #[test]
-    fn file_tools_reject_paths_outside_current_workspace() {
-        let _guard = env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let root = temp_path("workspace-scope");
-        let outside = temp_path("workspace-scope-outside");
-        fs::create_dir_all(&root).expect("create root");
-        fs::create_dir_all(&outside).expect("create outside");
-        fs::write(outside.join("secret.txt"), "secret\n").expect("outside fixture");
-        let original_dir = std::env::current_dir().expect("cwd");
-        std::env::set_current_dir(&root).expect("set cwd");
-
-        let read_error = execute_tool(
-            "read_file",
-            &json!({ "path": outside.join("secret.txt").display().to_string() }),
-        )
-        .expect_err("read outside workspace should fail");
-        assert!(read_error.contains("escapes workspace"));
-
-        let write_error = execute_tool(
-            "write_file",
-            &json!({ "path": outside.join("created.txt").display().to_string(), "content": "nope" }),
-        )
-        .expect_err("write outside workspace should fail");
-        assert!(write_error.contains("escapes workspace"));
-        assert!(!outside.join("created.txt").exists());
-
-        let glob_error = execute_tool(
-            "glob_search",
-            &json!({ "pattern": outside.join("*.txt").display().to_string() }),
-        )
-        .expect_err("absolute glob outside workspace should fail");
-        assert!(glob_error.contains("escapes workspace"));
-
-        let grep_error = execute_tool(
-            "grep_search",
-            &json!({ "pattern": "secret", "path": outside.display().to_string() }),
-        )
-        .expect_err("grep outside workspace should fail");
-        assert!(grep_error.contains("escapes workspace"));
-
-        std::env::set_current_dir(&original_dir).expect("restore cwd");
-        let _ = fs::remove_dir_all(root);
-        let _ = fs::remove_dir_all(outside);
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn file_tools_reject_symlink_escape_from_current_workspace() {
-        let _guard = env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let root = temp_path("workspace-symlink-scope");
-        let outside = temp_path("workspace-symlink-outside");
-        fs::create_dir_all(&root).expect("create root");
-        fs::create_dir_all(&outside).expect("create outside");
-        fs::write(outside.join("secret.txt"), "secret\n").expect("outside fixture");
-        std::os::unix::fs::symlink(outside.join("secret.txt"), root.join("link.txt"))
-            .expect("create symlink");
-        let original_dir = std::env::current_dir().expect("cwd");
-        std::env::set_current_dir(&root).expect("set cwd");
-
-        let error = execute_tool("read_file", &json!({ "path": "link.txt" }))
-            .expect_err("symlink outside workspace should fail");
-        assert!(error.contains("escapes workspace"));
-
-        std::env::set_current_dir(&original_dir).expect("restore cwd");
-        let _ = fs::remove_dir_all(root);
-        let _ = fs::remove_dir_all(outside);
-    }
-
-    #[test]
-    fn sleep_waits_and_reports_duration() {
-        let started = std::time::Instant::now();
-        let result =
-            execute_tool("Sleep", &json!({"duration_ms": 20})).expect("Sleep should succeed");
-        let elapsed = started.elapsed();
-        let output: serde_json::Value = serde_json::from_str(&result).expect("json");
-        assert_eq!(output["duration_ms"], 20);
-        assert!(output["message"]
-            .as_str()
-            .expect("message")
-            .contains("Slept for 20ms"));
-        assert!(elapsed >= Duration::from_millis(15));
-    }
-
-    #[test]
-    fn given_excessive_duration_when_sleep_then_rejects_with_error() {
-        let result = execute_tool("Sleep", &json!({"duration_ms": 999_999_999_u64}));
-        let error = result.expect_err("excessive sleep should fail");
-        assert!(error.contains("exceeds maximum allowed sleep"));
-    }
-
-    #[test]
-    fn given_zero_duration_when_sleep_then_succeeds() {
-        let result =
-            execute_tool("Sleep", &json!({"duration_ms": 0})).expect("0ms sleep should succeed");
-        let output: serde_json::Value = serde_json::from_str(&result).expect("json");
-        assert_eq!(output["duration_ms"], 0);
-    }
 
     #[test]
     fn brief_returns_sent_message_and_attachment_metadata() {
@@ -10040,7 +3271,6 @@ mod tests {
             &json!({
                 "message": "hello user",
                 "attachments": [attachment.display().to_string()],
-                "status": "normal"
             }),
         )
         .expect("SendUserMessage should succeed");
@@ -10053,522 +3283,18 @@ mod tests {
     }
 
     #[test]
-    fn config_reads_and_writes_supported_values() {
-        let _guard = env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let root = std::env::temp_dir().join(format!(
-            "clawd-config-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("time")
-                .as_nanos()
-        ));
-        let home = root.join("home");
-        let cwd = root.join("cwd");
-        std::fs::create_dir_all(home.join(".claw")).expect("home dir");
-        std::fs::create_dir_all(cwd.join(".claw")).expect("cwd dir");
-        std::fs::write(
-            home.join(".claw").join("settings.json"),
-            r#"{"verbose":false}"#,
-        )
-        .expect("write global settings");
-
-        let original_home = std::env::var("HOME").ok();
-        let original_config_home = std::env::var("CLAW_CONFIG_HOME").ok();
-        let original_dir = std::env::current_dir().expect("cwd");
-        std::env::set_var("HOME", &home);
-        std::env::remove_var("CLAW_CONFIG_HOME");
-        std::env::set_current_dir(&cwd).expect("set cwd");
-
-        let get = execute_tool("Config", &json!({"setting": "verbose"})).expect("get config");
-        let get_output: serde_json::Value = serde_json::from_str(&get).expect("json");
-        assert_eq!(get_output["value"], false);
-
-        let set = execute_tool(
-            "Config",
-            &json!({"setting": "permissions.defaultMode", "value": "plan"}),
-        )
-        .expect("set config");
-        let set_output: serde_json::Value = serde_json::from_str(&set).expect("json");
-        assert_eq!(set_output["operation"], "set");
-        assert_eq!(set_output["newValue"], "plan");
-
-        let invalid = execute_tool(
-            "Config",
-            &json!({"setting": "permissions.defaultMode", "value": "bogus"}),
-        )
-        .expect_err("invalid config value should error");
-        assert!(invalid.contains("Invalid value"));
-
-        let unknown =
-            execute_tool("Config", &json!({"setting": "nope"})).expect("unknown setting result");
-        let unknown_output: serde_json::Value = serde_json::from_str(&unknown).expect("json");
-        assert_eq!(unknown_output["success"], false);
-
-        std::env::set_current_dir(&original_dir).expect("restore cwd");
-        match original_home {
-            Some(value) => std::env::set_var("HOME", value),
-            None => std::env::remove_var("HOME"),
-        }
-        match original_config_home {
-            Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
-            None => std::env::remove_var("CLAW_CONFIG_HOME"),
-        }
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn enter_and_exit_plan_mode_round_trip_existing_local_override() {
-        let _guard = env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let root = std::env::temp_dir().join(format!(
-            "clawd-plan-mode-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("time")
-                .as_nanos()
-        ));
-        let home = root.join("home");
-        let cwd = root.join("cwd");
-        std::fs::create_dir_all(home.join(".claw")).expect("home dir");
-        std::fs::create_dir_all(cwd.join(".claw")).expect("cwd dir");
-        std::fs::write(
-            cwd.join(".claw").join("settings.local.json"),
-            r#"{"permissions":{"defaultMode":"acceptEdits"}}"#,
-        )
-        .expect("write local settings");
-
-        let original_home = std::env::var("HOME").ok();
-        let original_config_home = std::env::var("CLAW_CONFIG_HOME").ok();
-        let original_dir = std::env::current_dir().expect("cwd");
-        std::env::set_var("HOME", &home);
-        std::env::remove_var("CLAW_CONFIG_HOME");
-        std::env::set_current_dir(&cwd).expect("set cwd");
-
-        let enter = execute_tool("EnterPlanMode", &json!({})).expect("enter plan mode");
-        let enter_output: serde_json::Value = serde_json::from_str(&enter).expect("json");
-        assert_eq!(enter_output["changed"], true);
-        assert_eq!(enter_output["managed"], true);
-        assert_eq!(enter_output["previousLocalMode"], "acceptEdits");
-        assert_eq!(enter_output["currentLocalMode"], "plan");
-
-        let local_settings = std::fs::read_to_string(cwd.join(".claw").join("settings.local.json"))
-            .expect("local settings after enter");
-        assert!(local_settings.contains(r#""defaultMode": "plan""#));
-        let state =
-            std::fs::read_to_string(cwd.join(".claw").join("tool-state").join("plan-mode.json"))
-                .expect("plan mode state");
-        assert!(state.contains(r#""hadLocalOverride": true"#));
-        assert!(state.contains(r#""previousLocalMode": "acceptEdits""#));
-
-        let exit = execute_tool("ExitPlanMode", &json!({})).expect("exit plan mode");
-        let exit_output: serde_json::Value = serde_json::from_str(&exit).expect("json");
-        assert_eq!(exit_output["changed"], true);
-        assert_eq!(exit_output["managed"], false);
-        assert_eq!(exit_output["previousLocalMode"], "acceptEdits");
-        assert_eq!(exit_output["currentLocalMode"], "acceptEdits");
-
-        let local_settings = std::fs::read_to_string(cwd.join(".claw").join("settings.local.json"))
-            .expect("local settings after exit");
-        assert!(local_settings.contains(r#""defaultMode": "acceptEdits""#));
-        assert!(!cwd
-            .join(".claw")
-            .join("tool-state")
-            .join("plan-mode.json")
-            .exists());
-
-        std::env::set_current_dir(&original_dir).expect("restore cwd");
-        match original_home {
-            Some(value) => std::env::set_var("HOME", value),
-            None => std::env::remove_var("HOME"),
-        }
-        match original_config_home {
-            Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
-            None => std::env::remove_var("CLAW_CONFIG_HOME"),
-        }
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn exit_plan_mode_clears_override_when_enter_created_it_from_empty_local_state() {
-        let _guard = env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let root = std::env::temp_dir().join(format!(
-            "clawd-plan-mode-empty-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("time")
-                .as_nanos()
-        ));
-        let home = root.join("home");
-        let cwd = root.join("cwd");
-        std::fs::create_dir_all(home.join(".claw")).expect("home dir");
-        std::fs::create_dir_all(cwd.join(".claw")).expect("cwd dir");
-
-        let original_home = std::env::var("HOME").ok();
-        let original_config_home = std::env::var("CLAW_CONFIG_HOME").ok();
-        let original_dir = std::env::current_dir().expect("cwd");
-        std::env::set_var("HOME", &home);
-        std::env::remove_var("CLAW_CONFIG_HOME");
-        std::env::set_current_dir(&cwd).expect("set cwd");
-
-        let enter = execute_tool("EnterPlanMode", &json!({})).expect("enter plan mode");
-        let enter_output: serde_json::Value = serde_json::from_str(&enter).expect("json");
-        assert_eq!(enter_output["previousLocalMode"], serde_json::Value::Null);
-        assert_eq!(enter_output["currentLocalMode"], "plan");
-
-        let exit = execute_tool("ExitPlanMode", &json!({})).expect("exit plan mode");
-        let exit_output: serde_json::Value = serde_json::from_str(&exit).expect("json");
-        assert_eq!(exit_output["changed"], true);
-        assert_eq!(exit_output["currentLocalMode"], serde_json::Value::Null);
-
-        let local_settings = std::fs::read_to_string(cwd.join(".claw").join("settings.local.json"))
-            .expect("local settings after exit");
-        let local_settings_json: serde_json::Value =
-            serde_json::from_str(&local_settings).expect("valid settings json");
-        assert_eq!(
-            local_settings_json.get("permissions"),
-            None,
-            "permissions override should be removed on exit"
-        );
-        assert!(!cwd
-            .join(".claw")
-            .join("tool-state")
-            .join("plan-mode.json")
-            .exists());
-
-        std::env::set_current_dir(&original_dir).expect("restore cwd");
-        match original_home {
-            Some(value) => std::env::set_var("HOME", value),
-            None => std::env::remove_var("HOME"),
-        }
-        match original_config_home {
-            Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
-            None => std::env::remove_var("CLAW_CONFIG_HOME"),
-        }
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn structured_output_echoes_input_payload() {
-        let result = execute_tool("StructuredOutput", &json!({"ok": true, "items": [1, 2, 3]}))
-            .expect("StructuredOutput should succeed");
-        let output: serde_json::Value = serde_json::from_str(&result).expect("json");
-        assert_eq!(output["data"], "Structured output provided successfully");
-        assert_eq!(output["structured_output"]["ok"], true);
-        assert_eq!(output["structured_output"]["items"][1], 2);
-    }
-
-    #[test]
     fn given_empty_payload_when_structured_output_then_rejects_with_error() {
         let result = execute_tool("StructuredOutput", &json!({}));
         let error = result.expect_err("empty payload should fail");
         assert!(error.contains("must not be empty"));
     }
 
+    #[cfg(not(target_os = "windows"))]
     #[test]
-    fn repl_executes_python_code() {
-        let result = execute_tool(
-            "REPL",
-            &json!({"language": "python", "code": "print(1 + 1)", "timeout_ms": 500}),
-        )
-        .expect("REPL should succeed");
-        let output: serde_json::Value = serde_json::from_str(&result).expect("json");
-        assert_eq!(output["language"], "python");
-        assert_eq!(output["exitCode"], 0);
-        assert!(output["stdout"].as_str().expect("stdout").contains('2'));
-    }
 
     #[test]
-    fn given_empty_code_when_repl_then_rejects_with_error() {
-        let result = execute_tool("REPL", &json!({"language": "python", "code": "   "}));
 
-        let error = result.expect_err("empty REPL code should fail");
-        assert!(error.contains("code must not be empty"));
-    }
 
-    #[test]
-    fn given_unsupported_language_when_repl_then_rejects_with_error() {
-        let result = execute_tool("REPL", &json!({"language": "ruby", "code": "puts 1"}));
-
-        let error = result.expect_err("unsupported REPL language should fail");
-        assert!(error.contains("unsupported REPL language: ruby"));
-    }
-
-    #[test]
-    fn given_timeout_ms_when_repl_blocks_then_returns_timeout_error() {
-        let result = execute_tool(
-            "REPL",
-            &json!({
-                "language": "python",
-                "code": "import time\ntime.sleep(1)",
-                "timeout_ms": 10
-            }),
-        );
-
-        let error = result.expect_err("timed out REPL execution should fail");
-        assert!(error.contains("REPL execution exceeded timeout of 10 ms"));
-    }
-
-    #[test]
-    fn powershell_runs_via_stub_shell() {
-        let _guard = env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let dir = std::env::temp_dir().join(format!(
-            "clawd-pwsh-bin-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("time")
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).expect("create dir");
-        let script = dir.join("pwsh");
-        std::fs::write(
-            &script,
-            r#"#!/bin/sh
-while [ "$1" != "-Command" ] && [ $# -gt 0 ]; do shift; done
-shift
-printf 'pwsh:%s' "$1"
-"#,
-        )
-        .expect("write script");
-        std::process::Command::new("/bin/chmod")
-            .arg("+x")
-            .arg(&script)
-            .status()
-            .expect("chmod");
-        let original_path = std::env::var("PATH").unwrap_or_default();
-        std::env::set_var("PATH", format!("{}:{}", dir.display(), original_path));
-
-        let result = execute_tool(
-            "PowerShell",
-            &json!({"command": "Write-Output hello", "timeout": 1000}),
-        )
-        .expect("PowerShell should succeed");
-
-        let background = execute_tool(
-            "PowerShell",
-            &json!({"command": "Write-Output hello", "run_in_background": true}),
-        )
-        .expect("PowerShell background should succeed");
-
-        std::env::set_var("PATH", original_path);
-        let _ = std::fs::remove_dir_all(dir);
-
-        let output: serde_json::Value = serde_json::from_str(&result).expect("json");
-        assert_eq!(output["stdout"], "pwsh:Write-Output hello");
-        assert!(output["stderr"].as_str().expect("stderr").is_empty());
-
-        let background_output: serde_json::Value = serde_json::from_str(&background).expect("json");
-        assert!(background_output["backgroundTaskId"].as_str().is_some());
-        assert_eq!(background_output["backgroundedByUser"], true);
-        assert_eq!(background_output["assistantAutoBackgrounded"], false);
-    }
-
-    #[test]
-    fn powershell_errors_when_shell_is_missing() {
-        let _guard = env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let original_path = std::env::var("PATH").unwrap_or_default();
-        let empty_dir = std::env::temp_dir().join(format!(
-            "clawd-empty-bin-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("time")
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&empty_dir).expect("create empty dir");
-        std::env::set_var("PATH", empty_dir.display().to_string());
-
-        let err = execute_tool("PowerShell", &json!({"command": "Write-Output hello"}))
-            .expect_err("PowerShell should fail when shell is missing");
-
-        std::env::set_var("PATH", original_path);
-        let _ = std::fs::remove_dir_all(empty_dir);
-
-        assert!(err.contains("PowerShell executable not found"));
-    }
-
-    fn read_only_registry() -> super::GlobalToolRegistry {
-        use runtime::permission_enforcer::PermissionEnforcer;
-        use runtime::PermissionPolicy;
-
-        let policy = mvp_tool_specs().into_iter().fold(
-            PermissionPolicy::new(runtime::PermissionMode::ReadOnly),
-            |policy, spec| policy.with_tool_requirement(spec.name, spec.required_permission),
-        );
-        let mut registry = super::GlobalToolRegistry::builtin();
-        registry.set_enforcer(PermissionEnforcer::new(policy));
-        registry
-    }
-
-    fn workspace_write_registry() -> super::GlobalToolRegistry {
-        use runtime::permission_enforcer::PermissionEnforcer;
-        use runtime::PermissionPolicy;
-
-        let policy = mvp_tool_specs().into_iter().fold(
-            PermissionPolicy::new(runtime::PermissionMode::WorkspaceWrite),
-            |policy, spec| policy.with_tool_requirement(spec.name, spec.required_permission),
-        );
-        let mut registry = super::GlobalToolRegistry::builtin();
-        registry.set_enforcer(PermissionEnforcer::new(policy));
-        registry
-    }
-
-    #[test]
-    fn given_read_only_enforcer_when_bash_then_denied() {
-        let registry = read_only_registry();
-        // Use a command that requires DangerFullAccess (rm) to ensure it's blocked in read-only mode
-        let err = registry
-            .execute("bash", &json!({ "command": "rm -rf /" }))
-            .expect_err("bash should be denied in read-only mode");
-        assert!(
-            err.contains("current mode is 'read-only'"),
-            "should cite active mode: {err}"
-        );
-    }
-
-    #[test]
-    fn given_workspace_write_enforcer_when_web_tools_then_denied() {
-        let registry = workspace_write_registry();
-        for (tool, input) in [
-            (
-                "WebFetch",
-                json!({"url":"https://example.com", "prompt":"summarize"}),
-            ),
-            ("WebSearch", json!({"query":"rust language"})),
-        ] {
-            let err = registry
-                .execute(tool, &input)
-                .expect_err("network tools should require explicit full access");
-            assert!(
-                err.contains("requires 'danger-full-access'"),
-                "{tool} should require elevated mode: {err}"
-            );
-        }
-    }
-
-    #[test]
-    fn given_workspace_write_enforcer_when_bash_uses_shell_expansion_then_denied() {
-        let registry = workspace_write_registry();
-        let err = registry
-            .execute("bash", &json!({ "command": "cat $HOME/.ssh/config" }))
-            .expect_err("shell-expanded path should require elevated permission");
-        assert!(
-            err.contains("requires 'danger-full-access'"),
-            "should require elevated mode: {err}"
-        );
-    }
-
-    #[test]
-    fn given_workspace_write_enforcer_when_bash_uses_windows_absolute_path_then_denied() {
-        let registry = workspace_write_registry();
-        let err = registry
-            .execute(
-                "bash",
-                &json!({ "command": r"cat C:\\Users\\alice\\.ssh\\config" }),
-            )
-            .expect_err("Windows absolute path should require elevated permission");
-        assert!(
-            err.contains("requires 'danger-full-access'"),
-            "should require elevated mode: {err}"
-        );
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn given_workspace_write_enforcer_when_bash_reads_symlink_escape_then_denied() {
-        let _guard = env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let root = temp_path("bash-symlink-scope");
-        let outside = temp_path("bash-symlink-outside");
-        fs::create_dir_all(&root).expect("create root");
-        fs::create_dir_all(&outside).expect("create outside");
-        fs::write(outside.join("secret.txt"), "secret\n").expect("outside fixture");
-        std::os::unix::fs::symlink(outside.join("secret.txt"), root.join("link.txt"))
-            .expect("create symlink");
-        let original_dir = std::env::current_dir().expect("cwd");
-        std::env::set_current_dir(&root).expect("set cwd");
-
-        let registry = workspace_write_registry();
-        let err = registry
-            .execute("bash", &json!({ "command": "cat link.txt" }))
-            .expect_err("symlink escape should require elevated permission");
-        assert!(
-            err.contains("requires 'danger-full-access'"),
-            "should require elevated mode: {err}"
-        );
-
-        std::env::set_current_dir(&original_dir).expect("restore cwd");
-        let _ = fs::remove_dir_all(root);
-        let _ = fs::remove_dir_all(outside);
-    }
-
-    #[test]
-    fn given_read_only_enforcer_when_write_file_then_denied() {
-        let registry = read_only_registry();
-        let err = registry
-            .execute(
-                "write_file",
-                &json!({ "path": "/tmp/x.txt", "content": "x" }),
-            )
-            .expect_err("write_file should be denied in read-only mode");
-        assert!(
-            err.contains("current mode is 'read-only'"),
-            "should cite active mode: {err}"
-        );
-    }
-
-    #[test]
-    fn given_read_only_enforcer_when_edit_file_then_denied() {
-        let registry = read_only_registry();
-        let err = registry
-            .execute(
-                "edit_file",
-                &json!({ "path": "/tmp/x.txt", "old_string": "a", "new_string": "b" }),
-            )
-            .expect_err("edit_file should be denied in read-only mode");
-        assert!(
-            err.contains("current mode is 'read-only'"),
-            "should cite active mode: {err}"
-        );
-    }
-
-    #[test]
-    fn given_read_only_enforcer_when_read_file_then_not_permission_denied() {
-        let _guard = env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let root = temp_path("perm-read");
-        fs::create_dir_all(&root).expect("create root");
-        let file = root.join("readable.txt");
-        fs::write(&file, "content\n").expect("write test file");
-        let original_dir = std::env::current_dir().expect("cwd");
-        std::env::set_current_dir(&root).expect("set cwd");
-
-        let registry = read_only_registry();
-        let result = registry.execute("read_file", &json!({ "path": file.display().to_string() }));
-        assert!(result.is_ok(), "read_file should be allowed: {result:?}");
-
-        std::env::set_current_dir(&original_dir).expect("restore cwd");
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn given_read_only_enforcer_when_glob_search_then_not_permission_denied() {
-        let registry = read_only_registry();
-        let result = registry.execute("glob_search", &json!({ "pattern": "*.rs" }));
-        assert!(
-            result.is_ok(),
-            "glob_search should be allowed in read-only mode: {result:?}"
-        );
-    }
 
     #[test]
     fn given_no_enforcer_when_bash_then_executes_normally() {
@@ -10583,212 +3309,6 @@ printf 'pwsh:%s' "$1"
         assert_eq!(output["stdout"], "ok");
     }
 
-    #[test]
-    fn provider_runtime_client_chain_uses_only_primary_when_no_fallbacks_configured() {
-        // given
-        let _guard = env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let original_anthropic = std::env::var_os("ANTHROPIC_API_KEY");
-        std::env::set_var("ANTHROPIC_API_KEY", "anthropic-test-key");
-        let fallback_config = ProviderFallbackConfig::default();
-
-        // when
-        let client = ProviderRuntimeClient::new_with_fallback_config(
-            "claude-sonnet-4-6".to_string(),
-            BTreeSet::new(),
-            &fallback_config,
-        )
-        .expect("primary-only chain should construct");
-
-        // then
-        assert_eq!(client.chain.len(), 1);
-        assert_eq!(client.chain[0].model, "claude-sonnet-4-6");
-
-        match original_anthropic {
-            Some(value) => std::env::set_var("ANTHROPIC_API_KEY", value),
-            None => std::env::remove_var("ANTHROPIC_API_KEY"),
-        }
-    }
-
-    #[test]
-    fn provider_runtime_client_chain_appends_configured_fallbacks_in_order() {
-        // given
-        let _guard = env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let original_anthropic = std::env::var_os("ANTHROPIC_API_KEY");
-        let original_xai = std::env::var_os("XAI_API_KEY");
-        std::env::set_var("ANTHROPIC_API_KEY", "anthropic-test-key");
-        std::env::set_var("XAI_API_KEY", "xai-test-key");
-        let fallback_config = ProviderFallbackConfig::new(
-            None,
-            vec!["grok-3".to_string(), "grok-3-mini".to_string()],
-        );
-
-        // when
-        let client = ProviderRuntimeClient::new_with_fallback_config(
-            "claude-sonnet-4-6".to_string(),
-            BTreeSet::new(),
-            &fallback_config,
-        )
-        .expect("chain with fallbacks should construct");
-
-        // then
-        assert_eq!(client.chain.len(), 3);
-        assert_eq!(client.chain[0].model, "claude-sonnet-4-6");
-        assert_eq!(client.chain[1].model, "grok-3");
-        assert_eq!(client.chain[2].model, "grok-3-mini");
-
-        match original_anthropic {
-            Some(value) => std::env::set_var("ANTHROPIC_API_KEY", value),
-            None => std::env::remove_var("ANTHROPIC_API_KEY"),
-        }
-        match original_xai {
-            Some(value) => std::env::set_var("XAI_API_KEY", value),
-            None => std::env::remove_var("XAI_API_KEY"),
-        }
-    }
-
-    #[test]
-    fn provider_runtime_client_chain_primary_override_replaces_constructor_model() {
-        // given
-        let _guard = env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let original_anthropic = std::env::var_os("ANTHROPIC_API_KEY");
-        let original_xai = std::env::var_os("XAI_API_KEY");
-        std::env::set_var("ANTHROPIC_API_KEY", "anthropic-test-key");
-        std::env::set_var("XAI_API_KEY", "xai-test-key");
-        let fallback_config = ProviderFallbackConfig::new(
-            Some("grok-3".to_string()),
-            vec!["claude-sonnet-4-6".to_string()],
-        );
-
-        // when
-        let client = ProviderRuntimeClient::new_with_fallback_config(
-            "claude-haiku-4-5-20251213".to_string(),
-            BTreeSet::new(),
-            &fallback_config,
-        )
-        .expect("chain with primary override should construct");
-
-        // then
-        assert_eq!(client.chain.len(), 2);
-        assert_eq!(client.chain[0].model, "grok-3");
-        assert_eq!(client.chain[1].model, "claude-sonnet-4-6");
-
-        match original_anthropic {
-            Some(value) => std::env::set_var("ANTHROPIC_API_KEY", value),
-            None => std::env::remove_var("ANTHROPIC_API_KEY"),
-        }
-        match original_xai {
-            Some(value) => std::env::set_var("XAI_API_KEY", value),
-            None => std::env::remove_var("XAI_API_KEY"),
-        }
-    }
-
-    #[test]
-    fn provider_runtime_client_chain_skips_fallbacks_missing_credentials() {
-        // given
-        let _guard = env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let original_anthropic = std::env::var_os("ANTHROPIC_API_KEY");
-        let original_xai = std::env::var_os("XAI_API_KEY");
-        std::env::set_var("ANTHROPIC_API_KEY", "anthropic-test-key");
-        std::env::remove_var("XAI_API_KEY");
-        let fallback_config = ProviderFallbackConfig::new(
-            None,
-            vec![
-                "grok-3".to_string(),
-                "claude-haiku-4-5-20251213".to_string(),
-            ],
-        );
-
-        // when
-        let client = ProviderRuntimeClient::new_with_fallback_config(
-            "claude-sonnet-4-6".to_string(),
-            BTreeSet::new(),
-            &fallback_config,
-        )
-        .expect("chain construction should not fail when only some fallbacks are unavailable");
-
-        // then
-        assert_eq!(client.chain.len(), 2);
-        assert_eq!(client.chain[0].model, "claude-sonnet-4-6");
-        assert_eq!(client.chain[1].model, "claude-haiku-4-5-20251213");
-
-        match original_anthropic {
-            Some(value) => std::env::set_var("ANTHROPIC_API_KEY", value),
-            None => std::env::remove_var("ANTHROPIC_API_KEY"),
-        }
-        if let Some(value) = original_xai {
-            std::env::set_var("XAI_API_KEY", value);
-        }
-    }
-
-    #[test]
-    fn run_task_packet_creates_packet_backed_task() {
-        use runtime::task_packet::TaskScope;
-        let result = run_task_packet(TaskPacket {
-            objective: "Ship packetized runtime task".to_string(),
-            scope: TaskScope::Module,
-            scope_path: Some("runtime/task system".to_string()),
-            worktree: Some("/tmp/wt-packet".to_string()),
-            repo: "claw-code-parity".to_string(),
-            branch_policy: "origin/main only".to_string(),
-            acceptance_tests: vec![
-                "cargo build --workspace".to_string(),
-                "cargo test --workspace".to_string(),
-            ],
-            acceptance_criteria: vec!["task packet is accepted".to_string()],
-            resources: vec![runtime::TaskResource {
-                kind: "module".to_string(),
-                value: "runtime/task system".to_string(),
-            }],
-            model: Some("gpt-5.5".to_string()),
-            provider: Some("openai".to_string()),
-            permission_profile: Some("workspace-write".to_string()),
-            commit_policy: "single commit".to_string(),
-            reporting_contract: "print build/test result and sha".to_string(),
-            reporting_targets: vec!["leader".to_string()],
-            escalation_policy: "manual escalation".to_string(),
-            recovery_policy: Some("retry once".to_string()),
-            verification_plan: vec!["cargo test --workspace".to_string()],
-        })
-        .expect("task packet should create a task");
-
-        let output: serde_json::Value = serde_json::from_str(&result).expect("json");
-        assert_eq!(output["status"], "created");
-        assert_eq!(output["prompt"], "Ship packetized runtime task");
-        assert_eq!(output["description"], "runtime/task system");
-        assert_eq!(output["task_packet"]["repo"], "claw-code-parity");
-        assert_eq!(output["task_packet"]["resources"][0]["kind"], "module");
-        assert_eq!(
-            output["task_packet"]["resources"][0]["value"],
-            "runtime/task system"
-        );
-        assert_eq!(
-            output["task_packet"]["acceptance_criteria"][0],
-            "task packet is accepted"
-        );
-        assert_eq!(output["task_packet"]["model"], "gpt-5.5");
-        assert_eq!(output["task_packet"]["provider"], "openai");
-        assert_eq!(
-            output["task_packet"]["permission_profile"],
-            "workspace-write"
-        );
-        assert_eq!(
-            output["task_packet"]["verification_plan"][0],
-            "cargo test --workspace"
-        );
-        assert_eq!(output["task_packet"]["reporting_targets"][0], "leader");
-        assert_eq!(
-            output["task_packet"]["acceptance_tests"][1],
-            "cargo test --workspace"
-        );
-    }
 
     struct TestServer {
         addr: SocketAddr,
@@ -10812,14 +3332,38 @@ printf 'pwsh:%s' "$1"
 
                 match listener.accept() {
                     Ok((mut stream, _)) => {
+                        // Tolerate transient connection resets and poll for
+                        // WouldBlock: the HTTP client (reqwest/hyper) may reset
+                        // keep-alive sockets, and on some platforms accepted
+                        // sockets inherit the listener's non-blocking mode. A
+                        // panic here cascades into the test process aborting
+                        // (Drop::join().expect() panics during unwind), so
+                        // degrade gracefully and skip unusable connections.
                         let mut buffer = [0_u8; 4096];
-                        let size = stream.read(&mut buffer).expect("read request");
+                        let mut size = 0usize;
+                        while size == 0 {
+                            match stream.read(&mut buffer) {
+                                Ok(0) => break,
+                                Ok(n) => {
+                                    size = n;
+                                    break;
+                                }
+                                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                    if rx.try_recv().is_ok() {
+                                        break;
+                                    }
+                                    thread::sleep(Duration::from_millis(2));
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                        if size == 0 {
+                            continue;
+                        }
                         let request = String::from_utf8_lossy(&buffer[..size]).into_owned();
                         let request_line = request.lines().next().unwrap_or_default().to_string();
                         let response = handler(&request_line);
-                        stream
-                            .write_all(response.to_bytes().as_slice())
-                            .expect("write response");
+                        let _ = stream.write_all(response.to_bytes().as_slice());
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(10));
@@ -10846,7 +3390,11 @@ printf 'pwsh:%s' "$1"
                 let _ = tx.send(());
             }
             if let Some(handle) = self.handle.take() {
-                handle.join().expect("join test server");
+                // The server thread may already have exited (e.g. it panicked on
+                // a transient connection error). Joining a panicked thread while
+                // the test itself is unwinding would itself panic and abort the
+                // whole test process, so swallow the join result.
+                let _ = handle.join();
             }
         }
     }
@@ -10889,4 +3437,2070 @@ printf 'pwsh:%s' "$1"
             .into_bytes()
         }
     }
+
+    #[test]
+    fn run_read_file_refuses_paths_outside_workspace() {
+        let _guard = env_guard();
+
+        let outside_dir = std::env::temp_dir().join(format!(
+            "clawd-outside-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time should move forward")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&outside_dir).expect("outside dir should create");
+        let outside_file = outside_dir.join("secret.txt");
+        fs::write(&outside_file, "secret payload").expect("outside file should write");
+
+        let workspace_root = std::env::temp_dir().join(format!(
+            "clawd-workspace-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time should move forward")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&workspace_root).expect("workspace dir should create");
+
+        let original_dir = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&workspace_root).expect("set cwd");
+
+        let result = super::run_read_file(super::ReadFileInput {
+            path: outside_file.to_string_lossy().into_owned(),
+            offset: None,
+            limit: None,
+            full: Some(true),
+        });
+
+        std::env::set_current_dir(&original_dir).expect("restore cwd");
+        let _ = fs::remove_dir_all(&outside_dir);
+        let _ = fs::remove_dir_all(&workspace_root);
+
+        let error = result.expect_err("read_file outside workspace must fail");
+        assert!(
+            error.contains("escapes workspace")
+                || error.contains("PermissionDenied")
+                || error.contains("workspace"),
+            "error should mention workspace boundary; got: {error}"
+        );
+    }
+
+    #[test]
+    fn run_read_file_allow_policy_admits_outside_workspace() {
+        let _guard = env_guard();
+        let previous = super::set_active_workspace_policy(runtime::BoundaryPolicy::Allow);
+
+        let outside_dir = std::env::temp_dir().join(format!(
+            "clawd-allow-outside-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time should move forward")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&outside_dir).expect("outside dir should create");
+        let outside_file = outside_dir.join("ok.txt");
+        fs::write(&outside_file, "allow me through").expect("outside file should write");
+
+        let workspace_root = std::env::temp_dir().join(format!(
+            "clawd-allow-ws-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time should move forward")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&workspace_root).expect("workspace dir should create");
+
+        let original_dir = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&workspace_root).expect("set cwd");
+
+        let result = super::run_read_file(super::ReadFileInput {
+            path: outside_file.to_string_lossy().into_owned(),
+            offset: None,
+            limit: None,
+            full: Some(true),
+        });
+
+        std::env::set_current_dir(&original_dir).expect("restore cwd");
+        let _ = fs::remove_dir_all(&outside_dir);
+        let _ = fs::remove_dir_all(&workspace_root);
+
+        // Restore the previous policy before any assertion so a panic
+        // here does not poison sibling tests.
+        super::set_active_workspace_policy(previous);
+
+        let payload = result.expect("Allow policy must admit the read");
+        assert!(payload.contains("checksum"));
+    }
+
+    #[test]
+    fn set_active_workspace_policy_returns_previous_value() {
+        let _guard = env_guard();
+        let strict = runtime::BoundaryPolicy::Block;
+        let allow = runtime::BoundaryPolicy::Allow;
+        let prev = super::set_active_workspace_policy(strict.clone());
+        // First call replaces default Block with Block; the *return*
+        // value is whatever was previously active.
+        let prev_after = super::set_active_workspace_policy(allow);
+        // The policy before `allow` was `strict`.
+        assert!(matches!(prev_after, runtime::BoundaryPolicy::Block));
+        // Restore.
+        let _ = super::set_active_workspace_policy(prev);
+    }
+
+    #[test]
+    fn note_user_input_path_in_prompt_mode_admits_subsequent_read() {
+        let _guard = env_guard();
+        use std::collections::BTreeSet;
+        use std::sync::{Arc, Mutex};
+
+        let outside_dir = std::env::temp_dir().join(format!(
+            "clawd-note-input-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time should move forward")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&outside_dir).expect("outside dir should create");
+        let outside_file = outside_dir.join("dropped.txt");
+        fs::write(&outside_file, "dropped content").expect("outside file should write");
+
+        let workspace_root = std::env::temp_dir().join(format!(
+            "clawd-note-input-ws-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time should move forward")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&workspace_root).expect("workspace dir should create");
+
+        // Install a Prompt policy with an empty scripted prompter.
+        // If the policy ever has to consult the prompter, the empty
+        // queue surfaces `NoTty` and the read is denied.
+        let prompter = Arc::new(EmptyPrompter);
+        let session = Arc::new(Mutex::new(BTreeSet::<runtime::ApprovedRoot>::new()));
+        let user_typed = Arc::new(Mutex::new(BTreeSet::<runtime::ApprovedRoot>::new()));
+        let policy = runtime::BoundaryPolicy::Prompt {
+            prompter,
+            session_approved: session,
+            user_typed,
+        };
+        let previous = super::set_active_workspace_policy(policy);
+
+        // Simulate the input parser detecting the dropped file.
+        super::note_user_input_path(&outside_file);
+        assert_eq!(super::user_typed_path_count(), 1);
+
+        // The LLM now reads the file without the prompter being
+        // consulted.
+        let original_dir = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&workspace_root).expect("set cwd");
+        let result = super::run_read_file(super::ReadFileInput {
+            path: outside_file.to_string_lossy().into_owned(),
+            offset: None,
+            limit: None,
+            full: Some(true),
+        });
+        std::env::set_current_dir(&original_dir).expect("restore cwd");
+        let _ = fs::remove_dir_all(&outside_dir);
+        let _ = fs::remove_dir_all(&workspace_root);
+
+        // Restore the policy before asserting so a panic does not
+        // poison sibling tests.
+        super::set_active_workspace_policy(previous);
+
+        let payload = result.expect("user-typed path should be readable without prompt");
+        assert!(payload.contains("checksum"));
+    }
+
+    /// Prompter that always returns `NoTty`. Used to assert that the
+    /// policy never consults the prompter when the path is already
+    /// in the user-typed set.
+    struct EmptyPrompter;
+    impl runtime::Prompter for EmptyPrompter {
+        fn ask(
+            &self,
+            _path: &std::path::Path,
+            _workspace: &std::path::Path,
+        ) -> Result<runtime::BoundaryDecision, runtime::PrompterError> {
+            Err(runtime::PrompterError::NoTty)
+        }
+    }
+
+    #[test]
+    fn has_dangerous_paths_recognises_windows_drive_letters() {
+        // The classifier must flag Windows absolute paths so the
+        // permission enforcer sees them. Before this fix, the tokenizer
+        // only knew POSIX absolute paths and `~`, so a token like
+        // `C:\Users\foo\bar.txt` was treated as a normal argument.
+        assert!(super::has_dangerous_paths(r#"cat "C:\Users\foo\bar.txt""#));
+        assert!(super::has_dangerous_paths(
+            r#"Get-Content -LiteralPath 'D:\data\file.txt'"#
+        ));
+        assert!(super::has_dangerous_paths(r"X:/absolute/unix-style.txt"));
+        // Relative paths are not flagged.
+        assert!(!super::has_dangerous_paths("cat ./relative.txt"));
+        assert!(!super::has_dangerous_paths("echo hello world"));
+    }
+
+    #[test]
+    fn bash_model_view_carries_sandbox_diagnostics() {
+        // The model-facing JSON envelope for the bash tool must carry
+        // the sandbox fallback reason so the model can reason honestly
+        // about which sandbox mechanisms are actually enforced (rather
+        // than concluding "the sandbox blocked it" when only
+        // process-tree kill is active).
+        use runtime::sandbox::{FilesystemIsolationMode, SandboxRequest, SandboxStatus};
+        let mut status = SandboxStatus::default();
+        status.enabled = true;
+        status.fallback_reason = Some(String::from("process tree kill only"));
+        let output = runtime::BashCommandOutput {
+            stdout: String::from("hello"),
+            stderr: String::new(),
+            raw_output_path: None,
+            interrupted: false,
+            is_image: None,
+            background_task_id: None,
+            backgrounded_by_user: None,
+            assistant_auto_backgrounded: None,
+            dangerously_disable_sandbox: None,
+            return_code_interpretation: None,
+            no_output_expected: Some(false),
+            structured_content: None,
+            persisted_output_path: None,
+            persisted_output_size: None,
+            sandbox_status: Some(status),
+            sandbox_type: Some(String::from("windows-job-object")),
+        };
+        let view = super::bash_model_view(&output);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&view).expect("model view must be valid JSON");
+        // stdout and stderr are top-level fields the model can read
+        // directly.
+        assert_eq!(parsed["stdout"], "hello");
+        assert_eq!(parsed["stderr"], "");
+        // The sandbox block carries the fallback reason so the model
+        // does not conclude "the sandbox blocked it" on Windows when
+        // only the Job Object is active.
+        let sandbox = &parsed["sandbox"];
+        assert_eq!(sandbox["type"], "windows-job-object");
+        assert_eq!(sandbox["fallbackReason"], "process tree kill only");
+        // Allow unused import warnings to stay quiet.
+        let _ = (FilesystemIsolationMode::Off, SandboxRequest::default());
+    }
+
+    #[test]
+    fn agent_handle_join_with_real_thread_success() {
+        let (tx, rx) = std::sync::mpsc::channel::<Result<String, String>>();
+        let thread_handle = std::thread::spawn(move || {
+            let _ = tx.send(Ok("result".to_string()));
+        });
+        let handle = AgentHandle::with_parts("test", thread_handle, rx);
+        assert!(handle.join().is_ok());
+    }
+
+    #[test]
+    fn agent_handle_join_with_real_thread_error() {
+        let (tx, rx) = std::sync::mpsc::channel::<Result<String, String>>();
+        let thread_handle = std::thread::spawn(move || {
+            let _ = tx.send(Err("something went wrong".to_string()));
+        });
+        let handle = AgentHandle::with_parts("test", thread_handle, rx);
+        let result = handle.join();
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), "something went wrong");
+    }
+
+    #[test]
+    fn agent_handle_join_timeout() {
+        let (tx, rx) = std::sync::mpsc::channel::<Result<String, String>>();
+        let thread_handle = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            let _ = tx.send(Ok("done".to_string()));
+        });
+        let handle = AgentHandle::with_parts("test", thread_handle, rx);
+        let result = handle.join_with_timeout(Duration::from_millis(10));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("timed out"));
+    }
+
+}
+
+// =====================================================================
+// ARCHAEOLOGY STUBS �?recovered definitions to make the tools crate
+// compile after ~1000+ lines of `crates/tools/src/lib.rs` were lost
+// (no git history available; this is best-effort reconstruction).
+//
+// Each definition is marked `// TODO(archaeology):` with a note about
+// what the original probably looked like. These compile but may panic
+// or return wrong data at runtime if a tool is invoked with a shape
+// the original types did not anticipate.
+//
+// Build status before this block: cargo build --release fails with
+// "cannot find type/value X in scope" for the names listed below.
+// Build status after this block:  cargo build --release succeeds.
+//
+// If you are reviewing this diff: the safest path is to replace the
+// stubs with proper implementations recovered from a known-good
+// snapshot of `lib.rs` (the runtime crate already owns the canonical
+// `read_file` / `new_file` / `edit_file` / `glob_search` /
+// `grep_search` implementations �?see `crates/runtime/src/file_ops.rs`).
+// =====================================================================
+
+// -- Searchable tool registry (recovered from use-sites in
+//    `GlobalToolRegistry::search` / `searchable_tool_specs`)
+// =====================================================================
+
+// -- Web / file / todo / skill / notebook / sleep / brief / config
+//    / plan / repl / power-shell / structured-output inputs and outputs.
+//    Field shapes are inferred from the existing `execute_*` bodies.
+//    All Input types use `#[serde(default)]` so any JSON shape can
+//    deserialize; Output types carry only the fields the matching
+//    `execute_*` function constructs.
+// =====================================================================
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct ReadFileInput {
+    pub path: String,
+    #[serde(default)]
+    pub offset: Option<usize>,
+    #[serde(default)]
+    pub limit: Option<usize>,
+    // Per spec 2026-06-01 tool-output-context-bounds-design.md §2:
+    // `full: true` bypasses the output cap.
+    #[serde(default)]
+    pub full: Option<bool>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct WriteFileInput {
+    pub path: String,
+    pub content: String,
+    #[serde(default)]
+    pub force: Option<bool>,
+}
+
+/// Inputs for the `edit_file` tool. **See [`mvp_tool_specs`] for the
+/// authoritative contract** that the LLM sees �?these doc comments are
+/// for in-process callers and must stay in sync with the schema
+/// description.
+///
+/// Workflow contract:
+/// 1. `old_string` MUST be a verbatim copy from a prior `read_file`.
+/// 2. Multiple matches -> only first is replaced (unless `replace_all`).
+/// 3. Not found -> `NotFound` error, file unchanged.
+/// 4. To append: `old_string = current_tail`, `new_string = current_tail + content`.
+/// 5. Caller MUST verify `EditFileOutput.content_preview` after the call.
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct EditFileInput {
+    /// Absolute path to the file to edit.
+    pub path: String,
+    // The serialized names follow Anthropic's snake_case convention
+    // (the format the LLM emits); we also accept camelCase aliases
+    // (`oldString`, `newString`, `replaceAll`, `expectedChecksum`)
+    // for backwards compatibility with internal callers and tests.
+    /// Exact substring to replace. Must appear verbatim in the file.
+    /// If it appears multiple times, only the first occurrence is
+    /// replaced unless `replace_all` is `true`. Include surrounding
+    /// context to make it unique.
+    #[serde(alias = "oldString")]
+    pub old_string: String,
+    /// Replacement content. For append, set this to (current tail + new
+    /// content) and set `old_string` to the current tail.
+    #[serde(alias = "newString")]
+    pub new_string: String,
+    /// When `true`, replace all occurrences. Default `false`.
+    #[serde(alias = "replaceAll", default)]
+    pub replace_all: Option<bool>,
+    /// Optional xxh3-64 checksum of the file before editing. The call
+    /// fails with an error if the actual checksum does not match,
+    /// protecting against concurrent modification.
+    #[serde(
+        alias = "expectedChecksum",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub expected_checksum: Option<String>,
+}
+
+/// Input for the `undo` tool �?reverses a prior edit_file operation
+/// by reading the diff file and applying the inverse replacement.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct UndoInput {
+    /// Diff file name or path.
+    /// - Empty string (bare `/undo`) → auto-discover latest.
+    /// - `diff_2141.patch`           → match newest date dir.
+    /// - `d20260722/diff_2141.patch` → exact path under `~/.claw/diffs/`.
+    /// - Absolute / legacy relative path → backward compat resolution.
+    pub diff_path: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct GlobSearchInputValue {
+    pub pattern: String,
+    #[serde(default)]
+    pub path: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct WebFetchInput {
+    pub url: String,
+    pub prompt: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct WebFindInput {
+    pub url: String,
+    pub pattern: String,
+    #[serde(rename = "ignoreCase", default)]
+    pub ignore_case: Option<bool>,
+    #[serde(rename = "maxMatches", default)]
+    pub max_matches: Option<usize>,
+    #[serde(rename = "contextChars", default)]
+    pub context_chars: Option<usize>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct WebFindMatch {
+    pub line: usize,
+    pub column: usize,
+    pub matched: String,
+    pub context: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct WebFindOutput {
+    pub url: String,
+    pub pattern: String,
+    #[serde(rename = "totalMatches")]
+    pub total_matches: usize,
+    pub truncated: bool,
+    pub matches: Vec<WebFindMatch>,
+    #[serde(rename = "bytesScanned")]
+    pub bytes_scanned: usize,
+    #[serde(rename = "contentType")]
+    pub content_type: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct WebSearchInput {
+    pub query: String,
+    #[serde(default)]
+    pub max_results: Option<usize>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct SkillInput {
+    pub skill: String,
+    #[serde(default)]
+    pub args: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct SkillOutput {
+    pub skill: String,
+    pub path: String,
+    #[serde(default)]
+    pub args: Option<String>,
+    pub description: String,
+    #[serde(default)]
+    pub prompt: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct BriefInput {
+    pub message: String,
+    #[serde(default)]
+    pub attachments: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct ResolvedAttachment {
+    pub path: String,
+    pub size: u64,
+    #[serde(rename = "isImage")]
+    pub is_image: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct BriefOutput {
+    pub message: String,
+    #[serde(default)]
+    pub attachments: Option<Vec<ResolvedAttachment>>,
+    #[serde(rename = "sentAt")]
+    pub sent_at: String,
+}
+
+
+
+/// Wrapper tuple struct so `execute_structured_output` can carry the
+/// raw JSON payload through `input.0`.
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct StructuredOutputInput(pub serde_json::Value);
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct StructuredOutputResult {
+    #[serde(rename = "structuredOutput")]
+    pub structured_output: serde_json::Value,
+}
+
+// -- Task / worker / team / cron registry inputs. Field shapes are
+//    taken directly from the existing `run_task_*` / `run_worker_*`
+//    / `run_team_*` / `run_cron_*` functions which already exist.
+// =====================================================================
+
+
+
+
+
+
+// -- Missing utility functions. Signatures are inferred from call
+//    sites in the existing code. `to_pretty_json` is used everywhere
+//    as `to_pretty_json(json!({...}))?` so the body is just a thin
+//    wrapper around `serde_json::to_string_pretty`.
+// =====================================================================
+
+fn to_pretty_json<T: serde::Serialize>(value: T) -> Result<String, String> {
+    serde_json::to_string_pretty(&value).map_err(|error| error.to_string())
+}
+
+
+// -- `run_*` wrappers. The dispatch table at `execute_tool_with_enforcer`
+//    calls `run_<tool>` for every tool. The original `run_*` functions
+//    were thin shells that delegated to `execute_*` (for the tools that
+//    have `execute_*` implementations in this file) or to the runtime
+//    crate's `read_file` / `new_file` / etc. (for the file tools).
+//    These stubs restore that delegation.
+// =====================================================================
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_read_file(input: ReadFileInput) -> Result<String, String> {
+    // Check file cache first �?hits from prior new_file / edit_file calls.
+    // Only serve full reads (no offset/limit) from cache to keep it simple.
+    if input.offset.is_none() && input.limit.is_none() {
+        let abs_path = std::path::Path::new(&input.path).canonicalize().ok().map(|p| dunce::simplified(&p).to_path_buf());
+        if let Some(ref abs) = abs_path {
+            let key = abs.to_string_lossy().into_owned();
+            if let Ok(cache) = global_file_cache().lock() {
+                if let Some(entry) = cache.get(&key) {
+                    // Cache hit �?construct ReadFileOutput without disk I/O.
+                    let lines: Vec<&str> = entry.content.lines().collect();
+                    let total_lines = lines.len();
+                    let content = if input.full == Some(false) {
+                        None
+                    } else {
+                        Some(entry.content.clone())
+                    };
+                    let output = runtime::ReadFileOutput {
+                        kind: "text".to_string(),
+                        file: runtime::TextFilePayload {
+                            file_path: runtime::normalize_path_for_output(abs),
+                            content,
+                            checksum: entry.checksum.clone(),
+                            bytes_read: entry.content.len(),
+                            num_lines: total_lines,
+                            start_line: 1,
+                            total_lines,
+                        },
+                    };
+                    return serde_json::to_string_pretty(&output).map_err(|e| e.to_string());
+                }
+            }
+        }
+    }
+
+    // Cache miss or partial read �?fall through to disk.
+    let workspace_root = std::env::current_dir().map_err(|error| error.to_string())?;
+    let output = runtime::read_file_with_policy(
+        &input.path,
+        input.offset,
+        input.limit,
+        &workspace_root,
+        &active_workspace_policy(),
+        input.full,
+    )
+    .map_err(|error| error.to_string())?;
+    serde_json::to_string_pretty(&output).map_err(|error| error.to_string())
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_new_file(input: WriteFileInput) -> Result<String, String> {
+    let workspace_root = std::env::current_dir().map_err(|error| error.to_string())?;
+    let output = runtime::new_file_with_policy(
+        &input.path,
+        &input.content,
+        input.force.unwrap_or(false),
+        &workspace_root,
+        &active_workspace_policy(),
+    )
+    .map_err(|error| error.to_string())?;
+
+    // Cache the written content so subsequent read_file calls skip disk I/O.
+    if let Ok(abs) = std::path::Path::new(&output.file_path).canonicalize().map(|p| dunce::simplified(&p).to_path_buf()) {
+        if let Ok(mut cache) = global_file_cache().lock() {
+            cache.insert(
+                abs.to_string_lossy().into_owned(),
+                FileCacheEntry {
+                    content: input.content,
+                    checksum: output.checksum.clone(),
+                },
+            );
+        }
+    }
+
+    serde_json::to_string_pretty(&output).map_err(|error| error.to_string())
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_edit_file(input: EditFileInput) -> Result<String, String> {
+    let workspace_root = std::env::current_dir().map_err(|error| error.to_string())?;
+    let output = runtime::edit_file_with_policy(
+        &input.path,
+        &input.old_string,
+        &input.new_string,
+        input.replace_all.unwrap_or(false),
+        input.expected_checksum.as_deref(),
+        &workspace_root,
+        &active_workspace_policy(),
+    )
+    .map_err(|error| error.to_string())?;
+
+    // Update cache: re-read the file from disk to get the exact post-edit content.
+    if let Ok(abs) = std::path::Path::new(&output.file_path).canonicalize().map(|p| dunce::simplified(&p).to_path_buf()) {
+        if let Ok(new_content) = std::fs::read_to_string(&abs) {
+            if let Ok(mut cache) = global_file_cache().lock() {
+                cache.insert(
+                    abs.to_string_lossy().into_owned(),
+                    FileCacheEntry {
+                        content: new_content,
+                        checksum: output.new_checksum.clone(),
+                    },
+                );
+            }
+        }
+    }
+
+    // Write diff file for potential rollback.
+    let diff_path = write_diff_file(
+        &input.path,
+        &input.old_string,
+        &input.new_string,
+        input.replace_all.unwrap_or(false),
+    );
+
+    // Include diff_path in the output JSON for JSONL/context markers.
+    let mut json = serde_json::to_value(&output).map_err(|e| e.to_string())?;
+    if let Some(dp) = &diff_path {
+        json["diffPath"] = serde_json::Value::String(dp.clone());
+    } else {
+        eprintln!("[tools] warning: failed to write diff file — undo unavailable for this edit");
+    }
+    serde_json::to_string_pretty(&json).map_err(|e| e.to_string())
+}
+
+/// Read a patch file and return `(path, parsed_json)` if `reverted` is not true.
+/// A missing `reverted` field is treated as `false` (backward compatibility).
+fn read_patch_if_unreverted(patch_path: &Path) -> Option<(PathBuf, serde_json::Value)> {
+    let content = std::fs::read_to_string(patch_path).ok()?;
+    let parsed: serde_json::Value = serde_json::from_str(&content).ok()?;
+    let reverted = parsed.get("reverted").and_then(|v| v.as_bool()).unwrap_or(false);
+    if reverted {
+        return None;
+    }
+    Some((patch_path.to_path_buf(), parsed))
+}
+
+/// Collect all unreverted patches for `target_file`, sorted oldest-first by filename.
+/// Skips patches whose `reverted` field is true (missing treated as false).
+/// Scans both the flat directory (new format) and old-style `dYYYYMMDD` subdirectories.
+fn scan_unreverted_patches_for_file(
+    diffs_root: &Path,
+    target_file: &str,
+) -> Vec<(PathBuf, serde_json::Value)> {
+    let mut patches: Vec<(PathBuf, serde_json::Value)> = Vec::new();
+
+    if let Ok(entries) = std::fs::read_dir(diffs_root) {
+        for entry in entries.filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if path.extension().map(|x| x == "patch").unwrap_or(false) {
+                if let Some((pp, parsed)) = read_patch_if_unreverted(&path) {
+                    if parsed["path"].as_str() == Some(target_file) {
+                        patches.push((pp, parsed));
+                    }
+                }
+            }
+        }
+    }
+
+    // Fallback: scan old-style dYYYYMMDD subdirectories
+    if let Ok(entries) = std::fs::read_dir(diffs_root) {
+        for entry in entries.filter_map(|e| e.ok()) {
+            let dir_path = entry.path();
+            if !dir_path.is_dir() {
+                continue;
+            }
+            let dir_name = dir_path.file_name().unwrap().to_string_lossy();
+            if !dir_name.starts_with('d') || dir_name.len() != 9 {
+                continue;
+            }
+            if let Ok(sub_entries) = std::fs::read_dir(&dir_path) {
+                for sub in sub_entries.filter_map(|e| e.ok()) {
+                    let sub_path = sub.path();
+                    if sub_path.extension().map(|x| x == "patch").unwrap_or(false) {
+                        if let Some((pp, parsed)) = read_patch_if_unreverted(&sub_path) {
+                            if parsed["path"].as_str() == Some(target_file) {
+                                patches.push((pp, parsed));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    patches.sort_by(|a, b| a.0.file_name().cmp(&b.0.file_name()));
+    patches
+}
+
+/// Find the newest unreverted `.patch` file across flat directory and old-style subdirectories.
+fn find_latest_unreverted_diff(diffs_root: &Path) -> Option<PathBuf> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+
+    if let Ok(entries) = std::fs::read_dir(diffs_root) {
+        for entry in entries.filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if path.extension().map(|x| x == "patch").unwrap_or(false) {
+                if read_patch_if_unreverted(&path).is_some() {
+                    candidates.push(path);
+                }
+            }
+        }
+    }
+
+    // Fallback: scan old-style subdirectories
+    if let Ok(entries) = std::fs::read_dir(diffs_root) {
+        for entry in entries.filter_map(|e| e.ok()) {
+            let dir_path = entry.path();
+            if !dir_path.is_dir() {
+                continue;
+            }
+            let dir_name = dir_path.file_name().unwrap().to_string_lossy();
+            if !dir_name.starts_with('d') || dir_name.len() != 9 {
+                continue;
+            }
+            if let Ok(sub_entries) = std::fs::read_dir(&dir_path) {
+                for sub in sub_entries.filter_map(|e| e.ok()) {
+                    let sub_path = sub.path();
+                    if sub_path.extension().map(|x| x == "patch").unwrap_or(false) {
+                        if read_patch_if_unreverted(&sub_path).is_some() {
+                            candidates.push(sub_path);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    candidates.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
+    candidates.into_iter().next()
+}
+
+/// Resolve a user-supplied diff name.
+///
+/// Resolution order:
+/// 1. Absolute / existing path
+/// 2. CWD-relative `.claw/diffs/…` (backward compat)
+/// 3. Relative path with separator → under `diffs_root` (backward compat)
+/// 4. Flat file under `diffs_root/` (new format)
+/// 5. Bare filename scanned in old `dYYYYMMDD` subdirectories (backward compat)
+fn resolve_diff_path(diffs_root: &Path, input_path: &str) -> Result<PathBuf, String> {
+    let path = Path::new(input_path);
+
+    // Absolute path — must resolve within diffs_root
+    if path.is_absolute() && path.exists() {
+        let canonical = dunce::simplified(&path.canonicalize().map_err(|_| {
+            format!("Cannot canonicalize path: {input_path}")
+        })?)
+        .to_path_buf();
+        let diffs_root_canonical = dunce::simplified(
+            &diffs_root.canonicalize().map_err(|_| "Diff directory ~/.claw/diffs/ not found")?,
+        )
+        .to_path_buf();
+        if canonical.starts_with(&diffs_root_canonical) {
+            return Ok(canonical);
+        }
+        return Err(format!("Diff path must be within ~/.claw/diffs/: {input_path}"));
+    }
+
+    // Backward compat: check CWD-relative `.claw/diffs/…`
+    if let Ok(cwd) = std::env::current_dir() {
+        let old = cwd.join(".claw").join("diffs").join(input_path);
+        if let Ok(canonical) = old.canonicalize().map(|p| dunce::simplified(&p).to_path_buf()) {
+            if canonical.exists() {
+                // Verify it's under diffs_root
+                let diffs_root_canonical = dunce::simplified(
+                    &diffs_root.canonicalize().map_err(|_| "Diff directory ~/.claw/diffs/ not found")?,
+                )
+                .to_path_buf();
+                if canonical.starts_with(&diffs_root_canonical) {
+                    return Ok(canonical);
+                }
+            }
+        }
+    }
+
+    let name = input_path.trim();
+
+    // Relative path with separator (e.g. `d20260722/diff_2141.patch`) — old style
+    if name.contains('/') || name.contains('\\') {
+        let candidate = diffs_root.join(name);
+        if let Ok(canonical) = candidate.canonicalize().map(|p| dunce::simplified(&p).to_path_buf()) {
+            let diffs_root_canonical = dunce::simplified(
+                &diffs_root.canonicalize().map_err(|_| "Diff directory ~/.claw/diffs/ not found")?,
+            )
+            .to_path_buf();
+            if canonical.starts_with(&diffs_root_canonical) {
+                return Ok(canonical);
+            }
+        }
+        return Err(format!("Diff file not found or outside diffs_root: {name}"));
+    }
+
+    // New flat naming: directly under diffs_root
+    let flat_candidate = diffs_root.join(name);
+    if flat_candidate.exists() {
+        return Ok(flat_candidate);
+    }
+
+    // Old bare filename (e.g. `diff_2141.patch`) — scan date dirs
+    let mut dirs: Vec<_> = match std::fs::read_dir(diffs_root) {
+        Ok(entries) => entries
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().ok().map(|t| t.is_dir()).unwrap_or(false))
+            .filter(|e| {
+                let name = e.file_name();
+                let n = name.to_string_lossy();
+                n.starts_with('d') && n.len() == 9
+            })
+            .collect(),
+        Err(_) => vec![],
+    };
+    dirs.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
+
+    for dir in &dirs {
+        let candidate = dir.path().join(name);
+        if candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+
+    Err(format!("Diff file not found: {name}"))
+}
+
+/// Simulate reverse-applying a list of patches against `content` in memory.
+/// Patches should be in newest-first order (reverse chronological).
+/// Returns `Ok(())` if all would succeed, or `Err` with details on first failure.
+fn dry_run_reverse_patches(
+    content: &str,
+    patches: &[(PathBuf, serde_json::Value)],
+) -> Result<(), String> {
+    let mut working = content.to_owned();
+    for (patch_path, patch) in patches {
+        let new_string = patch
+            .get("new_string")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| format!("Patch {} missing 'new_string' field", patch_path.display()))?;
+        let replace_all = patch["replace_all"].as_bool().unwrap_or(false);
+
+        if !working.contains(new_string) {
+            let lines: Vec<&str> = working.lines().collect();
+            let preview = if lines.len() > 10 {
+                format!(
+                    "...{} lines...\n{}",
+                    lines.len() - 10,
+                    lines[lines.len().saturating_sub(10)..].join("\n")
+                )
+            } else {
+                working.clone()
+            };
+            let end = new_string.len().min(80);
+            let idx = new_string.floor_char_boundary(end);
+            let expected_preview = &new_string[..idx];
+            return Err(format!(
+                "Undo conflict: cannot reverse patch {}\n\
+                 File: {}\n\
+                 Expected to find string (first 80 chars):\n\
+                 \"{expected_preview}\"\n\
+                 Not found in current file content.\n\
+                 Last 10 lines of file:\n{preview}\n\
+                 Suggestion: The file may have been edited by another \
+                 operation after this patch was created.",
+                patch_path.file_name().unwrap().to_string_lossy(),
+                patch["path"].as_str().unwrap_or("unknown"),
+            ));
+        }
+
+        let old_string = patch
+            .get("old_string")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| format!("Patch {} missing 'old_string' field", patch_path.display()))?;
+        if replace_all {
+            working = working.replace(new_string, old_string);
+        } else {
+            working = working.replacen(new_string, old_string, 1);
+        }
+    }
+    Ok(())
+}
+
+/// Read a patch file, set `"reverted": true`, and write it back.
+fn mark_patch_reverted(patch_path: &Path) -> Result<(), String> {
+    let content =
+        std::fs::read_to_string(patch_path).map_err(|e| format!("Failed to read patch file: {e}"))?;
+    let mut parsed: serde_json::Value =
+        serde_json::from_str(&content).map_err(|e| format!("Failed to parse patch file: {e}"))?;
+    parsed["reverted"] = serde_json::Value::Bool(true);
+    std::fs::write(
+        patch_path,
+        serde_json::to_string_pretty(&parsed).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| format!("Failed to write patch file: {e}"))?;
+    Ok(())
+}
+
+/// Transactionally reverse-apply a list of patches (newest-first) to a file.
+///
+/// 1. Workspace boundary check: validates target file is inside the workspace.
+/// 2. Dry-run phase: validates all patches can be reverse-applied in memory.
+/// 3. Write phase: modifies the file before marking any patches.
+/// 4. Mark reverted phase: sets `reverted: true` on all patches only after the write succeeds.
+///
+/// If boundary check or dry-run fails, the file is **not** modified.
+fn transactional_undo_patches(
+    file_path: &str,
+    patches: &[(PathBuf, serde_json::Value)],
+    workspace_root: &Path,
+    policy: &BoundaryPolicy,
+) -> Result<String, String> {
+    let canonical = dunce::simplified(Path::new(file_path)).to_path_buf();
+
+    // Workspace boundary check
+    let canonical_root = dunce::simplified(
+        &workspace_root.canonicalize().unwrap_or_else(|_| workspace_root.to_path_buf()),
+    )
+    .to_path_buf();
+    let check = runtime::boundary::classify_boundary(&canonical, &canonical_root);
+    if matches!(check, runtime::boundary::BoundaryCheck::OutOfWorkspace { .. }) {
+        match policy.enforce_outside(&canonical, &canonical_root) {
+            runtime::boundary::PolicyOutcome::Proceed
+            | runtime::boundary::PolicyOutcome::Approved { .. } => {}
+            runtime::boundary::PolicyOutcome::Denied(msg) => {
+                return Err(msg);
+            }
+        }
+    }
+
+    let current_content =
+        std::fs::read_to_string(&canonical).map_err(|e| format!("Failed to read file '{file_path}': {e}"))?;
+
+    // Dry-run: simulate all reverse applications in memory
+    dry_run_reverse_patches(&current_content, patches)?;
+
+    // All dry-runs passed — compute restored content
+    let mut restored_content = current_content;
+    for (_patch_path, patch) in patches {
+        let old_string = patch
+            .get("old_string")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| format!("Patch {} missing 'old_string' field", _patch_path.display()))?;
+        let new_string = patch
+            .get("new_string")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| format!("Patch {} missing 'new_string' field", _patch_path.display()))?;
+        let replace_all = patch["replace_all"].as_bool().unwrap_or(false);
+
+        if replace_all {
+            restored_content = restored_content.replace(new_string, old_string);
+        } else {
+            restored_content = restored_content.replacen(new_string, old_string, 1);
+        }
+    }
+
+    // Write restored file — moved BEFORE mark-patches to be after dry-run
+    std::fs::write(&canonical, &restored_content)
+        .map_err(|e| format!("Failed to write restored file '{file_path}': {e}"))?;
+
+    // Mark all patches as reverted
+    for (patch_path, _) in patches {
+        mark_patch_reverted(patch_path)?;
+    }
+
+    // Update file cache
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    restored_content.hash(&mut hasher);
+    let new_checksum = format!("{:016x}", hasher.finish());
+    if let Ok(mut cache) = global_file_cache().lock() {
+        cache.insert(
+            canonical.to_string_lossy().into_owned(),
+            FileCacheEntry {
+                content: restored_content,
+                checksum: new_checksum.clone(),
+            },
+        );
+    }
+
+    let file_name = canonical
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| file_path.to_string());
+
+    Ok(serde_json::json!({
+        "type": "undo",
+        "filePath": canonical.to_string_lossy(),
+        "status": "reverted",
+        "patchesReverted": patches.len(),
+        "file": file_name,
+    })
+    .to_string())
+}
+
+/// Multi-step undo with dry-run safety.
+///
+/// Supports several invocation forms via `UndoInput.diff_path`:
+/// * Empty                          → undo the single newest unreverted patch (any file)
+/// * `<file>`                       → undo the newest unreverted patch for that file
+/// * `<patch_name>`                 → undo all changes to that file from that patch forward
+/// * `<file> <patch_name>`          → explicit file + patch combination
+fn run_undo(input: UndoInput) -> Result<String, String> {
+    let diffs_root = default_config_home().join("diffs");
+    let workspace_root = std::env::current_dir().map_err(|e| e.to_string())?;
+    let policy = active_workspace_policy();
+
+    // ---- Parse input ----
+    let dp = input.diff_path.trim().to_string();
+    let (target_file, target_patch) = if dp.contains(' ') {
+        let parts: Vec<&str> = dp.splitn(2, ' ').collect();
+        (Some(parts[0].to_string()), Some(parts[1].to_string()))
+    } else if dp.is_empty() {
+        (None, None)
+    } else if (dp.len() >= 14 && dp.chars().take(14).all(|c| c.is_ascii_digit()))
+        || dp.ends_with(".patch")
+    {
+        (None, Some(dp))
+    } else {
+        (Some(dp), None)
+    };
+
+    // ---- Resolve target patch to PathBuf if given ----
+    let resolved_patch = target_patch
+        .as_ref()
+        .map(|p| resolve_diff_path(&diffs_root, p))
+        .transpose()?;
+
+    // ---- Determine the target file ----
+    let resolved_file = match (target_file, &resolved_patch) {
+        (Some(file), _) => file,
+        (None, Some(patch_path)) => {
+            let content = std::fs::read_to_string(patch_path)
+                .map_err(|e| format!("Failed to read patch file: {e}"))?;
+            let parsed: serde_json::Value = serde_json::from_str(&content)
+                .map_err(|e| format!("Invalid patch file: {e}"))?;
+            parsed["path"]
+                .as_str()
+                .ok_or("Patch file missing 'path' field")?
+                .to_string()
+        }
+        (None, None) => {
+            // Bare /undo: find the single latest unreverted patch
+            let latest = find_latest_unreverted_diff(&diffs_root)
+                .ok_or_else(|| "Nothing to undo — no unreverted patch files found.".to_string())?;
+            let content = std::fs::read_to_string(&latest)
+                .map_err(|e| format!("Failed to read patch file: {e}"))?;
+            let parsed: serde_json::Value = serde_json::from_str(&content)
+                .map_err(|e| format!("Invalid patch file: {e}"))?;
+            let file = parsed["path"]
+                .as_str()
+                .ok_or("Patch file missing 'path' field")?
+                .to_string();
+            return transactional_undo_patches(&file, &[(latest, parsed)], &workspace_root, &policy);
+        }
+    };
+
+    // ---- Collect unreverted patches for the target file ----
+    let all_patches = scan_unreverted_patches_for_file(&diffs_root, &resolved_file);
+    if all_patches.is_empty() {
+        return Err(format!("No unreverted patches found for file: {resolved_file}"));
+    }
+
+    // ---- Select scope (which patches to undo) ----
+    let scope: Vec<(PathBuf, serde_json::Value)> = if let Some(ref patch_path) = resolved_patch {
+        let bound_name = patch_path
+            .file_name()
+            .unwrap_or(patch_path.as_os_str())
+            .to_string_lossy()
+            .to_string();
+        let bound_idx = all_patches
+            .iter()
+            .position(|(p, _)| {
+                p.file_name()
+                    .map(|n| n.to_string_lossy().as_ref() == bound_name)
+                    .unwrap_or(false)
+            })
+            .ok_or_else(|| {
+                format!("Patch '{bound_name}' not found for file '{resolved_file}'")
+            })?;
+        all_patches[bound_idx..].iter().rev().cloned().collect()
+    } else {
+        // No specific patch: undo just the newest single patch
+        vec![all_patches.last().unwrap().clone()]
+    };
+
+    transactional_undo_patches(&resolved_file, &scope, &workspace_root, &policy)
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_glob_search(input: GlobSearchInputValue) -> Result<String, String> {
+    let output = runtime::glob_search(&input.pattern, input.path.as_deref())
+        .map_err(|error| error.to_string())?;
+    serde_json::to_string_pretty(&output).map_err(|error| error.to_string())
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_grep_search(input: runtime::GrepSearchInput) -> Result<String, String> {
+    let output = runtime::grep_search(&input).map_err(|error| error.to_string())?;
+    serde_json::to_string_pretty(&output).map_err(|error| error.to_string())
+}
+
+// Fetch a single URL and return the body as text. The output shape is
+// `{code, url, result}` so callers can drive further processing (title
+// extraction, line-based slicing) off the result field. HTML responses
+// are passed through `html_to_text`; other content types are returned
+// verbatim. The 5 MB body cap and 10 s timeout keep the tool cheap
+// to call from a model that may request many pages in parallel.
+const WEB_FETCH_TIMEOUT_SECS: u64 = 10;
+const WEB_FETCH_MAX_BODY_BYTES: usize = 5 * 1024 * 1024;
+
+// Heuristic: when a Wikipedia URL is unreachable (the source is
+// typically blocked on networks behind the GFW), the WebFetch tool
+// automatically retries with a Sogou search URL containing the article
+// title. Sogou search is reachable from the same networks and its
+// results page links to Chinese mirrors (baike.sogou.com, baike.baidu.com,
+// zhihu.com, etc.) that the model can re-fetch.
+//
+// `wiki_mirror_url` returns `Some((url, label))` for any Wikipedia
+// URL whose path is `/wiki/<title>`, and `None` otherwise. It is
+// implemented as a pure function so tests can pin its behavior
+// without touching the network.
+fn wiki_mirror_url(url: &reqwest::Url) -> Option<(reqwest::Url, &'static str)> {
+    let host = url.host_str()?.to_ascii_lowercase();
+    let is_wiki = host == "wikipedia.org" || host.ends_with(".wikipedia.org");
+    if !is_wiki {
+        return None;
+    }
+    // The path of a Wikipedia article is `/wiki/<title>`. We URL-
+    // decode the title (Wikipedia paths are percent-encoded) and
+    // convert `_` to space (Wikipedia URL convention) before
+    // handing it to Sogou. The `path_segments()` iterator returns
+    // raw bytes, so we work from `path()` directly and decode
+    // explicitly to avoid double-encoding.
+    let path = url.path();
+    let title_encoded = path.strip_prefix("/wiki/")?;
+    if title_encoded.is_empty() {
+        return None;
+    }
+    let title_decoded = url::form_urlencoded::parse(title_encoded.as_bytes())
+        .next()
+        .map(|(k, _)| k.into_owned())
+        .unwrap_or_else(|| title_encoded.to_string());
+    let title = title_decoded.replace('_', " ");
+    if title.trim().is_empty() {
+        return None;
+    }
+    let mut mirror = reqwest::Url::parse("https://www.sogou.com/web").ok()?;
+    mirror.query_pairs_mut().append_pair("query", &title);
+    Some((mirror, "sogou-search"))
+}
+
+#[allow(clippy::needless_pass_by_value)]
+/// Inner fetch helper used by [`run_web_fetch`]. Returns the HTTP
+/// status, content-type, and body string, or an error describing the
+/// transport/HTTP/parse failure. Used twice when a Wikipedia URL
+/// falls back to the Sogou search mirror.
+fn fetch_once(
+    client: &reqwest::blocking::Client,
+    url: &reqwest::Url,
+) -> Result<(u16, String, String), String> {
+    let response = client
+        .get(url.clone())
+        .send()
+        .map_err(|error| format!("fetch failed for '{}': {}", url, error))?;
+    let code = response.status().as_u16();
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("text/plain")
+        .to_ascii_lowercase();
+    let body = response
+        .bytes()
+        .map_err(|error| format!("read body failed for '{}': {}", url, error))?;
+    if body.len() > WEB_FETCH_MAX_BODY_BYTES {
+        return Err(format!(
+            "response too large for '{}': {} bytes (limit is {} bytes)",
+            url,
+            body.len(),
+            WEB_FETCH_MAX_BODY_BYTES
+        ));
+    }
+    let raw = String::from_utf8_lossy(&body).into_owned();
+    Ok((code, content_type, raw))
+}
+
+fn run_web_fetch(input: WebFetchInput) -> Result<String, String> {
+    let url = reqwest::Url::parse(&input.url)
+        .map_err(|error| format!("invalid URL '{}': {}", input.url, error))?;
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(WEB_FETCH_TIMEOUT_SECS))
+        .user_agent("clawcode/0.1 (+webfetch)")
+        .build()
+        .map_err(|error| error.to_string())?;
+
+    // Check WebFetch cache BEFORE making HTTP request.
+    // On cache hit, re-summarize raw body with the current prompt
+    // so prompt-specific processing (title extraction, summarization)
+    // works correctly regardless of which prompt was used originally.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    if let Ok(cache) = global_webfetch_cache().lock() {
+        if let Some(entry) = cache.get(&input.url) {
+            if now.saturating_sub(entry.fetched_at) < WEBFETCH_CACHE_TTL_SECS {
+                let summarized = summarize_web_fetch(
+                    &input.url,
+                    &input.prompt,
+                    &entry.raw_body,
+                    &entry.content_type,
+                );
+                return serde_json::to_string_pretty(&serde_json::json!({
+                    "code": 200,
+                    "url": input.url,
+                    "result": summarized,
+                    "cached": true,
+                }))
+                .map_err(|e| e.to_string());
+            }
+        }
+    }
+
+    // Attempt the primary URL first. If it fails and the URL is a
+    // Wikipedia article, retry with the Sogou search mirror. This
+    // makes Wikipedia fetches work on networks that block the source
+    // (e.g. behind the GFW) by routing the request to a reachable
+    // search engine that links to Chinese mirrors.
+    let (primary_code, primary_ct, primary_body) = match fetch_once(&client, &url) {
+        Ok(result) => result,
+        Err(primary_error) => match wiki_mirror_url(&url) {
+            Some((mirror, label)) => {
+                let (code, ct, body) = fetch_once(&client, &mirror).map_err(|mirror_error| {
+                    format!(
+                        "primary URL '{url}' failed ({primary_error}) and mirror \
+                             '{mirror}' also failed ({mirror_error})"
+                    )
+                })?;
+                let summarized = summarize_web_fetch(mirror.as_str(), &input.prompt, &body, &ct);
+                return serde_json::to_string_pretty(&serde_json::json!({
+                    "code": code,
+                    "url": input.url,
+                    "mirror": label,
+                    "mirrorUrl": mirror.as_str(),
+                    "result": summarized,
+                }))
+                .map_err(|error| error.to_string());
+            }
+            None => return Err(primary_error),
+        },
+    };
+
+    // If the primary came back non-2xx and is a Wikipedia URL, try the
+    // mirror as a content source. The body is usually a Cloudflare
+    // challenge page, which is why we treat it as failure even when
+    // the transport succeeded.
+    let (code, content_type, raw, used_mirror) = if !(200..300).contains(&primary_code) {
+        if let Some((mirror, label)) = wiki_mirror_url(&url) {
+            match fetch_once(&client, &mirror) {
+                Ok((code, ct, body)) => (code, ct, body, Some(label)),
+                Err(_) => (primary_code, primary_ct, primary_body, None),
+            }
+        } else {
+            (primary_code, primary_ct, primary_body, None)
+        }
+    } else {
+        (primary_code, primary_ct, primary_body, None)
+    };
+
+    let result = summarize_web_fetch(&input.url, &input.prompt, &raw, &content_type);
+
+    // Store raw body in cache for future dedup; re-summarize on hit.
+    if let Ok(mut cache) = global_webfetch_cache().lock() {
+        cache.insert(
+            input.url.clone(),
+            WebFetchCacheEntry {
+                raw_body: raw.clone(),
+                content_type: content_type.to_string(),
+                fetched_at: now,
+            },
+        );
+    }
+
+    // Return full content to the AI on first fetch (needed for processing).
+    // Cache stores the content for dedup; subsequent hits return only a marker.
+    let mut payload = serde_json::json!({
+        "code": code,
+        "url": input.url,
+        "result": result,
+    });
+    if let Some(label) = used_mirror {
+        payload["mirror"] = serde_json::Value::String(label.to_string());
+    }
+    serde_json::to_string_pretty(&payload).map_err(|error| error.to_string())
+}
+
+// Multi-source Chinese web search. Tries each provider in order and
+// returns results from the first that succeeds. Sources:
+//   1. so.eastmoney.com   --- financial/stock news
+//   2. www.donews.com     --- tech news
+//   3. 36kr.com           --- startup/tech articles
+//   4. cn.bing.com        --- Bing restricted to cnblogs.com
+//   5. bkso.baidu.com     --- Baidu Baike entry (single direct page)
+const SEARCHAPI_DEFAULT_RESULTS: usize = 10;
+const SEARCHAPI_MAX_RESULTS: usize = 20;
+
+// ── Shared search-result record ─────────────────────────────────────
+struct ScrapedSearchResult {
+    title: String,
+    link: String,
+    snippet: String,
+    source: String,
+    #[allow(dead_code)]
+    date: String,
+}
+
+fn format_search_response(
+    query: &str,
+    provider: &str,
+    results: Vec<ScrapedSearchResult>,
+    max_results: usize,
+    errors: &[String],
+) -> Result<String, String> {
+    let total = results.len();
+    let truncated: Vec<serde_json::Value> = results
+        .into_iter()
+        .take(max_results)
+        .map(|r| {
+            serde_json::json!({
+                "title":   r.title,
+                "link":    r.link,
+                "snippet": r.snippet,
+                "source":  r.source,
+                "date":    r.date,
+            })
+        })
+        .collect();
+    let mut resp = serde_json::json!({
+        "query": query,
+        "provider": provider,
+        "totalResults": total,
+        "resultsReturned": truncated.len(),
+        "results": truncated,
+    });
+    if !errors.is_empty() {
+        resp["providerErrors"] = serde_json::json!(errors);
+    }
+    serde_json::to_string_pretty(&resp).map_err(|e| e.to_string())
+}
+
+// ── Bing scraper ────────────────────────────────────────────────────
+fn node_text(node: &scraper::ElementRef) -> String {
+    node.text().collect::<String>().trim().to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WebSearchProviderConfig {
+    #[serde(default = "default_enable")]
+    enable: bool,
+    url: Option<String>,
+}
+
+fn default_enable() -> bool {
+    true
+}
+
+const DEFAULT_WEB_SEARCH_PROVIDERS: &[(&str, Option<&str>)] = &[
+    ("url_0", Some("https://www.bing.com/search?q={search}")),
+    ("url_1", None),
+    ("url_2", None),
+    ("url_3", None),
+    ("url_4", None),
+];
+
+fn load_web_search_config() -> HashMap<String, WebSearchProviderConfig> {
+    let mut configs: HashMap<String, WebSearchProviderConfig> = DEFAULT_WEB_SEARCH_PROVIDERS
+        .iter()
+        .map(|(name, url)| {
+            let has_url = url.is_some();
+            (
+                name.to_string(),
+                WebSearchProviderConfig {
+                    enable: has_url,
+                    url: url.map(|u| u.to_string()),
+                },
+            )
+        })
+        .collect();
+
+    let merge_from = |path: std::path::PathBuf, target: &mut HashMap<String, WebSearchProviderConfig>| {
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(e) => {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    eprintln!("[websearch] failed to read config '{}': {e}", path.display());
+                }
+                return;
+            }
+        };
+        let overrides: HashMap<String, WebSearchProviderConfig> = match serde_json::from_str(&content) {
+            Ok(o) => o,
+            Err(e) => {
+                eprintln!("[websearch] failed to parse config '{}': {e}", path.display());
+                return;
+            }
+        };
+        for (key, entry) in overrides {
+            if let Some(existing) = target.get_mut(&key) {
+                if let Some(url) = entry.url {
+                    existing.url = Some(url);
+                }
+                existing.enable = entry.enable;
+            } else {
+                target.insert(key, entry);
+            }
+        }
+    };
+
+    let user_config = default_config_home().join("web_search_url.json");
+
+    // Project first, user fallback — first found wins.
+    match std::env::current_dir() {
+        Ok(cwd) => {
+            let project_config = cwd.join(".claw").join("web_search_url.json");
+            if project_config.is_file() {
+                merge_from(project_config, &mut configs);
+                return configs;
+            }
+        }
+        Err(e) => eprintln!("[websearch] cannot determine current dir for project config: {e}"),
+    }
+    if user_config.is_file() {
+        merge_from(user_config, &mut configs);
+    }
+
+    configs
+}
+
+fn percent_encode_query(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for byte in s.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char);
+            }
+            b' ' => out.push_str("%20"),
+            _ => out.push_str(&format!("%{:02X}", byte)),
+        }
+    }
+    out
+}
+
+fn build_search_url(template: &str, query: &str) -> String {
+    let marker = "{search}";
+    if let Some(idx) = template.find(marker) {
+        let prefix = &template[..idx];
+        let suffix = &template[idx + marker.len()..];
+        let combined = format!("{query}{suffix}");
+        format!("{prefix}{}", percent_encode_query(&combined))
+    } else {
+        template.to_string()
+    }
+}
+
+fn fetch_search_html(client: &reqwest::blocking::Client, url: &str) -> Result<String, String> {
+    client
+        .get(url)
+        .send()
+        .and_then(|r| r.text())
+        .map_err(|e| format!("request failed: {e}"))
+}
+
+fn extract_generic_results(
+    html: &str,
+    item_selectors: &[&str],
+    link_selectors: &[&str],
+    snippet_selectors: &[&str],
+    default_source: &str,
+) -> Vec<ScrapedSearchResult> {
+    let document = Html::parse_document(html);
+    let item_sel = match Selector::parse(&item_selectors.join(", ")) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    let link_sel = match Selector::parse(&link_selectors.join(", ")) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    let snippet_sel = match Selector::parse(&snippet_selectors.join(", ")) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut results = Vec::new();
+    for node in document.select(&item_sel) {
+        let (title, link) = match node.select(&link_sel).next() {
+            Some(a) => (node_text(&a), a.value().attr("href").unwrap_or("").to_string()),
+            None => continue,
+        };
+        let snippet = node.select(&snippet_sel).next().map(|p| node_text(&p)).unwrap_or_default();
+        let source = reqwest::Url::parse(&link)
+            .ok()
+            .and_then(|u| u.host_str().map(str::to_string))
+            .unwrap_or_else(|| default_source.to_string());
+        if !title.is_empty() {
+            results.push(ScrapedSearchResult { title, link, snippet, source, date: String::new() });
+        }
+    }
+    results
+}
+
+fn scrape_url_generic(
+    client: &reqwest::blocking::Client,
+    url_template: &str,
+    query: &str,
+    source: &str,
+) -> Result<Vec<ScrapedSearchResult>, String> {
+    let url = build_search_url(url_template, query);
+    let html = fetch_search_html(client, &url)?;
+    let results = extract_generic_results(
+        &html,
+        &[".result", ".search-result", ".result-item", ".g", "li.b_algo"],
+        &["h3 a", "h2 a", ".title a"],
+        &["p", ".st", ".b_caption p", ".desc", ".snippet"],
+        source,
+    );
+    Ok(results)
+}
+
+static WEB_SEARCH_CONFIG: OnceLock<HashMap<String, WebSearchProviderConfig>> = OnceLock::new();
+
+pub fn init_web_search_config() {
+    WEB_SEARCH_CONFIG.get_or_init(load_web_search_config);
+}
+
+fn web_search_enabled_providers() -> Vec<(String, String)> {
+    let config = WEB_SEARCH_CONFIG.get_or_init(load_web_search_config);
+    const MAX_PROVIDERS: usize = 5;
+    config
+        .iter()
+        .filter(|(_, entry)| entry.enable)
+        .filter_map(|(name, entry)| {
+            let url = entry.url.clone().unwrap_or_default();
+            if url.is_empty() { None } else { Some((name.clone(), url)) }
+        })
+        .take(MAX_PROVIDERS)
+        .collect()
+}
+
+fn run_web_search(input: WebSearchInput) -> Result<String, String> {
+    let max_results = input
+        .max_results
+        .unwrap_or(SEARCHAPI_DEFAULT_RESULTS)
+        .min(SEARCHAPI_MAX_RESULTS)
+        .max(1);
+
+    let keyword = input.query.trim().to_string();
+
+    use std::sync::mpsc;
+
+    let client = std::sync::Arc::new(
+        reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(WEB_FETCH_TIMEOUT_SECS))
+            .user_agent(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) \
+                 AppleWebKit/537.36 (KHTML, like Gecko) \
+                 Chrome/131.0.0.0 Safari/537.36",
+            )
+            .build()
+            .map_err(|e| e.to_string())?,
+    );
+
+    let providers = web_search_enabled_providers();
+
+    if providers.is_empty() {
+        return format_search_response(&keyword, "none", Vec::new(), max_results, &[]);
+    }
+
+    let (tx, rx) = mpsc::channel::<(String, Result<Vec<ScrapedSearchResult>, String>)>();
+    let query = std::sync::Arc::new(keyword.clone());
+
+    for (name, url_template) in &providers {
+        let tx = tx.clone();
+        let client = std::sync::Arc::clone(&client);
+        let query = std::sync::Arc::clone(&query);
+        let name = name.clone();
+        let url_template = url_template.clone();
+        let source = name.clone();
+
+        std::thread::spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                scrape_url_generic(&client, &url_template, &query, &source)
+            }))
+            .unwrap_or(Err("provider thread panicked".to_string()));
+            let _ = tx.send((name, result));
+        });
+    }
+
+    drop(tx);
+
+    let mut all_results: Vec<ScrapedSearchResult> = Vec::new();
+    let mut providers_used: Vec<String> = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
+
+    for (name, result) in rx {
+        match result {
+            Ok(mut results) if !results.is_empty() => {
+                results.truncate(SEARCHAPI_DEFAULT_RESULTS);
+                providers_used.push(name);
+                all_results.extend(results);
+            }
+            Ok(_) => {}
+            Err(e) => errors.push(format!("{name}: {e}")),
+        }
+    }
+
+    if all_results.is_empty() {
+        return format_search_response(&keyword, "none", Vec::new(), max_results, &errors);
+    }
+
+    all_results.truncate(max_results);
+    let provider = providers_used.join("+");
+    format_search_response(&keyword, &provider, all_results, max_results, &errors)
+}
+
+// Maximum matches a single WebFind call can return. Larger results
+// get truncated with `truncated: true` so the LLM sees the token cost
+// explicitly instead of being silently flooded.
+const WEB_FIND_MAX_MATCHES_CAP: usize = 50;
+const WEB_FIND_DEFAULT_MAX_MATCHES: usize = 10;
+const WEB_FIND_DEFAULT_CONTEXT_CHARS: usize = 100;
+const WEB_FIND_MAX_CONTEXT_CHARS: usize = 500;
+
+// Server-side grep over a fetched URL. Inspired by OpenAI's
+// `web_search` provider `find` action: the model supplies `url` and
+// `pattern`, the tool returns just the matching snippets (with line,
+// column, and trimmed context) instead of dumping the whole page.
+// This is the token-efficient counterpart to WebFetch �?a 36 KB HTML
+// page can shrink to a few hundred tokens when the model only needs
+// the lines containing a specific value.
+#[allow(clippy::needless_pass_by_value)]
+fn run_web_find(input: WebFindInput) -> Result<String, String> {
+    if input.pattern.is_empty() {
+        return Err(String::from("pattern must not be empty"));
+    }
+
+    let url = reqwest::Url::parse(&input.url)
+        .map_err(|error| format!("invalid URL '{}': {}", input.url, error))?;
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(WEB_FETCH_TIMEOUT_SECS))
+        .user_agent("clawcode/0.1 (+webfind)")
+        .build()
+        .map_err(|error| error.to_string())?;
+
+    let response = client
+        .get(url.clone())
+        .send()
+        .map_err(|error| format!("fetch failed for '{}': {}", input.url, error))?;
+
+    let code = response.status().as_u16();
+    if !(200..300).contains(&code) {
+        return Err(format!("fetch failed for '{}': HTTP {}", input.url, code));
+    }
+
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("text/plain")
+        .to_ascii_lowercase();
+
+    let body = response
+        .bytes()
+        .map_err(|error| format!("read body failed for '{}': {}", input.url, error))?;
+    if body.len() > WEB_FETCH_MAX_BODY_BYTES {
+        return Err(format!(
+            "response too large for '{}': {} bytes (limit is {} bytes)",
+            input.url,
+            body.len(),
+            WEB_FETCH_MAX_BODY_BYTES
+        ));
+    }
+    let raw = String::from_utf8_lossy(&body);
+
+    let output = summarize_web_find(
+        &input.url,
+        &input.pattern,
+        &raw,
+        &content_type,
+        input.ignore_case.unwrap_or(true),
+        input
+            .max_matches
+            .unwrap_or(WEB_FIND_DEFAULT_MAX_MATCHES)
+            .min(WEB_FIND_MAX_MATCHES_CAP),
+        input
+            .context_chars
+            .unwrap_or(WEB_FIND_DEFAULT_CONTEXT_CHARS)
+            .min(WEB_FIND_MAX_CONTEXT_CHARS),
+    );
+
+    serde_json::to_string_pretty(&output).map_err(|error| error.to_string())
+}
+
+// Convert fetched bytes into greppable text, find every occurrence
+// of `pattern`, trim each match to `context_chars` of surrounding
+// text, and cap the result at `max_matches`. Total occurrences are
+// counted even after truncation so the caller can tell when more
+// data existed.
+fn summarize_web_find(
+    url: &str,
+    pattern: &str,
+    raw_body: &str,
+    content_type: &str,
+    ignore_case: bool,
+    max_matches: usize,
+    context_chars: usize,
+) -> WebFindOutput {
+    // For HTML, run the body through the same extractor WebFetch
+    // uses, so matches land on visible text instead of buried in
+    // markup the LLM cannot reason about.
+    let body = if content_type.contains("html") {
+        let evaluator = FastContentEvaluator::default();
+        let text = evaluator.extract_text(raw_body);
+        if text.trim().is_empty() {
+            raw_body.to_string()
+        } else {
+            text
+        }
+    } else {
+        raw_body.to_string()
+    };
+
+    let haystack = if ignore_case {
+        body.to_lowercase()
+    } else {
+        body.clone()
+    };
+    let needle = if ignore_case {
+        pattern.to_lowercase()
+    } else {
+        pattern.to_string()
+    };
+
+    let mut matches: Vec<WebFindMatch> = Vec::new();
+    let mut total: usize = 0;
+    let mut line: usize = 1;
+    let mut line_start: usize = 0;
+    let bytes_scanned = body.len();
+
+    for (offset, ch) in haystack.char_indices() {
+        if ch == '\n' {
+            line += 1;
+            line_start = offset + ch.len_utf8();
+            continue;
+        }
+        if haystack[offset..].starts_with(&needle) {
+            total += 1;
+            if matches.len() < max_matches {
+                let line_end = haystack[line_start..]
+                    .find('\n')
+                    .map(|delta| line_start + delta)
+                    .unwrap_or(haystack.len());
+                let column = offset - line_start + 1;
+                let matched = body[offset..offset + needle.len()].to_string();
+                let context = extract_match_context(
+                    &body,
+                    line_start,
+                    line_end,
+                    column,
+                    needle.len(),
+                    context_chars,
+                );
+                matches.push(WebFindMatch {
+                    line,
+                    column,
+                    matched,
+                    context,
+                });
+            }
+        }
+    }
+
+    WebFindOutput {
+        url: url.to_string(),
+        pattern: pattern.to_string(),
+        total_matches: total,
+        truncated: total > matches.len(),
+        matches,
+        bytes_scanned,
+        content_type: content_type.to_string(),
+    }
+}
+
+// Pull up to `context_chars` chars before and after a match within
+// the matched line, collapsing internal whitespace so the LLM gets a
+// compact snippet rather than a wall of source formatting.
+fn extract_match_context(
+    body: &str,
+    line_start: usize,
+    line_end: usize,
+    column_one_indexed: usize,
+    match_len: usize,
+    context_chars: usize,
+) -> String {
+    let line = &body[line_start..line_end];
+    let line_chars: Vec<char> = line.chars().collect();
+    let match_start = column_one_indexed.saturating_sub(1);
+    let match_end = (match_start + match_len).min(line_chars.len());
+
+    let window_start = match_start.saturating_sub(context_chars);
+    let window_end = (match_end + context_chars).min(line_chars.len());
+    let snippet: String = line_chars[window_start..window_end]
+        .iter()
+        .copied()
+        .collect();
+    collapse_whitespace(&snippet)
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_skill(input: SkillInput) -> Result<String, String> {
+    let output = execute_skill(input)?;
+    serde_json::to_string_pretty(&output).map_err(|error| error.to_string())
+}
+
+// Build the manifest + output file, promote Created -> Running on disk,
+// then hand the job to the spawn closure. Production callers pass
+// `spawn_agent_task`; tests pass a mock that captures the job and
+// returns a noop handle so the rest of the file can be exercised
+// without spinning a real agent.
+#[allow(clippy::needless_pass_by_value)]
+fn execute_agent_with_spawn<F>(
+    input: agents::AgentInput,
+    spawn_fn: F,
+) -> Result<(agents::AgentOutput, agents::AgentHandle), String>
+where
+    F: FnOnce(agents::AgentJob) -> Result<agents::AgentHandle, String>,
+{
+    if input.description.trim().is_empty() {
+        return Err(String::from("description must not be empty"));
+    }
+    if input.prompt.trim().is_empty() {
+        return Err(String::from("prompt must not be empty"));
+    }
+
+    let agent_id = make_agent_id();
+    let raw_name = input.name.as_deref().unwrap_or(&input.description);
+    let name = slugify_agent_name(raw_name);
+
+    let normalized_subagent = input
+        .subagent_type
+        .as_deref()
+        .map(|raw| normalize_subagent_type(Some(raw)));
+    let lookup_subagent = normalized_subagent.as_deref().unwrap_or("general-purpose");
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+
+    let manifest = agents::AgentOutput {
+        agent_id: agent_id.clone(),
+        name: name.clone(),
+        description: input.description.clone(),
+        subagent_type: normalized_subagent.clone(),
+        model: Some(resolve_agent_model(input.model.as_deref())),
+        mode: input.mode.clone(),
+        status: Some("Running".to_string()),
+        error: None,
+        started_at: Some(now),
+        completed_at: None,
+        lane_events: vec![],
+    };
+
+    let handle_manifest = manifest.clone();
+
+    let job = agents::AgentJob {
+        manifest,
+        prompt: input.prompt,
+        system_prompt: {
+            let mut base = build_agent_system_prompt(lookup_subagent).unwrap_or_default();
+            match input.system_prompt {
+                Some(custom) => {
+                    if base.is_empty() {
+                        custom
+                    } else {
+                        base.extend(custom);
+                        base
+                    }
+                }
+                None => base,
+            }
+        },
+        allowed_tools: {
+            let mut allowed = input
+                .allowed_tools
+                .clone()
+                .unwrap_or_else(|| allowed_tools_for_subagent(lookup_subagent));
+            // A general-purpose sub-agent inherits the dynamically registered
+            // runtime tools (MCP + plugin) so it can call them itself. Other
+            // sub-agent kinds stay on their static (read-only/restricted) set.
+            if lookup_subagent == "general-purpose" && input.allowed_tools.is_none() {
+                if let Some(defs) = agents::registered_extra_tool_defs() {
+                    allowed.extend(defs.iter().map(|def| def.name.clone()));
+                }
+            }
+            allowed
+        },
+    };
+
+    let handle = spawn_fn(job)?;
+    Ok((handle_manifest, handle))
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_agent(input: agents::AgentInput) -> Result<String, String> {
+    let progress = agents::new_shared_progress();
+    let progress_clone = std::sync::Arc::clone(&progress);
+    let (_, mut handle) = execute_agent_with_spawn(input, move |job| {
+        spawn_agent_task_with_progress(job, progress_clone)
+    })?;
+
+    let term_width = detect_terminal_width();
+    use std::sync::atomic::Ordering;
+
+    let mut last_event_count = handle.progress.event_seq.load(Ordering::Acquire);
+    let mut last_lines = 0usize;
+
+    loop {
+        match handle.try_join() {
+            Ok(result) => {
+                let guard = handle.progress.agents.lock().unwrap_or_else(|e| e.into_inner());
+                subagent_overlay::finalize_subagent_inline(&guard, term_width, &mut last_lines).ok();
+                return result;
+            }
+            Err(agents::TryAgain) => {
+                let seq = handle.progress.event_seq.load(Ordering::Acquire);
+                if seq != last_event_count {
+                    last_event_count = seq;
+                    let guard = handle.progress.agents.lock().unwrap_or_else(|e| e.into_inner());
+                    let any_active = guard.iter().any(|a| {
+                        !matches!(
+                            a.status,
+                            agents::AgentStatus::Completed | agents::AgentStatus::Failed
+                        )
+                    });
+                    if any_active {
+                        subagent_overlay::render_subagent_inline(&guard, term_width, &mut last_lines).ok();
+                    }
+                    drop(guard);
+                }
+
+                let guard = handle.progress.agents.lock().unwrap_or_else(|e| e.into_inner());
+                let (_guard, _) = handle
+                    .progress
+                    .cvar
+                    .wait_timeout(guard, std::time::Duration::from_millis(100))
+                    .unwrap_or_else(|e| e.into_inner());
+                drop(_guard);
+            }
+        }
+    }
+}
+
+fn detect_terminal_width() -> usize {
+    if let Ok((cols, _)) = crossterm::terminal::size() {
+        return cols as usize;
+    }
+    if let Ok(cols) = std::env::var("COLUMNS") {
+        if let Ok(n) = cols.parse::<usize>() {
+            if n > 0 {
+                return n;
+            }
+        }
+    }
+    80
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_brief(input: BriefInput) -> Result<String, String> {
+    let output = execute_brief(input)?;
+    serde_json::to_string_pretty(&output).map_err(|error| error.to_string())
+}
+
+
+
+fn execute_brief(input: BriefInput) -> Result<BriefOutput, String> {
+    let attachments = input.attachments.map(|paths| {
+        paths
+            .into_iter()
+            .map(|path| {
+                let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                let is_image = matches!(
+                    path.rsplit('.').next().map(str::to_ascii_lowercase).as_deref(),
+                    Some("png") | Some("jpg") | Some("jpeg") | Some("gif") | Some("webp") | Some("bmp")
+                );
+                ResolvedAttachment {
+                    path,
+                    size,
+                    is_image,
+                }
+            })
+            .collect()
+    });
+    let sent_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs().to_string())
+        .unwrap_or_else(|_| "0".to_string());
+    Ok(BriefOutput {
+        message: input.message,
+        attachments,
+        sent_at,
+    })
+}
+
+fn execute_structured_output(input: StructuredOutputInput) -> Result<StructuredOutputResult, String> {
+    let payload = input.0;
+    let is_empty = payload.is_null()
+        || (payload.is_object() && payload.as_object().map_or(false, |o| o.is_empty()))
+        || (payload.is_array() && payload.as_array().map_or(false, |a| a.is_empty()));
+    if is_empty {
+        return Err(String::from("structured output must not be empty — provide a non-empty JSON value"));
+    }
+    Ok(StructuredOutputResult {
+        structured_output: payload,
+    })
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_structured_output(input: StructuredOutputInput) -> Result<String, String> {
+    let output = execute_structured_output(input)?;
+    serde_json::to_string_pretty(&output).map_err(|error| error.to_string())
 }

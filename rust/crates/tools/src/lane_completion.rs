@@ -31,15 +31,9 @@ pub(crate) fn detect_lane_completion(
     }
 
     // Must have finished status
-    if !output.status.eq_ignore_ascii_case("completed")
-        && !output.status.eq_ignore_ascii_case("finished")
-    {
-        return None;
-    }
-
-    // Must have no current blocker
-    if output.current_blocker.is_some() {
-        return None;
+    match output.status.as_deref() {
+        Some(s) if s.eq_ignore_ascii_case("completed") || s.eq_ignore_ascii_case("finished") => {}
+        _ => return None,
     }
 
     // Must have green tests
@@ -56,18 +50,12 @@ pub(crate) fn detect_lane_completion(
     Some(LaneContext {
         lane_id: output.agent_id.clone(),
         green_level: 3, // Workspace green
-        green_contract_satisfied: true,
         branch_freshness: std::time::Duration::from_secs(0),
         blocker: LaneBlocker::None,
         review_status: ReviewStatus::Approved,
         diff_scope: runtime::DiffScope::Scoped,
         completed: true,
         reconciled: false,
-        retry_count: 0,
-        retry_limit: 1,
-        rebase_required: false,
-        stale_cleanup_required: false,
-        approval_token: None,
     })
 }
 
@@ -107,16 +95,12 @@ mod tests {
             description: "Test".to_string(),
             subagent_type: None,
             model: None,
-            status: "Finished".to_string(),
-            output_file: "/tmp/test.output".to_string(),
-            manifest_file: "/tmp/test.manifest".to_string(),
-            created_at: "2024-01-01T00:00:00Z".to_string(),
-            started_at: Some("2024-01-01T00:00:00Z".to_string()),
-            completed_at: Some("2024-01-01T00:00:00Z".to_string()),
-            lane_events: vec![],
-            derived_state: "working".to_string(),
-            current_blocker: None,
+            mode: None,
+            status: Some("completed".to_string()),
             error: None,
+            started_at: Some(1704067200),
+            completed_at: Some(1704067200),
+            lane_events: vec![],
         }
     }
 
@@ -144,7 +128,7 @@ mod tests {
     #[test]
     fn no_completion_when_not_finished() {
         let mut output = test_output();
-        output.status = "Running".to_string();
+        output.status = Some("running".to_string());
 
         let result = detect_lane_completion(&output, true, true);
         assert!(result.is_none());
@@ -171,18 +155,12 @@ mod tests {
         let context = LaneContext {
             lane_id: "completed-lane".to_string(),
             green_level: 3,
-            green_contract_satisfied: true,
             branch_freshness: std::time::Duration::from_secs(0),
             blocker: LaneBlocker::None,
             review_status: ReviewStatus::Approved,
             diff_scope: DiffScope::Scoped,
             completed: true,
             reconciled: false,
-            retry_count: 0,
-            retry_limit: 1,
-            rebase_required: false,
-            stale_cleanup_required: false,
-            approval_token: None,
         };
 
         let actions = evaluate_completed_lane(&context);

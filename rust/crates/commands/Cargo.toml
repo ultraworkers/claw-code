@@ -9,6 +9,7 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+agents = { path = "../agents" }
 plugins = { path = "../plugins" }
 runtime = { path = "../runtime" }
 serde_json.workspace = true

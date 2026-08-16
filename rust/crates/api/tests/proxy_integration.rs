@@ -35,6 +35,7 @@ impl Drop for EnvVarGuard {
     }
 }
 
+#[cfg(not(target_os = "windows"))]
 #[test]
 fn proxy_config_from_env_reads_uppercase_proxy_vars() {
     // given
@@ -123,6 +124,42 @@ fn proxy_config_from_env_treats_empty_values_as_unset() {
     assert!(config.is_empty());
 }
 
+/// On Windows, environment variable names are case-insensitive, so `HTTP_PROXY`
+/// and `http_proxy` are the same slot. Verify the single value is read correctly.
+#[cfg(target_os = "windows")]
+#[test]
+fn proxy_config_from_env_reads_proxy_vars_windows_upper() {
+    let _lock = env_lock();
+    let _http = EnvVarGuard::set("HTTP_PROXY", Some("http://proxy.corp:3128"));
+    let _https = EnvVarGuard::set("HTTPS_PROXY", Some("http://secure.corp:3129"));
+    let _no = EnvVarGuard::set("NO_PROXY", Some("localhost,127.0.0.1"));
+
+    let config = ProxyConfig::from_env();
+
+    assert_eq!(config.http_proxy.as_deref(), Some("http://proxy.corp:3128"));
+    assert_eq!(config.https_proxy.as_deref(), Some("http://secure.corp:3129"));
+    assert_eq!(config.no_proxy.as_deref(), Some("localhost,127.0.0.1"));
+    assert!(!config.is_empty());
+}
+
+/// On Windows, setting the lowercase variant overwrites the uppercase due to
+/// case-insensitive env var names. Verify the last-written value is read.
+#[cfg(target_os = "windows")]
+#[test]
+fn proxy_config_from_env_reads_proxy_vars_windows_lower() {
+    let _lock = env_lock();
+    let _http = EnvVarGuard::set("http_proxy", Some("http://lower.corp:3128"));
+    let _https = EnvVarGuard::set("https_proxy", Some("http://lower-secure.corp:3129"));
+    let _no = EnvVarGuard::set("no_proxy", Some(".internal"));
+
+    let config = ProxyConfig::from_env();
+
+    assert_eq!(config.http_proxy.as_deref(), Some("http://lower.corp:3128"));
+    assert_eq!(config.https_proxy.as_deref(), Some("http://lower-secure.corp:3129"));
+    assert_eq!(config.no_proxy.as_deref(), Some(".internal"));
+    assert!(!config.is_empty());
+}
+
 #[test]
 fn build_client_with_env_proxy_config_succeeds() {
     // given
@@ -154,6 +191,7 @@ fn build_client_with_proxy_url_config_succeeds() {
     assert!(result.is_ok());
 }
 
+#[cfg(not(target_os = "windows"))]
 #[test]
 fn proxy_config_from_env_prefers_uppercase_over_lowercase() {
     // given

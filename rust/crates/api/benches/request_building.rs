@@ -13,6 +13,8 @@
     clippy::uninlined_format_args
 )]
 
+use std::sync::Arc;
+
 use api::{
     build_chat_completion_request, flatten_tool_result_content, is_reasoning_model,
     translate_message, InputContentBlock, InputMessage, MessageRequest, OpenAiCompatConfig,
@@ -49,13 +51,14 @@ fn create_sample_request(message_count: usize) -> MessageRequest {
                         text: format!("Tool result content {}", i),
                     }],
                     is_error: false,
+                    cache_reference: None,
                 }],
             }),
             _ => messages.push(InputMessage {
                 role: "assistant".to_string(),
                 content: vec![InputContentBlock::ToolUse {
                     id: format!("call_{}", i),
-                    name: "write_file".to_string(),
+                    name: "new_file".to_string(),
                     input: json!({"path": format!("/tmp/out{}", i), "content": "data"}),
                 }],
             }),
@@ -65,18 +68,11 @@ fn create_sample_request(message_count: usize) -> MessageRequest {
     MessageRequest {
         model: "gpt-4o".to_string(),
         max_tokens: 1024,
-        messages,
+        messages: messages.into(),
         stream: false,
-        system: Some("You are a helpful assistant.".to_string()),
+        system: Some(Arc::from("You are a helpful assistant.")),
         temperature: Some(0.7),
-        top_p: None,
-        tools: None,
-        tool_choice: None,
-        frequency_penalty: None,
-        presence_penalty: None,
-        stop: None,
-        reasoning_effort: None,
-        extra_body: std::collections::BTreeMap::new(),
+        ..Default::default()
     }
 }
 
@@ -108,7 +104,7 @@ fn bench_translate_message(c: &mut Criterion) {
             },
             InputContentBlock::ToolUse {
                 id: "call_2".to_string(),
-                name: "write_file".to_string(),
+                name: "new_file".to_string(),
                 input: json!({"path": "/tmp/out", "content": "data"}),
             },
         ],
@@ -130,6 +126,7 @@ fn bench_translate_message(c: &mut Criterion) {
                 text: "File contents here".to_string(),
             }],
             is_error: false,
+            cache_reference: None,
         }],
     };
     group.bench_with_input(
@@ -137,15 +134,6 @@ fn bench_translate_message(c: &mut Criterion) {
         &tool_result_message,
         |b, msg| {
             b.iter(|| translate_message(black_box(msg), black_box("gpt-4o")));
-        },
-    );
-
-    // Tool result for kimi model (is_error excluded)
-    group.bench_with_input(
-        BenchmarkId::new("tool_result_kimi", "kimi-k2.5"),
-        &tool_result_message,
-        |b, msg| {
-            b.iter(|| translate_message(black_box(msg), black_box("kimi-k2.5")));
         },
     );
 

@@ -48,6 +48,35 @@ pub struct ContainerEnvironment {
     pub markers: Vec<String>,
 }
 
+/// Linux-shaped container detection inputs (filesystem markers + cgroup).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SandboxDetectionInputs<'a> {
+    pub env_pairs: Vec<(String, String)>,
+    pub dockerenv_exists: bool,
+    pub containerenv_exists: bool,
+    pub proc_1_cgroup: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinuxSandboxCommand {
+    pub program: String,
+    pub args: Vec<String>,
+    pub env: Vec<(String, String)>,
+}
+
+/// Windows-shaped sandbox command. AppContainer spawn is not yet wired into
+/// the tool execution pipeline, so this is currently descriptive only — the
+/// same shape as `LinuxSandboxCommand` but tagged with the AppContainer
+/// profile name we would pass to `CreateProcess` if/when enforcement lands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WindowsSandboxCommand {
+    pub program: String,
+    pub args: Vec<String>,
+    pub env: Vec<(String, String)>,
+    pub app_container_profile: String,
+    pub capabilities: Vec<String>,
+}
+
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct SandboxStatus {
@@ -65,21 +94,6 @@ pub struct SandboxStatus {
     pub in_container: bool,
     pub container_markers: Vec<String>,
     pub fallback_reason: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SandboxDetectionInputs<'a> {
-    pub env_pairs: Vec<(String, String)>,
-    pub dockerenv_exists: bool,
-    pub containerenv_exists: bool,
-    pub proc_1_cgroup: Option<&'a str>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LinuxSandboxCommand {
-    pub program: String,
-    pub args: Vec<String>,
-    pub env: Vec<(String, String)>,
 }
 
 impl SandboxConfig {
@@ -105,19 +119,33 @@ impl SandboxConfig {
     }
 }
 
+/// Cross-platform container detection. Dispatches to the platform-shaped
+/// parser so the same `ContainerEnvironment` value flows back to the rest of
+/// the runtime regardless of host OS.
 #[must_use]
 pub fn detect_container_environment() -> ContainerEnvironment {
+    if cfg!(target_os = "windows") {
+        let env_pairs: Vec<(String, String)> = env::vars().collect();
+        let identity_exists = Path::new(r"C:\identity.txt").exists();
+        let dev_marker = env::var_os("CLAWD_IN_DEV_CONTAINER").is_some_and(|v| !v.is_empty());
+        return detect_container_environment_windows_from(dev_marker, identity_exists, &env_pairs);
+    }
     let proc_1_cgroup = fs::read_to_string("/proc/1/cgroup").ok();
-    detect_container_environment_from(SandboxDetectionInputs {
+    let dockerenv_exists = cfg!(target_os = "linux") && Path::new("/.dockerenv").exists();
+    let containerenv_exists = cfg!(target_os = "linux") && Path::new("/run/.containerenv").exists();
+    detect_container_environment_linux_from(SandboxDetectionInputs {
         env_pairs: env::vars().collect(),
-        dockerenv_exists: Path::new("/.dockerenv").exists(),
-        containerenv_exists: Path::new("/run/.containerenv").exists(),
+        dockerenv_exists,
+        containerenv_exists,
         proc_1_cgroup: proc_1_cgroup.as_deref(),
     })
 }
 
+/// Linux-shaped container detection: dockerenv + containerenv files, cgroup
+/// contents, and the standard env-var set (`container`, `docker`, `podman`,
+/// `KUBERNETES_SERVICE_HOST`).
 #[must_use]
-pub fn detect_container_environment_from(
+pub fn detect_container_environment_linux_from(
     inputs: SandboxDetectionInputs<'_>,
 ) -> ContainerEnvironment {
     let mut markers = Vec::new();
@@ -152,6 +180,54 @@ pub fn detect_container_environment_from(
     }
 }
 
+/// Backwards-compatible alias. Existing callers and the pre-split test
+/// fixtures import `detect_container_environment_from`; keep that name
+/// pointing at the Linux implementation so no consumer has to change.
+#[must_use]
+pub fn detect_container_environment_from(
+    inputs: SandboxDetectionInputs<'_>,
+) -> ContainerEnvironment {
+    detect_container_environment_linux_from(inputs)
+}
+
+/// Windows-shaped container detection. Walks the env-var set first, then
+/// checks for the Hyper-V `C:\identity.txt` marker that process-isolated
+/// Windows containers leave behind. The `clawd_in_dev_container` flag is
+/// derived by the caller from `CLAWD_IN_DEV_CONTAINER` so this function
+/// stays pure for unit tests.
+#[must_use]
+pub fn detect_container_environment_windows_from(
+    clawd_in_dev_container: bool,
+    identity_txt_exists: bool,
+    env_pairs: &[(String, String)],
+) -> ContainerEnvironment {
+    let mut markers = Vec::new();
+    if identity_txt_exists {
+        markers.push(r"C:\identity.txt".to_string());
+    }
+    if clawd_in_dev_container {
+        markers.push("env:CLAWD_IN_DEV_CONTAINER".to_string());
+    }
+    for (key, value) in env_pairs {
+        if value.is_empty() {
+            continue;
+        }
+        let normalized = key.to_ascii_uppercase();
+        match normalized.as_str() {
+            "CONTAINER_SAS_URL" | "CONTAINER_NAME" | "CONTAINER_ID" | "KUBERNETES_SERVICE_HOST" => {
+                markers.push(format!("env:{key}={value}"));
+            }
+            _ => {}
+        }
+    }
+    markers.sort();
+    markers.dedup();
+    ContainerEnvironment {
+        in_container: !markers.is_empty(),
+        markers,
+    }
+}
+
 #[must_use]
 pub fn resolve_sandbox_status(config: &SandboxConfig, cwd: &Path) -> SandboxStatus {
     let request = config.resolve_request(None, None, None, None, None);
@@ -161,19 +237,16 @@ pub fn resolve_sandbox_status(config: &SandboxConfig, cwd: &Path) -> SandboxStat
 #[must_use]
 pub fn resolve_sandbox_status_for_request(request: &SandboxRequest, cwd: &Path) -> SandboxStatus {
     let container = detect_container_environment();
-    let namespace_supported = cfg!(target_os = "linux") && unshare_user_namespace_works();
-    let network_supported = namespace_supported;
+    let isolation_supported = platform_isolation_supported();
     let filesystem_active =
         request.enabled && request.filesystem_mode != FilesystemIsolationMode::Off;
     let mut fallback_reasons = Vec::new();
 
-    if request.enabled && request.namespace_restrictions && !namespace_supported {
-        fallback_reasons
-            .push("namespace isolation unavailable (requires Linux with `unshare`)".to_string());
+    if request.enabled && request.namespace_restrictions && !isolation_supported {
+        fallback_reasons.push(namespace_fallback_message());
     }
-    if request.enabled && request.network_isolation && !network_supported {
-        fallback_reasons
-            .push("network isolation unavailable (requires Linux with `unshare`)".to_string());
+    if request.enabled && request.network_isolation && !isolation_supported {
+        fallback_reasons.push(network_fallback_message());
     }
     if request.enabled
         && request.filesystem_mode == FilesystemIsolationMode::AllowList
@@ -182,22 +255,40 @@ pub fn resolve_sandbox_status_for_request(request: &SandboxRequest, cwd: &Path) 
         fallback_reasons
             .push("filesystem allow-list requested without configured mounts".to_string());
     }
+    // On Windows, the current status snapshot reports filesystem modes
+    // that the runtime cannot yet *enforce* via AppContainer at execution
+    // time. Job Object kill-on-close is wired in `bash.rs`, but the
+    // workspace-only / allow-list filesystem mode still lands when
+    // AppContainer spawn is wired into the tool pipeline. Surface the gap
+    // honestly so users don't think `filesystem_mode: workspace-only` is
+    // actively confining child processes on Windows.
+    if cfg!(target_os = "windows")
+        && request.enabled
+        && request.filesystem_mode == FilesystemIsolationMode::WorkspaceOnly
+    {
+        fallback_reasons.push(
+            "filesystem_mode: workspace-only is reported but AppContainer enforcement \
+             is not yet wired into tool execution on Windows (process tree kill via \
+             Job Object is active)"
+                .to_string(),
+        );
+    }
 
     let active = request.enabled
-        && (!request.namespace_restrictions || namespace_supported)
-        && (!request.network_isolation || network_supported);
+        && (!request.namespace_restrictions || isolation_supported)
+        && (!request.network_isolation || isolation_supported);
 
     let allowed_mounts = normalize_mounts(&request.allowed_mounts, cwd);
 
     SandboxStatus {
         enabled: request.enabled,
         requested: request.clone(),
-        supported: namespace_supported,
+        supported: isolation_supported,
         active,
-        namespace_supported,
-        namespace_active: request.enabled && request.namespace_restrictions && namespace_supported,
-        network_supported,
-        network_active: request.enabled && request.network_isolation && network_supported,
+        namespace_supported: isolation_supported,
+        namespace_active: request.enabled && request.namespace_restrictions && isolation_supported,
+        network_supported: isolation_supported,
+        network_active: request.enabled && request.network_isolation && isolation_supported,
         filesystem_mode: request.filesystem_mode,
         filesystem_active,
         allowed_mounts,
@@ -207,57 +298,177 @@ pub fn resolve_sandbox_status_for_request(request: &SandboxRequest, cwd: &Path) 
     }
 }
 
+/// Returns true when the current host can enforce the sandbox request's
+/// namespace / network isolation. On Linux this means `unshare(1)` actually
+/// works; on Windows it means we're on Win10+ where AppContainer is
+/// available; on other targets the answer is always `false`.
+#[must_use]
+pub fn platform_isolation_supported() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        unshare_user_namespace_works()
+    }
+    #[cfg(target_os = "windows")]
+    {
+        appcontainer_is_supported()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    {
+        false
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn namespace_fallback_message() -> String {
+    "namespace isolation unavailable (requires Linux with `unshare`)".to_string()
+}
+
+#[cfg(target_os = "windows")]
+fn namespace_fallback_message() -> String {
+    "namespace isolation unavailable (requires Windows 10+ with AppContainer; \
+     enforcement into tool execution is not yet wired)"
+        .to_string()
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+fn namespace_fallback_message() -> String {
+    "namespace isolation unavailable on this platform".to_string()
+}
+
+#[cfg(target_os = "linux")]
+fn network_fallback_message() -> String {
+    "network isolation unavailable (requires Linux with `unshare`)".to_string()
+}
+
+#[cfg(target_os = "windows")]
+fn network_fallback_message() -> String {
+    "network isolation unavailable (requires AppContainer profile with no \
+     INTERNET_CLIENT/INTERNET_SERVER capability; enforcement is not yet wired)"
+        .to_string()
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+fn network_fallback_message() -> String {
+    "network isolation unavailable on this platform".to_string()
+}
+
 #[must_use]
 pub fn build_linux_sandbox_command(
     command: &str,
     cwd: &Path,
     status: &SandboxStatus,
 ) -> Option<LinuxSandboxCommand> {
-    if !cfg!(target_os = "linux")
-        || !status.enabled
-        || (!status.namespace_active && !status.network_active)
+    #[cfg(not(target_os = "linux"))]
     {
+        let _ = (command, cwd, status);
         return None;
     }
+    #[cfg(target_os = "linux")]
+    {
+        if !status.enabled || (!status.namespace_active && !status.network_active) {
+            return None;
+        }
 
-    let mut args: Vec<String> = working_unshare_mapping()
-        .unwrap_or(UNSHARE_MAPPING_CANDIDATES[0])
-        .iter()
-        .map(|arg| arg.to_string())
-        .collect();
-    // The candidates already carry the namespace flags, so the probe and the
-    // launcher share a single argument shape; only the opt-in `--net` is
-    // added here.
-    if status.network_active {
-        args.push("--net".to_string());
+        let mut args = vec![
+            "--user".to_string(),
+            "--map-root-user".to_string(),
+            "--mount".to_string(),
+            "--ipc".to_string(),
+            "--pid".to_string(),
+            "--uts".to_string(),
+            "--fork".to_string(),
+        ];
+        if status.network_active {
+            args.push("--net".to_string());
+        }
+        args.push("sh".to_string());
+        args.push("-lc".to_string());
+        args.push(command.to_string());
+
+        let sandbox_home = cwd.join(".sandbox-home");
+        let sandbox_tmp = cwd.join(".sandbox-tmp");
+        let mut env = vec![
+            ("HOME".to_string(), sandbox_home.display().to_string()),
+            ("TMPDIR".to_string(), sandbox_tmp.display().to_string()),
+            (
+                "CLAWD_SANDBOX_FILESYSTEM_MODE".to_string(),
+                status.filesystem_mode.as_str().to_string(),
+            ),
+            (
+                "CLAWD_SANDBOX_ALLOWED_MOUNTS".to_string(),
+                status.allowed_mounts.join(":"),
+            ),
+        ];
+        if let Ok(path) = env::var("PATH") {
+            env.push(("PATH".to_string(), path));
+        }
+
+        Some(LinuxSandboxCommand {
+            program: "unshare".to_string(),
+            args,
+            env,
+        })
     }
-    args.push("sh".to_string());
-    args.push("-lc".to_string());
-    args.push(command.to_string());
+}
 
-    let sandbox_home = cwd.join(".sandbox-home");
-    let sandbox_tmp = cwd.join(".sandbox-tmp");
-    let mut env = vec![
-        ("HOME".to_string(), sandbox_home.display().to_string()),
-        ("TMPDIR".to_string(), sandbox_tmp.display().to_string()),
-        (
+/// Windows equivalent of `build_linux_sandbox_command`. Currently a
+/// descriptive builder: it never spawns anything itself, but the returned
+/// `WindowsSandboxCommand` documents what AppContainer + CreateProcess call
+/// we would make once the tool-execution pipeline is wired to consume it.
+#[must_use]
+pub fn build_windows_sandbox_command(
+    command: &str,
+    cwd: &Path,
+    status: &SandboxStatus,
+) -> Option<WindowsSandboxCommand> {
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (command, cwd, status);
+        return None;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        if !status.enabled {
+            return None;
+        }
+        let profile = format!("clawcode-{}", profile_suffix(cwd));
+        let mut capabilities = Vec::new();
+        if status.network_active {
+            // In the eventual enforcement pass we'd *omit* the INTERNET_CLIENT
+            // capability to actually isolate. The descriptive builder lists
+            // the capability the non-sandboxed parent would carry so the
+            // diff between sandboxed vs non-sandboxed is visible at a glance.
+            capabilities.push("INTERNET_CLIENT".to_string());
+        }
+        let args = vec!["cmd".to_string(), "/C".to_string(), command.to_string()];
+        let mut env = vec![(
             "CLAWD_SANDBOX_FILESYSTEM_MODE".to_string(),
             status.filesystem_mode.as_str().to_string(),
-        ),
-        (
-            "CLAWD_SANDBOX_ALLOWED_MOUNTS".to_string(),
-            status.allowed_mounts.join(":"),
-        ),
-    ];
-    if let Ok(path) = env::var("PATH") {
-        env.push(("PATH".to_string(), path));
+        )];
+        if let Ok(path) = env::var("PATH") {
+            env.push(("PATH".to_string(), path));
+        }
+        Some(WindowsSandboxCommand {
+            program: "CreateProcessW".to_string(),
+            args,
+            env,
+            app_container_profile: profile,
+            capabilities,
+        })
     }
+}
 
-    Some(LinuxSandboxCommand {
-        program: "unshare".to_string(),
-        args,
-        env,
-    })
+#[cfg(target_os = "windows")]
+fn profile_suffix(cwd: &Path) -> String {
+    // Use a short, filesystem-safe suffix of the cwd so AppContainer profile
+    // names (which have a 64-char limit) stay within bounds.
+    let s = cwd.display().to_string();
+    let trimmed = s.replace(['\\', '/', ':', ' '], "_");
+    if trimmed.len() > 32 {
+        trimmed[trimmed.len() - 32..].to_string()
+    } else {
+        trimmed
+    }
 }
 
 fn normalize_mounts(mounts: &[String], cwd: &Path) -> Vec<String> {
@@ -276,90 +487,16 @@ fn normalize_mounts(mounts: &[String], cwd: &Path) -> Vec<String> {
         .collect()
 }
 
+#[cfg(target_os = "linux")]
 fn command_exists(command: &str) -> bool {
     env::var_os("PATH")
         .is_some_and(|paths| env::split_paths(&paths).any(|path| path.join(command).exists()))
 }
 
-/// Candidate `unshare` user-namespace mapping options, in preference order.
-///
-/// Most systems accept `--map-root-user` alone. Some hardened containers and
-/// seccomp profiles block unprivileged writes to `/proc/self/uid_map`; there,
-/// util-linux delegates to the setuid `newuidmap`/`newgidmap` helpers when
-/// `--map-auto` is also present.
-///
-/// That fallback therefore depends on the setuid helpers (the `uidmap`
-/// package on Debian/Ubuntu) and on the current user having a range in
-/// `/etc/subuid` and `/etc/subgid`. When either is missing, `--map-auto`
-/// fails and the startup probe rejects the candidate, keeping the plain form.
-///
-/// Each candidate is the **complete** static argument shape the launcher
-/// uses (see `build_linux_sandbox_command`): mapping flags followed by the
-/// namespace flags `--mount --ipc --pid --uts --fork`. The startup probe
-/// runs each candidate verbatim (plus a trivial program), so probe success
-/// implies launch success: on systems where the mapping works but the
-/// namespace flags are denied (e.g. AppArmor-restricted CI runners that
-/// block mount propagation in user namespaces), the probe fails and the
-/// sandbox stays disabled instead of activating a launcher that always
-/// errors.
-///
-/// `--net` is intentionally absent: it is appended only when network
-/// isolation is active (the non-default path), and probing with it would
-/// disable the sandbox on hosts that block network-namespace creation (e.g.
-/// Docker's default seccomp profile) even when network isolation is never
-/// requested.
-const UNSHARE_MAPPING_CANDIDATES: &[&[&str]] = &[
-    &[
-        "--user",
-        "--map-root-user",
-        "--mount",
-        "--ipc",
-        "--pid",
-        "--uts",
-        "--fork",
-    ],
-    &[
-        "--user",
-        "--map-root-user",
-        "--map-auto",
-        "--mount",
-        "--ipc",
-        "--pid",
-        "--uts",
-        "--fork",
-    ],
-];
-
-/// Probe a candidate `unshare` mapping invocation with a trivial program.
-fn unshare_probe(args: &[&str]) -> bool {
-    std::process::Command::new("unshare")
-        .args(args)
-        .arg("true")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
-}
-
-/// The first mapping option set that works on this machine, if any.
-///
-/// Probes are cached for the process lifetime; a missing `unshare` binary or a
-/// kernel that refuses every mapping yields `None`.
-fn working_unshare_mapping() -> Option<&'static [&'static str]> {
-    use std::sync::OnceLock;
-    static MAPPING: OnceLock<Option<&'static [&'static str]>> = OnceLock::new();
-    *MAPPING.get_or_init(|| {
-        UNSHARE_MAPPING_CANDIDATES
-            .iter()
-            .copied()
-            .find(|args| unshare_probe(args))
-    })
-}
-
 /// Check whether `unshare --user` actually works on this system.
 /// On some CI environments (e.g. GitHub Actions), the binary exists but
 /// user namespaces are restricted, causing silent failures.
+#[cfg(target_os = "linux")]
 fn unshare_user_namespace_works() -> bool {
     use std::sync::OnceLock;
     static RESULT: OnceLock<bool> = OnceLock::new();
@@ -367,20 +504,56 @@ fn unshare_user_namespace_works() -> bool {
         if !command_exists("unshare") {
             return false;
         }
-        working_unshare_mapping().is_some()
+        std::process::Command::new("unshare")
+            .args(["--user", "--map-root-user", "true"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    })
+}
+
+/// AppContainer ships in every Windows build that has Rust toolchain
+/// support (Windows 10 1709+ / Windows Server 2019+). Rather than pin a
+/// specific OS build, we treat the question as "is the host capable" and
+/// allow the operator to opt out via `CLAWD_FORCE_APPCONTAINER=0`.
+///
+/// A real `windows-sys` based probe of `CreateAppContainerProfile` in
+/// `userenv.dll` is the right next step when tool execution is wired to
+/// consume the `WindowsSandboxCommand`; the snapshot-only contract that
+/// `/sandbox` exposes today does not need the dynamic-link call.
+#[cfg(target_os = "windows")]
+fn appcontainer_is_supported() -> bool {
+    use std::sync::OnceLock;
+    static RESULT: OnceLock<bool> = OnceLock::new();
+    *RESULT.get_or_init(|| {
+        if env::var("CLAWD_FORCE_APPCONTAINER")
+            .map(|v| v == "0")
+            .unwrap_or(false)
+        {
+            return false;
+        }
+        true
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        build_linux_sandbox_command, detect_container_environment_from, FilesystemIsolationMode,
-        SandboxConfig, SandboxDetectionInputs,
+        detect_container_environment_windows_from, FilesystemIsolationMode, SandboxConfig,
+    };
+
+    #[cfg(target_os = "linux")]
+    use super::{
+        build_linux_sandbox_command, detect_container_environment_from, SandboxDetectionInputs,
     };
     use std::path::Path;
 
+    #[cfg(target_os = "linux")]
     #[test]
-    fn detects_container_markers_from_multiple_sources() {
+    fn linux_detection_picks_up_markers_from_multiple_sources() {
         let detected = detect_container_environment_from(SandboxDetectionInputs {
             env_pairs: vec![("container".to_string(), "docker".to_string())],
             dockerenv_exists: true,
@@ -401,6 +574,59 @@ mod tests {
             .markers
             .iter()
             .any(|marker| marker == "/proc/1/cgroup:docker"));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_detection_picks_up_kubernetes_and_identity() {
+        let detected = detect_container_environment_windows_from(
+            false,
+            true,
+            &[("KUBERNETES_SERVICE_HOST".to_string(), "10.0.0.1".to_string())],
+        );
+        assert!(detected.in_container);
+        assert!(detected
+            .markers
+            .iter()
+            .any(|marker| marker == r"C:\identity.txt"));
+        assert!(detected
+            .markers
+            .iter()
+            .any(|marker| marker == "env:KUBERNETES_SERVICE_HOST=10.0.0.1"));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_detection_picks_up_clawd_dev_container_marker() {
+        let detected = detect_container_environment_windows_from(
+            true,
+            false,
+            &[("CONTAINER_NAME".to_string(), "claw-dev".to_string())],
+        );
+        assert!(detected.in_container);
+        assert!(detected
+            .markers
+            .iter()
+            .any(|marker| marker == "env:CLAWD_IN_DEV_CONTAINER"));
+        assert!(detected
+            .markers
+            .iter()
+            .any(|marker| marker == "env:CONTAINER_NAME=claw-dev"));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_detection_ignores_empty_env_values() {
+        let detected = detect_container_environment_windows_from(
+            false,
+            false,
+            &[
+                ("CONTAINER_SAS_URL".to_string(), String::new()),
+                ("KUBERNETES_SERVICE_HOST".to_string(), String::new()),
+            ],
+        );
+        assert!(!detected.in_container);
+        assert!(detected.markers.is_empty());
     }
 
     #[test]
@@ -428,52 +654,7 @@ mod tests {
         assert_eq!(request.allowed_mounts, vec!["tmp"]);
     }
 
-    #[test]
-    fn mapping_candidates_prefer_plain_root_mapping() {
-        assert!(!super::UNSHARE_MAPPING_CANDIDATES.is_empty());
-        for candidate in super::UNSHARE_MAPPING_CANDIDATES {
-            // Mapping flags.
-            assert!(candidate.contains(&"--user"));
-            assert!(candidate.contains(&"--map-root-user"));
-            // Namespace flags the real launcher appends — the probe must
-            // exercise the full invocation shape, not just mapping flags.
-            assert!(candidate.contains(&"--mount"));
-            assert!(candidate.contains(&"--ipc"));
-            assert!(candidate.contains(&"--pid"));
-            assert!(candidate.contains(&"--uts"));
-            assert!(candidate.contains(&"--fork"));
-        }
-        // The plain form must be tried first; `--map-auto` is only a fallback
-        // for kernels/containers that block unprivileged uid_map writes.
-        assert_eq!(
-            super::UNSHARE_MAPPING_CANDIDATES[0],
-            &[
-                "--user",
-                "--map-root-user",
-                "--mount",
-                "--ipc",
-                "--pid",
-                "--uts",
-                "--fork",
-            ]
-        );
-        // The second candidate inserts `--map-auto` in the position util-linux
-        // expects (after `--map-root-user`, before the namespace flags).
-        assert_eq!(
-            super::UNSHARE_MAPPING_CANDIDATES[1],
-            &[
-                "--user",
-                "--map-root-user",
-                "--map-auto",
-                "--mount",
-                "--ipc",
-                "--pid",
-                "--uts",
-                "--fork",
-            ]
-        );
-    }
-
+    #[cfg(target_os = "linux")]
     #[test]
     fn builds_linux_launcher_with_network_flag_when_requested() {
         let config = SandboxConfig::default();
@@ -494,6 +675,58 @@ mod tests {
             assert_eq!(launcher.program, "unshare");
             assert!(launcher.args.iter().any(|arg| arg == "--mount"));
             assert!(launcher.args.iter().any(|arg| arg == "--net") == status.network_active);
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn builds_windows_descriptive_command_when_enabled() {
+        use super::{build_windows_sandbox_command, resolve_sandbox_status_for_request};
+        let config = SandboxConfig::default();
+        let status = resolve_sandbox_status_for_request(
+            &config.resolve_request(
+                Some(true),
+                Some(true),
+                Some(false),
+                Some(FilesystemIsolationMode::Off),
+                None,
+            ),
+            Path::new(r"C:\workspace"),
+        );
+
+        if let Some(launcher) =
+            build_windows_sandbox_command("echo hi", Path::new(r"C:\workspace"), &status)
+        {
+            assert_eq!(launcher.program, "CreateProcessW");
+            assert!(launcher.args.iter().any(|arg| arg == "/C"));
+            assert!(launcher.app_container_profile.starts_with("clawcode-"));
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn resolve_sandbox_status_reports_windows_fallback_wording() {
+        use super::resolve_sandbox_status_for_request;
+        let config = SandboxConfig::default();
+        let status = resolve_sandbox_status_for_request(
+            &config.resolve_request(
+                Some(true),
+                Some(true),
+                Some(true),
+                Some(FilesystemIsolationMode::WorkspaceOnly),
+                None,
+            ),
+            Path::new(r"C:\workspace"),
+        );
+
+        if !status.supported {
+            // On hosts where AppContainer is force-disabled the wording
+            // should mention the platform, not Linux's unshare.
+            let reason = status.fallback_reason.unwrap_or_default();
+            assert!(
+                reason.contains("Windows") || reason.contains("AppContainer"),
+                "unexpected fallback_reason: {reason}"
+            );
         }
     }
 }

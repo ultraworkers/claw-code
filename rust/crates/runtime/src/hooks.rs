@@ -2,6 +2,8 @@ use std::ffi::OsStr;
 use std::fmt::Write as FmtWrite;
 use std::io::Write;
 use std::process::{Command, Stdio};
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -11,27 +13,42 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
-use crate::config::{RuntimeFeatureConfig, RuntimeHookCommand, RuntimeHookConfig};
+use crate::config::{RuntimeFeatureConfig, RuntimeHookConfig};
 use crate::permissions::PermissionOverride;
 
 const HOOK_PREVIEW_CHAR_LIMIT: usize = 160;
 
 pub type HookPermissionDecision = PermissionOverride;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HookEvent {
     PreToolUse,
     PostToolUse,
     PostToolUseFailure,
+    /// Any other Claude Code hook event (e.g. `SessionStart`, `Stop`,
+    /// `UserPromptSubmit`). Carried by name so new events work without a code
+    /// change.
+    Custom(String),
 }
 
 impl HookEvent {
     #[must_use]
-    pub fn as_str(self) -> &'static str {
+    pub fn as_str(&self) -> &str {
         match self {
             Self::PreToolUse => "PreToolUse",
             Self::PostToolUse => "PostToolUse",
             Self::PostToolUseFailure => "PostToolUseFailure",
+            Self::Custom(name) => name,
+        }
+    }
+
+    #[must_use]
+    pub fn from_name(name: &str) -> Self {
+        match name {
+            "PreToolUse" => Self::PreToolUse,
+            "PostToolUse" => Self::PostToolUse,
+            "PostToolUseFailure" => Self::PostToolUseFailure,
+            other => Self::Custom(other.to_string()),
         }
     }
 }
@@ -40,17 +57,17 @@ impl HookEvent {
 pub enum HookProgressEvent {
     Started {
         event: HookEvent,
-        tool_name: String,
+        tool_name: Option<String>,
         command: String,
     },
     Completed {
         event: HookEvent,
-        tool_name: String,
+        tool_name: Option<String>,
         command: String,
     },
     Cancelled {
         event: HookEvent,
-        tool_name: String,
+        tool_name: Option<String>,
         command: String,
     },
 }
@@ -182,9 +199,11 @@ impl HookRunner {
     ) -> HookRunResult {
         Self::run_commands(
             HookEvent::PreToolUse,
-            self.config.pre_tool_use_entries(),
-            tool_name,
-            tool_input,
+            self.config.commands_for("PreToolUse"),
+            None,
+            None,
+            Some(tool_name),
+            Some(tool_input),
             None,
             false,
             abort_signal,
@@ -232,9 +251,11 @@ impl HookRunner {
     ) -> HookRunResult {
         Self::run_commands(
             HookEvent::PostToolUse,
-            self.config.post_tool_use_entries(),
-            tool_name,
-            tool_input,
+            self.config.commands_for("PostToolUse"),
+            None,
+            None,
+            Some(tool_name),
+            Some(tool_input),
             Some(tool_output),
             is_error,
             abort_signal,
@@ -282,9 +303,11 @@ impl HookRunner {
     ) -> HookRunResult {
         Self::run_commands(
             HookEvent::PostToolUseFailure,
-            self.config.post_tool_use_failure_entries(),
-            tool_name,
-            tool_input,
+            self.config.commands_for("PostToolUseFailure"),
+            None,
+            None,
+            Some(tool_name),
+            Some(tool_input),
             Some(tool_error),
             true,
             abort_signal,
@@ -309,12 +332,39 @@ impl HookRunner {
         )
     }
 
+    /// Run every command registered for an arbitrary hook `event`. Lifecycle
+    /// events (SessionStart, Stop, UserPromptSubmit, PreCompact, ...) carry a
+    /// `session_id` and `cwd` instead of tool metadata.
+    #[must_use]
+    pub fn run_event(
+        &self,
+        event: &str,
+        session_id: Option<&str>,
+        cwd: Option<&str>,
+    ) -> HookRunResult {
+        let commands = self.config.commands_for(event);
+        Self::run_commands(
+            HookEvent::from_name(event),
+            commands,
+            session_id,
+            cwd,
+            None,
+            None,
+            None,
+            false,
+            None,
+            None,
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn run_commands(
         event: HookEvent,
-        commands: &[RuntimeHookCommand],
-        tool_name: &str,
-        tool_input: &str,
+        commands: &[String],
+        session_id: Option<&str>,
+        cwd: Option<&str>,
+        tool_name: Option<&str>,
+        tool_input: Option<&str>,
         tool_output: Option<&str>,
         is_error: bool,
         abort_signal: Option<&HookAbortSignal>,
@@ -339,25 +389,25 @@ impl HookRunner {
             };
         }
 
-        let payload = hook_payload(event, tool_name, tool_input, tool_output, is_error).to_string();
+        let payload =
+            hook_payload(&event, session_id, cwd, tool_name, tool_input, tool_output, is_error)
+                .to_string();
         let mut result = HookRunResult::allow(Vec::new());
 
-        for command in commands
-            .iter()
-            .filter(|command| command.matches_tool(tool_name))
-        {
-            let command_text = command.command();
-            if let Some(reporter) = reporter.as_deref_mut() {
-                reporter.on_event(&HookProgressEvent::Started {
-                    event,
-                    tool_name: tool_name.to_string(),
-                    command: command_text.to_string(),
-                });
-            }
+        for command in commands {
+                if let Some(reporter) = reporter.as_deref_mut() {
+                    reporter.on_event(&HookProgressEvent::Started {
+                event: event.clone(),
+                    tool_name: tool_name.map(str::to_string),
+                        command: command.clone(),
+                    });
+                }
 
             match Self::run_command(
-                command_text,
-                event,
+                command,
+                &event,
+                session_id,
+                cwd,
                 tool_name,
                 tool_input,
                 tool_output,
@@ -368,9 +418,9 @@ impl HookRunner {
                 HookCommandOutcome::Allow { parsed } => {
                     if let Some(reporter) = reporter.as_deref_mut() {
                         reporter.on_event(&HookProgressEvent::Completed {
-                            event,
-                            tool_name: tool_name.to_string(),
-                            command: command_text.to_string(),
+                            event: event.clone(),
+                            tool_name: tool_name.map(str::to_string),
+                            command: command.clone(),
                         });
                     }
                     merge_parsed_hook_output(&mut result, parsed);
@@ -378,9 +428,9 @@ impl HookRunner {
                 HookCommandOutcome::Deny { parsed } => {
                     if let Some(reporter) = reporter.as_deref_mut() {
                         reporter.on_event(&HookProgressEvent::Completed {
-                            event,
-                            tool_name: tool_name.to_string(),
-                            command: command_text.to_string(),
+                            event: event.clone(),
+                            tool_name: tool_name.map(str::to_string),
+                            command: command.clone(),
                         });
                     }
                     merge_parsed_hook_output(&mut result, parsed);
@@ -390,9 +440,9 @@ impl HookRunner {
                 HookCommandOutcome::Failed { parsed } => {
                     if let Some(reporter) = reporter.as_deref_mut() {
                         reporter.on_event(&HookProgressEvent::Completed {
-                            event,
-                            tool_name: tool_name.to_string(),
-                            command: command_text.to_string(),
+                            event: event.clone(),
+                            tool_name: tool_name.map(str::to_string),
+                            command: command.clone(),
                         });
                     }
                     merge_parsed_hook_output(&mut result, parsed);
@@ -401,11 +451,11 @@ impl HookRunner {
                 }
                 HookCommandOutcome::Cancelled { message } => {
                     if let Some(reporter) = reporter.as_deref_mut() {
-                        reporter.on_event(&HookProgressEvent::Cancelled {
-                            event,
-                            tool_name: tool_name.to_string(),
-                            command: command_text.to_string(),
-                        });
+                    reporter.on_event(&HookProgressEvent::Cancelled {
+                event: event.clone(),
+                    tool_name: tool_name.map(str::to_string),
+                        command: command.clone(),
+                    });
                     }
                     result.cancelled = true;
                     result.messages.push(message);
@@ -420,9 +470,11 @@ impl HookRunner {
     #[allow(clippy::too_many_arguments)]
     fn run_command(
         command: &str,
-        event: HookEvent,
-        tool_name: &str,
-        tool_input: &str,
+        event: &HookEvent,
+        session_id: Option<&str>,
+        cwd: Option<&str>,
+        tool_name: Option<&str>,
+        tool_input: Option<&str>,
         tool_output: Option<&str>,
         is_error: bool,
         payload: &str,
@@ -433,13 +485,24 @@ impl HookRunner {
         child.stdout(Stdio::piped());
         child.stderr(Stdio::piped());
         child.env("HOOK_EVENT", event.as_str());
-        child.env("HOOK_TOOL_NAME", tool_name);
-        child.env("HOOK_TOOL_INPUT", tool_input);
+        if let Some(session_id) = session_id {
+            child.env("CLAUDE_SESSION_ID", session_id);
+        }
+        if let Some(cwd) = cwd {
+            child.env("CLAUDE_CWD", cwd);
+        }
+        if let Some(tool_name) = tool_name {
+            child.env("HOOK_TOOL_NAME", tool_name);
+        }
+        if let Some(tool_input) = tool_input {
+            child.env("HOOK_TOOL_INPUT", tool_input);
+        }
         child.env("HOOK_TOOL_IS_ERROR", if is_error { "1" } else { "0" });
         if let Some(tool_output) = tool_output {
             child.env("HOOK_TOOL_OUTPUT", tool_output);
         }
 
+        let tool_name = tool_name.unwrap_or("");
         match child.output_with_stdin(payload.as_bytes(), abort_signal) {
             Ok(CommandExecution::Finished(output)) => {
                 let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -540,7 +603,7 @@ fn merge_parsed_hook_output(target: &mut HookRunResult, parsed: ParsedHookOutput
 }
 
 fn parse_hook_output(
-    event: HookEvent,
+    event: &HookEvent,
     tool_name: &str,
     command: &str,
     stdout: &str,
@@ -634,30 +697,48 @@ fn parse_hook_output(
 }
 
 fn hook_payload(
-    event: HookEvent,
-    tool_name: &str,
-    tool_input: &str,
+    event: &HookEvent,
+    session_id: Option<&str>,
+    cwd: Option<&str>,
+    tool_name: Option<&str>,
+    tool_input: Option<&str>,
     tool_output: Option<&str>,
     is_error: bool,
 ) -> Value {
-    match event {
-        HookEvent::PostToolUseFailure => json!({
-            "hook_event_name": event.as_str(),
-            "tool_name": tool_name,
-            "tool_input": parse_tool_input(tool_input),
-            "tool_input_json": tool_input,
-            "tool_error": tool_output,
-            "tool_result_is_error": true,
-        }),
-        _ => json!({
-            "hook_event_name": event.as_str(),
-            "tool_name": tool_name,
-            "tool_input": parse_tool_input(tool_input),
-            "tool_input_json": tool_input,
-            "tool_output": tool_output,
-            "tool_result_is_error": is_error,
-        }),
+    let mut payload = serde_json::Map::new();
+    payload.insert("hook_event_name".to_string(), json!(event.as_str()));
+    if let Some(session_id) = session_id {
+        payload.insert("session_id".to_string(), json!(session_id));
     }
+    if let Some(cwd) = cwd {
+        payload.insert("cwd".to_string(), json!(cwd));
+    }
+    let mut obj = Value::Object(payload);
+    match event {
+        HookEvent::PostToolUseFailure => {
+            if let Some(tool_name) = tool_name {
+                obj["tool_name"] = json!(tool_name);
+                obj["tool_input"] = parse_tool_input(tool_input.unwrap_or("{}"));
+                obj["tool_input_json"] = json!(tool_input.unwrap_or("{}"));
+            }
+            if let Some(tool_output) = tool_output {
+                obj["tool_error"] = json!(tool_output);
+            }
+            obj["tool_result_is_error"] = json!(true);
+        }
+        _ => {
+            if let Some(tool_name) = tool_name {
+                obj["tool_name"] = json!(tool_name);
+                obj["tool_input"] = parse_tool_input(tool_input.unwrap_or("{}"));
+                obj["tool_input_json"] = json!(tool_input.unwrap_or("{}"));
+            }
+            if let Some(tool_output) = tool_output {
+                obj["tool_output"] = json!(tool_output);
+            }
+            obj["tool_result_is_error"] = json!(is_error);
+        }
+    }
+    obj
 }
 
 fn parse_tool_input(tool_input: &str) -> Value {
@@ -665,7 +746,7 @@ fn parse_tool_input(tool_input: &str) -> Value {
 }
 
 fn format_invalid_hook_output(
-    event: HookEvent,
+    event: &HookEvent,
     tool_name: &str,
     command: &str,
     detail: &str,
@@ -743,7 +824,8 @@ fn shell_command(command: &str) -> CommandWithStdin {
     #[cfg(windows)]
     let command_builder = {
         let mut command_builder = Command::new("cmd");
-        command_builder.arg("/C").arg(command);
+        command_builder.raw_arg("/C ");
+        command_builder.raw_arg(command);
         CommandWithStdin::new(command_builder)
     };
 
@@ -829,7 +911,7 @@ mod tests {
         HookAbortSignal, HookEvent, HookProgressEvent, HookProgressReporter, HookRunResult,
         HookRunner,
     };
-    use crate::config::{RuntimeFeatureConfig, RuntimeHookCommand, RuntimeHookConfig};
+    use crate::config::{RuntimeFeatureConfig, RuntimeHookConfig};
     use crate::permissions::PermissionOverride;
 
     struct RecordingReporter {
@@ -853,37 +935,6 @@ mod tests {
         let result = runner.run_pre_tool_use("Read", r#"{"path":"README.md"}"#);
 
         assert_eq!(result, HookRunResult::allow(vec!["pre ok".to_string()]));
-    }
-
-    #[test]
-    fn object_style_hook_matchers_filter_runtime_execution() {
-        let runner = HookRunner::new(RuntimeHookConfig::from_hook_commands(
-            vec![
-                RuntimeHookCommand::new(shell_snippet("printf 'legacy'")),
-                RuntimeHookCommand::with_matcher(
-                    shell_snippet("printf 'bash only'"),
-                    Some("Bash".to_string()),
-                ),
-                RuntimeHookCommand::with_matcher(
-                    shell_snippet("printf 'read only'"),
-                    Some("Read*".to_string()),
-                ),
-            ],
-            Vec::new(),
-            Vec::new(),
-        ));
-
-        let read_result = runner.run_pre_tool_use("ReadFile", r#"{"path":"README.md"}"#);
-        let bash_result = runner.run_pre_tool_use("Bash", r#"{"command":"pwd"}"#);
-
-        assert_eq!(
-            read_result,
-            HookRunResult::allow(vec!["legacy".to_string(), "read only".to_string()])
-        );
-        assert_eq!(
-            bash_result,
-            HookRunResult::allow(vec!["legacy".to_string(), "bash only".to_string()])
-        );
     }
 
     #[test]
@@ -1016,38 +1067,73 @@ mod tests {
             HookRunResult::allow(vec!["first".to_string(), "second".to_string()])
         );
         assert_eq!(reporter.events.len(), 4);
-        assert!(matches!(
-            &reporter.events[0],
-            HookProgressEvent::Started {
-                event: HookEvent::PreToolUse,
-                command,
-                ..
-            } if command == "printf 'first'"
-        ));
-        assert!(matches!(
-            &reporter.events[1],
-            HookProgressEvent::Completed {
-                event: HookEvent::PreToolUse,
-                command,
-                ..
-            } if command == "printf 'first'"
-        ));
-        assert!(matches!(
-            &reporter.events[2],
-            HookProgressEvent::Started {
-                event: HookEvent::PreToolUse,
-                command,
-                ..
-            } if command == "printf 'second'"
-        ));
-        assert!(matches!(
-            &reporter.events[3],
-            HookProgressEvent::Completed {
-                event: HookEvent::PreToolUse,
-                command,
-                ..
-            } if command == "printf 'second'"
-        ));
+        if cfg!(windows) {
+            assert!(matches!(
+                &reporter.events[0],
+                HookProgressEvent::Started {
+                    event: HookEvent::PreToolUse,
+                    command,
+                    ..
+                } if command == "echo first"
+            ));
+            assert!(matches!(
+                &reporter.events[1],
+                HookProgressEvent::Completed {
+                    event: HookEvent::PreToolUse,
+                    command,
+                    ..
+                } if command == "echo first"
+            ));
+            assert!(matches!(
+                &reporter.events[2],
+                HookProgressEvent::Started {
+                    event: HookEvent::PreToolUse,
+                    command,
+                    ..
+                } if command == "echo second"
+            ));
+            assert!(matches!(
+                &reporter.events[3],
+                HookProgressEvent::Completed {
+                    event: HookEvent::PreToolUse,
+                    command,
+                    ..
+                } if command == "echo second"
+            ));
+        } else {
+            assert!(matches!(
+                &reporter.events[0],
+                HookProgressEvent::Started {
+                    event: HookEvent::PreToolUse,
+                    command,
+                    ..
+                } if command == "printf 'first'"
+            ));
+            assert!(matches!(
+                &reporter.events[1],
+                HookProgressEvent::Completed {
+                    event: HookEvent::PreToolUse,
+                    command,
+                    ..
+                } if command == "printf 'first'"
+            ));
+            assert!(matches!(
+                &reporter.events[2],
+                HookProgressEvent::Started {
+                    event: HookEvent::PreToolUse,
+                    command,
+                    ..
+                } if command == "printf 'second'"
+            ));
+            assert!(matches!(
+                &reporter.events[3],
+                HookProgressEvent::Completed {
+                    event: HookEvent::PreToolUse,
+                    command,
+                    ..
+                } if command == "printf 'second'"
+            ));
+        }
     }
 
     #[test]
@@ -1091,8 +1177,13 @@ mod tests {
         assert!(rendered.contains("hook_invalid_json:"));
         assert!(rendered.contains("phase=PreToolUse"));
         assert!(rendered.contains("tool=Edit"));
-        assert!(rendered.contains("command=printf '{not-json"));
-        assert!(rendered.contains("printf 'stderr warning' >&2; exit 1"));
+        if cfg!(windows) {
+            assert!(rendered.contains("command=echo {not-json"));
+            assert!(rendered.contains("echo stderr warning 1>&2"));
+        } else {
+            assert!(rendered.contains("command=printf '{not-json"));
+            assert!(rendered.contains("printf 'stderr warning' >&2; exit 1"));
+        }
         assert!(rendered.contains("detail=key must be a string"));
         assert!(rendered.contains("stdout_preview={not-json"));
         assert!(rendered.contains("second line stderr_preview=stderr warning"));
@@ -1139,9 +1230,144 @@ mod tests {
         )));
     }
 
+    // ----- Ports of the four plugin-side hook tests that lived in  -----
+    // ----- the deleted plugins hooks module.                       -----
+    // ----- Each port adapts the plugins-side API (PluginHooks /     -----
+    // ----- HookRunner::from_registry) to the runtime-side API       -----
+    // ----- (RuntimeHookConfig). Behavior under test is identical:   -----
+    // ----- the engine consumes the config and dispatches commands   -----
+    // ----- the same way regardless of which crate produced it.      -----
+
+    #[test]
+    fn runs_all_three_event_types_with_multiple_scripts() {
+        let runner = HookRunner::new(RuntimeHookConfig::new(
+            vec![
+                shell_snippet("printf 'pre one'"),
+                shell_snippet("printf 'pre two'"),
+            ],
+            vec![
+                shell_snippet("printf 'post one'"),
+                shell_snippet("printf 'post two'"),
+            ],
+            vec![
+                shell_snippet("printf 'failure one'"),
+                shell_snippet("printf 'failure two'"),
+            ],
+        ));
+
+        assert_eq!(
+            runner.run_pre_tool_use("Read", r#"{"path":"README.md"}"#),
+            HookRunResult::allow(vec!["pre one".to_string(), "pre two".to_string()])
+        );
+        assert_eq!(
+            runner.run_post_tool_use("Read", r#"{"path":"README.md"}"#, "ok", false),
+            HookRunResult::allow(vec![
+                "post one".to_string(),
+                "post two".to_string(),
+            ])
+        );
+        assert_eq!(
+            runner.run_post_tool_use_failure(
+                "Read",
+                r#"{"path":"README.md"}"#,
+                "tool failed",
+            ),
+            HookRunResult::allow(vec![
+                "failure one".to_string(),
+                "failure two".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn pre_tool_use_denies_when_runtime_hook_exits_two() {
+        let runner = HookRunner::new(RuntimeHookConfig::new(
+            vec![shell_snippet("printf 'blocked by hook'; exit 2")],
+            Vec::new(),
+            Vec::new(),
+        ));
+
+        let result = runner.run_pre_tool_use("Bash", r#"{"command":"pwd"}"#);
+
+        assert!(result.is_denied());
+        assert_eq!(result.messages(), &["blocked by hook".to_string()]);
+    }
+
+    #[test]
+    fn propagates_runtime_hook_failures_and_short_circuits() {
+        let runner = HookRunner::new(RuntimeHookConfig::new(
+            vec![
+                shell_snippet("printf 'broken hook'; exit 1"),
+                shell_snippet("printf 'later hook'"),
+            ],
+            Vec::new(),
+            Vec::new(),
+        ));
+
+        let result = runner.run_pre_tool_use("Bash", r#"{"command":"pwd"}"#);
+
+        assert!(result.is_failed());
+        assert!(result
+            .messages()
+            .iter()
+            .any(|message| message.contains("broken hook")));
+        assert!(!result
+            .messages()
+            .iter()
+            .any(|message| message == "later hook"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generated_hook_scripts_are_executable_after_chmod() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time should be after epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("runtime-hook-exec-{nanos}"));
+        std::fs::create_dir_all(&root).expect("mkdir");
+        let script_path = root.join("hook.sh");
+        std::fs::write(&script_path, "#!/bin/sh\nprintf 'hi'\n").expect("write script");
+
+        let mut perms = std::fs::metadata(&script_path)
+            .expect("metadata before chmod")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script_path, perms).expect("chmod");
+
+        let mode = std::fs::metadata(&script_path)
+            .expect("metadata after chmod")
+            .permissions()
+            .mode();
+        assert!(
+            mode & 0o111 != 0,
+            "execute bit set, got mode {mode:#o}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[cfg(windows)]
     fn shell_snippet(script: &str) -> String {
-        script.replace('\'', "\"")
+        let mut result = script.to_string();
+        result = result.replace("printf '%s' ", "echo ");
+        result = result.replace("printf ", "echo ");
+        result = result.replace('\'', "");
+        result = result.replace('\n', " ");
+        let parts: Vec<&str> = result.split(';').collect();
+        if parts.len() > 1 {
+            result = parts.join(" &");
+        }
+        result = result.replace(">&2", "1>&2");
+        if result.contains("sleep ") {
+            result = result.replace("sleep ", "ping -n ");
+            if !result.contains("127.0.0.1") {
+                result = format!("{} 127.0.0.1 >nul", result.trim_end());
+            }
+        }
+        result
     }
 
     #[cfg(not(windows))]

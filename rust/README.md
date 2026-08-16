@@ -1,231 +1,189 @@
-# 🦞 Claw Code — Rust Implementation
+# Claw Code
 
-A high-performance Rust rewrite of the Claw Code CLI agent harness. Built for speed, safety, and native tool execution.
+A terminal-native AI coding assistant built in Rust. Connects to Anthropic's Messages API and OpenAI-compatible providers (LM Studio, Ollama, vLLM, OpenRouter). Features a full REPL, MCP integration, WASM-based plugin system, agent delegation, and a permission-gated tool ecosystem.
 
-For a task-oriented guide with copy/paste examples, see [`../USAGE.md`](../USAGE.md).
+![Terminal](terminal.png)
 
-## Quick Start
+## Project Origin
 
-```bash
-# Inspect available commands
-cd rust/
-cargo run -p rusty-claude-cli -- --help
+This project was developed from a reset of the Claudecode project by UltraWorkers AI. Extensive work was done to make the project functional, with large-scale, wide-ranging modifications — only a small portion of the original code remains. This project holds significant value.
 
-# Build the workspace
-cargo build --workspace
+### Crate-Level Changes vs Original
 
-# Run the interactive REPL
-cargo run -p rusty-claude-cli -- --model claude-opus-4-7
+**Removed crates (3):**
 
-# One-shot prompt
-cargo run -p rusty-claude-cli -- prompt "explain this codebase"
+| Crate | Description |
+|---|---|
+| `claw-analog/` | Original main binary — replaced by `claw-cli` |
+| `claw-rag-service/` | RAG retrieval service (Qdrant + embeddings) — fully removed |
+| `rusty-claude-cli/` | Old CLI layer — merged into `claw-cli` |
 
-# JSON output for automation
-cargo run -p rusty-claude-cli -- --output-format json prompt "summarize src/main.rs"
-```
+**Added crates (4):**
 
-## Configuration
+| Crate | Description |
+|---|---|
+| `agents/` | Agent delegation engine (spawn, discovery, persist, runtime) |
+| `claw-cli/` | New main CLI binary (icons, build.rs, config_wizard, picker, render) |
+| `migrate-patch-names/` | One-shot patch-name migration utility |
+| `plugin-types/` | Plugin shared types (config, lifecycle, MCP) |
 
-Set your API credentials:
+**Shared crate changes:**
 
-```bash
-export ANTHROPIC_API_KEY="sk-ant-..."
-# Or use a proxy
-export ANTHROPIC_BASE_URL="https://your-proxy.com"
-```
+| Crate | Changes |
+|---|---|
+| `api/` | Added `convert.rs`, `incremental_body.rs`; `providers/` fully rewritten (anthropic, openai_compat); `error.rs` restructured |
+| `commands/` | `lib.rs` slimmed; extracted `handler.rs`, `registry.rs`, `path_extract.rs`, `plugin_agents.rs` |
+| `plugins/` | Removed bundled example hooks; added `frontmatter.rs`, `claude_settings.rs`; `lib.rs` expanded |
+| `runtime/` | **Most heavily changed** — removed 8 files (approval_tokens, g004_conformance, mcp_tool_bridge, report_schema, trident, worker_boot, etc.); added 18 new files (thinking/ module, tool_registry/ module, boundary, context, image_*, text_only_models, bash_job_object_ffi, etc.); `config.rs` significantly trimmed |
+| `tools/` | `lib.rs` massively refactored; added `excel_extract.rs`, `word_extract.rs`, `subagent_overlay.rs`; removed legacy docs and tests |
 
-Or provide an OAuth bearer token directly:
-
-```bash
-export ANTHROPIC_AUTH_TOKEN="anthropic-oauth-or-proxy-bearer-token"
-```
-
-For local OpenAI-compatible servers such as Ollama, including Qwen reasoning
-models, see [`../docs/local-openai-compatible-providers.md`](../docs/local-openai-compatible-providers.md).
-Use the exact model tag exposed by the server, for example `qwen3:latest`, and
-prefer `OLLAMA_HOST` for Ollama-specific local routing.
-
-## Mock parity harness
-
-The workspace now includes a deterministic Anthropic-compatible mock service and a clean-environment CLI harness for end-to-end parity checks.
-
-```bash
-cd rust/
-
-# Run the scripted clean-environment harness
-./scripts/run_mock_parity_harness.sh
-
-# Or start the mock service manually for ad hoc CLI runs
-cargo run -p mock-anthropic-service -- --bind 127.0.0.1:0
-```
-
-Harness coverage:
-
-- `streaming_text`
-- `read_file_roundtrip`
-- `grep_chunk_assembly`
-- `write_file_allowed`
-- `write_file_denied`
-- `multi_tool_turn_roundtrip`
-- `bash_stdout_roundtrip`
-- `bash_permission_prompt_approved`
-- `bash_permission_prompt_denied`
-- `plugin_tool_roundtrip`
-
-Primary artifacts:
-
-- `crates/mock-anthropic-service/` — reusable mock Anthropic-compatible service
-- `crates/rusty-claude-cli/tests/mock_parity_harness.rs` — clean-env CLI harness
-- `scripts/run_mock_parity_harness.sh` — reproducible wrapper
-- `scripts/run_mock_parity_diff.py` — scenario checklist + PARITY mapping runner
-- `mock_parity_scenarios.json` — scenario-to-PARITY manifest
+**Summary:** 13 original crates → 14 crates. Net deletion of ~15,000+ lines from removed crates, ~3,000+ lines in new crates. `runtime/` and `tools/` underwent architectural-level restructuring.
 
 ## Features
 
-| Feature | Status |
-|---------|--------|
-| Anthropic / OpenAI-compatible provider flows + streaming | ✅ |
-| Direct bearer-token auth via `ANTHROPIC_AUTH_TOKEN` | ✅ |
-| Interactive REPL (rustyline) | ✅ |
-| Tool system (bash, read, write, edit, grep, glob) | ✅ |
-| Web tools (search, fetch) | ✅ |
-| Sub-agent / agent surfaces | ✅ |
-| Todo tracking | ✅ |
-| Notebook editing | ✅ |
-| CLAUDE.md / CLAW.md / AGENTS.md project memory | ✅ |
-| Config file hierarchy (`.claw.json` + merged config sections) | ✅ |
-| Permission system | ✅ |
-| MCP server lifecycle + inspection | ✅ |
-| Session persistence + resume | ✅ |
-| Cost / usage / stats surfaces | ✅ |
-| Git integration | ✅ |
-| Markdown terminal rendering (ANSI) | ✅ |
-| Model aliases (opus/sonnet/haiku) | ✅ |
-| Direct CLI subcommands (`status`, `sandbox`, `agents`, `mcp`, `skills`, `doctor`) | ✅ |
-| Slash commands (including `/skills`, `/agents`, `/mcp`, `/doctor`, `/plugin`, `/subagent`) | ✅ |
-| Hooks (`/hooks`, config-backed lifecycle hooks) | ✅ |
-| Plugin management surfaces | ✅ |
-| Skills inventory / install / uninstall surfaces | ✅ |
-| Machine-readable JSON output across core CLI surfaces | ✅ |
+- **Dual Provider** — Anthropic Claude + any OpenAI-compatible endpoint (local or cloud)
+- **REPL & One-Shot** — Interactive session or single `claw "prompt"` invocation
+- **MCP** — Full Model Context Protocol over stdio, SSE, remote, and OAuth
+- **Plugins** — WASM-based extensions with versioned marketplace
+- **Agents** — `@agent` delegation for sub-task parallelism
+- **Skills** — Composable workflows via `/skill` slash commands
+- **Tools** — Bash, file R/W/E, grep, glob, PDF/Excel/Word extraction, web
+- **Permissions** — ReadOnly / WorkspaceWrite / DangerFullAccess tiers
+- **Session Persistence** — Save / resume / export to JSONL
 
-## Model Aliases
+## Quick Start
 
-Short names resolve to the latest model versions:
+### Prerequisites
 
-| Alias | Resolves To |
-|-------|------------|
-| `opus` | `claude-opus-4-7` |
-| `sonnet` | `claude-sonnet-4-6` |
-| `haiku` | `claude-haiku-4-5-20251213` |
+- Rust 2021 edition
+- MSVC + Clang-CL 22.x (see `CompilePreSet.bat`)
+- NASM, Perl (optional, for OpenSSL)
 
-## CLI Flags and Commands
+### Tool Dependencies
 
-Representative current surface:
+- **Git Bash** must be installed at `C:\Program Files\Git`. Download from [git-scm.com](https://git-scm.com) (use "Portable" or "Full installer" — either works).
+- **ripgrep** (`rg.exe`) — place in `C:\Program Files\Git\bin`. Repository: [github.com/BurntSushi/ripgrep](https://github.com/BurntSushi/ripgrep). Download from [releases](https://github.com/BurntSushi/ripgrep/releases) (Windows zip, extract `rg.exe`).
+- **fd** (`fd.exe`) — place in `C:\Program Files\Git\bin`. Repository: [github.com/sharkdp/fd](https://github.com/sharkdp/fd). Download from [releases](https://github.com/sharkdp/fd/releases) (Windows zip, extract `fd.exe`).
 
-```text
-claw [OPTIONS] [COMMAND]
+> Place `claw.exe` in a directory that is on your system `PATH`. If unsure where to put it, drop it in the Git Bash `bin\` directory alongside `rg.exe` and `fd.exe`.
 
-Flags:
-  --model MODEL
-  --output-format text|json  (case-insensitive; CLAW_OUTPUT_FORMAT supplies the default, flags override env)
-  --permission-mode MODE
-  --cwd PATH, -C PATH, --directory PATH
-  --dangerously-skip-permissions, --skip-permissions
-  --allowedTools TOOLS        canonical snake_case names or aliases; status JSON exposes allowed_tools.available/aliases
-  --resume [SESSION.jsonl|session-id|latest]
-  --version, -V
+### Build
 
-Top-level commands:
-  prompt <text>
-  help
-  version
-  status
-  sandbox
-  acp [serve]
-  dump-manifests
-  bootstrap-plan
-  agents
-  mcp
-  skills
-  system-prompt
-  init
+```bat
+CompilePreSet.bat && cargo build --release
 ```
 
-`claw acp` is a local discoverability surface for editor-first users: it reports the current ACP/Zed status without starting the runtime. As of April 16, 2026, claw-code does **not** ship an ACP/Zed daemon or JSON-RPC entrypoint yet, and `claw acp serve` is only a status alias until the real protocol surface lands. Status queries exit 0 and expose the same machine-readable contract via `--output-format json`; malformed ACP invocations exit 1 with `kind: unsupported_acp_invocation`.
-`--output-format` accepts `text` or `json` in any casing. `CLAW_OUTPUT_FORMAT=json` selects JSON as the default for non-interactive commands, explicit flags override it, repeated flags warn on stderr, and status JSON exposes `format_source`, `format_raw`, and `format_overridden`. Help and doctor output also surface `CLAW_LOG` / `RUST_LOG` as the logging environment knobs.
-`claw version --output-format json` is the provenance probe for automation: it reports full `git_sha`, derived `git_sha_short`, `is_dirty`, `branch`, `commit_date`, `commit_timestamp`, `rustc_version`, runtime `executable_path`, and `binary_provenance`; the text report is available as `human_readable` instead of a duplicate `message` field.
-`status --output-format json` reports loaded project memory files under `workspace.memory_files[]` with each file's `path`, `source` (`claude_md`, `claw_md`, `agents_md`, or scoped/rule sources), `origin`, `scope_path`, `outside_project`, `chars`, and `contributes`; `claw doctor --output-format json` includes a dedicated `memory` check. Root instruction-file priority is `CLAUDE.md`, then `CLAW.md`, then `AGENTS.md`, discovery is bounded to the current git root when present (otherwise cwd only), and all non-duplicate loaded files contribute to the rendered system prompt.
-`claw mcp --output-format json` reports partial MCP config success: valid servers remain in `servers[]` while malformed siblings appear in `invalid_servers[]`, with `total_configured`, `valid_count`, and `invalid_count` split out for automation. `status` mirrors this as `mcp_validation`, and doctor includes an `mcp validation` check.
-`status --output-format json` also reports partial hook config success under `hook_validation`: valid hook entries are retained while malformed or unknown-event siblings appear in `invalid_hooks[]`, with `valid_count`, `invalid_count`, and typed `kind` fields (`invalid_hooks_config` or `unknown_hook_event`) for automation. `doctor --output-format json` includes a `hook validation` check, and `config --output-format json` includes `hook_validation` metadata with degraded status when invalid entries exist.
-Shorthand prompt mode honors the POSIX `--` end-of-flags separator, so `claw -- "-prompt-with-dash"` and unknown dash-prefixed non-flag text stay on the prompt path instead of being treated as CLI options.
-`claw dump-manifests` is self-contained: it emits the Rust resolver inventory for the selected workspace (commands, tools, agents, skills, and bootstrap phases) without requiring an upstream Claude Code TypeScript checkout. Use `--manifests-dir PATH` only to scope resolver discovery to another directory.
+### Run
 
-The command surface is moving quickly. For the canonical live help text, run:
-
-```bash
-cargo run -p rusty-claude-cli -- --help
+```bat
+start.bat
 ```
 
-## Slash Commands (REPL)
+Or with a local LLM via LM Studio:
 
-Tab completion expands slash commands, model aliases, permission modes, and recent session IDs.
-
-The REPL now exposes a much broader surface than the original minimal shell:
-
-- session / visibility: `/help`, `/status`, `/sandbox`, `/cost`, `/resume`, `/session`, `/version`, `/usage`, `/stats`
-- workspace / git: `/compact`, `/clear`, `/config`, `/memory`, `/init`, `/diff`, `/commit`, `/pr`, `/issue`, `/export`, `/hooks`, `/files`, `/release-notes`
-- discovery / debugging: `/mcp`, `/agents`, `/skills`, `/doctor`, `/tasks`, `/context`, `/desktop`
-- automation / analysis: `/review`, `/advisor`, `/insights`, `/security-review`, `/subagent`, `/team`, `/telemetry`, `/providers`, `/cron`, and more
-- plugin management: `/plugin` (with aliases `/plugins`, `/marketplace`)
-
-Notable claw-first surfaces now available directly in slash form:
-- `/skills [list|show <name>|install <path>|uninstall <name>|help]`
-- `/agents [list|show <name>|create <name>|help]`
-- `/mcp [list|show <server>|help]`
-- `/doctor`
-- `/plugin [list|install <path>|enable <name>|disable <name>|uninstall <id>|update <id>]`
-- `/subagent [list|steer <target> <msg>|kill <id>]`
-
-See [`../USAGE.md`](../USAGE.md) for usage examples and run `cargo run -p rusty-claude-cli -- --help` for the live canonical command list.
-
-## Workspace Layout
-
-```text
-rust/
-├── Cargo.toml              # Workspace root
-├── Cargo.lock
-└── crates/
-    ├── api/                # Provider clients + streaming + request preflight
-    ├── commands/           # Shared slash-command registry + help rendering
-    ├── compat-harness/     # Compatibility/parity harness utilities
-    ├── mock-anthropic-service/ # Deterministic local Anthropic-compatible mock
-    ├── plugins/            # Plugin metadata, manager, install/enable/disable surfaces
-    ├── runtime/            # Session, config, permissions, MCP, prompts, auth/runtime loop
-    ├── rusty-claude-cli/   # Main CLI binary (`claw`)
-    ├── telemetry/          # Session tracing and usage telemetry types
-    └── tools/              # Built-in tools, skill resolution, tool search, agent runtime surfaces
+```bat
+run_local_openai.bat
 ```
 
-### Crate Responsibilities
+### Configure
 
-- **api** — provider clients, SSE streaming, request/response types, auth (`ANTHROPIC_API_KEY` + bearer-token support), request-size/context-window preflight
-- **commands** — slash command definitions, parsing, help text generation, JSON/text command rendering
-- **compat-harness** — compatibility and parity helpers for comparing behavior with upstream fixtures
-- **mock-anthropic-service** — deterministic `/v1/messages` mock for CLI parity tests and local harness runs
-- **plugins** — plugin metadata, install/enable/disable/update flows, plugin tool definitions, hook integration surfaces
-- **runtime** — `ConversationRuntime`, config loading, session persistence, permission policy, MCP client lifecycle, system prompt assembly, usage tracking
-- **rusty-claude-cli** — REPL, one-shot prompt, direct CLI subcommands, streaming display, tool call rendering, CLI argument parsing
-- **telemetry** — session trace events and supporting telemetry payloads
-- **tools** — tool specs + execution: Bash, ReadFile, WriteFile, EditFile, GlobSearch, GrepSearch, WebSearch, WebFetch, Agent, TodoWrite, NotebookEdit, Skill, ToolSearch, and runtime-facing tool discovery
+Reference config lives in `claw/` — place the files placed in it to the project root to .claw/ for per-project settings, or at `~/.claw/` for a global user-level config. Copy `.env.example` to `.claw/.env` and set your API key or local endpoint.
+### Text-Only Model Configuration
 
-## Stats
+If your LLM does not support image (multimodal) input — common for local/self-hosted models — add its exact name to `LLM_ONLY_MODEL.config`:
 
-- **~20K lines** of Rust
-- **9 crates** in workspace
-- **Binary name:** `claw`
-- **Default model:** `claude-opus-4-7`
-- **Default permissions:** `workspace-write`
+- **User-level** (all projects): `~/.claw/LLM_ONLY_MODEL.config`
+- **Project-level** (per repo): `.claw/LLM_ONLY_MODEL.config` (walks ancestor dirs)
 
-## License
+The model name must match what is sent in the API `model` field. Examples:
 
-See repository root.
+```conf
+# Exact match
+deepseek-v4-flash
+
+# Substring match — matches any ID containing "llama-3"
+llama-3
+
+# Prefix match — matches any ID starting with "gpt-"
+gpt-:
+```
+
+When a model is listed, `Image` and `ImageRef` blocks are replaced with `[Image attached: ...] (not supported by this model)` text placeholders, preventing API errors.
+
+### WebSearch Configuration
+
+Put `web_search_url.json` in `~/.claw/` (global) or `.claw/` (project) to add extra search providers:
+
+```json
+{
+  "url_1": {
+    "enable": true,
+    "url": "https://www.bing.com/search?q={search} site:github.com"
+  }
+}
+```
+
+**Built-in default** (no file needed): `url_0` = general Bing search (`q={search}`), always active.
+Slots `url_1`–`url_4` are empty and disabled by default.
+
+The config file can add or override `url_1` through `url_4` for site-specific searches.
+Built-in `url_0` is always present and provides unrestricted search results alongside
+your custom providers. Toggle any entry on/off with `"enable": true` / `"enable": false`.
+
+**`{search}` placeholder:** The keyword and everything after `{search}` in the URL template
+is percent-encoded together as a single query value. Use a literal space (not `%20`) between
+`{search}` and any suffix — the space is encoded automatically.
+
+Example with query `ardour` and the template above:
+
+```
+Template: https://www.bing.com/search?q={search} site:github.com
+                                                                  ↓
+Suffix extracted:  site:github.com
+Keyword + suffix combined:  ardour site:github.com
+                                                                  ↓
+Percent-encoded query:  ardour%20site%3Agithub.com
+                                                                  ↓
+Final request:  GET https://www.bing.com/search?q=ardour%20site%3Agithub.com
+```
+
+Multiple enabled providers run in parallel; all results are aggregated.
+
+### Claude Code Plugin Compatibility
+
+Claw Code auto-loads plugins from `~/.claude/plugins/` — any Claude Code plugin installed there is available without additional setup.
+
+## Project Structure
+
+```
+Claw Code/
+├── claw/                         # Config (project-local; or use ~/.claw/ for global)
+│   ├── .env
+│   ├── .env.example
+│   ├── CLAUDE.md
+│   ├── LLM_ONLY_MODEL.config
+│   ├── settings.json
+│   ├── web_search_url.json
+│   ├── agents/                   # Sub-agent definitions
+│   └── skills/                   # Skill workflow definitions
+├── rust/                         # Rust workspace (binary: claw)
+│   ├── Cargo.toml
+│   ├── crates/
+│   │   ├── agents/               # Agent delegation engine
+│   │   ├── api/                  # Provider-agnostic API client
+│   │   ├── claw-cli/             # Main CLI binary entrypoint
+│   │   ├── commands/             # Slash commands, skills, MCP dispatch
+│   │   ├── compat-harness/       # Claude Code project manifest compat
+│   │   ├── migrate-patch-names/  # One-shot patch-name migration tool
+│   │   ├── mock-anthropic-service/ # Test mock
+│   │   ├── plugin-types/         # Plugin shared types
+│   │   ├── plugins/              # WASM plugin loader & marketplace
+│   │   ├── runtime/              # Core engine: config, MCP, permissions
+│   │   ├── telemetry/            # Analytics infrastructure
+│   │   └── tools/                # Tool implementations
+│   └── target/
+├── CLAUDE.md
+
+
+
+

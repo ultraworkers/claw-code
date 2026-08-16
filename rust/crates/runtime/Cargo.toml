@@ -6,18 +6,28 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+clawcode-plugin-types = { path = "../plugin-types" }
+jiff = "0.2"
 sha2 = "0.10"
+getrandom = "0.2"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+base64 = "0.22.1"
 glob = "0.3"
+image = "0.25"
+tiktoken-rs = "0.5"
 plugins = { path = "../plugins" }
 regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json.workspace = true
+toml = "0.8"
 telemetry = { path = "../telemetry" }
 tokio = { version = "1", features = ["io-std", "io-util", "macros", "process", "rt", "rt-multi-thread", "time"] }
+dunce.workspace = true
+unicode-width = "0.2"
 walkdir = "2"
-
-[dev-dependencies]
-tempfile = "3"
+win32job = "2"
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_JobObjects", "Win32_System_Threading"] }
 
 [lints]
 workspace = true

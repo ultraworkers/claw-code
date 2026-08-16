@@ -1,0 +1,16 @@
+{
+"mcp": {
+    "chrome-devtools": {
+      "type": "local",
+      "command": [
+        "chrome-devtools-mcp"
+      ],
+      "enabled": false
+    },
+    "search-mcp": {
+      "type": "local",
+      "command": ["uv", "run", "--directory", "C:/Users/%USERPROFILE%/openspace/free-search-mcp", "search-mcp"],
+      "enabled": false
+    },
+  }
+}

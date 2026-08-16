@@ -3,7 +3,7 @@ use std::io;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use api::{InputContentBlock, MessageRequest, MessageResponse, OutputContentBlock, Usage};
+use api::{MessageResponse, OutputContentBlock, Usage};
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -93,7 +93,6 @@ enum Scenario {
     GrepChunkAssembly,
     WriteFileAllowed,
     WriteFileDenied,
-    MultiToolTurnRoundtrip,
     BashStdoutRoundtrip,
     BashPermissionPromptApproved,
     BashPermissionPromptDenied,
@@ -108,9 +107,8 @@ impl Scenario {
             "streaming_text" => Some(Self::StreamingText),
             "read_file_roundtrip" => Some(Self::ReadFileRoundtrip),
             "grep_chunk_assembly" => Some(Self::GrepChunkAssembly),
-            "write_file_allowed" => Some(Self::WriteFileAllowed),
-            "write_file_denied" => Some(Self::WriteFileDenied),
-            "multi_tool_turn_roundtrip" => Some(Self::MultiToolTurnRoundtrip),
+            "new_file_allowed" => Some(Self::WriteFileAllowed),
+            "new_file_denied" => Some(Self::WriteFileDenied),
             "bash_stdout_roundtrip" => Some(Self::BashStdoutRoundtrip),
             "bash_permission_prompt_approved" => Some(Self::BashPermissionPromptApproved),
             "bash_permission_prompt_denied" => Some(Self::BashPermissionPromptDenied),
@@ -126,9 +124,8 @@ impl Scenario {
             Self::StreamingText => "streaming_text",
             Self::ReadFileRoundtrip => "read_file_roundtrip",
             Self::GrepChunkAssembly => "grep_chunk_assembly",
-            Self::WriteFileAllowed => "write_file_allowed",
-            Self::WriteFileDenied => "write_file_denied",
-            Self::MultiToolTurnRoundtrip => "multi_tool_turn_roundtrip",
+            Self::WriteFileAllowed => "new_file_allowed",
+            Self::WriteFileDenied => "new_file_denied",
             Self::BashStdoutRoundtrip => "bash_stdout_roundtrip",
             Self::BashPermissionPromptApproved => "bash_permission_prompt_approved",
             Self::BashPermissionPromptDenied => "bash_permission_prompt_denied",
@@ -144,22 +141,40 @@ async fn handle_connection(
     requests: Arc<Mutex<Vec<CapturedRequest>>>,
 ) -> io::Result<()> {
     let (method, path, headers, raw_body) = read_http_request(&mut socket).await?;
-    let request: MessageRequest = serde_json::from_str(&raw_body)
+
+    // The count_tokens endpoint shares the request shape but expects a
+    // different response envelope. Always answer it so the client never blocks.
+    if path == "/v1/messages/count_tokens" {
+        let response = build_count_tokens_response();
+        socket.write_all(response.as_bytes()).await?;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let _ = socket.shutdown().await;
+        return Ok(());
+    }
+
+    let body: Value = serde_json::from_str(&raw_body)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
-    let scenario = detect_scenario(&request)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing parity scenario"))?;
+    let stream = body.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
+    // Fall back to StreamingText so every request gets a valid response
+    // instead of dropping the socket (which would hang the client).
+    let scenario = detect_scenario_from_value(&body).unwrap_or(Scenario::StreamingText);
 
     requests.lock().await.push(CapturedRequest {
         method,
         path,
         headers,
         scenario: scenario.name().to_string(),
-        stream: request.stream,
+        stream,
         raw_body,
     });
 
-    let response = build_http_response(&request, scenario);
+    let response = build_http_response_for_value(&body, scenario);
     socket.write_all(response.as_bytes()).await?;
+    // Brief delay so the client has time to drain the response before the
+    // socket closes, avoiding a race on Windows where reqwest may not
+    // detect EOF on a multi-packet chunked response.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let _ = socket.shutdown().await;
     Ok(())
 }
 
@@ -241,223 +256,185 @@ fn find_header_end(bytes: &[u8]) -> Option<usize> {
     bytes.windows(4).position(|window| window == b"\r\n\r\n")
 }
 
-fn detect_scenario(request: &MessageRequest) -> Option<Scenario> {
-    request.messages.iter().rev().find_map(|message| {
-        message.content.iter().rev().find_map(|block| match block {
-            InputContentBlock::Text { text } => text
-                .split_whitespace()
-                .find_map(|token| token.strip_prefix(SCENARIO_PREFIX))
-                .and_then(Scenario::parse),
-            _ => None,
-        })
-    })
-}
-
-fn latest_tool_result(request: &MessageRequest) -> Option<(String, bool)> {
-    request.messages.iter().rev().find_map(|message| {
-        message.content.iter().rev().find_map(|block| match block {
-            InputContentBlock::ToolResult {
-                content, is_error, ..
-            } => Some((flatten_tool_result_content(content), *is_error)),
-            _ => None,
-        })
-    })
-}
-
-fn tool_results_by_name(request: &MessageRequest) -> HashMap<String, (String, bool)> {
-    let mut tool_names_by_id = HashMap::new();
-    for message in &request.messages {
-        for block in &message.content {
-            if let InputContentBlock::ToolUse { id, name, .. } = block {
-                tool_names_by_id.insert(id.clone(), name.clone());
-            }
-        }
-    }
-
-    let mut results = HashMap::new();
-    for message in request.messages.iter().rev() {
-        for block in message.content.iter().rev() {
-            if let InputContentBlock::ToolResult {
-                tool_use_id,
-                content,
-                is_error,
-            } = block
-            {
-                let tool_name = tool_names_by_id
-                    .get(tool_use_id)
-                    .cloned()
-                    .unwrap_or_else(|| tool_use_id.clone());
-                results
-                    .entry(tool_name)
-                    .or_insert_with(|| (flatten_tool_result_content(content), *is_error));
-            }
-        }
-    }
-    results
-}
-
-fn flatten_tool_result_content(content: &[api::ToolResultContentBlock]) -> String {
-    content
-        .iter()
-        .map(|block| match block {
-            api::ToolResultContentBlock::Text { text } => text.clone(),
-            api::ToolResultContentBlock::Json { value } => value.to_string(),
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-#[allow(clippy::too_many_lines)]
-fn build_http_response(request: &MessageRequest, scenario: Scenario) -> String {
-    let response = if request.stream {
-        let body = build_stream_body(request, scenario);
-        return http_response(
-            "200 OK",
-            "text/event-stream",
-            &body,
-            &[("x-request-id", request_id_for(scenario))],
-        );
-    } else {
-        build_message_response(request, scenario)
-    };
-
-    http_response(
-        "200 OK",
-        "application/json",
-        &serde_json::to_string(&response).expect("message response should serialize"),
-        &[("request-id", request_id_for(scenario))],
-    )
-}
-
-#[allow(clippy::too_many_lines)]
-fn build_stream_body(request: &MessageRequest, scenario: Scenario) -> String {
-    match scenario {
-        Scenario::StreamingText => streaming_text_sse(),
-        Scenario::ReadFileRoundtrip => match latest_tool_result(request) {
-            Some((tool_output, _)) => final_text_sse(&format!(
-                "read_file roundtrip complete: {}",
-                extract_read_content(&tool_output)
-            )),
-            None => tool_use_sse(
-                "toolu_read_fixture",
-                "read_file",
-                &[r#"{"path":"fixture.txt"}"#],
-            ),
-        },
-        Scenario::GrepChunkAssembly => match latest_tool_result(request) {
-            Some((tool_output, _)) => final_text_sse(&format!(
-                "grep_search matched {} occurrences",
-                extract_num_matches(&tool_output)
-            )),
-            None => tool_use_sse(
-                "toolu_grep_fixture",
-                "grep_search",
-                &[
-                    "{\"pattern\":\"par",
-                    "ity\",\"path\":\"fixture.txt\"",
-                    ",\"output_mode\":\"count\"}",
-                ],
-            ),
-        },
-        Scenario::WriteFileAllowed => match latest_tool_result(request) {
-            Some((tool_output, _)) => final_text_sse(&format!(
-                "write_file succeeded: {}",
-                extract_file_path(&tool_output)
-            )),
-            None => tool_use_sse(
-                "toolu_write_allowed",
-                "write_file",
-                &[r#"{"path":"generated/output.txt","content":"created by mock service\n"}"#],
-            ),
-        },
-        Scenario::WriteFileDenied => match latest_tool_result(request) {
-            Some((tool_output, _)) => {
-                final_text_sse(&format!("write_file denied as expected: {tool_output}"))
-            }
-            None => tool_use_sse(
-                "toolu_write_denied",
-                "write_file",
-                &[r#"{"path":"generated/denied.txt","content":"should not exist\n"}"#],
-            ),
-        },
-        Scenario::MultiToolTurnRoundtrip => {
-            let tool_results = tool_results_by_name(request);
-            match (
-                tool_results.get("read_file"),
-                tool_results.get("grep_search"),
-            ) {
-                (Some((read_output, _)), Some((grep_output, _))) => final_text_sse(&format!(
-                    "multi-tool roundtrip complete: {} / {} occurrences",
-                    extract_read_content(read_output),
-                    extract_num_matches(grep_output)
-                )),
-                _ => tool_uses_sse(&[
-                    ToolUseSse {
-                        tool_id: "toolu_multi_read",
-                        tool_name: "read_file",
-                        partial_json_chunks: &[r#"{"path":"fixture.txt"}"#],
-                    },
-                    ToolUseSse {
-                        tool_id: "toolu_multi_grep",
-                        tool_name: "grep_search",
-                        partial_json_chunks: &[
-                            "{\"pattern\":\"par",
-                            "ity\",\"path\":\"fixture.txt\"",
-                            ",\"output_mode\":\"count\"}",
-                        ],
-                    },
-                ]),
-            }
-        }
-        Scenario::BashStdoutRoundtrip => match latest_tool_result(request) {
-            Some((tool_output, _)) => final_text_sse(&format!(
-                "bash completed: {}",
-                extract_bash_stdout(&tool_output)
-            )),
-            None => tool_use_sse(
-                "toolu_bash_stdout",
-                "bash",
-                &[r#"{"command":"printf 'alpha from bash'","timeout":1000}"#],
-            ),
-        },
-        Scenario::BashPermissionPromptApproved => match latest_tool_result(request) {
-            Some((tool_output, is_error)) => {
-                if is_error {
-                    final_text_sse(&format!("bash approval unexpectedly failed: {tool_output}"))
-                } else {
-                    final_text_sse(&format!(
-                        "bash approved and executed: {}",
-                        extract_bash_stdout(&tool_output)
-                    ))
+fn detect_scenario_from_value(body: &Value) -> Option<Scenario> {
+    let messages = body.get("messages")?.as_array()?;
+    for message in messages.iter().rev() {
+        let Some(content) = message.get("content").and_then(|v| v.as_array()) else {
+            continue;
+        };
+        for block in content.iter().rev() {
+            let Some(text) = block.get("text").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            for token in text.split_whitespace() {
+                if let Some(suffix) = token.strip_prefix(SCENARIO_PREFIX) {
+                    return Scenario::parse(suffix);
                 }
             }
-            None => tool_use_sse(
-                "toolu_bash_prompt_allow",
-                "bash",
-                &[r#"{"command":"printf 'approved via prompt'","timeout":1000}"#],
-            ),
-        },
-        Scenario::BashPermissionPromptDenied => match latest_tool_result(request) {
-            Some((tool_output, _)) => {
-                final_text_sse(&format!("bash denied as expected: {tool_output}"))
+        }
+    }
+    None
+}
+
+fn has_tool_result_in_value(body: &Value) -> bool {
+    body.get("messages")
+        .and_then(|v| v.as_array())
+        .is_some_and(|messages| {
+            messages.iter().any(|msg| {
+                msg.get("content")
+                    .and_then(|c| c.as_array())
+                    .is_some_and(|content| {
+                        content.iter().any(|b| {
+                            b.get("type").and_then(|t| t.as_str()) == Some("tool_result")
+                        })
+                    })
+            })
+        })
+}
+
+fn latest_tool_result_from_value(body: &Value) -> Option<(String, bool)> {
+    let messages = body.get("messages")?.as_array()?;
+    for message in messages.iter().rev() {
+        let content = message.get("content")?.as_array()?;
+        for block in content.iter().rev() {
+            if block.get("type").and_then(|v| v.as_str()) == Some("tool_result") {
+                let content = flatten_value_content(block.get("content")?);
+                let is_error = block.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false);
+                return Some((content, is_error));
             }
-            None => tool_use_sse(
-                "toolu_bash_prompt_deny",
-                "bash",
-                &[r#"{"command":"printf 'should not run'","timeout":1000}"#],
-            ),
-        },
-        Scenario::PluginToolRoundtrip => match latest_tool_result(request) {
-            Some((tool_output, _)) => final_text_sse(&format!(
-                "plugin tool completed: {}",
-                extract_plugin_message(&tool_output)
-            )),
-            None => tool_use_sse(
-                "toolu_plugin_echo",
-                "plugin_echo",
-                &[r#"{"message":"hello from plugin parity"}"#],
-            ),
-        },
+        }
+    }
+    None
+}
+
+fn flatten_value_content(content: &Value) -> String {
+    match content {
+        Value::Array(arr) => arr.iter().filter_map(|b| {
+            b.get("text").and_then(|v| v.as_str()).map(String::from)
+        }).collect::<Vec<_>>().join("\n"),
+        Value::String(s) => s.clone(),
+        _ => content.to_string(),
+    }
+}
+
+fn build_http_response_for_value(body: &Value, scenario: Scenario) -> String {
+    let stream = body.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
+    if stream {
+        let sse_body = build_value_stream_body(body, scenario);
+        http_response(
+            "200 OK",
+            "text/event-stream",
+            &sse_body,
+            &[("x-request-id", request_id_for(scenario))],
+        )
+    } else {
+        let response = build_value_message_response(body, scenario);
+        http_response(
+            "200 OK",
+            "application/json",
+            &serde_json::to_string(&response).expect("message response should serialize"),
+            &[("request-id", request_id_for(scenario))],
+        )
+    }
+}
+
+fn build_value_stream_body(body: &Value, scenario: Scenario) -> String {
+    match scenario {
+        Scenario::StreamingText => streaming_text_sse(),
+        Scenario::ReadFileRoundtrip if !has_tool_result_in_value(body) => tool_use_sse(
+            "toolu_read_fixture",
+            "read_file",
+            &[r#"{"path":"fixture.txt"}"#],
+        ),
+        Scenario::ReadFileRoundtrip => {
+            let content = latest_tool_result_from_value(body)
+                .map(|(output, _)| extract_read_content(&output))
+                .unwrap_or_default();
+            final_text_sse(&format!("read_file roundtrip complete: {content}"))
+        }
+        Scenario::GrepChunkAssembly if !has_tool_result_in_value(body) => tool_use_sse(
+            "toolu_grep_fixture",
+            "grep_search",
+            &[
+                "{\"pattern\":\"par",
+                "ity\",\"path\":\"fixture.txt\"",
+                ",\"output_mode\":\"count\"}",
+            ],
+        ),
+        Scenario::GrepChunkAssembly => {
+            let count = latest_tool_result_from_value(body)
+                .map(|(output, _)| extract_num_matches(&output))
+                .unwrap_or(0);
+            final_text_sse(&format!("grep_search matched {count} occurrences"))
+        }
+        Scenario::WriteFileAllowed if !has_tool_result_in_value(body) => tool_use_sse(
+            "toolu_write_allowed",
+            "new_file",
+            &[r#"{"path":"generated/output.txt","content":"created by mock service\n"}"#],
+        ),
+        Scenario::WriteFileAllowed => {
+            let path = latest_tool_result_from_value(body)
+                .map(|(output, _)| extract_file_path(&output))
+                .unwrap_or_default();
+            final_text_sse(&format!("new_file succeeded: {path}"))
+        }
+        Scenario::WriteFileDenied if !has_tool_result_in_value(body) => tool_use_sse(
+            "toolu_write_denied",
+            "new_file",
+            &[r#"{"path":"generated/denied.txt","content":"should not exist\n"}"#],
+        ),
+        Scenario::WriteFileDenied => {
+            let output = latest_tool_result_from_value(body)
+                .map(|(out, _)| out)
+                .unwrap_or_default();
+            final_text_sse(&format!("new_file denied as expected: {output}"))
+        }
+        Scenario::BashStdoutRoundtrip if !has_tool_result_in_value(body) => tool_use_sse(
+            "toolu_bash_stdout",
+            "bash",
+            &[r#"{"command":"printf 'alpha from bash'","timeout":10000}"#],
+        ),
+        Scenario::BashStdoutRoundtrip => {
+            let output = latest_tool_result_from_value(body)
+                .map(|(out, _)| extract_bash_stdout(&out))
+                .unwrap_or_default();
+            final_text_sse(&format!("bash completed: {output}"))
+        }
+        Scenario::BashPermissionPromptApproved if !has_tool_result_in_value(body) => tool_use_sse(
+            "toolu_bash_prompt_allow",
+            "bash",
+            &[r#"{"command":"printf 'approved via prompt'","timeout":10000}"#],
+        ),
+        Scenario::BashPermissionPromptApproved => {
+            let (output, is_error) = latest_tool_result_from_value(body).unwrap_or_default();
+            if is_error {
+                final_text_sse(&format!("bash approval unexpectedly failed: {output}"))
+            } else {
+                final_text_sse(&format!("bash approved and executed: {output}"))
+            }
+        }
+        Scenario::BashPermissionPromptDenied if !has_tool_result_in_value(body) => tool_use_sse(
+            "toolu_bash_prompt_deny",
+            "bash",
+            &[r#"{"command":"printf 'should not run'","timeout":1000}"#],
+        ),
+        Scenario::BashPermissionPromptDenied => {
+            let output = latest_tool_result_from_value(body)
+                .map(|(out, _)| out)
+                .unwrap_or_default();
+            final_text_sse(&format!("bash denied as expected: {output}"))
+        }
+        Scenario::PluginToolRoundtrip if !has_tool_result_in_value(body) => tool_use_sse(
+            "toolu_plugin_echo",
+            "plugin_echo",
+            &[r#"{"message":"hello from plugin parity"}"#],
+        ),
+        Scenario::PluginToolRoundtrip => {
+            let message = latest_tool_result_from_value(body)
+                .map(|(output, _)| extract_plugin_message(&output))
+                .unwrap_or_default();
+            final_text_sse(&format!("plugin tool completed: {message}"))
+        }
         Scenario::AutoCompactTriggered => {
             final_text_sse_with_usage("auto compact parity complete.", 50_000, 200)
         }
@@ -467,161 +444,137 @@ fn build_stream_body(request: &MessageRequest, scenario: Scenario) -> String {
     }
 }
 
-#[allow(clippy::too_many_lines)]
-fn build_message_response(request: &MessageRequest, scenario: Scenario) -> MessageResponse {
+fn build_value_message_response(body: &Value, scenario: Scenario) -> MessageResponse {
     match scenario {
         Scenario::StreamingText => text_message_response(
             "msg_streaming_text",
             "Mock streaming says hello from the parity harness.",
         ),
-        Scenario::ReadFileRoundtrip => match latest_tool_result(request) {
-            Some((tool_output, _)) => text_message_response(
+        Scenario::ReadFileRoundtrip if !has_tool_result_in_value(body) => tool_message_response(
+            "msg_read_file_tool",
+            "toolu_read_fixture",
+            "read_file",
+            json!({"path": "fixture.txt"}),
+        ),
+        Scenario::ReadFileRoundtrip => {
+            let content = latest_tool_result_from_value(body)
+                .map(|(output, _)| extract_read_content(&output))
+                .unwrap_or_default();
+            text_message_response(
                 "msg_read_file_final",
-                &format!(
-                    "read_file roundtrip complete: {}",
-                    extract_read_content(&tool_output)
-                ),
-            ),
-            None => tool_message_response(
-                "msg_read_file_tool",
-                "toolu_read_fixture",
-                "read_file",
-                json!({"path": "fixture.txt"}),
-            ),
-        },
-        Scenario::GrepChunkAssembly => match latest_tool_result(request) {
-            Some((tool_output, _)) => text_message_response(
+                &format!("read_file roundtrip complete: {content}"),
+            )
+        }
+        Scenario::GrepChunkAssembly if !has_tool_result_in_value(body) => tool_message_response(
+            "msg_grep_tool",
+            "toolu_grep_fixture",
+            "grep_search",
+            json!({"pattern": "parity", "path": "fixture.txt", "output_mode": "count"}),
+        ),
+        Scenario::GrepChunkAssembly => {
+            let count = latest_tool_result_from_value(body)
+                .map(|(output, _)| extract_num_matches(&output))
+                .unwrap_or(0);
+            text_message_response(
                 "msg_grep_final",
-                &format!(
-                    "grep_search matched {} occurrences",
-                    extract_num_matches(&tool_output)
-                ),
-            ),
-            None => tool_message_response(
-                "msg_grep_tool",
-                "toolu_grep_fixture",
-                "grep_search",
-                json!({"pattern": "parity", "path": "fixture.txt", "output_mode": "count"}),
-            ),
-        },
-        Scenario::WriteFileAllowed => match latest_tool_result(request) {
-            Some((tool_output, _)) => text_message_response(
+                &format!("grep_search matched {count} occurrences"),
+            )
+        }
+        Scenario::WriteFileAllowed if !has_tool_result_in_value(body) => tool_message_response(
+            "msg_write_allowed_tool",
+            "toolu_write_allowed",
+            "new_file",
+            json!({"path": "generated/output.txt", "content": "created by mock service\n"}),
+        ),
+        Scenario::WriteFileAllowed => {
+            let path = latest_tool_result_from_value(body)
+                .map(|(output, _)| extract_file_path(&output))
+                .unwrap_or_default();
+            text_message_response(
                 "msg_write_allowed_final",
-                &format!("write_file succeeded: {}", extract_file_path(&tool_output)),
-            ),
-            None => tool_message_response(
-                "msg_write_allowed_tool",
-                "toolu_write_allowed",
-                "write_file",
-                json!({"path": "generated/output.txt", "content": "created by mock service\n"}),
-            ),
-        },
-        Scenario::WriteFileDenied => match latest_tool_result(request) {
-            Some((tool_output, _)) => text_message_response(
+                &format!("new_file succeeded: {path}"),
+            )
+        }
+        Scenario::WriteFileDenied if !has_tool_result_in_value(body) => tool_message_response(
+            "msg_write_denied_tool",
+            "toolu_write_denied",
+            "new_file",
+            json!({"path": "generated/denied.txt", "content": "should not exist\n"}),
+        ),
+        Scenario::WriteFileDenied => {
+            let output = latest_tool_result_from_value(body)
+                .map(|(out, _)| out)
+                .unwrap_or_default();
+            text_message_response(
                 "msg_write_denied_final",
-                &format!("write_file denied as expected: {tool_output}"),
-            ),
-            None => tool_message_response(
-                "msg_write_denied_tool",
-                "toolu_write_denied",
-                "write_file",
-                json!({"path": "generated/denied.txt", "content": "should not exist\n"}),
-            ),
-        },
-        Scenario::MultiToolTurnRoundtrip => {
-            let tool_results = tool_results_by_name(request);
-            match (
-                tool_results.get("read_file"),
-                tool_results.get("grep_search"),
-            ) {
-                (Some((read_output, _)), Some((grep_output, _))) => text_message_response(
-                    "msg_multi_tool_final",
-                    &format!(
-                        "multi-tool roundtrip complete: {} / {} occurrences",
-                        extract_read_content(read_output),
-                        extract_num_matches(grep_output)
-                    ),
-                ),
-                _ => tool_message_response_many(
-                    "msg_multi_tool_start",
-                    &[
-                        ToolUseMessage {
-                            tool_id: "toolu_multi_read",
-                            tool_name: "read_file",
-                            input: json!({"path": "fixture.txt"}),
-                        },
-                        ToolUseMessage {
-                            tool_id: "toolu_multi_grep",
-                            tool_name: "grep_search",
-                            input: json!({"pattern": "parity", "path": "fixture.txt", "output_mode": "count"}),
-                        },
-                    ],
-                ),
+                &format!("new_file denied as expected: {output}"),
+            )
+        }
+        Scenario::BashStdoutRoundtrip if !has_tool_result_in_value(body) => tool_message_response(
+            "msg_bash_stdout_tool",
+            "toolu_bash_stdout",
+            "bash",
+            json!({"command": "printf 'alpha from bash'", "timeout": 10000}),
+        ),
+        Scenario::BashStdoutRoundtrip => {
+            let output = latest_tool_result_from_value(body)
+                .map(|(out, _)| extract_bash_stdout(&out))
+                .unwrap_or_default();
+            text_message_response(
+                "msg_bash_stdout_final",
+                &format!("bash completed: {output}"),
+            )
+        }
+        Scenario::BashPermissionPromptApproved if !has_tool_result_in_value(body) => tool_message_response(
+            "msg_bash_prompt_allow_tool",
+            "toolu_bash_prompt_allow",
+            "bash",
+            json!({"command": "printf 'approved via prompt'", "timeout": 1000}),
+        ),
+        Scenario::BashPermissionPromptApproved => {
+            let (output, is_error) = latest_tool_result_from_value(body).unwrap_or_default();
+            if is_error {
+                text_message_response(
+                    "msg_bash_prompt_allow_error",
+                    &format!("bash approval unexpectedly failed: {output}"),
+                )
+            } else {
+                text_message_response(
+                    "msg_bash_prompt_allow_final",
+                    &format!("bash approved and executed: {output}"),
+                )
             }
         }
-        Scenario::BashStdoutRoundtrip => match latest_tool_result(request) {
-            Some((tool_output, _)) => text_message_response(
-                "msg_bash_stdout_final",
-                &format!("bash completed: {}", extract_bash_stdout(&tool_output)),
-            ),
-            None => tool_message_response(
-                "msg_bash_stdout_tool",
-                "toolu_bash_stdout",
-                "bash",
-                json!({"command": "printf 'alpha from bash'", "timeout": 1000}),
-            ),
-        },
-        Scenario::BashPermissionPromptApproved => match latest_tool_result(request) {
-            Some((tool_output, is_error)) => {
-                if is_error {
-                    text_message_response(
-                        "msg_bash_prompt_allow_error",
-                        &format!("bash approval unexpectedly failed: {tool_output}"),
-                    )
-                } else {
-                    text_message_response(
-                        "msg_bash_prompt_allow_final",
-                        &format!(
-                            "bash approved and executed: {}",
-                            extract_bash_stdout(&tool_output)
-                        ),
-                    )
-                }
-            }
-            None => tool_message_response(
-                "msg_bash_prompt_allow_tool",
-                "toolu_bash_prompt_allow",
-                "bash",
-                json!({"command": "printf 'approved via prompt'", "timeout": 1000}),
-            ),
-        },
-        Scenario::BashPermissionPromptDenied => match latest_tool_result(request) {
-            Some((tool_output, _)) => text_message_response(
+        Scenario::BashPermissionPromptDenied if !has_tool_result_in_value(body) => tool_message_response(
+            "msg_bash_prompt_deny_tool",
+            "toolu_bash_prompt_deny",
+            "bash",
+            json!({"command": "printf 'should not run'", "timeout": 1000}),
+        ),
+        Scenario::BashPermissionPromptDenied => {
+            let output = latest_tool_result_from_value(body)
+                .map(|(out, _)| out)
+                .unwrap_or_default();
+            text_message_response(
                 "msg_bash_prompt_deny_final",
-                &format!("bash denied as expected: {tool_output}"),
-            ),
-            None => tool_message_response(
-                "msg_bash_prompt_deny_tool",
-                "toolu_bash_prompt_deny",
-                "bash",
-                json!({"command": "printf 'should not run'", "timeout": 1000}),
-            ),
-        },
-        Scenario::PluginToolRoundtrip => match latest_tool_result(request) {
-            Some((tool_output, _)) => text_message_response(
+                &format!("bash denied as expected: {output}"),
+            )
+        }
+        Scenario::PluginToolRoundtrip if !has_tool_result_in_value(body) => tool_message_response(
+            "msg_plugin_tool_start",
+            "toolu_plugin_echo",
+            "plugin_echo",
+            json!({"message": "hello from plugin parity"}),
+        ),
+        Scenario::PluginToolRoundtrip => {
+            let message = latest_tool_result_from_value(body)
+                .map(|(output, _)| extract_plugin_message(&output))
+                .unwrap_or_default();
+            text_message_response(
                 "msg_plugin_tool_final",
-                &format!(
-                    "plugin tool completed: {}",
-                    extract_plugin_message(&tool_output)
-                ),
-            ),
-            None => tool_message_response(
-                "msg_plugin_tool_start",
-                "toolu_plugin_echo",
-                "plugin_echo",
-                json!({"message": "hello from plugin parity"}),
-            ),
-        },
+                &format!("plugin tool completed: {message}"),
+            )
+        }
         Scenario::AutoCompactTriggered => text_message_response_with_usage(
             "msg_auto_compact_triggered",
             "auto compact parity complete.",
@@ -642,9 +595,8 @@ fn request_id_for(scenario: Scenario) -> &'static str {
         Scenario::StreamingText => "req_streaming_text",
         Scenario::ReadFileRoundtrip => "req_read_file_roundtrip",
         Scenario::GrepChunkAssembly => "req_grep_chunk_assembly",
-        Scenario::WriteFileAllowed => "req_write_file_allowed",
-        Scenario::WriteFileDenied => "req_write_file_denied",
-        Scenario::MultiToolTurnRoundtrip => "req_multi_tool_turn_roundtrip",
+        Scenario::WriteFileAllowed => "req_new_file_allowed",
+        Scenario::WriteFileDenied => "req_new_file_denied",
         Scenario::BashStdoutRoundtrip => "req_bash_stdout_roundtrip",
         Scenario::BashPermissionPromptApproved => "req_bash_permission_prompt_approved",
         Scenario::BashPermissionPromptDenied => "req_bash_permission_prompt_denied",
@@ -660,10 +612,21 @@ fn http_response(status: &str, content_type: &str, body: &str, headers: &[(&str,
         use std::fmt::Write as _;
         write!(&mut extra_headers, "{name}: {value}\r\n").expect("header write should succeed");
     }
+    // Use Transfer-Encoding: chunked so the client detects EOF via the
+    // terminal `0\r\n\r\n` rather than relying on TCP socket shutdown
+    // (which behaves differently across platforms, notably on Windows).
+    let chunk = format!("{:x}\r\n{body}\r\n", body.len());
+    let trailer = "0\r\n\r\n";
     format!(
-        "HTTP/1.1 {status}\r\ncontent-type: {content_type}\r\n{extra_headers}content-length: {}\r\nconnection: close\r\n\r\n{body}",
-        body.len()
+        "HTTP/1.1 {status}\r\ncontent-type: {content_type}\r\n{extra_headers}transfer-encoding: chunked\r\nconnection: close\r\n\r\n{chunk}{trailer}",
     )
+}
+
+/// Always-valid answer for `POST /v1/messages/count_tokens`.
+/// The client (`count_tokens`, anthropic.rs:604-629) only reads `input_tokens`.
+fn build_count_tokens_response() -> String {
+    let body = json!({ "input_tokens": 10 }).to_string();
+    http_response("200 OK", "application/json", &body, &[])
 }
 
 fn text_message_response(id: &str, text: &str) -> MessageResponse {
