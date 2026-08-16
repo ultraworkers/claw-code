@@ -9,7 +9,56 @@ from src.models import PermissionDenial
 from src.path_scope import WorkspacePathScope, extract_path_candidates
 from src.permissions import ToolPermissionContext
 from src.query_engine import QueryEnginePort
+from src.session_store import StoredSession, load_session, save_session
 from src.tools import execute_tool
+
+
+class SessionStorePathTraversalTests(unittest.TestCase):
+    def test_traversal_session_id_is_rejected_on_load(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Path(tmp) / 'store'
+            store.mkdir()
+            # A secret living outside the session store that traversal would reach.
+            (Path(tmp) / 'secret.json').write_text('{}')
+
+            with self.assertRaises(ValueError):
+                load_session('../secret', directory=store)
+
+    def test_absolute_and_separator_session_ids_are_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Path(tmp) / 'store'
+            store.mkdir()
+            for bad_id in ('/etc/passwd', 'nested/child', '..', 'a/../../b'):
+                with self.assertRaises(ValueError):
+                    load_session(bad_id, directory=store)
+
+    def test_traversal_session_id_is_rejected_on_save(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Path(tmp) / 'store'
+            store.mkdir()
+            session = StoredSession(
+                session_id='../escape',
+                messages=('hello',),
+                input_tokens=1,
+                output_tokens=2,
+            )
+            with self.assertRaises(ValueError):
+                save_session(session, directory=store)
+
+    def test_legitimate_session_id_round_trips(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Path(tmp) / 'store'
+            session = StoredSession(
+                session_id='session-1775386832313-0',
+                messages=('hi', 'there'),
+                input_tokens=3,
+                output_tokens=4,
+            )
+            path = save_session(session, directory=store)
+
+            self.assertEqual(store, path.parent)
+            loaded = load_session('session-1775386832313-0', directory=store)
+            self.assertEqual(session, loaded)
 
 
 class WorkspacePathScopeTests(unittest.TestCase):
