@@ -181,9 +181,10 @@ fn serialise_base(request: &MessageRequest) -> Map<String, Value> {
             map.insert("stop_sequences".into(), serde_json::to_value(v).unwrap_or_default());
         }
     }
-    if let Some(ref v) = request.reasoning_effort {
-        map.insert("reasoning_effort".into(), Value::String(v.clone()));
-    }
+    // `reasoning_effort` is intentionally absent from the Anthropic body: the
+    // level is translated to a `thinking` budget (see `render_anthropic_body`
+    // and `effective_thinking_config`), never carried through as the raw
+    // OpenAI-style field.
     if let Some(ref v) = request.thinking {
         map.insert("thinking".into(), serde_json::to_value(v).unwrap_or_default());
     }

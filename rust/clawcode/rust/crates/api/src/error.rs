@@ -76,6 +76,15 @@ pub enum ApiError {
         max_bytes: usize,
         provider: &'static str,
     },
+    /// The requested reasoning-effort level is not supported by the resolved
+    /// model, or the level string is not a recognised level. Produced before
+    /// any network I/O so a stale, mistyped, or model-unsupported level fails
+    /// fast instead of being silently ignored by the backend.
+    UnsupportedReasoningEffort {
+        model: String,
+        level: String,
+        supported: Vec<String>,
+    },
 }
 
 impl ApiError {
@@ -157,7 +166,8 @@ impl ApiError {
             | Self::Json { .. }
             | Self::InvalidSseFrame(_)
             | Self::BackoffOverflow { .. }
-            | Self::RequestBodySizeExceeded { .. } => false,
+            | Self::RequestBodySizeExceeded { .. }
+            | Self::UnsupportedReasoningEffort { .. } => false,
         }
     }
 
@@ -177,7 +187,8 @@ impl ApiError {
             | Self::Json { .. }
             | Self::InvalidSseFrame(_)
             | Self::BackoffOverflow { .. }
-            | Self::RequestBodySizeExceeded { .. } => None,
+            | Self::RequestBodySizeExceeded { .. }
+            | Self::UnsupportedReasoningEffort { .. } => None,
         }
     }
 
@@ -203,6 +214,7 @@ impl ApiError {
             }
             Self::InvalidApiKeyEnv(_) | Self::Io(_) | Self::Json { .. } => "runtime_io",
             Self::RequestBodySizeExceeded { .. } => "request_size",
+            Self::UnsupportedReasoningEffort { .. } => "invalid_request",
         }
     }
 
@@ -227,7 +239,8 @@ impl ApiError {
             | Self::Json { .. }
             | Self::InvalidSseFrame(_)
             | Self::BackoffOverflow { .. }
-            | Self::RequestBodySizeExceeded { .. } => false,
+            | Self::RequestBodySizeExceeded { .. }
+            | Self::UnsupportedReasoningEffort { .. } => false,
         }
     }
 
@@ -258,7 +271,8 @@ impl ApiError {
             | Self::Json { .. }
             | Self::InvalidSseFrame(_)
             | Self::BackoffOverflow { .. }
-            | Self::RequestBodySizeExceeded { .. } => false,
+            | Self::RequestBodySizeExceeded { .. }
+            | Self::UnsupportedReasoningEffort { .. } => false,
         }
     }
 }
@@ -373,6 +387,15 @@ impl Display for ApiError {
             } => write!(
                 f,
                 "request body size ({estimated_bytes} bytes) exceeds {provider} limit ({max_bytes} bytes); reduce prompt length or context before retrying"
+            ),
+            Self::UnsupportedReasoningEffort {
+                model,
+                level,
+                supported,
+            } => write!(
+                f,
+                "model \"{model}\" does not support reasoning effort \"{level}\"; supported: {}",
+                supported.join(", ")
             ),
         }
     }

@@ -5,10 +5,12 @@ use std::pin::Pin;
 use serde::Serialize;
 
 use crate::error::ApiError;
-use crate::types::{MessageRequest, MessageResponse};
+use crate::types::{MessageRequest, MessageResponse, ReasoningEffort};
+use crate::providers::reasoning::reasoning_levels;
 
 pub mod anthropic;
 pub mod openai_compat;
+pub mod reasoning;
 
 #[allow(dead_code)]
 pub type ProviderFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, ApiError>> + Send + 'a>>;
@@ -242,7 +244,45 @@ pub fn is_local_inference() -> bool {
     false
 }
 
+/// Fail-fast reasoning-effort validation: reject a level the resolved model
+/// does not support, or a level string that is not a recognised level, before
+/// the request leaves the process. Mirrors the dsh `resolveReasoningLevel`
+/// posture — a stale or mistyped level fails here instead of being silently
+/// ignored by the backend.
+///
+/// `None` (no level requested) always passes: the provider's own server
+/// default applies (the `reasoning_effort` field is omitted from the wire).
+fn validate_reasoning_effort_for_request(request: &MessageRequest) -> Result<(), ApiError> {
+    let Some(level_str) = request.reasoning_effort.as_deref() else {
+        return Ok(());
+    };
+    let canonical = resolve_model_alias(&request.model);
+    let provider = detect_provider_kind(&canonical);
+    let supported = reasoning_levels(provider, &canonical);
+    let supported_names: Vec<String> = supported
+        .iter()
+        .map(|level| level.as_str().to_string())
+        .collect();
+    let level = ReasoningEffort::from_name(level_str).ok_or_else(|| {
+        ApiError::UnsupportedReasoningEffort {
+            model: canonical.clone(),
+            level: level_str.to_string(),
+            supported: supported_names.clone(),
+        }
+    })?;
+    if supported.contains(&level) {
+        Ok(())
+    } else {
+        Err(ApiError::UnsupportedReasoningEffort {
+            model: canonical,
+            level: level_str.to_string(),
+            supported: supported_names,
+        })
+    }
+}
+
 pub fn preflight_message_request(request: &MessageRequest) -> Result<(), ApiError> {
+    validate_reasoning_effort_for_request(request)?;
     let Some(limit) = model_token_limit(&request.model) else {
         return Ok(());
     };
@@ -646,6 +686,72 @@ mod tests {
 
         preflight_message_request(&request)
             .expect("models without context metadata should skip the guarded preflight");
+    }
+
+    #[test]
+    fn preflight_rejects_unsupported_reasoning_effort() {
+        // `max` is not a level native OpenAI exposes (`off/low/medium/high`
+        // only), so it must fail before any network I/O. The `openai/` prefix
+        // makes provider detection environment-independent.
+        let request = MessageRequest {
+            model: "openai/o4-mini".to_string(),
+            max_tokens: 1024,
+            messages: Arc::new(vec![InputMessage::user_text("think")]),
+            reasoning_effort: Some("max".to_string()),
+            ..Default::default()
+        };
+        let err = preflight_message_request(&request)
+            .expect_err("max must be rejected for native OpenAI reasoning models");
+        assert!(err.to_string().contains("o4-mini"));
+        assert!(err.to_string().contains("max"));
+        assert!(err.to_string().contains("off, low, medium, high"));
+    }
+
+    #[test]
+    fn preflight_rejects_high_against_non_reasoning_model() {
+        // A non-reasoning model exposes only `off`; `high` must fail fast.
+        let request = MessageRequest {
+            model: "gpt-4o".to_string(),
+            max_tokens: 1024,
+            messages: Arc::new(vec![InputMessage::user_text("hi")]),
+            reasoning_effort: Some("high".to_string()),
+            ..Default::default()
+        };
+        let err = preflight_message_request(&request)
+            .expect_err("high must be rejected for non-reasoning models");
+        assert!(err.to_string().contains("gpt-4o"));
+        assert!(err.to_string().contains("high"));
+    }
+
+    #[test]
+    fn preflight_rejects_unrecognised_level_string() {
+        let request = MessageRequest {
+            model: "o4-mini".to_string(),
+            max_tokens: 1024,
+            messages: Arc::new(vec![InputMessage::user_text("hi")]),
+            reasoning_effort: Some("turbo".to_string()),
+            ..Default::default()
+        };
+        let err = preflight_message_request(&request)
+            .expect_err("an unrecognised level string must fail fast");
+        assert!(err.to_string().contains("turbo"));
+    }
+
+    #[test]
+    fn preflight_accepts_off_for_every_model() {
+        let reasoning = |model: &str| MessageRequest {
+            model: model.to_string(),
+            max_tokens: 1024,
+            messages: Arc::new(vec![InputMessage::user_text("hi")]),
+            reasoning_effort: Some("off".to_string()),
+            ..Default::default()
+        };
+        preflight_message_request(&reasoning("gpt-4o"))
+            .expect("off is always supported");
+        preflight_message_request(&reasoning("o4-mini"))
+            .expect("off is always supported");
+        preflight_message_request(&reasoning("claude-sonnet-4-6"))
+            .expect("off is always supported");
     }
 
     #[test]

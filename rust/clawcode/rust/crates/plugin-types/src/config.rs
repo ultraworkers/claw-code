@@ -8,6 +8,11 @@ pub struct RuntimePluginConfig {
     pub install_root: Option<String>,
     pub registry_path: Option<String>,
     pub max_output_tokens: Option<u32>,
+    /// Default reasoning-effort level (e.g. `low`/`medium`/`high`/`max`/`off`)
+    /// applied when no CLI flag or agent frontmatter selects one. Lower
+    /// precedence than the `CLAW_REASONING_EFFORT` env var. Validated against
+    /// the resolved model at request time.
+    pub reasoning_effort: Option<String>,
 }
 
 impl RuntimePluginConfig {
@@ -38,6 +43,15 @@ impl RuntimePluginConfig {
 
     pub fn set_max_output_tokens(&mut self, max_output_tokens: Option<u32>) {
         self.max_output_tokens = max_output_tokens;
+    }
+
+    /// The default reasoning-effort level from `settings.json`
+    /// (`plugins.reasoningEffort`), or `None` when unset. Lower precedence than
+    /// the `CLAW_REASONING_EFFORT` env var and any CLI flag or agent
+    /// frontmatter value.
+    #[must_use]
+    pub fn reasoning_effort(&self) -> Option<&str> {
+        self.reasoning_effort.as_deref()
     }
 
     pub fn set_plugin_state(&mut self, plugin_id: String, enabled: bool) {

@@ -892,6 +892,8 @@ fn parse_optional_plugin_config(root: &JsonValue) -> Result<RuntimePluginConfig,
     config.registry_path =
         optional_string(plugins, "registryPath", "merged settings.plugins")?.map(str::to_string);
     config.max_output_tokens = optional_u32(plugins, "maxOutputTokens", "merged settings.plugins")?;
+    config.reasoning_effort =
+        optional_string(plugins, "reasoningEffort", "merged settings.plugins")?.map(str::to_string);
 
     // Scan for plugin-name entries (standard opencode/claw format):
     //   "plugins": {
@@ -905,6 +907,7 @@ fn parse_optional_plugin_config(root: &JsonValue) -> Result<RuntimePluginConfig,
         "registryPath",
         "bundledRoot",
         "maxOutputTokens",
+        "reasoningEffort",
     ];
     for (key, value) in plugins {
         if known_plugin_fields.contains(&key.as_str()) {

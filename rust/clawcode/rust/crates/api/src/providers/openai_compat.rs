@@ -10,9 +10,11 @@ use crate::http_client::build_http_client_or_default;
 use crate::types::{
     ContentBlockDelta, ContentBlockDeltaEvent, ContentBlockStartEvent, ContentBlockStopEvent,
     InputContentBlock, InputMessage, MessageDelta, MessageDeltaEvent, MessageRequest,
-    MessageResponse, MessageStartEvent, MessageStopEvent, OutputContentBlock, StreamEvent,
-    ToolChoice, ToolDefinition, ToolResultContentBlock, Usage,
+    MessageResponse, MessageStartEvent, MessageStopEvent, OutputContentBlock, ReasoningEffort,
+    StreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock, Usage,
 };
+
+use super::reasoning::openai_wire_effort;
 
 use super::{preflight_message_request, Provider, ProviderFuture};
 
@@ -951,9 +953,17 @@ pub fn build_chat_completion_request_with_options(
             payload["stop"] = json!(stop);
         }
     }
-    // reasoning_effort for OpenAI-compatible reasoning models (o4-mini, o3, etc.)
-    if let Some(effort) = &request.reasoning_effort {
-        payload["reasoning_effort"] = json!(effort);
+    // reasoning_effort for OpenAI-compatible reasoning models (o4-mini, o3, etc.).
+    // Translate the level string via the registry: `off` omits the field (OpenAI
+    // has no `off` spelling) and other levels emit their wire spelling. An
+    // unrecognised string is omitted here as a defensive fallback — the
+    // preflight validator rejects it before the request reaches this point.
+    if let Some(level_str) = &request.reasoning_effort {
+        if let Some(level) = ReasoningEffort::from_name(level_str) {
+            if let Some(wire) = openai_wire_effort(level) {
+                payload["reasoning_effort"] = json!(wire);
+            }
+        }
     }
 
     payload
@@ -1650,6 +1660,46 @@ mod tests {
                 model: "gpt-4o".to_string(),
                 max_tokens: 64,
                 messages: Arc::new(vec![InputMessage::user_text("hello")]),
+                ..Default::default()
+            },
+            OpenAiCompatConfig::openai(),
+        );
+        assert!(payload.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn reasoning_effort_off_omits_the_field() {
+        // `off` is the "disable reasoning" level: OpenAI has no `off` wire
+        // spelling, so the registry translates it to `None` and the field is
+        // omitted — the provider's own server default (no reasoning) applies.
+        let payload = build_chat_completion_request(
+            &MessageRequest {
+                model: "o4-mini".to_string(),
+                max_tokens: 1024,
+                messages: Arc::new(vec![InputMessage::user_text("skip thinking")]),
+                reasoning_effort: Some("off".to_string()),
+                ..Default::default()
+            },
+            OpenAiCompatConfig::openai(),
+        );
+        assert!(
+            payload.get("reasoning_effort").is_none(),
+            "off must omit reasoning_effort, got: {payload}"
+        );
+    }
+
+    #[test]
+    fn reasoning_effort_unrecognised_string_is_omitted() {
+        // An unrecognised level string is omitted at the emit layer as a
+        // defensive fallback; the preflight validator rejects it before this
+        // point, so a `None` here only signals the request never carried a
+        // valid wire spelling.
+        let payload = build_chat_completion_request(
+            &MessageRequest {
+                model: "o4-mini".to_string(),
+                max_tokens: 1024,
+                messages: Arc::new(vec![InputMessage::user_text("oops")]),
+                reasoning_effort: Some("turbo".to_string()),
                 ..Default::default()
             },
             OpenAiCompatConfig::openai(),

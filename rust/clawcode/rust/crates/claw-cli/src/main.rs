@@ -30,10 +30,11 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use api::{
     convert_messages, convert_messages_cached, convert_messages_inner, detect_provider_kind,
-    resolve_startup_auth_source, AnthropicClient, AuthSource, ContentBlockDelta, InputContentBlock,
-    InputMessage, MessageRequest, MessageResponse, OutputContentBlock, PromptCache,
-    ProviderClient as ApiProviderClient, ProviderKind, StreamEvent as ApiStreamEvent,
-    ThinkingConfig, ToolChoice, ToolDefinition, ToolResultContentBlock,
+    effective_thinking_config, resolve_startup_auth_source, AnthropicClient, AuthSource,
+    ContentBlockDelta, InputContentBlock, InputMessage, MessageRequest, MessageResponse,
+    OutputContentBlock, PromptCache, ProviderClient as ApiProviderClient, ProviderKind,
+    ReasoningEffort, StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition,
+    ToolResultContentBlock,
 };
 
 use commands::{
@@ -783,19 +784,19 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 let value = args
                     .get(index + 1)
                     .ok_or_else(|| "missing value for --reasoning-effort".to_string())?;
-                if !matches!(value.as_str(), "low" | "medium" | "high") {
+                if ReasoningEffort::from_name(value).is_none() {
                     return Err(format!(
-                        "invalid value for --reasoning-effort: '{value}'; must be low, medium, or high"
+                        "invalid value for --reasoning-effort: '{value}'; must be off, low, medium, high, or max"
                     ));
                 }
                 reasoning_effort = Some(value.clone());
                 index += 2;
             }
             flag if flag.starts_with("--reasoning-effort=") => {
-                let value = &flag[19..];
-                if !matches!(value, "low" | "medium" | "high") {
+                let value = &flag["--reasoning-effort=".len()..];
+                if ReasoningEffort::from_name(value).is_none() {
                     return Err(format!(
-                        "invalid value for --reasoning-effort: '{value}'; must be low, medium, or high"
+                        "invalid value for --reasoning-effort: '{value}'; must be off, low, medium, high, or max"
                     ));
                 }
                 reasoning_effort = Some(value.to_string());
@@ -4259,6 +4260,10 @@ struct RuntimePluginState {
     tool_registry: GlobalToolRegistry,
     plugin_registry: PluginRegistry,
     mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
+    /// Default reasoning-effort level from `settings.json`
+    /// (`plugins.reasoningEffort`); applied when no CLI flag, agent
+    /// frontmatter, or `CLAW_REASONING_EFFORT` env var selects one.
+    reasoning_default: Option<String>,
 }
 
 struct RuntimeMcpState {
@@ -7684,6 +7689,10 @@ fn build_runtime_plugin_state_with_loader(
         tool_registry,
         plugin_registry,
         mcp_state,
+        reasoning_default: runtime_config
+            .plugins()
+            .reasoning_effort()
+            .map(str::to_string),
     })
 }
 
@@ -8181,6 +8190,7 @@ fn build_runtime_with_plugin_state(
         tool_registry,
         plugin_registry,
         mcp_state,
+        reasoning_default,
     } = runtime_plugin_state;
     // Register the runtime tool provider against THIS live MCP state and plugin
     // registry so sub-agents can execute MCP/plugin tools. Must happen here, not
@@ -8200,6 +8210,7 @@ fn build_runtime_with_plugin_state(
             allowed_tools.clone(),
             tool_registry.clone(),
             progress_reporter,
+            reasoning_default,
         )?,
         CliToolExecutor::new(
             allowed_tools.clone(),
@@ -8417,6 +8428,10 @@ struct AnthropicRuntimeClient {
     tool_registry: GlobalToolRegistry,
     progress_reporter: Option<InternalPromptProgressReporter>,
     reasoning_effort: Option<String>,
+    /// Default reasoning-effort level from `settings.json`, applied when
+    /// `reasoning_effort` (CLI/agent) and the `CLAW_REASONING_EFFORT` env var
+    /// are both unset.
+    reasoning_default: Option<String>,
     temperature: Option<f64>,
     message_cache: Option<MessageCache>,
 }
@@ -8430,6 +8445,7 @@ impl AnthropicRuntimeClient {
         allowed_tools: Option<AllowedToolSet>,
         tool_registry: GlobalToolRegistry,
         progress_reporter: Option<InternalPromptProgressReporter>,
+        reasoning_default: Option<String>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         // Dispatch to the correct provider at construction time.
         // `ApiProviderClient` (exposed by the api crate as
@@ -8485,6 +8501,7 @@ impl AnthropicRuntimeClient {
             tool_registry,
             progress_reporter,
             reasoning_effort: None,
+            reasoning_default,
             temperature: None,
             message_cache: None,
         })
@@ -8497,6 +8514,26 @@ impl AnthropicRuntimeClient {
     fn set_temperature(&mut self, temperature: Option<f64>) {
         self.temperature = temperature;
     }
+}
+
+/// Resolve the effective reasoning-effort level by precedence. Highest wins:
+/// an explicit CLI flag or agent frontmatter value, then the
+/// `CLAW_REASONING_EFFORT` env var, then the `settings.json`
+/// `plugins.reasoningEffort` default. Returns `None` when no layer selects
+/// one, letting the provider's own server default apply (the `reasoning_effort`
+/// field is omitted from the wire).
+fn resolve_reasoning_effort(
+    explicit: Option<&str>,
+    settings_default: Option<&str>,
+) -> Option<String> {
+    explicit
+        .map(str::to_string)
+        .or_else(|| {
+            std::env::var("CLAW_REASONING_EFFORT")
+                .ok()
+                .filter(|value| !value.is_empty())
+        })
+        .or_else(|| settings_default.map(str::to_string))
 }
 
 fn resolve_cli_auth_source() -> Result<AuthSource, Box<dyn std::error::Error>> {
@@ -8546,6 +8583,15 @@ impl ApiClient for AnthropicRuntimeClient {
                 full_convert_and_cache_cli(&mut self.message_cache, &request, msg_ptr, msg_len, model_name)
             }
         };
+        // Resolve the effective reasoning level once so the wire field and the
+        // Anthropic `thinking` budget both reflect it. Precedence (high→low):
+        // CLI flag / agent frontmatter → `CLAW_REASONING_EFFORT` env →
+        // `settings.json` `plugins.reasoningEffort`. `None` lets the provider's
+        // own server default apply (field omitted).
+        let resolved_reasoning = resolve_reasoning_effort(
+            self.reasoning_effort.as_deref(),
+            self.reasoning_default.as_deref(),
+        );
         let message_request = MessageRequest {
             model: self.model.clone(),
             max_tokens: max_tokens_for_model(&self.model),
@@ -8556,12 +8602,9 @@ impl ApiClient for AnthropicRuntimeClient {
                 .then(|| filter_tool_specs(&self.tool_registry, self.allowed_tools.as_ref())),
             tool_choice: self.enable_tools.then_some(ToolChoice::Auto),
             stream: true,
-            reasoning_effort: self.reasoning_effort.clone(),
+            reasoning_effort: resolved_reasoning.clone(),
             temperature: self.temperature,
-            thinking: Some(ThinkingConfig {
-                config_type: "enabled".to_string(),
-                budget_tokens: Some(10000),
-            }),
+            thinking: effective_thinking_config(&self.model, resolved_reasoning.as_deref()),
             cached_message_values: cached_values,
             ..Default::default()
         };
@@ -14899,7 +14942,7 @@ UU conflicted.rs",
 
     #[test]
     fn accepts_valid_reasoning_effort_values() {
-        for value in ["low", "medium", "high"] {
+        for value in ["off", "low", "medium", "high", "max"] {
             let result = parse_args(&[
                 "--reasoning-effort".to_string(),
                 value.to_string(),

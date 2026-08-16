@@ -183,10 +183,11 @@ pub struct AgentInput {
     /// reporting parity with the definition.
     #[serde(default)]
     pub mode: Option<String>,
-    /// Optional reasoning-effort level (e.g. `low`/`medium`/`high`) forwarded
-    /// to the provider's `MessageRequest`. When present, the spawned sub-agent
-    /// runs with the agent definition's configured effort instead of the
-    /// provider default.
+    /// Optional reasoning-effort level (`off`/`low`/`medium`/`high`/`max`)
+    /// forwarded to the provider's `MessageRequest`. When present, the spawned
+    /// sub-agent runs with the agent definition's configured effort instead of
+    /// the provider default. `off` disables reasoning; the rest map to a
+    /// provider-specific wire spelling via the reasoning registry.
     #[serde(default)]
     pub reasoning_effort: Option<String>,
     /// Optional `permission:` directives from the agent file frontmatter

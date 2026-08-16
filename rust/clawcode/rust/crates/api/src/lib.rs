@@ -35,10 +35,15 @@ pub use sse::{parse_frame, SseParser};
 pub use types::{
     ContentBlockDelta, ContentBlockDeltaEvent, ContentBlockStartEvent, ContentBlockStopEvent,
     InputContentBlock, InputMessage, MessageDelta, MessageDeltaEvent, MessageRequest,
-    MessageResponse, MessageStartEvent, MessageStopEvent, OutputContentBlock, StreamEvent,
-    ThinkingConfig, ToolChoice, ToolDefinition, ToolResultContentBlock, Usage,
+    MessageResponse, MessageStartEvent, MessageStopEvent, OutputContentBlock, ReasoningEffort,
+    StreamEvent, ThinkingConfig, ToolChoice, ToolDefinition, ToolResultContentBlock, Usage,
 };
 pub use types::render_tools_block;
+pub use providers::reasoning::{
+    anthropic_thinking_budget, default_reasoning_effort, effective_thinking_config,
+    openai_wire_effort, reasoning_levels, supports_level, validate_reasoning_effort,
+    UnsupportedReasoningEffort,
+};
 
 pub use telemetry::{
     AnalyticsEvent, AnthropicRequestProfile, ClientIdentity, JsonlTelemetrySink,

@@ -342,7 +342,7 @@ For MCP, plugin, or skill work that is multi-step or benefits from isolated cont
                     "name": { "type": "string" },
                     "model": { "type": "string" },
                     "mode": { "type": "string", "description": "Agent mode from the definition. Display-only; not consumed by the runtime." },
-                    "reasoning_effort": { "type": "string", "description": "Reasoning-effort level (e.g. low/medium/high) forwarded to the provider." },
+                    "reasoning_effort": { "type": "string", "description": "Reasoning-effort level (off/low/medium/high/max) forwarded to the provider. `off` disables reasoning; the rest map to a provider-specific wire spelling." },
                     "system_prompt": { "type": "array", "items": { "type": "string" }, "description": "Optional explicit system prompt lines." },
                     "allowed_tools": { "type": "array", "items": { "type": "string" }, "description": "Optional tool allowlist override for the sub-agent." }
                 },

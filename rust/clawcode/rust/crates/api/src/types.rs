@@ -12,6 +12,61 @@ pub struct ThinkingConfig {
     pub budget_tokens: Option<u32>,
 }
 
+/// Reasoning effort level. Escalation order is `Off < Low < Medium < High < Max`.
+/// `Off` disables reasoning (omits the wire field); the remaining levels map
+/// to a provider-specific wire spelling via [`crate::providers::reasoning`].
+/// Serialises as the lowercase level name so the wire value stays stable and
+/// matches the prior `Option<String>` representation (`"low"`, `"medium"`, …).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReasoningEffort {
+    Off,
+    Low,
+    Medium,
+    High,
+    Max,
+}
+
+impl ReasoningEffort {
+    /// The lowercase wire name (`"off"`, `"low"`, `"medium"`, `"high"`, `"max"`).
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Max => "max",
+        }
+    }
+
+    /// Parse a level name (case-insensitive). Returns `None` for unknown names
+    /// so callers can produce a precise "must be one of …" diagnostic.
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name.to_ascii_lowercase().as_str() {
+            "off" => Some(Self::Off),
+            "low" => Some(Self::Low),
+            "medium" => Some(Self::Medium),
+            "high" => Some(Self::High),
+            "max" => Some(Self::Max),
+            _ => None,
+        }
+    }
+
+    /// Every level in escalation order.
+    #[must_use]
+    pub const fn all() -> &'static [Self] {
+        &[
+            Self::Off,
+            Self::Low,
+            Self::Medium,
+            Self::High,
+            Self::Max,
+        ]
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct MessageRequest {
     pub model: String,
@@ -87,6 +142,12 @@ impl MessageRequest {
     #[inline]
     pub fn render_anthropic_body(&self) -> Result<Value, serde_json::Error> {
         let mut body = serde_json::to_value(self)?;
+        // Anthropic's wire uses `thinking` (derived from the reasoning level),
+        // not the OpenAI-style `reasoning_effort` field. Strip the pass-through
+        // field so it never reaches a backend that would reject or misread it.
+        if let Value::Object(ref mut obj) = body {
+            obj.remove("reasoning_effort");
+        }
         if self.skip_tools {
             if let Value::Object(ref mut obj) = body {
                 obj.remove("tools");

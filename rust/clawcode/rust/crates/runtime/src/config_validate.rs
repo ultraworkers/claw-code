@@ -270,6 +270,10 @@ const PLUGINS_FIELDS: &[FieldSpec] = &[
         name: "maxOutputTokens",
         expected: FieldType::Number,
     },
+    FieldSpec {
+        name: "reasoningEffort",
+        expected: FieldType::String,
+    },
 ];
 
 const SANDBOX_FIELDS: &[FieldSpec] = &[
