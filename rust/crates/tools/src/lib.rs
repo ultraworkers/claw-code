@@ -2040,14 +2040,9 @@ fn run_git_status(input: GitStatusInput) -> Result<String, String> {
         args.push("--short");
         args.push("--branch");
     }
-    match git_stdout(&args) {
-        Some(output) => to_pretty_json(json!({
-            "output": output
-        })),
-        None => Err(
-            "git status failed. Ensure the current directory is inside a git repository."
-                .to_string(),
-        ),
+    match git_stdout_allow_empty(&args) {
+        Some(output) => git_tool_success(output),
+        None => Err(git_tool_failure("status")),
     }
 }
 
@@ -2071,13 +2066,9 @@ fn run_git_diff(input: GitDiffInput) -> Result<String, String> {
         args.push(path.clone());
     }
     let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-    match git_stdout(&arg_refs) {
-        Some(output) => to_pretty_json(json!({
-            "output": output
-        })),
-        None => Err(
-            "git diff failed. Ensure the current directory is inside a git repository.".to_string(),
-        ),
+    match git_stdout_allow_empty(&arg_refs) {
+        Some(output) => git_tool_success(output),
+        None => Err(git_tool_failure("diff")),
     }
 }
 
@@ -2105,13 +2096,9 @@ fn run_git_log(input: GitLogInput) -> Result<String, String> {
         args.push(path.clone());
     }
     let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-    match git_stdout(&arg_refs) {
-        Some(output) => to_pretty_json(json!({
-            "output": output
-        })),
-        None => Err(
-            "git log failed. Ensure the current directory is inside a git repository.".to_string(),
-        ),
+    match git_stdout_allow_empty(&arg_refs) {
+        Some(output) => git_tool_success(output),
+        None => Err(git_tool_failure("log")),
     }
 }
 
@@ -2152,10 +2139,8 @@ fn run_git_show(input: GitShowInput) -> Result<String, String> {
         args.push(input.commit.clone());
     }
     let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-    match git_stdout(&arg_refs) {
-        Some(output) => to_pretty_json(json!({
-            "output": output
-        })),
+    match git_stdout_allow_empty(&arg_refs) {
+        Some(output) => git_tool_success(output),
         None => Err(format!(
             "git show {} failed. Ensure the commit exists.",
             input.commit
@@ -2172,10 +2157,8 @@ fn run_git_blame(input: GitBlameInput) -> Result<String, String> {
     }
     args.push(input.path.clone());
     let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-    match git_stdout(&arg_refs) {
-        Some(output) => to_pretty_json(json!({
-            "output": output
-        })),
+    match git_stdout_allow_empty(&arg_refs) {
+        Some(output) => git_tool_success(output),
         None => Err(format!("git blame {} failed. Ensure the file exists and the directory is inside a git repository.", input.path)),
     }
 }
@@ -2379,13 +2362,99 @@ fn git_ref_exists(reference: &str) -> bool {
         .is_ok_and(|output| output.status.success())
 }
 
-fn git_stdout(args: &[&str]) -> Option<String> {
+/// Interprets a finished `git` invocation.
+///
+/// `None` means git itself failed. Success with no output yields `Some("")` — a
+/// clean diff or an empty log is git working correctly, not a missing repository.
+fn interpret_git_output(success: bool, stdout: &[u8]) -> Option<String> {
+    success.then(|| String::from_utf8_lossy(stdout).trim().to_string())
+}
+
+/// Runs `git` and returns its trimmed stdout, preserving empty successful output.
+fn git_stdout_allow_empty(args: &[&str]) -> Option<String> {
     let output = Command::new("git").args(args).output().ok()?;
-    if !output.status.success() {
-        return None;
+    interpret_git_output(output.status.success(), &output.stdout)
+}
+
+/// Runs `git` and returns its trimmed stdout only when it is non-empty.
+///
+/// For callers where an empty result carries no usable meaning, such as
+/// `branch --show-current` on a detached HEAD.
+fn git_stdout(args: &[&str]) -> Option<String> {
+    git_stdout_allow_empty(args).filter(|stdout| !stdout.is_empty())
+}
+
+/// Success payload for the read-only `Git*` tools.
+///
+/// `empty` is reported explicitly so that "git ran and found nothing" cannot be
+/// confused with "the tool failed".
+fn git_tool_success(output: String) -> Result<String, String> {
+    let empty = output.is_empty();
+    to_pretty_json(json!({
+        "output": output,
+        "empty": empty
+    }))
+}
+
+/// Error text for a `git` invocation that genuinely failed.
+///
+/// Names the directory git ran in: the `Git*` tools always use the process
+/// working directory and ignore any `cd`, so a workspace root that is not itself
+/// a repository is the most common cause and the least visible from the message.
+fn git_tool_failure(subcommand: &str) -> String {
+    let cwd = std::env::current_dir().map_or_else(
+        |_| "the current directory".to_string(),
+        |path| path.display().to_string(),
+    );
+    format!(
+        "git {subcommand} failed in {cwd}. The Git tools always run there and ignore any `cd`. \
+         If that directory is not inside a git repository, use the bash tool with an explicit \
+         prefix instead: `cd <repo> && git {subcommand} ...`."
+    )
+}
+
+#[cfg(test)]
+mod git_output_tests {
+    use super::{git_tool_failure, git_tool_success, interpret_git_output};
+
+    #[test]
+    fn treats_empty_successful_output_as_success() {
+        // A clean `git diff` exits 0 with no stdout. Reporting that as a failure
+        // told the model it was not in a repository when it was.
+        assert_eq!(interpret_git_output(true, b""), Some(String::new()));
     }
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    (!stdout.is_empty()).then_some(stdout)
+
+    #[test]
+    fn trims_successful_output() {
+        assert_eq!(
+            interpret_git_output(true, b"  ## main...origin/main\n"),
+            Some("## main...origin/main".to_string())
+        );
+    }
+
+    #[test]
+    fn reports_only_a_failing_exit_status_as_failure() {
+        assert_eq!(interpret_git_output(false, b""), None);
+        assert_eq!(interpret_git_output(false, b"partial output"), None);
+    }
+
+    #[test]
+    fn success_payload_flags_empty_output_explicitly() {
+        let empty = git_tool_success(String::new()).expect("empty payload");
+        assert!(empty.contains("\"empty\": true"), "{empty}");
+
+        let populated = git_tool_success("M src/lib.rs".to_string()).expect("populated payload");
+        assert!(populated.contains("\"empty\": false"), "{populated}");
+        assert!(populated.contains("M src/lib.rs"), "{populated}");
+    }
+
+    #[test]
+    fn failure_message_names_the_directory_and_the_bash_workaround() {
+        let message = git_tool_failure("status");
+        assert!(message.starts_with("git status failed in "), "{message}");
+        assert!(message.contains("ignore any `cd`"), "{message}");
+        assert!(message.contains("cd <repo> && git status ..."), "{message}");
+    }
 }
 
 fn branch_divergence_output(
