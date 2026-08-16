@@ -12624,6 +12624,16 @@ fn resolve_cli_auth_source_for_cwd() -> Result<AuthSource, api::ApiError> {
     resolve_startup_auth_source(|| Ok(None))
 }
 
+fn model_supports_local_tools(model: &str) -> bool {
+    !matches!(
+        api::resolve_model_alias(model)
+            .rsplit('/')
+            .next()
+            .unwrap_or(model),
+        "compound" | "compound-mini"
+    )
+}
+
 impl ApiClient for AnthropicRuntimeClient {
     #[allow(clippy::too_many_lines)]
     fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
@@ -12631,15 +12641,15 @@ impl ApiClient for AnthropicRuntimeClient {
             progress_reporter.mark_model_phase();
         }
         let is_post_tool = request_ends_with_tool_result(&request);
+        let enable_local_tools = self.enable_tools && model_supports_local_tools(&self.model);
         let message_request = MessageRequest {
             model: self.model.clone(),
             max_tokens: max_tokens_for_model(&self.model),
             messages: convert_messages(&request.messages),
             system: (!request.system_prompt.is_empty()).then(|| request.system_prompt.join("\n\n")),
-            tools: self
-                .enable_tools
+            tools: enable_local_tools
                 .then(|| filter_tool_specs(&self.tool_registry, self.allowed_tools.as_ref())),
-            tool_choice: self.enable_tools.then_some(ToolChoice::Auto),
+            tool_choice: enable_local_tools.then_some(ToolChoice::Auto),
             stream: true,
             reasoning_effort: self.reasoning_effort.clone(),
             ..Default::default()
@@ -19435,6 +19445,14 @@ UU conflicted.rs",
                 assert_eq!(reasoning_effort.as_deref(), Some(value));
             }
         }
+    }
+
+    #[test]
+    fn groq_compound_disables_local_tools() {
+        assert!(!super::model_supports_local_tools("groq/compound"));
+        assert!(!super::model_supports_local_tools("groq/compound-mini"));
+        assert!(super::model_supports_local_tools("sonnet"));
+        assert!(super::model_supports_local_tools("llama-3.1-8b-instant"));
     }
 
     #[test]
