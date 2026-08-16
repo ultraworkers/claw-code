@@ -16,6 +16,7 @@
 )]
 mod init;
 mod input;
+mod interrupt;
 mod render;
 mod setup_wizard;
 
@@ -7194,6 +7195,18 @@ impl BuiltRuntime {
         self
     }
 
+    fn with_turn_interrupt_signal(mut self, signal: runtime::TurnInterruptSignal) -> Self {
+        let mut runtime = self
+            .runtime
+            .take()
+            .expect("runtime should exist before installing turn interrupt signal");
+        runtime
+            .api_client_mut()
+            .set_turn_interrupt_signal(signal.clone());
+        self.runtime = Some(runtime.with_turn_interrupt_signal(signal));
+        self
+    }
+
     fn shutdown_plugins(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         if self.plugins_active {
             self.plugin_registry.shutdown()?;
@@ -7576,7 +7589,10 @@ struct HookAbortMonitor {
 }
 
 impl HookAbortMonitor {
-    fn spawn(abort_signal: runtime::HookAbortSignal) -> Self {
+    fn spawn(
+        abort_signal: runtime::HookAbortSignal,
+        turn_interrupt_signal: runtime::TurnInterruptSignal,
+    ) -> Self {
         Self::spawn_with_waiter(abort_signal, move |stop_rx, abort_signal| {
             let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -7593,7 +7609,11 @@ impl HookAbortMonitor {
                 tokio::select! {
                     result = tokio::signal::ctrl_c() => {
                         if result.is_ok() {
+                            // Ctrl+C stops the whole turn, not just running
+                            // hooks: the conversation loop and the streaming
+                            // client both poll the turn interrupt signal.
                             abort_signal.abort();
+                            turn_interrupt_signal.interrupt();
                         }
                     }
                     _ = wait_for_stop => {}
@@ -7698,7 +7718,7 @@ impl LiveCli {
   \x1b[2mDirectory\x1b[0m        {}\n\
   \x1b[2mSession\x1b[0m          {}\n\
   \x1b[2mAuto-save\x1b[0m        {}\n\n\
-  Type \x1b[1m/help\x1b[0m for commands · \x1b[1m/status\x1b[0m for live context · \x1b[2m/resume latest\x1b[0m jumps back to the newest session · \x1b[1m/diff\x1b[0m then \x1b[1m/commit\x1b[0m to ship · \x1b[2mTab\x1b[0m for workflow completions · \x1b[2mShift+Enter\x1b[0m for newline",
+  Type \x1b[1m/help\x1b[0m for commands · \x1b[1m/status\x1b[0m for live context · \x1b[2m/resume latest\x1b[0m jumps back to the newest session · \x1b[1m/diff\x1b[0m then \x1b[1m/commit\x1b[0m to ship · \x1b[2mTab\x1b[0m for workflow completions · \x1b[2mShift+Enter\x1b[0m for newline · \x1b[2mEsc\x1b[0m interrupts a running turn",
             self.model,
             self.permission_mode.as_str(),
             git_branch,
@@ -7723,8 +7743,12 @@ impl LiveCli {
     fn prepare_turn_runtime(
         &self,
         emit_output: bool,
-    ) -> Result<(BuiltRuntime, HookAbortMonitor), Box<dyn std::error::Error>> {
+    ) -> Result<
+        (BuiltRuntime, HookAbortMonitor, runtime::TurnInterruptSignal),
+        Box<dyn std::error::Error>,
+    > {
         let hook_abort_signal = runtime::HookAbortSignal::new();
+        let turn_interrupt_signal = runtime::TurnInterruptSignal::new();
         let runtime = build_runtime(
             self.runtime.session().clone(),
             &self.session.id,
@@ -7736,10 +7760,12 @@ impl LiveCli {
             self.permission_mode,
             None,
         )?
-        .with_hook_abort_signal(hook_abort_signal.clone());
-        let hook_abort_monitor = HookAbortMonitor::spawn(hook_abort_signal);
+        .with_hook_abort_signal(hook_abort_signal.clone())
+        .with_turn_interrupt_signal(turn_interrupt_signal.clone());
+        let hook_abort_monitor =
+            HookAbortMonitor::spawn(hook_abort_signal, turn_interrupt_signal.clone());
 
-        Ok((runtime, hook_abort_monitor))
+        Ok((runtime, hook_abort_monitor, turn_interrupt_signal))
     }
 
     fn replace_runtime(&mut self, runtime: BuiltRuntime) -> Result<(), Box<dyn std::error::Error>> {
@@ -7749,22 +7775,41 @@ impl LiveCli {
     }
 
     fn run_turn(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
-        let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(true)?;
+        let (mut runtime, hook_abort_monitor, turn_interrupt_signal) =
+            self.prepare_turn_runtime(true)?;
+        let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
+        let mut escape_monitor = None;
+        if let Some((monitor, stdin_gate)) =
+            interrupt::EscapeInterruptMonitor::spawn(turn_interrupt_signal)
+        {
+            permission_prompter = permission_prompter.with_stdin_gate(stdin_gate);
+            escape_monitor = Some(monitor);
+        }
         let mut spinner = Spinner::new();
         let mut stdout = io::stdout();
         spinner.tick(
-            "🦀 Thinking...",
+            if escape_monitor.is_some() {
+                "🦀 Thinking... (esc to interrupt)"
+            } else {
+                "🦀 Thinking..."
+            },
             TerminalRenderer::new().color_theme(),
             &mut stdout,
         )?;
-        let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
         let result = runtime.run_turn(input, Some(&mut permission_prompter));
+        if let Some(monitor) = escape_monitor {
+            monitor.stop();
+        }
         hook_abort_monitor.stop();
         match result {
             Ok(summary) => {
                 self.replace_runtime(runtime)?;
                 spinner.finish(
-                    "✨ Done",
+                    if summary.interrupted {
+                        "⏹ Interrupted"
+                    } else {
+                        "✨ Done"
+                    },
                     TerminalRenderer::new().color_theme(),
                     &mut stdout,
                 )?;
@@ -7895,7 +7940,7 @@ impl LiveCli {
                         *self.runtime.session_mut() = result.compacted_session.clone();
 
                         // Build a new runtime with the compacted session and retry
-                        let (mut new_runtime, hook_abort_monitor) =
+                        let (mut new_runtime, hook_abort_monitor, _turn_interrupt_signal) =
                             self.prepare_turn_runtime(true)?;
                         drop(hook_abort_monitor);
 
@@ -7985,7 +8030,8 @@ impl LiveCli {
     }
 
     fn run_prompt_compact(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
-        let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(false)?;
+        let (mut runtime, hook_abort_monitor, _turn_interrupt_signal) =
+            self.prepare_turn_runtime(false)?;
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
         let result = runtime.run_turn(input, Some(&mut permission_prompter));
         hook_abort_monitor.stop();
@@ -7998,7 +8044,8 @@ impl LiveCli {
     }
 
     fn run_prompt_compact_json(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
-        let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(false)?;
+        let (mut runtime, hook_abort_monitor, _turn_interrupt_signal) =
+            self.prepare_turn_runtime(false)?;
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
         let result = runtime.run_turn(input, Some(&mut permission_prompter));
         hook_abort_monitor.stop();
@@ -8023,7 +8070,8 @@ impl LiveCli {
     }
 
     fn run_prompt_json(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
-        let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(false)?;
+        let (mut runtime, hook_abort_monitor, _turn_interrupt_signal) =
+            self.prepare_turn_runtime(false)?;
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
         let result = runtime.run_turn(input, Some(&mut permission_prompter));
         hook_abort_monitor.stop();
@@ -9495,6 +9543,7 @@ fn render_repl_help() -> String {
         "  Ctrl-R               Reverse-search prompt history".to_string(),
         "  Tab                  Complete commands, modes, and recent sessions".to_string(),
         "  Ctrl-C               Clear input (or exit on empty prompt)".to_string(),
+        "  Esc                  Interrupt the running turn".to_string(),
         "  Shift+Enter/Ctrl+J   Insert a newline".to_string(),
         "  Auto-save            .claw/sessions/<workspace-fingerprint>/<session-id>.jsonl"
             .to_string(),
@@ -12478,11 +12527,20 @@ impl runtime::HookProgressReporter for CliHookProgressReporter {
 
 struct CliPermissionPrompter {
     current_mode: PermissionMode,
+    stdin_gate: Option<interrupt::StdinPromptGate>,
 }
 
 impl CliPermissionPrompter {
     fn new(current_mode: PermissionMode) -> Self {
-        Self { current_mode }
+        Self {
+            current_mode,
+            stdin_gate: None,
+        }
+    }
+
+    fn with_stdin_gate(mut self, stdin_gate: interrupt::StdinPromptGate) -> Self {
+        self.stdin_gate = Some(stdin_gate);
+        self
     }
 }
 
@@ -12491,6 +12549,12 @@ impl runtime::PermissionPrompter for CliPermissionPrompter {
         &mut self,
         request: &runtime::PermissionRequest,
     ) -> runtime::PermissionPromptDecision {
+        // Take stdin back from the Esc listener (restoring canonical
+        // mode) for the duration of this line-based prompt.
+        let _stdin_lease = self
+            .stdin_gate
+            .as_ref()
+            .map(interrupt::StdinPromptGate::lease);
         println!();
         println!("Permission approval required");
         println!("  Tool             {}", request.tool_name);
@@ -12542,6 +12606,7 @@ struct AnthropicRuntimeClient {
     tool_registry: GlobalToolRegistry,
     progress_reporter: Option<InternalPromptProgressReporter>,
     reasoning_effort: Option<String>,
+    turn_interrupt_signal: Option<runtime::TurnInterruptSignal>,
 }
 
 impl AnthropicRuntimeClient {
@@ -12607,11 +12672,16 @@ impl AnthropicRuntimeClient {
             tool_registry,
             progress_reporter,
             reasoning_effort: None,
+            turn_interrupt_signal: None,
         })
     }
 
     fn set_reasoning_effort(&mut self, effort: Option<String>) {
         self.reasoning_effort = effort;
+    }
+
+    fn set_turn_interrupt_signal(&mut self, signal: runtime::TurnInterruptSignal) {
+        self.turn_interrupt_signal = Some(signal);
     }
 }
 
@@ -12646,30 +12716,50 @@ impl ApiClient for AnthropicRuntimeClient {
         };
 
         self.runtime.block_on(async {
-            // When resuming after tool execution, apply a stall timeout on the
-            // first stream event.  If the model does not respond within the
-            // deadline we drop the stalled connection and re-send the request as
-            // a continuation nudge (one retry only).
-            let max_attempts: usize = if is_post_tool { 2 } else { 1 };
+            let request_loop = async {
+                // When resuming after tool execution, apply a stall timeout on the
+                // first stream event.  If the model does not respond within the
+                // deadline we drop the stalled connection and re-send the request as
+                // a continuation nudge (one retry only).
+                let max_attempts: usize = if is_post_tool { 2 } else { 1 };
 
-            for attempt in 1..=max_attempts {
-                let result = self
-                    .consume_stream(&message_request, is_post_tool && attempt == 1)
-                    .await;
-                match result {
-                    Ok(events) => return Ok(events),
-                    Err(error)
-                        if error.to_string().contains("post-tool stall")
-                            && attempt < max_attempts =>
-                    {
-                        // Stalled after tool completion — nudge the model by
-                        // re-sending the same request.
+                for attempt in 1..=max_attempts {
+                    let result = self
+                        .consume_stream(&message_request, is_post_tool && attempt == 1)
+                        .await;
+                    match result {
+                        Ok(events) => return Ok(events),
+                        Err(error)
+                            if error.to_string().contains("post-tool stall")
+                                && attempt < max_attempts =>
+                        {
+                            // Stalled after tool completion — nudge the model by
+                            // re-sending the same request.
+                        }
+                        Err(error) => return Err(error),
                     }
-                    Err(error) => return Err(error),
+                }
+
+                Err(RuntimeError::new("post-tool continuation nudge exhausted"))
+            };
+
+            let Some(interrupt) = self.turn_interrupt_signal.clone() else {
+                return request_loop.await;
+            };
+
+            tokio::select! {
+                result = request_loop => result,
+                () = async {
+                    while !interrupt.is_interrupted() {
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    }
+                } => {
+                    // Dropping the request future aborts the in-flight HTTP
+                    // stream. The conversation loop sees the interrupt flag and
+                    // reports this as an interruption rather than a failure.
+                    Err(RuntimeError::new("request interrupted by user"))
                 }
             }
-
-            Err(RuntimeError::new("post-tool continuation nudge exhausted"))
         })
     }
 }
