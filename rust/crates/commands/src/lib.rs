@@ -1131,6 +1131,9 @@ pub enum SlashCommand {
     SecurityReview,
     Keybindings,
     PrivacySettings,
+    Workspace {
+        path: Option<String>,
+    },
     Plan {
         mode: Option<String>,
     },
@@ -1272,6 +1275,7 @@ impl SlashCommand {
             Self::SecurityReview => "/security-review",
             Self::Keybindings => "/keybindings",
             Self::PrivacySettings => "/privacy-settings",
+            Self::Workspace { .. } => "/workspace",
             Self::Plan { .. } => "/plan",
             Self::Review { .. } => "/review",
             Self::Tasks { .. } => "/tasks",
@@ -1405,6 +1409,9 @@ pub fn validate_slash_command_input(
             validate_no_args(command, &args)?;
             SlashCommand::Setup
         }
+        "workspace" | "cwd" => SlashCommand::Workspace {
+            path: optional_single_arg(command, &args, "[path]")?,
+        },
         "login" | "logout" => {
             return Err(command_error(
                 "This auth flow was removed. Set ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN instead.",
@@ -5342,6 +5349,7 @@ pub fn handle_slash_command(
         | SlashCommand::Cost
         | SlashCommand::Resume { .. }
         | SlashCommand::Config { .. }
+        | SlashCommand::Workspace { .. }
         | SlashCommand::Mcp { .. }
         | SlashCommand::Memory
         | SlashCommand::Init
@@ -6117,6 +6125,24 @@ mod tests {
         let plugin_suggestions = suggest_slash_commands("/plugns", 3);
         assert!(plugin_suggestions.contains(&"/plugin".to_string()));
         assert_eq!(suggest_slash_commands("zzz", 3), Vec::<String>::new());
+    }
+
+    #[test]
+    fn parses_workspace_slash_command_and_alias() {
+        let workspace = validate_slash_command_input("/workspace")
+            .expect("workspace should parse")
+            .expect("workspace should be a slash command");
+        assert_eq!(workspace, SlashCommand::Workspace { path: None });
+
+        let cwd = validate_slash_command_input("/cwd src")
+            .expect("cwd alias should parse")
+            .expect("cwd alias should be a slash command");
+        assert_eq!(
+            cwd,
+            SlashCommand::Workspace {
+                path: Some("src".to_string()),
+            }
+        );
     }
 
     #[test]
