@@ -609,16 +609,43 @@ fn web_passthrough_diagnostic(
     }
 }
 
+/// Overrides the context window every sizing guard is computed against.
+///
+/// The model *name* is not a reliable statement of the window when the endpoint is a local
+/// server: the harness sends its compiled-in default name (a Claude alias) while the backend
+/// serves whatever `-c` it was started with. Every guard downstream of [`model_token_limit`]
+/// then sizes itself against the name's window instead of the real one, which makes the
+/// preflights unable to fire rather than merely inaccurate. This variable is the operator's
+/// statement of the truth, and it wins over the table.
+const CONTEXT_WINDOW_ENV_VAR: &str = "CLAW_CONTEXT_WINDOW";
+
+/// Fraction of the window a single response may be allowed to claim when the window is
+/// declared. Output and input share one budget on a local server, so reserving a quarter for
+/// the reply leaves three quarters for prompt plus transcript.
+const MAX_OUTPUT_SHARE_OF_WINDOW: u32 = 4;
+
+/// The operator-declared context window, when set and parseable as a positive token count.
+#[must_use]
+pub fn context_window_override() -> Option<u32> {
+    parse_context_window_override(std::env::var(CONTEXT_WINDOW_ENV_VAR).ok().as_deref())
+}
+
+#[must_use]
+fn parse_context_window_override(value: Option<&str>) -> Option<u32> {
+    value
+        .and_then(|raw| raw.trim().parse::<u32>().ok())
+        .filter(|window| *window > 0)
+}
+
 #[must_use]
 pub fn max_tokens_for_model(model: &str) -> u32 {
-    let canonical = resolve_model_alias(model);
-    let heuristic = if canonical.contains("opus") {
-        32_000
-    } else {
-        64_000
-    };
-
-    model_token_limit(model).map_or(heuristic, |limit| heuristic.min(limit.max_output_tokens))
+    // A declared window caps the reply too. Asking a 65k server for 32k of output reserves half
+    // the window for a single message, which the server then silently clamps — leaving the
+    // client's own accounting wrong by the difference.
+    model_token_limit(model).map_or_else(
+        || max_tokens_for_model_by_name(model),
+        |limit| max_tokens_for_model_by_name(model).min(limit.max_output_tokens),
+    )
 }
 
 /// Returns the effective max output tokens for a model, preferring a plugin
@@ -631,6 +658,33 @@ pub fn max_tokens_for_model_with_override(model: &str, plugin_override: Option<u
 
 #[must_use]
 pub fn model_token_limit(model: &str) -> Option<ModelTokenLimit> {
+    // A declared window replaces the table's, and supplies one for models the table has never
+    // heard of. Returning `Some` for an unknown model is the point: `None` makes both preflights
+    // return `Ok` without looking at anything, so an unrecognised local model gets no guard at all.
+    if let Some(context_window_tokens) = context_window_override() {
+        return Some(ModelTokenLimit {
+            max_output_tokens: max_tokens_for_model_by_name(model)
+                .min(context_window_tokens / MAX_OUTPUT_SHARE_OF_WINDOW),
+            context_window_tokens,
+        });
+    }
+    model_token_limit_by_name(model)
+}
+
+#[must_use]
+fn max_tokens_for_model_by_name(model: &str) -> u32 {
+    let canonical = resolve_model_alias(model);
+    let heuristic = if canonical.contains("opus") {
+        32_000
+    } else {
+        64_000
+    };
+    model_token_limit_by_name(model)
+        .map_or(heuristic, |limit| heuristic.min(limit.max_output_tokens))
+}
+
+#[must_use]
+fn model_token_limit_by_name(model: &str) -> Option<ModelTokenLimit> {
     let canonical = resolve_model_alias(model);
     let base_model = canonical.rsplit('/').next().unwrap_or(canonical.as_str());
     match base_model {
@@ -698,7 +752,7 @@ pub fn preflight_message_request(request: &MessageRequest) -> Result<(), ApiErro
     Ok(())
 }
 
-fn estimate_message_request_input_tokens(request: &MessageRequest) -> u32 {
+pub fn estimate_message_request_input_tokens(request: &MessageRequest) -> u32 {
     let mut estimate = estimate_serialized_tokens(&request.messages);
     estimate = estimate.saturating_add(estimate_serialized_tokens(&request.system));
     estimate = estimate.saturating_add(estimate_serialized_tokens(&request.tools));

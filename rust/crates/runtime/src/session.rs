@@ -718,6 +718,20 @@ impl ConversationMessage {
         }
     }
 
+    /// Text the harness injected on its own initiative, not something the user typed.
+    ///
+    /// Reaches the model as an ordinary turn — the wire protocol has nowhere else to put it — but
+    /// stays labelled in the transcript, so a replay, an export, or a compaction summary does not
+    /// present the harness's own prompting back as the user's words.
+    #[must_use]
+    pub fn system_text(text: impl Into<String>) -> Self {
+        Self {
+            role: MessageRole::System,
+            blocks: vec![ContentBlock::Text { text: text.into() }],
+            usage: None,
+        }
+    }
+
     #[must_use]
     pub fn assistant(blocks: Vec<ContentBlock>) -> Self {
         Self {

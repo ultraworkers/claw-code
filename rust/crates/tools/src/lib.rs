@@ -506,13 +506,17 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "read_file",
-            description: "Read a text file from the workspace.",
+            description: "Read a text file from the workspace. Large files come back one page at \
+                          a time: if the response has \"truncated\": true you have NOT seen the \
+                          whole file, and \"nextOffset\" is the line to pass as `offset` to \
+                          continue. Prefer grep_search to locate what you need over paging \
+                          through a big file, and never re-read a page you already have.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "path": { "type": "string" },
-                    "offset": { "type": "integer", "minimum": 0 },
-                    "limit": { "type": "integer", "minimum": 1 }
+                    "offset": { "type": "integer", "minimum": 0, "description": "First line to read (0-based). Pass the previous response's nextOffset to continue." },
+                    "limit": { "type": "integer", "minimum": 1, "description": "Maximum lines to return. Capped by a byte ceiling regardless." }
                 },
                 "required": ["path"],
                 "additionalProperties": false
@@ -10271,6 +10275,12 @@ mod tests {
 
     #[test]
     fn repl_executes_python_code() {
+        // Resolving the python runtime reads PATH, and PATH is process-global: the PowerShell
+        // tests below blank it while they run. Without this guard that races and this test
+        // intermittently fails with "python runtime not found" on a machine that has python.
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let result = execute_tool(
             "REPL",
             &json!({"language": "python", "code": "print(1 + 1)", "timeout_ms": 500}),

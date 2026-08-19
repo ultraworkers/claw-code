@@ -72,6 +72,22 @@ use tools::{
 
 const DEFAULT_MODEL: &str = "anthropic/claude-opus-4-7";
 
+/// Ceiling on model/tool round trips within one turn.
+///
+/// `ConversationRuntime` defaults to `usize::MAX`, which for the interactive and `-p` paths means
+/// no ceiling at all: a model that keeps re-reading the same file loops until the user kills it.
+/// Spawned subagents have always been bounded; this gives the top-level loop the same treatment.
+const DEFAULT_MAX_TURN_ITERATIONS: usize = 32;
+const MAX_TURN_ITERATIONS_ENV_VAR: &str = "CLAW_MAX_TURN_ITERATIONS";
+
+fn max_turn_iterations_from_env() -> usize {
+    std::env::var(MAX_TURN_ITERATIONS_ENV_VAR)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .filter(|iterations| *iterations > 0)
+        .unwrap_or(DEFAULT_MAX_TURN_ITERATIONS)
+}
+
 /// #148: Model provenance for `claw status` JSON/text output. Records where
 /// the resolved model string came from so claws don't have to re-read argv
 /// to audit whether their `--model` flag was honored vs falling back to env
@@ -1939,9 +1955,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         // Only reject for known top-level subcommands that don't use compact.
         let first = rest[0].as_str();
         if is_known_top_level_subcommand(first) && first != "prompt" {
-            return Err(format!(
-                "invalid_flag_value: --compact is only supported with prompt mode.\nUsage: claw --compact \"<prompt>\" or echo \"<prompt>\" | claw --compact"
-            ));
+            return Err("invalid_flag_value: --compact is only supported with prompt mode.\nUsage: claw --compact \"<prompt>\" or echo \"<prompt>\" | claw --compact".to_string());
         }
     }
 
@@ -3134,10 +3148,11 @@ fn print_model_validation_warning_status(
         usage,
         permission_mode,
         context,
-        None,
-        None,
-        allowed_tools,
-        Some(&format_selection),
+        &StatusJsonExtras {
+            allowed_tools,
+            format_selection: Some(&format_selection),
+            ..StatusJsonExtras::default()
+        },
     );
     let object = value
         .as_object_mut()
@@ -3213,9 +3228,7 @@ fn parse_system_prompt_args(
                 })?;
                 // #99: validate --date is a plausible date string (no newlines, reasonable length)
                 if value.contains('\n') || value.contains('\r') {
-                    return Err(format!(
-                        "invalid_flag_value: --date value contains invalid characters.\nUsage: --date <YYYY-MM-DD>"
-                    ));
+                    return Err("invalid_flag_value: --date value contains invalid characters.\nUsage: --date <YYYY-MM-DD>".to_string());
                 }
                 if value.len() > 20 {
                     return Err(format!(
@@ -3452,11 +3465,7 @@ impl DiagnosticCheck {
 
     fn json_value(&self) -> Value {
         // Derive a stable snake_case id from the check name for machine-readable keying (#704).
-        let id = self
-            .name
-            .to_ascii_lowercase()
-            .replace(' ', "_")
-            .replace('-', "_");
+        let id = self.name.to_ascii_lowercase().replace([' ', '-'], "_");
         let mut value = Map::from_iter([
             ("id".to_string(), Value::String(id.clone())),
             (
@@ -6589,10 +6598,8 @@ fn run_resume_command(
                     },
                     default_permission_mode().as_str(),
                     &context,
-                    None, // #148: resumed sessions don't have flag provenance
-                    None,
-                    None,
-                    None,
+                    // #148: resumed sessions don't have flag provenance
+                    &StatusJsonExtras::default(),
                 )),
             })
         }
@@ -6730,16 +6737,15 @@ fn run_resume_command(
         }
         SlashCommand::Plugins { action, target } => {
             // Only list is supported in resume mode (no runtime to reload)
-            match action.as_deref() {
-                Some(action @ ("install" | "uninstall" | "enable" | "disable" | "update")) => {
-                    // #777: use interactive_only: prefix + \n hint so #776's classify/split
-                    // emits error_kind:interactive_only + non-null hint instead of unknown+null.
-                    // Orchestrators can now detect this and switch to a live REPL instead of retrying.
-                    return Err(format!(
-                        "interactive_only: /plugins {action} requires a live session to reload the plugin runtime.\nStart `claw` and run `/plugins {action}` inside the REPL, or use `claw plugins {action}` as a direct CLI command."
-                    ).into());
-                }
-                _ => {}
+            if let Some(action @ ("install" | "uninstall" | "enable" | "disable" | "update")) =
+                action.as_deref()
+            {
+                // #777: use interactive_only: prefix + \n hint so #776's classify/split
+                // emits error_kind:interactive_only + non-null hint instead of unknown+null.
+                // Orchestrators can now detect this and switch to a live REPL instead of retrying.
+                return Err(format!(
+                    "interactive_only: /plugins {action} requires a live session to reload the plugin runtime.\nStart `claw` and run `/plugins {action}` inside the REPL, or use `claw plugins {action}` as a direct CLI command."
+                ).into());
             }
             let cwd = env::current_dir()?;
             let payload = plugins_command_payload_for(
@@ -7783,6 +7789,15 @@ impl LiveCli {
                 Ok(())
             }
             Err(error) => {
+                // Salvage the transcript before the failed runtime is torn down.
+                //
+                // `prepare_turn_runtime` handed `run_turn` a CLONE of the session, and the turn
+                // mutated only that clone — appending the user message, each assistant reply, and
+                // a tool_result for every tool that actually executed. Dropping the clone throws
+                // all of that away while the side effects of those tools remain on disk, so the
+                // retry below would re-issue them against a session that shows no sign they ever
+                // ran. Adopting the clone keeps the record and the reality in step.
+                *self.runtime.session_mut() = runtime.session().clone();
                 runtime.shutdown_plugins()?;
                 spinner.fail(
                     "❌ Request failed",
@@ -7802,37 +7817,17 @@ impl LiveCli {
                 // This eliminates the need for users to manually run /compact when they
                 // hit context limits - the recovery happens automatically.
                 //
-                // Detection: We look for "context_window" or "Context window" in the error
-                // message, which covers error types like:
-                // - "context_window_blocked"
-                // - "Context window blocked"
-                // - "This model's maximum context length is X tokens..."
+                // Detection: the API layer classified this when it still had the typed error and
+                // the outgoing request in hand — see `AnthropicRuntimeClient::runtime_error_from_api`.
+                // It is deliberately NOT re-derived from the rendered message here: compaction
+                // discards conversation history, and the substrings that used to gate it
+                // ("error decoding response body", "Failed to parse input at pos") are emitted by
+                // ordinary transport failures as well as by overflow, so a dropped connection cost
+                // the session its transcript.
                 // ============================================================================
 
                 let error_str = error.to_string();
-                // Detect context window overflow. Some providers (e.g. OpenAI-compat backends)
-                // return 400 with "no parseable body" instead of a proper context_length_exceeded
-                // error when the request is too large to even parse — treat that as context overflow too.
-                // Also detect model-specific context error markers (e.g. llama.cpp returns
-                // "Context size has been exceeded." / "exceed_context_size_error" / "exceeds the available context size").
-                let is_context_window = error_str.contains("context_window")
-                    || error_str.contains("Context window")
-                    || error_str.contains("no parseable body")
-                    || error_str.contains("exceed_context_size")
-                    || error_str.contains("exceeds the available context size")
-                    || error_str
-                        .to_ascii_lowercase()
-                        .contains("context size has been exceeded");
-
-                // Also treat "assistant stream produced no content" and reqwest decode failures
-                // as recoverable errors that may benefit from auto-compaction. Some backends (e.g.
-                // llama.cpp) return a non-SSE HTTP 500 body when context overflows, causing
-                // reqwest to fail with "error decoding response body" — treat that as context overflow too.
-                let is_no_content = error_str.contains("assistant stream produced no content")
-                    || error_str.contains("Failed to parse input at pos")
-                    || error_str.contains("error decoding response body");
-
-                if is_context_window || is_no_content {
+                if error.is_context_window_failure() {
                     // If the error tells us the server's actual context window, adapt our
                     // auto-compaction threshold so future auto-compact-trigger checks are accurate.
                     if let Some(window) = extract_context_window_tokens_from_error(&error_str) {
@@ -7852,8 +7847,7 @@ impl LiveCli {
                     let max_compact_rounds = 4;
                     let preserve_schedule = [4, 2, 1, 0];
 
-                    for round in 0..max_compact_rounds {
-                        let preserve = preserve_schedule[round];
+                    for (round, &preserve) in preserve_schedule.iter().enumerate() {
                         println!(
                             "  Auto-compacting session (round {}/{}, preserving {} recent messages)...",
                             round + 1,
@@ -7900,7 +7894,11 @@ impl LiveCli {
                         drop(hook_abort_monitor);
 
                         let mut rp = CliPermissionPrompter::new(self.permission_mode);
-                        match new_runtime.run_turn(input, Some(&mut rp)) {
+                        // Resume, do not replay. The salvaged session already carries this turn's
+                        // user message and every tool result that completed before the failure;
+                        // re-running `run_turn(input, ..)` would duplicate the prompt and invite a
+                        // second execution of tools that are not idempotent.
+                        match new_runtime.resume_turn(Some(&mut rp)) {
                             Ok(summary) => {
                                 self.replace_runtime(new_runtime)?;
                                 spinner.finish(
@@ -7924,20 +7922,7 @@ impl LiveCli {
                             }
                             Err(retry_error) => {
                                 let retry_str = retry_error.to_string();
-                                let still_context_window = retry_str.contains("context_window")
-                                    || retry_str.contains("Context window")
-                                    || retry_str.contains("no parseable body")
-                                    || retry_str.contains("exceed_context_size")
-                                    || retry_str.contains("exceeds the available context size")
-                                    || retry_str
-                                        .to_ascii_lowercase()
-                                        .contains("context size has been exceeded");
-                                let still_no_content = retry_str
-                                    .contains("assistant stream produced no content")
-                                    || retry_str.contains("Failed to parse input at pos")
-                                    || retry_str.contains("error decoding response body");
-
-                                if (still_context_window || still_no_content)
+                                if retry_error.is_context_window_failure()
                                     && round + 1 < max_compact_rounds
                                 {
                                     // If the retry error reveals the context window, adapt threshold.
@@ -8611,8 +8596,8 @@ impl LiveCli {
         let cwd = env::current_dir()?;
         // #803: reject flag-shaped tokens in list filter for BOTH text and JSON modes.
         // Previously the guard was JSON-only (#793); text mode silently returned empty success.
-        if action.as_deref() == Some("list") {
-            if let Some(filter) = target.as_deref() {
+        if action == Some("list") {
+            if let Some(filter) = target {
                 if filter.starts_with('-') {
                     if matches!(output_format, CliOutputFormat::Json) {
                         // ROADMAP #817: this is a handled local inventory parse error.
@@ -9567,14 +9552,34 @@ fn print_status_snapshot(
                 usage,
                 permission_mode.mode.as_str(),
                 &context,
-                Some(&provenance),
-                Some(&permission_mode),
-                allowed_tools,
-                Some(&format_selection),
+                &StatusJsonExtras {
+                    provenance: Some(&provenance),
+                    permission_provenance: Some(&permission_mode),
+                    allowed_tools,
+                    format_selection: Some(&format_selection),
+                },
             ))?
         ),
     }
     Ok(())
+}
+
+/// Optional provenance and selection inputs for [`status_json_value`].
+///
+/// Grouped into a struct rather than trailing positional parameters: they are all
+/// `Option<&_>` and most callers pass `None` for most of them, which makes a
+/// positional tail easy to transpose silently.
+///
+/// `provenance` (#148) drives the `model_source` field ("flag" | "env" | "config" |
+/// "default") and `model_raw` (user input before alias resolution, or null when the
+/// source is "default"). Callers without provenance (legacy resume paths) leave it
+/// `None`, in which case both fields are omitted.
+#[derive(Default)]
+struct StatusJsonExtras<'a> {
+    provenance: Option<&'a ModelProvenance>,
+    permission_provenance: Option<&'a PermissionModeProvenance>,
+    allowed_tools: Option<&'a AllowedToolSet>,
+    format_selection: Option<&'a OutputFormatSelection>,
 }
 
 fn status_json_value(
@@ -9582,16 +9587,14 @@ fn status_json_value(
     usage: StatusUsage,
     permission_mode: &str,
     context: &StatusContext,
-    // #148: optional provenance for `model` field. Surfaces `model_source`
-    // ("flag" | "env" | "config" | "default") and `model_raw` (user input
-    // before alias resolution, or null when source is "default"). Callers
-    // that don't have provenance (legacy resume paths) pass None, in which
-    // case both new fields are omitted.
-    provenance: Option<&ModelProvenance>,
-    permission_provenance: Option<&PermissionModeProvenance>,
-    allowed_tools: Option<&AllowedToolSet>,
-    format_selection: Option<&OutputFormatSelection>,
+    extras: &StatusJsonExtras<'_>,
 ) -> serde_json::Value {
+    let StatusJsonExtras {
+        provenance,
+        permission_provenance,
+        allowed_tools,
+        format_selection,
+    } = *extras;
     // #143: top-level `status` marker so claws can distinguish
     // a clean run from a degraded run (config parse failed but other fields
     // are still populated). `config_load_error` carries the parse-error string
@@ -10073,9 +10076,7 @@ fn sandbox_json_value(status: &runtime::SandboxStatus) -> serde_json::Value {
     //        (#731: "not supported on macOS" is a degraded state, not a hard error;
     //         filesystem_active:true means partial containment is working)
     // error = enabled but unsupported AND no filesystem sandbox either (nothing active)
-    let top_status = if !status.enabled {
-        "ok"
-    } else if status.active {
+    let top_status = if !status.enabled || status.active {
         "ok"
     } else if status.supported {
         "warn"
@@ -10450,18 +10451,20 @@ fn render_doctor_help_json() -> serde_json::Value {
 }
 
 /// #683-#692: extract structured metadata from help prose
-fn extract_help_metadata(
-    topic: LocalHelpTopic,
-) -> (
-    Option<String>,      // usage
-    Option<String>,      // purpose
-    Option<String>,      // output description
-    Option<Vec<String>>, // formats
-    Option<Vec<String>>, // related
-    Option<Vec<String>>, // aliases
-    bool,                // local_only
-    bool,                // requires_credentials
-) {
+/// Parsed fields of a help topic: usage, purpose, output description, formats,
+/// related topics, aliases, local-only, requires-credentials.
+type HelpMetadata = (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<Vec<String>>,
+    Option<Vec<String>>,
+    Option<Vec<String>>,
+    bool,
+    bool,
+);
+
+fn extract_help_metadata(topic: LocalHelpTopic) -> HelpMetadata {
     let text = render_help_topic(topic);
     let mut usage = None;
     let mut purpose = None;
@@ -12436,7 +12439,8 @@ fn build_runtime_with_plugin_state(
         policy,
         system_prompt,
         &feature_config,
-    );
+    )
+    .with_max_iterations(max_turn_iterations_from_env());
     if emit_output {
         runtime = runtime.with_hook_progress_reporter(Box::new(CliHookProgressReporter));
     }
@@ -12674,7 +12678,49 @@ impl ApiClient for AnthropicRuntimeClient {
     }
 }
 
+/// How full a request must be, as a percentage of the declared context window, before an
+/// unreadable failure is taken to mean the window overflowed.
+const AMBIGUOUS_FAILURE_WINDOW_PERCENT: u64 = 85;
+
+/// True when a request was close enough to the window that an otherwise unreadable failure is
+/// most likely an overflow.
+///
+/// This is the piece that lets transport errors be classified without matching on their prose.
+/// A backend can answer an oversized request with a non-SSE 500 that reqwest reports as
+/// "error decoding response body"; the same string also appears when the connection simply
+/// dropped. What separates them is not the text, it is whether the request we just sent had any
+/// room left. Requires a declared window — with none, every request looks small and this
+/// correctly returns false.
+fn request_fills_context_window(request: &MessageRequest) -> bool {
+    let Some(limit) = api::model_token_limit(&request.model) else {
+        return false;
+    };
+    let estimated =
+        api::estimate_message_request_input_tokens(request).saturating_add(request.max_tokens);
+    u64::from(estimated) * 100
+        >= u64::from(limit.context_window_tokens) * AMBIGUOUS_FAILURE_WINDOW_PERCENT
+}
+
 impl AnthropicRuntimeClient {
+    /// Converts an API failure into a runtime error, carrying the overflow verdict with it.
+    ///
+    /// The verdict is made here, where the error still has its type and the request is still in
+    /// hand, rather than reconstructed downstream from the rendered message.
+    fn runtime_error_from_api(
+        &self,
+        error: &api::ApiError,
+        request: &MessageRequest,
+    ) -> RuntimeError {
+        let message = format_user_visible_api_error(&self.session_id, error);
+        if error.is_context_window_failure()
+            || (error.is_ambiguous_transport_failure() && request_fills_context_window(request))
+        {
+            RuntimeError::context_window(message)
+        } else {
+            RuntimeError::new(message)
+        }
+    }
+
     /// Consume a single streaming response, optionally applying a stall
     /// timeout on the first event for post-tool continuations.
     #[allow(clippy::too_many_lines)]
@@ -12687,9 +12733,7 @@ impl AnthropicRuntimeClient {
             .client
             .stream_message(message_request)
             .await
-            .map_err(|error| {
-                RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
-            })?;
+            .map_err(|error| self.runtime_error_from_api(&error, message_request))?;
         let mut stdout = io::stdout();
         let mut sink = io::sink();
         let out: &mut dyn Write = if self.emit_output {
@@ -12710,9 +12754,8 @@ impl AnthropicRuntimeClient {
         loop {
             let next = if apply_stall_timeout && !received_any_event {
                 match tokio::time::timeout(POST_TOOL_STALL_TIMEOUT, stream.next_event()).await {
-                    Ok(inner) => inner.map_err(|error| {
-                        RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
-                    })?,
+                    Ok(inner) => inner
+                        .map_err(|error| self.runtime_error_from_api(&error, message_request))?,
                     Err(_elapsed) => {
                         return Err(RuntimeError::new(
                             "post-tool stall: model did not respond within timeout",
@@ -12720,9 +12763,10 @@ impl AnthropicRuntimeClient {
                     }
                 }
             } else {
-                stream.next_event().await.map_err(|error| {
-                    RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
-                })?
+                stream
+                    .next_event()
+                    .await
+                    .map_err(|error| self.runtime_error_from_api(&error, message_request))?
             };
 
             let Some(event) = next else {
@@ -12862,9 +12906,7 @@ impl AnthropicRuntimeClient {
                 ..message_request.clone()
             })
             .await
-            .map_err(|error| {
-                RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
-            })?;
+            .map_err(|error| self.runtime_error_from_api(&error, message_request))?;
         let mut events = response_to_events(response, out)?;
         push_prompt_cache_record(&self.client, &mut events);
         Ok(events)
@@ -12988,8 +13030,8 @@ fn format_context_window_blocked_error(session_id: &str, error: &api::ApiError) 
             ));
             lines.push(format!("  Context window   {context_window_tokens} tokens"));
         }
-        api::ApiError::Api { message, body, .. } => {
-            let detail = message.as_deref().unwrap_or(body).trim();
+        api::ApiError::Api(details) => {
+            let detail = details.message.as_deref().unwrap_or(&details.body).trim();
             if !detail.is_empty() {
                 lines.push(format!(
                     "  Detail           {}",
@@ -12999,7 +13041,7 @@ fn format_context_window_blocked_error(session_id: &str, error: &api::ApiError) 
         }
         api::ApiError::RetriesExhausted { last_error, .. } => {
             let detail = match last_error.as_ref() {
-                api::ApiError::Api { message, body, .. } => message.as_deref().unwrap_or(body),
+                api::ApiError::Api(details) => details.message.as_deref().unwrap_or(&details.body),
                 other => return format_context_window_blocked_error(session_id, other),
             }
             .trim();
@@ -14008,39 +14050,37 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
             let content = message
                 .blocks
                 .iter()
-                .filter_map(|block| match block {
-                    ContentBlock::Text { text } => {
-                        Some(InputContentBlock::Text { text: text.clone() })
-                    }
+                .map(|block| match block {
+                    ContentBlock::Text { text } => InputContentBlock::Text { text: text.clone() },
                     ContentBlock::Thinking {
                         thinking,
                         signature,
                     } => {
                         // 保留 Thinking 块：OpenAI 兼容协议会把它转成 reasoning_content 字段
                         // 回传给 DeepSeek V4（避免 400 "reasoning_content must be passed back" 错误）
-                        Some(InputContentBlock::Thinking {
+                        InputContentBlock::Thinking {
                             thinking: thinking.clone(),
                             signature: signature.clone(),
-                        })
+                        }
                     }
-                    ContentBlock::ToolUse { id, name, input } => Some(InputContentBlock::ToolUse {
+                    ContentBlock::ToolUse { id, name, input } => InputContentBlock::ToolUse {
                         id: id.clone(),
                         name: name.clone(),
                         input: serde_json::from_str(input)
                             .unwrap_or_else(|_| serde_json::json!({ "raw": input })),
-                    }),
+                    },
                     ContentBlock::ToolResult {
                         tool_use_id,
                         output,
                         is_error,
                         ..
-                    } => Some(InputContentBlock::ToolResult {
+                    } => InputContentBlock::ToolResult {
                         tool_use_id: tool_use_id.clone(),
                         content: vec![ToolResultContentBlock::Text {
                             text: output.clone(),
                         }],
                         is_error: *is_error,
-                    }),
+                    },
                 })
                 .collect::<Vec<_>>();
             (!content.is_empty()).then(|| InputMessage {
@@ -14293,7 +14333,7 @@ mod tests {
         SessionLifecycleSummary, SlashCommand, StatusUsage, TmuxPaneSnapshot, DEFAULT_MODEL,
         LATEST_SESSION_REFERENCE, STUB_COMMANDS,
     };
-    use api::{ApiError, MessageResponse, OutputContentBlock, Usage};
+    use api::{ApiError, ApiErrorDetails, MessageResponse, OutputContentBlock, Usage};
     use plugins::{
         PluginManager, PluginManagerConfig, PluginTool, PluginToolDefinition, PluginToolPermission,
     };
@@ -14338,7 +14378,7 @@ mod tests {
 
     #[test]
     fn opaque_provider_wrapper_surfaces_failure_class_session_and_trace() {
-        let error = ApiError::Api {
+        let error = ApiError::Api(Box::new(ApiErrorDetails {
             status: "500".parse().expect("status"),
             error_type: Some("api_error".to_string()),
             message: Some(
@@ -14350,7 +14390,7 @@ mod tests {
             retryable: true,
             suggested_action: None,
             retry_after: None,
-};
+}));
 
         let rendered = format_user_visible_api_error("session-issue-22", &error);
         assert!(rendered.contains("provider_internal"));
@@ -14362,7 +14402,7 @@ mod tests {
     fn retry_exhaustion_uses_retry_failure_class_for_generic_provider_wrapper() {
         let error = ApiError::RetriesExhausted {
             attempts: 3,
-            last_error: Box::new(ApiError::Api {
+            last_error: Box::new(ApiError::Api(Box::new(ApiErrorDetails {
                 status: "502".parse().expect("status"),
                 error_type: Some("api_error".to_string()),
                 message: Some(
@@ -14374,7 +14414,7 @@ mod tests {
                 retryable: true,
                 suggested_action: None,
                 retry_after: None,
-}),
+}))),
         };
 
         let rendered = format_user_visible_api_error("session-issue-22", &error);
@@ -14427,7 +14467,7 @@ mod tests {
 
     #[test]
     fn provider_context_window_errors_are_reframed_with_same_guidance() {
-        let error = ApiError::Api {
+        let error = ApiError::Api(Box::new(ApiErrorDetails {
             status: "400".parse().expect("status"),
             error_type: Some("invalid_request_error".to_string()),
             message: Some(
@@ -14439,7 +14479,7 @@ mod tests {
             retryable: false,
             suggested_action: None,
             retry_after: None,
-};
+}));
 
         let rendered = format_user_visible_api_error("session-issue-32", &error);
         assert!(rendered.contains("context_window_blocked"), "{rendered}");
@@ -14461,7 +14501,7 @@ mod tests {
 
     #[test]
     fn openai_configured_limit_errors_are_rendered_as_context_window_guidance() {
-        let error = ApiError::Api {
+        let error = ApiError::Api(Box::new(ApiErrorDetails {
             status: "400".parse().expect("status"),
             error_type: Some("invalid_request_error".to_string()),
             message: Some(
@@ -14473,7 +14513,7 @@ mod tests {
             retryable: false,
             suggested_action: None,
             retry_after: None,
-        };
+        }));
 
         let rendered = format_user_visible_api_error("session-issue-32", &error);
         assert!(rendered.contains("Context window blocked"), "{rendered}");
@@ -14499,7 +14539,7 @@ mod tests {
     fn retry_wrapped_context_window_errors_keep_recovery_guidance() {
         let error = ApiError::RetriesExhausted {
             attempts: 2,
-            last_error: Box::new(ApiError::Api {
+            last_error: Box::new(ApiError::Api(Box::new(ApiErrorDetails {
                 status: "413".parse().expect("status"),
                 error_type: Some("invalid_request_error".to_string()),
                 message: Some("Request is too large for this model's context window.".to_string()),
@@ -14508,7 +14548,7 @@ mod tests {
                 retryable: false,
                 suggested_action: None,
                 retry_after: None,
-            }),
+            }))),
         };
 
         let rendered = format_user_visible_api_error("session-issue-32", &error);
@@ -14555,11 +14595,54 @@ mod tests {
         );
     }
 
-    fn env_lock() -> MutexGuard<'static, ()> {
+    /// Serialises tests that mutate process-global state, and isolates them from the
+    /// developer's real `~/.claw`.
+    ///
+    /// `parse_args` resolves defaults — notably `permissions.defaultMode` — through the
+    /// user-scope config, which `default_config_home()` reads from `CLAW_CONFIG_HOME`,
+    /// falling back to `$HOME/.claw`. Without an override, these tests therefore assert
+    /// against whatever the machine running them happens to have configured: a
+    /// `defaultMode` of `dontAsk` there resolves to `DangerFullAccess` and turns a dozen
+    /// `WorkspaceWrite` assertions red. Point the config home at a fresh empty directory
+    /// so "no user config" is the state under test, and restore the caller's value on drop.
+    ///
+    /// Tests that need a *populated* config home can still set `CLAW_CONFIG_HOME`
+    /// themselves after taking this guard; the guard restores the real value afterwards.
+    struct EnvGuard {
+        _lock: MutexGuard<'static, ()>,
+        config_home: PathBuf,
+        previous_config_home: Option<std::ffi::OsString>,
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match self.previous_config_home.take() {
+                Some(previous) => std::env::set_var("CLAW_CONFIG_HOME", previous),
+                None => std::env::remove_var("CLAW_CONFIG_HOME"),
+            }
+            // Best effort: a leftover temp dir must never fail a test.
+            let _ = std::fs::remove_dir_all(&self.config_home);
+        }
+    }
+
+    fn env_lock() -> EnvGuard {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
+        let lock = LOCK
+            .get_or_init(|| Mutex::new(()))
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        // Deliberately empty: the point is that no user settings.json is discoverable.
+        let config_home = temp_dir();
+        std::fs::create_dir_all(&config_home).expect("isolated config home should be creatable");
+        let previous_config_home = std::env::var_os("CLAW_CONFIG_HOME");
+        std::env::set_var("CLAW_CONFIG_HOME", &config_home);
+
+        EnvGuard {
+            _lock: lock,
+            config_home,
+            previous_config_home,
+        }
     }
 
     fn with_current_dir<T>(cwd: &Path, f: impl FnOnce() -> T) -> T {
@@ -15286,6 +15369,8 @@ mod tests {
 
     #[test]
     fn removed_login_and_logout_subcommands_error_helpfully() {
+        // Asserts a `Default`-sourced permission mode, so it must not see a user config.
+        let _guard = env_lock();
         let login = parse_args(&["login".to_string()]).expect_err("login should be removed");
         assert!(login.contains("ANTHROPIC_API_KEY"));
         let logout = parse_args(&["logout".to_string()]).expect_err("logout should be removed");
@@ -15913,10 +15998,7 @@ mod tests {
             usage,
             "workspace-write",
             &context,
-            None,
-            None,
-            None,
-            None,
+            &super::StatusJsonExtras::default(),
         );
         assert_eq!(
             json.get("status").and_then(|v| v.as_str()),
@@ -15988,10 +16070,10 @@ mod tests {
             usage,
             "workspace-write",
             &context,
-            None,
-            None,
-            Some(&allowed),
-            None,
+            &super::StatusJsonExtras {
+                allowed_tools: Some(&allowed),
+                ..super::StatusJsonExtras::default()
+            },
         );
         assert_eq!(
             restricted_json
@@ -16021,10 +16103,7 @@ mod tests {
             usage,
             "workspace-write",
             &clean_context,
-            None,
-            None,
-            None,
-            None,
+            &super::StatusJsonExtras::default(),
         );
         assert_eq!(
             clean_json.get("status").and_then(|v| v.as_str()),
@@ -16972,7 +17051,7 @@ mod tests {
         for action in ["remove", "uninstall", "delete"] {
             assert_eq!(
                 parse_args(&["skills".to_string(), action.to_string()])
-                    .expect(&format!("skills {action} should parse")),
+                    .unwrap_or_else(|_| panic!("skills {action} should parse")),
                 CliAction::Skills {
                     args: Some(action.to_string()),
                     output_format: CliOutputFormat::Text,
@@ -17926,10 +18005,7 @@ mod tests {
             },
             "workspace-write",
             &context,
-            None,
-            None,
-            None,
-            None,
+            &super::StatusJsonExtras::default(),
         );
 
         assert_eq!(

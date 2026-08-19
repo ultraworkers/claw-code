@@ -89,6 +89,19 @@ impl TokenUsage {
             + self.cache_read_input_tokens
     }
 
+    /// Total tokens the provider had to read to serve this call, i.e. the live size of the
+    /// context window.
+    ///
+    /// `input_tokens` alone is NOT that number. With prompt caching a warm call reports
+    /// `input_tokens: 2` and puts the real bulk in `cache_read_input_tokens`, so anything
+    /// budgeting against the context window must sum all three input counters.
+    #[must_use]
+    pub fn total_input_tokens(self) -> u32 {
+        self.input_tokens
+            .saturating_add(self.cache_creation_input_tokens)
+            .saturating_add(self.cache_read_input_tokens)
+    }
+
     #[must_use]
     pub fn estimate_cost_usd(self) -> UsageCostEstimate {
         self.estimate_cost_usd_with_pricing(ModelPricing::default_sonnet_tier())
@@ -241,6 +254,41 @@ mod tests {
         assert_eq!(tracker.cumulative_usage().output_tokens, 10);
         assert_eq!(tracker.cumulative_usage().input_tokens, 30);
         assert_eq!(tracker.cumulative_usage().total_tokens(), 48);
+    }
+
+    #[test]
+    fn total_input_tokens_includes_cached_context() {
+        // The shape a warm prompt-cached call actually reports: input_tokens is ~nothing and
+        // the real context size is in the cache counters.
+        let cached = TokenUsage {
+            input_tokens: 2,
+            output_tokens: 1_133,
+            cache_creation_input_tokens: 1_453,
+            cache_read_input_tokens: 111_186,
+        };
+        assert_eq!(cached.total_input_tokens(), 112_641);
+        // Output tokens are not part of the input budget.
+        assert_ne!(cached.total_input_tokens(), cached.total_tokens());
+
+        // A backend without prompt caching reports the whole prompt as input_tokens.
+        let uncached = TokenUsage {
+            input_tokens: 29_056,
+            output_tokens: 73,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+        };
+        assert_eq!(uncached.total_input_tokens(), 29_056);
+    }
+
+    #[test]
+    fn total_input_tokens_saturates_instead_of_overflowing() {
+        let usage = TokenUsage {
+            input_tokens: u32::MAX,
+            output_tokens: 0,
+            cache_creation_input_tokens: u32::MAX,
+            cache_read_input_tokens: u32::MAX,
+        };
+        assert_eq!(usage.total_input_tokens(), u32::MAX);
     }
 
     #[test]
