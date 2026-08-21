@@ -40,11 +40,11 @@ jobs:
       run:
         working-directory: rust
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@400e7407cfd7a091e5fbb6afec01ec146c432b7c # v2.7.7
         with:
           workspaces: rust -> target
 
@@ -60,7 +60,7 @@ jobs:
           (cd dist && sha256sum "${{ matrix.artifact_name }}" > "${{ matrix.artifact_name }}.sha256")
 
       - name: Upload workflow artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1 # v4.6.1
         with:
           name: ${{ matrix.artifact_name }}
           path: |
@@ -69,7 +69,7 @@ jobs:
 
       - name: Upload release asset
         if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@c95fe1489396fe8a9eb87c0abf8aa5b2ef267fda # v2.2.1
         with:
           files: |
             rust/dist/${{ matrix.artifact_name }}
