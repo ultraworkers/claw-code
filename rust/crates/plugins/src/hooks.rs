@@ -1,4 +1,5 @@
 use std::ffi::OsStr;
+#[cfg(not(windows))]
 use std::path::Path;
 use std::process::Command;
 
