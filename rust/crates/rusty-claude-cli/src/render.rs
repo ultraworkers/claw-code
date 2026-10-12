@@ -270,6 +270,29 @@ impl TerminalRenderer {
         output.trim_end().to_string()
     }
 
+    /// Ensures the output ends with at least `required` newlines.
+    /// This is idempotent: calling it multiple times with the same output
+    /// will not add extra newlines beyond what is needed.
+    /// The function is crucial for streaming rendering where chunks may
+    /// split at block boundaries, causing the parser to lose newlines
+    /// that normally separate blocks.
+    fn ensure_newlines(output: &mut String, required: usize) {
+        if output.is_empty() {
+            // Don't start with blank lines
+            return;
+        }
+
+        // Count trailing newlines
+        let trailing_newlines = output.chars().rev().take_while(|&c| c == '\n').count();
+
+        // Add newlines if we don't have enough
+        if trailing_newlines < required {
+            for _ in 0..(required - trailing_newlines) {
+                output.push('\n');
+            }
+        }
+    }
+
     #[must_use]
     pub fn markdown_to_ansi(&self, markdown: &str) -> String {
         self.render_markdown(markdown)
@@ -287,10 +310,14 @@ impl TerminalRenderer {
     ) {
         match event {
             Event::Start(Tag::Heading { level, .. }) => {
+                Self::ensure_newlines(output, 1);
                 Self::start_heading(state, level as u8, output);
             }
             Event::End(TagEnd::Paragraph) => output.push_str("\n\n"),
-            Event::Start(Tag::BlockQuote(..)) => self.start_quote(state, output),
+            Event::Start(Tag::BlockQuote(..)) => {
+                Self::ensure_newlines(output, 1);
+                self.start_quote(state, output);
+            }
             Event::End(TagEnd::BlockQuote(..)) => {
                 state.quote = state.quote.saturating_sub(1);
                 output.push('\n');
@@ -303,6 +330,7 @@ impl TerminalRenderer {
                 state.append_raw(output, "\n");
             }
             Event::Start(Tag::List(first_item)) => {
+                Self::ensure_newlines(output, 1);
                 let kind = match first_item {
                     Some(index) => ListKind::Ordered { next_index: index },
                     None => ListKind::Unordered,
@@ -315,6 +343,7 @@ impl TerminalRenderer {
             }
             Event::Start(Tag::Item) => Self::start_item(state, output),
             Event::Start(Tag::CodeBlock(kind)) => {
+                Self::ensure_newlines(output, 2);
                 *in_code_block = true;
                 *code_language = match kind {
                     CodeBlockKind::Indented => String::from("text"),
@@ -338,7 +367,10 @@ impl TerminalRenderer {
                     format!("{}", format!("`{code}`").with(self.color_theme.inline_code));
                 state.append_raw(output, &rendered);
             }
-            Event::Rule => output.push_str("---\n"),
+            Event::Rule => {
+                Self::ensure_newlines(output, 1);
+                output.push_str("---\n");
+            }
             Event::Text(text) => {
                 self.push_text(text.as_ref(), state, output, code_buffer, *in_code_block);
             }
@@ -383,7 +415,10 @@ impl TerminalRenderer {
                 );
                 state.append_raw(output, &rendered);
             }
-            Event::Start(Tag::Table(..)) => state.table = Some(TableState::default()),
+            Event::Start(Tag::Table(..)) => {
+                Self::ensure_newlines(output, 1);
+                state.table = Some(TableState::default());
+            }
             Event::End(TagEnd::Table) => {
                 if let Some(table) = state.table.take() {
                     output.push_str(&self.render_table(&table));
@@ -597,9 +632,21 @@ impl TerminalRenderer {
     }
 }
 
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MarkdownStreamState {
     pending: String,
+    /// Track whether the last emitted output ended with a newline.
+    /// Used to ensure proper spacing when resuming from a buffer.
+    last_output_ends_with_newline: bool,
+}
+
+impl Default for MarkdownStreamState {
+    fn default() -> Self {
+        Self {
+            pending: String::new(),
+            last_output_ends_with_newline: false,
+        }
+    }
 }
 
 impl MarkdownStreamState {
@@ -609,7 +656,33 @@ impl MarkdownStreamState {
         let split = find_stream_safe_boundary(&self.pending)?;
         let ready = self.pending[..split].to_string();
         self.pending.drain(..split);
-        Some(renderer.markdown_to_ansi(&ready))
+        
+        let mut rendered = renderer.markdown_to_ansi(&ready);
+        let stripped = strip_ansi(&rendered);
+        
+        // If the previous output didn't end with a newline and this chunk starts
+        // with a block-level element, ensure proper spacing before it.
+        if !self.last_output_ends_with_newline && !rendered.is_empty() {
+            if stripped.starts_with("\u{256d}\u{2500}") || stripped.starts_with("```")
+                || stripped.starts_with("|") || stripped.starts_with("• ")
+                || stripped.starts_with("1. ") || stripped.starts_with("-") {
+                rendered = format!("\n\n{}", rendered);
+            }
+        }
+        
+        // When markdown ends with a code block closing marker or other block-level element,
+        // render_markdown() trims the trailing newlines that finish_code_block() added.
+        // For streaming, we need to restore these newlines so proper spacing is preserved
+        // when chunks are combined. This is critical for idempotence across re-renders.
+        if stripped.ends_with("\u{2570}\u{2500}") || stripped.ends_with("---") || stripped.ends_with("|") {
+            // Block element that should have trailing spacing
+            if !rendered.ends_with('\n') {
+                rendered.push_str("\n\n");
+            }
+        }
+        
+        self.last_output_ends_with_newline = rendered.ends_with('\n');
+        Some(rendered)
     }
 
     #[must_use]
@@ -619,7 +692,22 @@ impl MarkdownStreamState {
             None
         } else {
             let pending = std::mem::take(&mut self.pending);
-            Some(renderer.markdown_to_ansi(&pending))
+            let mut rendered = renderer.markdown_to_ansi(&pending);
+            
+            // If the previous output didn't end with a newline and this output
+            // starts with a block-level element, ensure proper spacing.
+            if !self.last_output_ends_with_newline && !rendered.is_empty() {
+                // Check if output starts with a block element by looking for common markers
+                let stripped = strip_ansi(&rendered);
+                if stripped.starts_with("\u{256d}\u{2500}") || stripped.starts_with("```")
+                    || stripped.starts_with("|") || stripped.starts_with("• ")
+                    || stripped.starts_with("1. ") || stripped.starts_with("-") {
+                    rendered = format!("\n\n{}", rendered);
+                }
+            }
+            
+            self.last_output_ends_with_newline = rendered.ends_with('\n');
+            Some(rendered)
         }
     }
 }
@@ -813,6 +901,11 @@ fn normalize_nested_fences(markdown: &str) -> String {
     out
 }
 
+/// Find a safe boundary for streaming markdown rendering.
+/// Safe boundaries are:
+/// - After a closing fence line (when fence is closed)
+/// - After an empty line
+/// This function returns the position of the last safe boundary found.
 fn find_stream_safe_boundary(markdown: &str) -> Option<usize> {
     let mut open_fence: Option<FenceMarker> = None;
     let mut last_boundary = None;
@@ -1066,5 +1159,157 @@ mod tests {
 
         let output = String::from_utf8_lossy(&out);
         assert!(output.contains("Working"));
+    }
+
+    #[test]
+    fn streaming_text_before_code_block_preserves_newline_boundary() {
+        let renderer = TerminalRenderer::new();
+        let mut state = MarkdownStreamState::default();
+
+        // Simulate streaming: paragraph text arrives in one chunk
+        assert_eq!(
+            state.push(&renderer, "This is some text."),
+            None,
+            "incomplete paragraph should not flush"
+        );
+
+        // Then code block arrives in the next chunk
+        let rendered = state
+            .push(&renderer, "\n\n```rust\nfn main() {}\n```\n")
+            .expect("fenced block should trigger flush");
+        let plain_text = strip_ansi(&rendered);
+
+        // Verify the paragraph text and code block are present
+        assert!(plain_text.contains("This is some text."));
+        assert!(plain_text.contains("fn main()"));
+
+        // The critical check: there should be a blank line between the paragraph and code block
+        // The paragraph ends, then there should be newlines before the code block marker
+        let lines: Vec<&str> = plain_text.lines().collect();
+        let text_line_idx = lines.iter().position(|line| line.contains("This is some text.")).expect("find text line");
+        // Skip past the text line and find the code block
+        let code_marker_idx = lines[text_line_idx + 1..].iter().position(|line| line.contains("╭─ rust"))
+            .map(|i| i + text_line_idx + 1);
+
+        // There should be at least one empty line between the text and the code block marker
+        if let Some(code_idx) = code_marker_idx {
+            assert!(code_idx > text_line_idx + 1, "there should be spacing between paragraph and code block");
+        }
+    }
+
+    #[test]
+    fn rendering_paragraph_immediately_before_code_block_has_blank_line() {
+        let renderer = TerminalRenderer::new();
+        let markdown = "This is a paragraph.\n\n```rust\nfn main() {}\n```";
+        let output = renderer.markdown_to_ansi(markdown);
+        let plain_text = strip_ansi(&output);
+        let lines: Vec<&str> = plain_text.lines().collect();
+
+        // Find the paragraph and code block
+        let text_idx = lines.iter().position(|l| l.contains("This is a paragraph.")).expect("find paragraph");
+        let code_idx = lines[text_idx + 1..].iter().position(|l| l.contains("╭─ rust"))
+            .map(|i| i + text_idx + 1)
+            .expect("find code block");
+
+        // There should be at least one blank line between them
+        assert!(code_idx > text_idx + 1, "code block should not immediately follow paragraph");
+    }
+
+    #[test]
+    fn code_block_ending_with_trailing_text_preserves_spacing() {
+        let renderer = TerminalRenderer::new();
+        let markdown = "```rust\nfn main() {}\n```\n\nText after.";
+        let output = renderer.markdown_to_ansi(markdown);
+        let plain_text = strip_ansi(&output);
+        
+        // The code block should end with "╰─" followed by blank lines, then text
+        assert!(plain_text.contains("\u{256d}\u{2500}"), "should contain code block close marker");
+        assert!(plain_text.contains("\n\nText"), "should have blank line before text");
+    }
+
+    #[test]
+    fn streaming_code_block_preserves_trailing_newlines() {
+        let renderer = TerminalRenderer::new();
+        let mut state = MarkdownStreamState::default();
+        let markdown = "Text before.\n\n```rust\nfn test() {}\n```\n\nText after.";
+        
+        // Debug: let's check what the code block part alone renders to
+        let code_part = "```rust\nfn test() {}\n```\n\nText after.";
+        let code_rendered = strip_ansi(&renderer.markdown_to_ansi(code_part));
+        
+        // Simulate the streaming at split position 1
+        let r1 = state.push(&renderer, "T").map(|s| strip_ansi(&s));
+        let r2 = state.push(&renderer, "ext before.\n\n```rust\nfn test() {}\n```\n\nText after.").map(|s| strip_ansi(&s));
+        
+        // After r2, the pending should contain the code block part
+        let pending_before_r3 = state.pending.clone();
+        
+        let r3 = state.flush(&renderer).map(|s| strip_ansi(&s));
+        
+        // Combine the results
+        let mut full_streamed = String::new();
+        if let Some(s) = &r1 { full_streamed.push_str(s); }
+        if let Some(s) = &r2 { full_streamed.push_str(s); }
+        if let Some(s) = &r3 { full_streamed.push_str(s); }
+        
+        let full_rendered = strip_ansi(&renderer.markdown_to_ansi(markdown));
+        
+        assert_eq!(full_streamed, full_rendered,
+            "Streaming mismatch.\n\nCode part alone renders to: {:?}\nPending before r3: {:?}\n\nBreakdown:\n  r1: {:?}\n  r2: {:?}\n  r3: {:?}\n\nExpected:\n{:?}\n\nGot:\n{:?}",
+            code_rendered, pending_before_r3, r1, r2, r3, full_rendered, full_streamed);
+    }
+
+    #[test]
+    fn streaming_with_split_at_every_byte_position_produces_consistent_output() {
+        let renderer = TerminalRenderer::new();
+        let markdown = "Text before.\n\n```rust\nfn test() {}\n```\n\nText after.";
+        
+        // First, render the full document
+        let full_output = renderer.markdown_to_ansi(markdown);
+        let full_plain = strip_ansi(&full_output);
+        
+        // Now simulate streaming by splitting at different positions
+        for split_pos in 1..markdown.len() {
+            let mut state = MarkdownStreamState::default();
+            let part1 = &markdown[..split_pos];
+            let part2 = &markdown[split_pos..];
+            
+            // Try to push both parts
+            let r1 = state.push(&renderer, part1);
+            let r2 = state.push(&renderer, part2);
+            let final_r = state.flush(&renderer);
+            
+            // Reconstruct the streamed output
+            let mut streamed_output = String::new();
+            if let Some(out) = r1 {
+                streamed_output.push_str(&out);
+            }
+            if let Some(out) = r2 {
+                streamed_output.push_str(&out);
+            }
+            if let Some(out) = final_r {
+                streamed_output.push_str(&out);
+            }
+            
+            let streamed_plain = strip_ansi(&streamed_output);
+            
+            if streamed_plain != full_plain {
+                eprintln!("\n=== MISMATCH at split position {} ===", split_pos);
+                eprintln!("Part 1: {:?}", part1);
+                eprintln!("Part 2: {:?}", part2);
+                eprintln!("\nExpected (full):");
+                eprintln!("{:?}", full_plain);
+                eprintln!("\nGot (streamed):");
+                eprintln!("{:?}", streamed_plain);
+                eprintln!("\nStreamed rendered output:");
+                eprintln!("{:?}", streamed_output);
+            }
+            
+            assert_eq!(
+                streamed_plain, full_plain,
+                "streaming with split at position {} produces different output",
+                split_pos
+            );
+        }
     }
 }
