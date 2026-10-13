@@ -93,7 +93,7 @@ checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
 name = "api"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "criterion",
  "reqwest",
@@ -478,7 +478,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "claw-analog"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "api",
  "clap",
@@ -498,7 +498,7 @@ dependencies = [
 
 [[package]]
 name = "claw-rag-service"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "axum 0.8.9",
  "blake3",
@@ -531,7 +531,7 @@ checksum = "1d07550c9036bf2ae0c684c4297d503f838287c83c53686d05370d0e139ae570"
 
 [[package]]
 name = "commands"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "plugins",
  "runtime",
@@ -540,7 +540,7 @@ dependencies = [
 
 [[package]]
 name = "compat-harness"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "commands",
  "runtime",
@@ -1568,7 +1568,7 @@ dependencies = [
 
 [[package]]
 name = "mock-anthropic-service"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "api",
  "serde_json",
@@ -1761,7 +1761,7 @@ dependencies = [
 
 [[package]]
 name = "plugins"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "serde",
  "serde_json",
@@ -2136,7 +2136,7 @@ dependencies = [
 
 [[package]]
 name = "runtime"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "glob",
  "plugins",
@@ -2261,7 +2261,7 @@ checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
 
 [[package]]
 name = "rusty-claude-cli"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "api",
  "commands",
@@ -2621,7 +2621,7 @@ dependencies = [
 
 [[package]]
 name = "telemetry"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "serde",
  "serde_json",
@@ -2901,7 +2901,7 @@ dependencies = [
 
 [[package]]
 name = "tools"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "api",
  "aspect-core",
