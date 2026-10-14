@@ -109,7 +109,11 @@ impl SandboxConfig {
 pub fn detect_container_environment() -> ContainerEnvironment {
     let proc_1_cgroup = fs::read_to_string("/proc/1/cgroup").ok();
     detect_container_environment_from(SandboxDetectionInputs {
-        env_pairs: env::vars().collect(),
+        // `env::vars()` panics on non-UTF-8 values (e.g. zsh exports a
+        // metafied `$_` for non-ASCII paths); skip those entries instead.
+        env_pairs: env::vars_os()
+            .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
+            .collect(),
         dockerenv_exists: Path::new("/.dockerenv").exists(),
         containerenv_exists: Path::new("/run/.containerenv").exists(),
         proc_1_cgroup: proc_1_cgroup.as_deref(),

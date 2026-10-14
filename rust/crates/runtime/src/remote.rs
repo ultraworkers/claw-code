@@ -66,7 +66,7 @@ pub struct UpstreamProxyState {
 impl RemoteSessionContext {
     #[must_use]
     pub fn from_env() -> Self {
-        Self::from_env_map(&env::vars().collect())
+        Self::from_env_map(&utf8_env_map())
     }
 
     #[must_use]
@@ -89,7 +89,7 @@ impl RemoteSessionContext {
 impl UpstreamProxyBootstrap {
     #[must_use]
     pub fn from_env() -> Self {
-        Self::from_env_map(&env::vars().collect())
+        Self::from_env_map(&utf8_env_map())
     }
 
     #[must_use]
@@ -231,6 +231,16 @@ pub fn inherited_upstream_proxy_env(
                 .get(*key)
                 .map(|value| ((*key).to_string(), value.clone()))
         })
+        .collect()
+}
+
+/// Snapshot of the process environment, skipping non-UTF-8 entries.
+///
+/// `env::vars()` panics on non-UTF-8 values (e.g. zsh exports a metafied `$_`
+/// when the command path contains non-ASCII characters).
+fn utf8_env_map() -> BTreeMap<String, String> {
+    env::vars_os()
+        .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
         .collect()
 }
 

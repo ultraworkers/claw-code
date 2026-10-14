@@ -257,6 +257,34 @@ fn local_smoke_commands_do_not_require_live_credentials() {
     fs::remove_dir_all(temp_dir).expect("cleanup temp dir");
 }
 
+#[cfg(unix)]
+#[test]
+fn doctor_tolerates_non_utf8_environment_values() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    // given: zsh exports a metafied (non-UTF-8) `$_` when the command path
+    // contains non-ASCII characters such as `下載`
+    let temp_dir = unique_temp_dir("non-utf8-env");
+    let config_home = temp_dir.join(".claw");
+    fs::create_dir_all(&config_home).expect("config home should exist");
+    let metafied_path = OsStr::from_bytes(b"/home/user/\xe4\xb8\x83\xab\xe8\xbc\x83\xa9/claw");
+
+    // when
+    let output = offline_command_in(&temp_dir, &config_home)
+        .env("_", metafied_path)
+        .arg("doctor")
+        .output()
+        .expect("claw should launch");
+
+    // then
+    assert_success(&output);
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be utf8");
+    assert!(stdout.contains("Doctor"));
+
+    fs::remove_dir_all(temp_dir).expect("cleanup temp dir");
+}
+
 #[test]
 fn local_subcommand_help_does_not_fall_through_to_runtime_or_provider_calls() {
     let temp_dir = unique_temp_dir("subcommand-help");
