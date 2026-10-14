@@ -14466,7 +14466,7 @@ fn push_output_block(
     out: &mut (impl Write + ?Sized),
     events: &mut Vec<AssistantEvent>,
     pending_tool: &mut Option<(String, String, String)>,
-    streaming_tool_input: bool,
+    streaming: bool,
     block_has_thinking_summary: &mut bool,
 ) -> Result<(), RuntimeError> {
     match block {
@@ -14483,7 +14483,7 @@ fn push_output_block(
             // During streaming, the initial content_block_start has an empty input ({}).
             // The real input arrives via input_json_delta events. In
             // non-streaming responses, preserve a legitimate empty object.
-            let initial_input = if streaming_tool_input
+            let initial_input = if streaming
                 && input.is_object()
                 && input.as_object().is_some_and(serde_json::Map::is_empty)
             {
@@ -14498,10 +14498,16 @@ fn push_output_block(
             signature,
         } => {
             render_thinking_block_summary(out, Some(thinking.chars().count()), false)?;
-            events.push(AssistantEvent::Thinking {
-                thinking,
-                signature,
-            });
+            // During streaming, content_block_start only carries an empty
+            // placeholder; the full block (thinking + signature) is emitted on
+            // content_block_stop. Pushing it here too would replay an empty
+            // thinking block that the API rejects with 400 on the next turn.
+            if !streaming {
+                events.push(AssistantEvent::Thinking {
+                    thinking,
+                    signature,
+                });
+            }
             *block_has_thinking_summary = true;
         }
         OutputContentBlock::RedactedThinking { .. } => {
@@ -19770,6 +19776,34 @@ UU conflicted.rs",
             pending_tool,
             Some(("tool-1".to_string(), "read_file".to_string(), String::new(),))
         );
+    }
+
+    #[test]
+    fn push_output_block_defers_thinking_event_while_streaming() {
+        let mut out = Vec::new();
+        let mut events = Vec::new();
+        let mut pending_tool = None;
+        let mut block_has_thinking_summary = false;
+
+        push_output_block(
+            OutputContentBlock::Thinking {
+                thinking: String::new(),
+                signature: Some(String::new()),
+            },
+            &mut out,
+            &mut events,
+            &mut pending_tool,
+            true,
+            &mut block_has_thinking_summary,
+        )
+        .expect("thinking block start should render");
+
+        // The full thinking block is emitted on content_block_stop; emitting the
+        // empty placeholder here would duplicate it in the session history.
+        assert!(events.is_empty());
+        assert!(block_has_thinking_summary);
+        let rendered = String::from_utf8(out).expect("utf8");
+        assert!(rendered.contains("▶ Thinking (0 chars hidden)"));
     }
 
     #[test]
