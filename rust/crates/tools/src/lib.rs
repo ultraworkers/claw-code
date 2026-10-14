@@ -4374,6 +4374,7 @@ fn build_agent_system_prompt(subagent_type: &str, model: &str) -> Result<Vec<Str
         DEFAULT_AGENT_SYSTEM_DATE.to_string(),
         std::env::consts::OS,
         "unknown",
+        model,
         model_family_identity_for(model),
     )
     .map_err(|error| error.to_string())?;
@@ -9507,7 +9508,8 @@ mod tests {
 
         // then: the prompt renders a generic model family identity
         assert!(prompt.contains("Model family: an AI assistant"));
-        assert!(!prompt.contains("Model family: Claude Opus 4.6"));
+        assert!(!prompt.contains("Model family: Claude"));
+        assert!(prompt.contains("Model: openai/gpt-4.1-mini"));
 
         fs::remove_dir_all(root).expect("cleanup temp workspace");
     }

@@ -5012,6 +5012,7 @@ fn print_system_prompt(
         date,
         env::consts::OS,
         "unknown",
+        model,
         model_family_identity_for(model),
     )?;
     let (project_root, _) =
@@ -8749,11 +8750,12 @@ impl LiveCli {
         let previous = self.model.clone();
         let session = self.runtime.session().clone();
         let message_count = session.messages.len();
+        let system_prompt = build_system_prompt(&model)?;
         let runtime = build_runtime(
             session,
             &self.session.id,
             model.clone(),
-            self.system_prompt.clone(),
+            system_prompt.clone(),
             true,
             true,
             TerminalTail::new(),
@@ -8763,6 +8765,7 @@ impl LiveCli {
         )?;
         self.replace_runtime(runtime)?;
         self.model.clone_from(&model);
+        self.system_prompt = system_prompt;
         println!(
             "{}",
             format_model_switch_report(&previous, &model, message_count)
@@ -12360,6 +12363,7 @@ fn build_system_prompt(model: &str) -> Result<Vec<String>, Box<dyn std::error::E
         DEFAULT_DATE,
         env::consts::OS,
         "unknown",
+        model,
         model_family_identity_for(model),
     )?)
 }

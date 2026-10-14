@@ -38,8 +38,6 @@ impl From<ConfigError> for PromptBuildError {
 
 /// Marker separating static prompt scaffolding from dynamic runtime context.
 pub const SYSTEM_PROMPT_DYNAMIC_BOUNDARY: &str = "__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__";
-/// Human-readable default frontier model name embedded into generated prompts.
-pub const FRONTIER_MODEL_NAME: &str = "Claude Opus 4.6";
 const MAX_INSTRUCTION_FILE_CHARS: usize = 4_000;
 const MAX_TOTAL_INSTRUCTION_CHARS: usize = 12_000;
 const MAX_GIT_DIFF_CHARS: usize = 50_000;
@@ -56,7 +54,7 @@ impl ModelFamilyIdentity {
     #[must_use]
     pub const fn family_label(self) -> &'static str {
         match self {
-            Self::Claude => FRONTIER_MODEL_NAME,
+            Self::Claude => "Claude",
             Self::Generic => "an AI assistant",
         }
     }
@@ -158,6 +156,7 @@ pub struct SystemPromptBuilder {
     os_name: Option<String>,
     os_version: Option<String>,
     model_family: Option<ModelFamilyIdentity>,
+    model: Option<String>,
     append_sections: Vec<String>,
     project_context: Option<ProjectContext>,
     config: Option<RuntimeConfig>,
@@ -188,6 +187,12 @@ impl SystemPromptBuilder {
     #[must_use]
     pub fn with_model_family(mut self, model_family: ModelFamilyIdentity) -> Self {
         self.model_family = Some(model_family);
+        self
+    }
+
+    #[must_use]
+    pub fn with_model(mut self, model: impl Into<String>) -> Self {
+        self.model = Some(model.into());
         self
     }
 
@@ -294,9 +299,11 @@ impl SystemPromptBuilder {
             |context| context.current_date.clone(),
         );
         let identity = self.model_family.unwrap_or_default();
-        let mut lines = vec!["# Environment context".to_string()];
-        lines.extend(prepend_bullets(vec![
-            format!("Model family: {}", identity.family_label()),
+        let mut items = vec![format!("Model family: {}", identity.family_label())];
+        if let Some(model) = &self.model {
+            items.push(format!("Model: {model}"));
+        }
+        items.extend([
             format!("Working directory: {cwd}"),
             format!("Date: {date}"),
             format!(
@@ -304,7 +311,9 @@ impl SystemPromptBuilder {
                 self.os_name.as_deref().unwrap_or("unknown"),
                 self.os_version.as_deref().unwrap_or("unknown")
             ),
-        ]));
+        ]);
+        let mut lines = vec!["# Environment context".to_string()];
+        lines.extend(prepend_bullets(items));
         lines.join("\n")
     }
 }
@@ -670,11 +679,18 @@ pub fn load_system_prompt(
     current_date: impl Into<String>,
     os_name: impl Into<String>,
     os_version: impl Into<String>,
+    model: impl Into<String>,
     model_family: ModelFamilyIdentity,
 ) -> Result<Vec<String>, PromptBuildError> {
     let cwd = cwd.into();
-    let (sections, _) =
-        load_system_prompt_with_context(cwd, current_date, os_name, os_version, model_family)?;
+    let (sections, _) = load_system_prompt_with_context(
+        cwd,
+        current_date,
+        os_name,
+        os_version,
+        model,
+        model_family,
+    )?;
     Ok(sections)
 }
 
@@ -684,6 +700,7 @@ pub fn load_system_prompt_with_context(
     current_date: impl Into<String>,
     os_name: impl Into<String>,
     os_version: impl Into<String>,
+    model: impl Into<String>,
     model_family: ModelFamilyIdentity,
 ) -> Result<(Vec<String>, ProjectContext), PromptBuildError> {
     let cwd = cwd.into();
@@ -693,6 +710,7 @@ pub fn load_system_prompt_with_context(
     let memory_enabled = config.feature_config().auto_memory_enabled();
     let mut builder = SystemPromptBuilder::new()
         .with_os(os_name, os_version)
+        .with_model(model)
         .with_model_family(model_family)
         .with_project_context(project_context.clone())
         .with_runtime_config(config);
@@ -1255,6 +1273,7 @@ mod tests {
             "2026-03-31",
             "linux",
             "6.8",
+            "claude-opus-4-6",
             ModelFamilyIdentity::Claude,
         )
         .expect("system prompt should load")
@@ -1304,6 +1323,7 @@ mod tests {
             "2026-03-31",
             "linux",
             "6.8",
+            "claude-opus-4-6",
             ModelFamilyIdentity::Claude,
         )
         .expect("system prompt should load")
@@ -1341,7 +1361,30 @@ mod tests {
             .render();
 
         // then: the Claude model family label is preserved by default
-        assert!(prompt.contains("Model family: Claude Opus 4.6"));
+        assert!(prompt.contains(" - Model family: Claude\n"));
+        assert!(!prompt.contains("Model:"));
+    }
+
+    #[test]
+    fn renders_configured_model_instead_of_a_fixed_claude_version() {
+        // given: a prompt builder for the model the session actually uses
+        let project_context = ProjectContext {
+            cwd: PathBuf::from("/tmp/project"),
+            current_date: "2026-03-31".to_string(),
+            ..ProjectContext::default()
+        };
+
+        // when: rendering the system prompt environment section
+        let prompt = SystemPromptBuilder::new()
+            .with_os("linux", "6.8")
+            .with_model("claude-sonnet-4-6")
+            .with_model_family(ModelFamilyIdentity::Claude)
+            .with_project_context(project_context)
+            .render();
+
+        // then: the prompt names that model rather than a hardcoded Opus release
+        assert!(prompt.contains(" - Model family: Claude\n - Model: claude-sonnet-4-6\n"));
+        assert!(!prompt.contains("Opus"));
     }
 
     #[test]
@@ -1364,9 +1407,9 @@ mod tests {
             .find(|line| line.contains("Model family:"))
             .expect("model family line should render");
 
-        // then: the model family line is neutral and excludes Claude Opus 4.6
+        // then: the model family line is neutral and excludes Claude
         assert_eq!(model_family_line, " - Model family: an AI assistant");
-        assert!(!model_family_line.contains("Claude Opus 4.6"));
+        assert!(!model_family_line.contains("Claude"));
     }
 
     #[test]

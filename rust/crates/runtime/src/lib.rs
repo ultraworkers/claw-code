@@ -151,7 +151,7 @@ pub use policy_engine::{
 pub use prompt::{
     load_system_prompt, load_system_prompt_with_context, prepend_bullets, ContextFile,
     ModelFamilyIdentity, ProjectContext, PromptBuildError, SystemPromptBuilder,
-    FRONTIER_MODEL_NAME, SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
+    SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
 };
 pub use recovery_recipes::{
     attempt_recovery, recipe_for, EscalationPolicy, FailureScenario, RecoveryAttemptState,
