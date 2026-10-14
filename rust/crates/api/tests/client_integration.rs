@@ -208,7 +208,7 @@ async fn send_message_applies_request_profile_and_records_telemetry() {
                 "\"model\":\"claude-3-7-sonnet-latest\",",
                 "\"stop_reason\":\"end_turn\",",
                 "\"stop_sequence\":null,",
-                "\"usage\":{\"input_tokens\":1,\"cache_creation_input_tokens\":2,\"cache_read_input_tokens\":3,\"output_tokens\":1}",
+                "\"usage\":{\"input_tokens\":100,\"cache_creation_input_tokens\":200,\"cache_read_input_tokens\":300,\"output_tokens\":100}",
                 "}"
             ),
             &[("request-id", "req_profile_123")],
@@ -283,8 +283,8 @@ async fn send_message_applies_request_profile_and_records_telemetry() {
             if event.namespace == "api"
                 && event.action == "message_usage"
                 && event.properties.get("request_id") == Some(&json!("req_profile_123"))
-                && event.properties.get("total_tokens") == Some(&json!(7))
-                && event.properties.get("estimated_cost_usd") == Some(&json!("$0.0001"))
+                && event.properties.get("total_tokens") == Some(&json!(700))
+                && event.properties.get("estimated_cost_usd") == Some(&json!("$0.0026"))
     ));
     assert!(matches!(
         &events[5],
