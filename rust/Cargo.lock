@@ -2911,6 +2911,7 @@ dependencies = [
  "commands",
  "flate2",
  "log",
+ "mock-anthropic-service",
  "plugins",
  "reqwest",
  "runtime",
