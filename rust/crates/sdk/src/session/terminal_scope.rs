@@ -8,6 +8,7 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::error::{SdkError, SdkResult};
 
@@ -135,18 +136,17 @@ impl TerminalScopeStore {
         Ok(Some(record))
     }
 
+    /// Builds the record path for a correlation key.
+    ///
+    /// Files are named from a fixed-width digest instead of the key's hex
+    /// expansion: a maximal 512-byte key expands to 1024 hex characters, which
+    /// overflows the 1024-byte total-path limit enforced by APFS before any
+    /// chunking can help, and `File name too long` would be reported for a
+    /// generated leaf name the caller never chose. The key itself is still
+    /// stored in `TerminalScopeRecord::correlation_key` and checked on read.
     fn record_path(&self, correlation_key: &str) -> PathBuf {
-        const MAX_COMPONENT_BYTES: usize = 180;
-        let encoded = encode_key_as_hex(correlation_key);
-        let mut path = self.root.clone();
-        let mut remaining = encoded.as_str();
-        while remaining.len() > MAX_COMPONENT_BYTES {
-            let (component, tail) = remaining.split_at(MAX_COMPONENT_BYTES);
-            path.push(component);
-            remaining = tail;
-        }
-        path.push(format!("{remaining}.json"));
-        path
+        self.root
+            .join(format!("{}.json", encode_key_for_path(correlation_key)))
     }
 }
 
@@ -158,10 +158,14 @@ fn validate_correlation_key(correlation_key: &str) -> SdkResult<()> {
     }
 }
 
-fn encode_key_as_hex(key: &str) -> String {
+/// Encodes a correlation key as a fixed-width filesystem-safe path component.
+fn encode_key_for_path(key: &str) -> String {
     const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
-    let mut encoded = String::with_capacity(key.len() * 2);
-    for byte in key.as_bytes() {
+    let digest = Sha256::digest(key.as_bytes());
+    // The first 16 bytes are far more than the number of records one store
+    // holds, and the full key survives in the record for exact matching.
+    let mut encoded = String::with_capacity(32);
+    for byte in digest.iter().take(16) {
         encoded.push(char::from(HEX_DIGITS[usize::from(*byte >> 4)]));
         encoded.push(char::from(HEX_DIGITS[usize::from(*byte & 0x0f)]));
     }
@@ -180,6 +184,7 @@ fn current_timestamp_ms() -> u64 {
 mod tests {
     use super::*;
     use std::fs;
+    use std::path::Component;
     use uuid::Uuid;
 
     struct TestDirectory(PathBuf);
@@ -279,7 +284,7 @@ mod tests {
         let store = TerminalScopeStore::new(&root.0);
         let path = root
             .0
-            .join(format!("{}.json", encode_key_as_hex("request")));
+            .join(format!("{}.json", encode_key_for_path("request")));
         fs::write(path, "{").expect("write malformed scope");
         assert!(store.get("request").is_err());
     }
@@ -296,6 +301,39 @@ mod tests {
             store.get(&key).expect("get long key").unwrap().session_id,
             "session-long"
         );
+
+        // A maximum-length key is 1024 hex characters. Expanding it into the
+        // path used to exceed the filesystem's total-path limit, so assert on
+        // the path shape rather than only on the round trip: the store works in
+        // a short temporary root even when the generated path is unusable.
+        let record_path = single_record_path(&root.0);
+        let longest_component = record_path
+            .components()
+            .filter_map(|component| match component {
+                Component::Normal(part) => Some(part.to_string_lossy().len()),
+                _ => None,
+            })
+            .max()
+            .expect("record path has a component");
+        assert!(
+            longest_component <= 255,
+            "path component must stay within the filesystem filename limit, got {longest_component}"
+        );
+        assert!(
+            record_path.as_os_str().len() < 1024,
+            "record path must stay within the APFS total-path limit, got {} bytes",
+            record_path.as_os_str().len()
+        );
+    }
+
+    /// Returns the single record file under a store root.
+    fn single_record_path(root: &std::path::Path) -> PathBuf {
+        let entries = fs::read_dir(root)
+            .expect("read store root")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read store entries");
+        assert_eq!(entries.len(), 1, "store should hold exactly one record");
+        entries[0].path()
     }
 
     #[test]

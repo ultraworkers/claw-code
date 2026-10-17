@@ -18,11 +18,24 @@ use crate::mcp_lifecycle_hardened::{
     McpDegradedReport, McpErrorSurface, McpFailedServer, McpLifecyclePhase,
 };
 
+// Test builds shrink the production handshake budgets (10s/30s) so that cases
+// using the scripted stdio fixture finish quickly. The fixture is a real
+// `python3` child, whose cold start measures 18-21ms here, so 200ms/300ms is
+// roughly 10x headroom and enough when these tests run serially
+// (`--test-threads=1`); under the default parallel run a dozen fixture children
+// start at once and the budget runs out, which shows up as
+// `Timeout { method: "initialize", timeout_ms: 200 }` failures across
+// `mcp_stdio::tests` and `mcp_tool_bridge::tests` (ROADMAP #837). Re-run with
+// `--test-threads=1` before treating those failures as a regression: the suite
+// is green that way. Keep the budgets short rather than generous so a real
+// handshake slowdown still fails fast; production keeps its own values.
 #[cfg(test)]
 const MCP_INITIALIZE_TIMEOUT_MS: u64 = 200;
 #[cfg(not(test))]
 const MCP_INITIALIZE_TIMEOUT_MS: u64 = 10_000;
 
+// `MCP_LIST_TOOLS_TIMEOUT_MS` below shares the test-only shrink and the parallel
+// caveat described here.
 #[cfg(test)]
 const MCP_LIST_TOOLS_TIMEOUT_MS: u64 = 300;
 #[cfg(not(test))]

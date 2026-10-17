@@ -20,5 +20,8 @@ aspect-macros = "0.1"
 aspect-std = "0.1"
 log = "0.4"
 
+[dev-dependencies]
+mock-anthropic-service = { path = "../mock-anthropic-service" }
+
 [lints]
 workspace = true

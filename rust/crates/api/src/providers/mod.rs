@@ -773,12 +773,14 @@ fn env_or_dotenv_present(key: &str) -> bool {
     }
 }
 
-/// Produce a hint string describing the first foreign provider credential
-/// that is present in the environment when Anthropic auth resolution has
-/// just failed. Returns `None` when no foreign credential is set, in which
-/// case the caller should fall back to the plain `missing_credentials`
-/// error without a hint.
+/// Produce a hint string describing the most probable reason Anthropic auth
+/// resolution just failed. Returns `None` when nothing in the environment
+/// explains the failure, in which case the caller should fall back to the
+/// plain `missing_credentials` error without a hint.
 pub(crate) fn anthropic_missing_credentials_hint() -> Option<String> {
+    if let Some(hint) = custom_anthropic_base_url_hint() {
+        return Some(hint);
+    }
     for (env_var, provider_label, fix_hint) in FOREIGN_PROVIDER_ENV_VARS {
         if env_or_dotenv_present(env_var) {
             return Some(format!(
@@ -787,6 +789,34 @@ pub(crate) fn anthropic_missing_credentials_hint() -> Option<String> {
         }
     }
     None
+}
+
+/// Hint for the case where `ANTHROPIC_BASE_URL` points at something other than
+/// the Anthropic API.
+///
+/// Third-party Anthropic-compatible endpoints (DeepSeek's `/anthropic` path,
+/// corporate gateways, local proxies) authenticate with the `ANTHROPIC_API_KEY`
+/// and `ANTHROPIC_AUTH_TOKEN` variable names purely by wire-compatibility
+/// convention, so the standard missing-credential message reads as "go get an
+/// Anthropic key" when the user in fact needs a credential issued by the
+/// endpoint they already configured. Nothing in that message mentions the base
+/// URL, which is the one piece of configuration the user deliberately set.
+///
+/// This takes precedence over the foreign-provider hints: a configured endpoint
+/// is a fact about what the user asked for, while a presence check on another
+/// provider's key only guesses at intent.
+fn custom_anthropic_base_url_hint() -> Option<String> {
+    let base_url = anthropic::read_base_url();
+    let base_url = base_url.trim();
+    if base_url.is_empty() || base_url == anthropic::DEFAULT_BASE_URL {
+        return None;
+    }
+    Some(format!(
+        "ANTHROPIC_BASE_URL is set to {base_url}, which is not the Anthropic API. \
+         The ANTHROPIC_API_KEY and ANTHROPIC_AUTH_TOKEN variable names are a \
+         compatibility convention — this endpoint expects a credential it issued \
+         itself, not an Anthropic key."
+    ))
 }
 
 /// Build an Anthropic-specific `MissingCredentials` error, attaching a
@@ -1688,6 +1718,7 @@ NO_EQUALS_LINE
         let _openai = EnvVarGuard::set("OPENAI_API_KEY", None);
         let _xai = EnvVarGuard::set("XAI_API_KEY", None);
         let _dashscope = EnvVarGuard::set("DASHSCOPE_API_KEY", None);
+        let _base_url = EnvVarGuard::set("ANTHROPIC_BASE_URL", None);
 
         // when
         let hint = anthropic_missing_credentials_hint();
@@ -1700,12 +1731,93 @@ NO_EQUALS_LINE
     }
 
     #[test]
+    fn anthropic_missing_credentials_hint_names_a_custom_base_url() {
+        // given
+        let _lock = env_lock();
+        let _openai = EnvVarGuard::set("OPENAI_API_KEY", None);
+        let _xai = EnvVarGuard::set("XAI_API_KEY", None);
+        let _dashscope = EnvVarGuard::set("DASHSCOPE_API_KEY", None);
+        let _base_url = EnvVarGuard::set(
+            "ANTHROPIC_BASE_URL",
+            Some("https://api.deepseek.com/anthropic"),
+        );
+
+        // when
+        let hint = anthropic_missing_credentials_hint()
+            .expect("a configured non-Anthropic endpoint should produce a hint");
+
+        // then
+        assert!(
+            hint.contains("https://api.deepseek.com/anthropic"),
+            "hint should name the configured endpoint so the user recognizes their own setting: {hint}"
+        );
+        assert!(
+            hint.contains("not the Anthropic API"),
+            "hint should state that the endpoint is not Anthropic: {hint}"
+        );
+        assert!(
+            hint.contains("ANTHROPIC_API_KEY") && hint.contains("ANTHROPIC_AUTH_TOKEN"),
+            "hint should keep naming the env vars that carry the credential: {hint}"
+        );
+    }
+
+    #[test]
+    fn anthropic_missing_credentials_hint_prefers_custom_base_url_over_foreign_creds() {
+        // given
+        let _lock = env_lock();
+        let _openai = EnvVarGuard::set("OPENAI_API_KEY", Some("sk-openrouter-varleg"));
+        let _xai = EnvVarGuard::set("XAI_API_KEY", None);
+        let _dashscope = EnvVarGuard::set("DASHSCOPE_API_KEY", None);
+        let _base_url = EnvVarGuard::set(
+            "ANTHROPIC_BASE_URL",
+            Some("https://api.deepseek.com/anthropic"),
+        );
+
+        // when
+        let hint = anthropic_missing_credentials_hint()
+            .expect("a configured non-Anthropic endpoint should produce a hint");
+
+        // then
+        assert!(
+            hint.contains("ANTHROPIC_BASE_URL"),
+            "the endpoint the user configured is a fact and should win over a guess about intent: {hint}"
+        );
+        assert!(
+            !hint.contains("openai/"),
+            "the foreign-provider routing hint should not displace the base-url hint: {hint}"
+        );
+    }
+
+    #[test]
+    fn anthropic_missing_credentials_hint_is_none_for_the_default_base_url() {
+        // given
+        let _lock = env_lock();
+        let _openai = EnvVarGuard::set("OPENAI_API_KEY", None);
+        let _xai = EnvVarGuard::set("XAI_API_KEY", None);
+        let _dashscope = EnvVarGuard::set("DASHSCOPE_API_KEY", None);
+        let _base_url = EnvVarGuard::set(
+            "ANTHROPIC_BASE_URL",
+            Some(super::anthropic::DEFAULT_BASE_URL),
+        );
+
+        // when
+        let hint = anthropic_missing_credentials_hint();
+
+        // then
+        assert!(
+            hint.is_none(),
+            "pointing at the real Anthropic API should not produce a base-url hint, got {hint:?}"
+        );
+    }
+
+    #[test]
     fn anthropic_missing_credentials_hint_detects_openai_api_key_and_recommends_openai_prefix() {
         // given
         let _lock = env_lock();
         let _openai = EnvVarGuard::set("OPENAI_API_KEY", Some("sk-openrouter-varleg"));
         let _xai = EnvVarGuard::set("XAI_API_KEY", None);
         let _dashscope = EnvVarGuard::set("DASHSCOPE_API_KEY", None);
+        let _base_url = EnvVarGuard::set("ANTHROPIC_BASE_URL", None);
 
         // when
         let hint = anthropic_missing_credentials_hint()
@@ -1737,6 +1849,7 @@ NO_EQUALS_LINE
         let _openai = EnvVarGuard::set("OPENAI_API_KEY", None);
         let _xai = EnvVarGuard::set("XAI_API_KEY", Some("xai-test-key"));
         let _dashscope = EnvVarGuard::set("DASHSCOPE_API_KEY", None);
+        let _base_url = EnvVarGuard::set("ANTHROPIC_BASE_URL", None);
 
         // when
         let hint = anthropic_missing_credentials_hint()
@@ -1764,6 +1877,7 @@ NO_EQUALS_LINE
         let _openai = EnvVarGuard::set("OPENAI_API_KEY", None);
         let _xai = EnvVarGuard::set("XAI_API_KEY", None);
         let _dashscope = EnvVarGuard::set("DASHSCOPE_API_KEY", Some("sk-dashscope-test"));
+        let _base_url = EnvVarGuard::set("ANTHROPIC_BASE_URL", None);
 
         // when
         let hint = anthropic_missing_credentials_hint()
@@ -1791,6 +1905,7 @@ NO_EQUALS_LINE
         let _openai = EnvVarGuard::set("OPENAI_API_KEY", Some("sk-openrouter-varleg"));
         let _xai = EnvVarGuard::set("XAI_API_KEY", Some("xai-test-key"));
         let _dashscope = EnvVarGuard::set("DASHSCOPE_API_KEY", Some("sk-dashscope-test"));
+        let _base_url = EnvVarGuard::set("ANTHROPIC_BASE_URL", None);
 
         // when
         let hint = anthropic_missing_credentials_hint()
@@ -1814,6 +1929,7 @@ NO_EQUALS_LINE
         let _openai = EnvVarGuard::set("OPENAI_API_KEY", None);
         let _xai = EnvVarGuard::set("XAI_API_KEY", None);
         let _dashscope = EnvVarGuard::set("DASHSCOPE_API_KEY", None);
+        let _base_url = EnvVarGuard::set("ANTHROPIC_BASE_URL", None);
 
         // when
         let error = anthropic_missing_credentials();
@@ -1848,6 +1964,7 @@ NO_EQUALS_LINE
         let _openai = EnvVarGuard::set("OPENAI_API_KEY", Some("sk-openrouter-varleg"));
         let _xai = EnvVarGuard::set("XAI_API_KEY", None);
         let _dashscope = EnvVarGuard::set("DASHSCOPE_API_KEY", None);
+        let _base_url = EnvVarGuard::set("ANTHROPIC_BASE_URL", None);
 
         // when
         let error = anthropic_missing_credentials();
@@ -1896,6 +2013,7 @@ NO_EQUALS_LINE
         let _openai = EnvVarGuard::set("OPENAI_API_KEY", Some(""));
         let _xai = EnvVarGuard::set("XAI_API_KEY", None);
         let _dashscope = EnvVarGuard::set("DASHSCOPE_API_KEY", None);
+        let _base_url = EnvVarGuard::set("ANTHROPIC_BASE_URL", None);
 
         // when
         let hint = anthropic_missing_credentials_hint();

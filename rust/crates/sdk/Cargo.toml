@@ -14,6 +14,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 tracing = "0.1"
 url = "2"
 runtime = { path = "../runtime" }
+sha2 = "0.10"
 
 [dev-dependencies]
 tempfile = "3"
