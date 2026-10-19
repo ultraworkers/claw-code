@@ -5525,52 +5525,108 @@ fn tool_specs_for_allowed_tools(allowed_tools: Option<&BTreeSet<String>>) -> Vec
 fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
     messages
         .iter()
-        .filter_map(|message| {
-            let role = match message.role {
-                MessageRole::System | MessageRole::User | MessageRole::Tool => "user",
-                MessageRole::Assistant => "assistant",
-            };
-            let content = message
-                .blocks
-                .iter()
-                .map(|block| match block {
-                    ContentBlock::Text { text } => InputContentBlock::Text { text: text.clone() },
-                    ContentBlock::Thinking {
-                        thinking,
-                        signature,
-                    } => InputContentBlock::Thinking {
-                        thinking: thinking.clone(),
-                        signature: signature.clone(),
-                    },
-                    ContentBlock::ToolUse { id, name, input } => InputContentBlock::ToolUse {
-                        id: id.clone(),
-                        name: name.clone(),
-                        input: serde_json::from_str(input)
-                            .unwrap_or_else(|_| serde_json::json!({ "raw": input })),
-                    },
-                    ContentBlock::ToolResult {
-                        tool_use_id,
-                        output,
-                        is_error,
-                        ..
-                    } => InputContentBlock::ToolResult {
-                        tool_use_id: tool_use_id.clone(),
-                        content: vec![ToolResultContentBlock::Text {
-                            text: output.clone(),
-                        }],
-                        is_error: *is_error,
-                    },
-                })
-                .filter(
-                    |block| !matches!(block, InputContentBlock::Text { text } if text.is_empty()),
-                )
-                .collect::<Vec<_>>();
-            (!content.is_empty()).then(|| InputMessage {
-                role: role.to_string(),
-                content,
-            })
+        .filter_map(convert_message)
+        .fold(Vec::new(), absorb_tool_result_message)
+}
+
+/// Converts one conversation message into its wire form.
+fn convert_message(message: &ConversationMessage) -> Option<InputMessage> {
+    let role = match message.role {
+        MessageRole::System | MessageRole::User | MessageRole::Tool => "user",
+        MessageRole::Assistant => "assistant",
+    };
+    let content = message
+        .blocks
+        .iter()
+        .map(|block| match block {
+            ContentBlock::Text { text } => InputContentBlock::Text { text: text.clone() },
+            ContentBlock::Thinking {
+                thinking,
+                signature,
+            } => InputContentBlock::Thinking {
+                thinking: thinking.clone(),
+                signature: signature.clone(),
+            },
+            ContentBlock::ToolUse { id, name, input } => InputContentBlock::ToolUse {
+                id: id.clone(),
+                name: name.clone(),
+                input: serde_json::from_str(input)
+                    .unwrap_or_else(|_| serde_json::json!({ "raw": input })),
+            },
+            ContentBlock::ToolResult {
+                tool_use_id,
+                output,
+                is_error,
+                ..
+            } => InputContentBlock::ToolResult {
+                tool_use_id: tool_use_id.clone(),
+                content: vec![ToolResultContentBlock::Text {
+                    text: output.clone(),
+                }],
+                is_error: *is_error,
+            },
         })
-        .collect()
+        .filter(
+            |block| !matches!(block, InputContentBlock::Text { text } if text.is_empty()),
+        )
+        .collect::<Vec<_>>();
+    (!content.is_empty()).then(|| InputMessage {
+        role: role.to_string(),
+        content,
+    })
+}
+
+/// Identical in `rusty-claude-cli` and `tools`; kept in both copies by review
+/// decision rather than shared, but they must still be changed together.
+///
+/// The two `convert_messages` call sites are not interchangeable: `tools` drops
+/// empty `Text` blocks and the CLI keeps them. That difference is confined to
+/// `convert_message`, so it constrains hoisting the whole conversion, not this
+/// fold. It is reachable when history is not built from the model stream — an
+/// empty `user_text("")` or a persisted `"text":""` restored from a session log
+/// bypasses the `flush_text_block` filter that the streaming path applies.
+/// Appends a message to the wire history, merging a *run* of pure tool-result
+/// messages into one message.
+///
+/// `runtime` records one `MessageRole::Tool` message per tool call, but the
+/// Anthropic Messages API requires *every* `tool_use` of an assistant turn to be
+/// answered by `tool_result` blocks **in the same following message**. Emitting
+/// one message per result leaves the second and later results of a parallel
+/// tool-call turn one message too late, and the request is rejected with
+/// `messages.N: tool_use ids were found without tool_result blocks immediately
+/// after`.
+///
+/// A merge requires **both** sides to be pure tool results: the accumulated
+/// message and the incoming one. Checking only the accumulated side folds the
+/// turn that *follows* a tool result into it — the assistant reply the model
+/// produced after the tool ran, or a later user turn, would arrive as extra
+/// content inside the tool-result message and its role would be lost. That
+/// message is re-read on every request (`stream()` converts the whole history
+/// again), so the damage is not limited to the turn that produced it, and it
+/// happens on single-tool-call turns too.
+fn absorb_tool_result_message(
+    mut messages: Vec<InputMessage>,
+    message: InputMessage,
+) -> Vec<InputMessage> {
+    if is_tool_result_only(&message) {
+        if let Some(previous) = messages.last_mut() {
+            if previous.role == "user" && is_tool_result_only(previous) {
+                previous.content.extend(message.content);
+                return messages;
+            }
+        }
+    }
+    messages.push(message);
+    messages
+}
+
+/// Reports whether a wire message carries tool results and nothing else.
+fn is_tool_result_only(message: &InputMessage) -> bool {
+    !message.content.is_empty()
+        && message
+            .content
+            .iter()
+            .all(|block| matches!(block, InputContentBlock::ToolResult { .. }))
 }
 
 fn push_output_block(
