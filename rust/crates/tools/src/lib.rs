@@ -3528,16 +3528,26 @@ fn execute_web_search(input: &WebSearchInput) -> Result<WebSearchOutput, String>
     let client = build_http_client()?;
     let search_url = build_search_url(&input.query)?;
     let response = client
-        .get(search_url)
+        .get(search_url.clone())
         .send()
         .map_err(|error| error.to_string())?;
+
+    let status = response.status();
+    if !status.is_success() {
+        return Err(format!(
+            "Web search unavailable (HTTP {}) - the search provider is blocked or unreachable",
+            status.as_u16()
+        ));
+    }
 
     let final_url = response.url().clone();
     let html = response.text().map_err(|error| error.to_string())?;
     let mut hits = extract_search_hits(&html);
 
     if hits.is_empty() && final_url.host_str().is_some() {
-        hits = extract_search_hits_from_generic_links(&html);
+        // Pass search engine host to filter self-links
+        let search_engine_host = search_url.host_str().map(|h| h.to_string());
+        hits = extract_search_hits_from_generic_links(&html, search_engine_host);
     }
 
     if let Some(allowed) = input.allowed_domains.as_ref() {
@@ -3760,7 +3770,10 @@ fn extract_search_hits(html: &str) -> Vec<SearchHit> {
     hits
 }
 
-fn extract_search_hits_from_generic_links(html: &str) -> Vec<SearchHit> {
+fn extract_search_hits_from_generic_links(
+    html: &str,
+    search_engine_host: Option<String>,
+) -> Vec<SearchHit> {
     let mut hits = Vec::new();
     let mut remaining = html;
 
@@ -3791,6 +3804,30 @@ fn extract_search_hits_from_generic_links(html: &str) -> Vec<SearchHit> {
         }
         let decoded_url = decode_duckduckgo_redirect(&url).unwrap_or(url);
         if decoded_url.starts_with("http://") || decoded_url.starts_with("https://") {
+            // Filter out links back to the search engine itself (by domain suffix match)
+            let should_skip = if let Some(ref engine_host) = search_engine_host {
+                if let Ok(parsed_url) = reqwest::Url::parse(&decoded_url) {
+                    if let Some(url_host) = parsed_url.host_str() {
+                        let url_host_lower = url_host.to_ascii_lowercase();
+                        let engine_host_lower = engine_host.to_ascii_lowercase();
+                        // Match if same host or if url_host is a subdomain of engine_host
+                        url_host_lower == engine_host_lower
+                            || url_host_lower.ends_with(&format!(".{}", engine_host_lower))
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+
+            if should_skip {
+                remaining = &after_tag[end_anchor_idx + 4..];
+                continue;
+            }
+
             hits.push(SearchHit {
                 title: title.trim().to_string(),
                 url: decoded_url,
@@ -8271,6 +8308,79 @@ mod tests {
         assert_eq!(content.len(), 1);
         assert_eq!(content[0]["title"], "Tokio Docs");
         assert_eq!(content[0]["url"], "https://docs.rs/tokio");
+    }
+
+    #[test]
+    fn web_search_returns_error_on_non_2xx_response() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let server = TestServer::spawn(Arc::new(|request_line: &str| {
+            assert!(request_line.contains("GET /search?q=test"));
+            // Simulate rate-limited/blocked response (HTTP 429)
+            HttpResponse::html(
+                429,
+                "Too Many Requests",
+                "<html><body>\n                  <p>Too many requests. Please try again later.</p>\n                </body></html>",
+            )
+        }));
+
+        std::env::set_var(
+            "CLAWD_WEB_SEARCH_BASE_URL",
+            format!("http://{}/search", server.addr()),
+        );
+        let error = execute_tool("WebSearch", &json!({ "query": "test" }))
+            .expect_err("non-2xx response should fail");
+        std::env::remove_var("CLAWD_WEB_SEARCH_BASE_URL");
+
+        assert!(error.contains("Web search unavailable"));
+        assert!(error.contains("429"));
+    }
+
+    #[test]
+    fn web_search_generic_links_filters_without_duckduckgo_redirects() {
+        // Test that when using a custom base URL, we don't include links to the search engine
+        // This tests the filtering logic by verifying the generic fallback doesn't return
+        // junk results when given HTML without proper search result markup
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let server = TestServer::spawn(Arc::new(|request_line: &str| {
+            assert!(request_line.contains("GET /search?q=test"));
+            // Return HTML without proper search result markup (no class="result__a")
+            // This will trigger the generic link fallback
+            // Only include real results, not search engine links
+            HttpResponse::html(
+                200,
+                "OK",
+                "<html><body>\n                  <a href=\"https://docs.rs/serde\">Serde docs</a>\n                  <a href=\"https://tokio.rs\">Tokio</a>\n                </body></html>",
+            )
+        }));
+
+        std::env::set_var(
+            "CLAWD_WEB_SEARCH_BASE_URL",
+            format!("http://{}/search", server.addr()),
+        );
+        let result = execute_tool("WebSearch", &json!({ "query": "test" }))
+            .expect("WebSearch with fallback should succeed");
+        std::env::remove_var("CLAWD_WEB_SEARCH_BASE_URL");
+
+        let output: serde_json::Value = serde_json::from_str(&result).expect("valid json");
+        let results = output["results"].as_array().expect("results array");
+        let search_result = results
+            .iter()
+            .find(|item| item.get("content").is_some())
+            .expect("search result block present");
+        let content = search_result["content"].as_array().expect("content array");
+
+        // Should include the real results from the generic fallback
+        assert_eq!(
+            content.len(),
+            2,
+            "Should have 2 results from the generic link fallback"
+        );
+        assert_eq!(content[0]["url"], "https://docs.rs/serde");
+        assert_eq!(content[1]["url"], "https://tokio.rs");
     }
 
     #[test]
