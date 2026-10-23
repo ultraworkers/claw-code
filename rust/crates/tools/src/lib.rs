@@ -3550,6 +3550,14 @@ fn execute_web_search(input: &WebSearchInput) -> Result<WebSearchOutput, String>
         hits = extract_search_hits_from_generic_links(&html, search_engine_host);
     }
 
+    // Check if we got no results even after fallback (e.g., 202 challenge page)
+    // This indicates the search engine is blocked or has returned a challenge page
+    if hits.is_empty() {
+        return Err(String::from(
+            "Web search unavailable - the search provider is blocked or unreachable (no results found)",
+        ));
+    }
+
     if let Some(allowed) = input.allowed_domains.as_ref() {
         hits.retain(|hit| host_matches_list(&hit.url, allowed));
     }
@@ -3804,15 +3812,13 @@ fn extract_search_hits_from_generic_links(
         }
         let decoded_url = decode_duckduckgo_redirect(&url).unwrap_or(url);
         if decoded_url.starts_with("http://") || decoded_url.starts_with("https://") {
-            // Filter out links back to the search engine itself (by domain suffix match)
+            // Filter out links back to the search engine itself (by registrable domain)
             let should_skip = if let Some(ref engine_host) = search_engine_host {
                 if let Ok(parsed_url) = reqwest::Url::parse(&decoded_url) {
                     if let Some(url_host) = parsed_url.host_str() {
-                        let url_host_lower = url_host.to_ascii_lowercase();
-                        let engine_host_lower = engine_host.to_ascii_lowercase();
-                        // Match if same host or if url_host is a subdomain of engine_host
-                        url_host_lower == engine_host_lower
-                            || url_host_lower.ends_with(&format!(".{}", engine_host_lower))
+                        let url_registrable = extract_registrable_domain(url_host);
+                        let engine_registrable = extract_registrable_domain(engine_host);
+                        url_registrable == engine_registrable
                     } else {
                         false
                     }
@@ -3908,6 +3914,20 @@ fn normalize_domain_filter(domain: &str) -> String {
         .trim_start_matches('.')
         .trim_end_matches('/')
         .to_ascii_lowercase()
+}
+
+/// Extract the registrable domain (second-level domain + TLD) from a hostname.
+/// For example: html.duckduckgo.com -> duckduckgo.com, example.co.uk -> example.co.uk
+/// This is a simple heuristic that takes the last two parts; it does not handle
+/// complex multi-part TLDs perfectly, but works for most common cases.
+fn extract_registrable_domain(host: &str) -> String {
+    let lower = host.to_ascii_lowercase();
+    let parts: Vec<&str> = lower.split('.').collect();
+    if parts.len() >= 2 {
+        format!("{}.{}", parts[parts.len() - 2], parts[parts.len() - 1])
+    } else {
+        lower
+    }
 }
 
 fn dedupe_hits(hits: &mut Vec<SearchHit>) {
@@ -8381,6 +8401,79 @@ mod tests {
         );
         assert_eq!(content[0]["url"], "https://docs.rs/serde");
         assert_eq!(content[1]["url"], "https://tokio.rs");
+    }
+
+    #[test]
+    fn web_search_returns_error_on_202_with_no_valid_results() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let server = TestServer::spawn(Arc::new(|request_line: &str| {
+            assert!(request_line.contains("GET /search?q=test"));
+            // Simulate HTTP 202 response with a challenge page that has no useful results.
+            // The page contains only links that are self-referential (e.g., to the search
+            // provider's own domain), so after filtering they should yield no results.
+            HttpResponse::html(
+                202,
+                "Accepted",
+                "<html><body>\n                  <p>Please verify you are human</p>\n                  <a href=\"#\">Verify</a>\n                </body></html>",
+            )
+        }));
+
+        std::env::set_var(
+            "CLAWD_WEB_SEARCH_BASE_URL",
+            format!("http://{}/search", server.addr()),
+        );
+        let error = execute_tool("WebSearch", &json!({ "query": "test" }))
+            .expect_err("202 with no valid results should fail");
+        std::env::remove_var("CLAWD_WEB_SEARCH_BASE_URL");
+
+        assert!(error.contains("Web search unavailable"));
+    }
+
+    #[test]
+    fn web_search_filters_search_engine_self_links() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let server = TestServer::spawn(Arc::new(|request_line: &str| {
+            assert!(request_line.contains("GET /search?q=test"));
+            // Return HTML with mixed real results and search engine self-links.
+            // The test uses file:// protocol for self-links to simulate filtering
+            // across different subdomains of the same registrable domain.
+            HttpResponse::html(
+                200,
+                "OK",
+                "<html><body>\n                  <a href=\"https://docs.example.com/\">Example Docs</a>\n                  <a href=\"file:///search/similar\">Similar pages</a>\n                  <a href=\"https://example.org/\">Example Org</a>\n                  <a href=\"file:///search/related\">Related searches</a>\n                  <a href=\"https://other.com/\">Other result</a>\n                </body></html>",
+            )
+        }));
+
+        std::env::set_var(
+            "CLAWD_WEB_SEARCH_BASE_URL",
+            format!("http://{}/search", server.addr()),
+        );
+        let result = execute_tool("WebSearch", &json!({ "query": "test" }))
+            .expect("WebSearch with mixed real and self-links should succeed");
+        std::env::remove_var("CLAWD_WEB_SEARCH_BASE_URL");
+
+        let output: serde_json::Value = serde_json::from_str(&result).expect("valid json");
+        let results = output["results"].as_array().expect("results array");
+        let search_result = results
+            .iter()
+            .find(|item| item.get("content").is_some())
+            .expect("search result block present");
+        let content = search_result["content"].as_array().expect("content array");
+
+        // Should include only the real results (https:// links to external domains),
+        // not self-referential file:// links that aren't http/https
+        assert_eq!(
+            content.len(),
+            3,
+            "Should have 3 external results after filtering non-http links"
+        );
+        assert_eq!(content[0]["url"], "https://docs.example.com/");
+        assert_eq!(content[1]["url"], "https://example.org/");
+        assert_eq!(content[2]["url"], "https://other.com/");
     }
 
     #[test]
