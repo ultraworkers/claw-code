@@ -2096,9 +2096,13 @@ fn run_remote_trigger(input: RemoteTriggerInput) -> Result<String, String> {
             let status = response.status().as_u16();
             let body = response.text().unwrap_or_default();
             let truncated_body = if body.len() > 8192 {
+                let mut end = 8192;
+                while !body.is_char_boundary(end) {
+                    end -= 1;
+                }
                 format!(
                     "{}\n\n[response truncated — {} bytes total]",
-                    &body[..8192],
+                    &body[..end],
                     body.len()
                 )
             } else {
