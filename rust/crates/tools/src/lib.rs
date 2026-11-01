@@ -11441,4 +11441,48 @@ printf 'pwsh:%s' "$1"
             .collect::<Vec<_>>();
         assert_eq!(answered, vec!["toolu_multi_read", "toolu_multi_grep"]);
     }
+
+    #[test]
+    fn remote_trigger_truncates_multibyte_char_at_boundary() {
+        // This test verifies that run_remote_trigger safely truncates a body
+        // when a multibyte UTF-8 character spans the 8192-byte boundary.
+        // Without the char_boundary check, &body[..8192] would panic.
+        let server = TestServer::spawn(Arc::new(|_request| {
+            // Create a body that's >8192 bytes with a 4-byte character (🦀) at byte 8192.
+            // Strategy: fill with ASCII to reach byte 8189, then place the 4-byte crab emoji
+            // so that byte 8192 falls in the middle of it.
+            let mut body = String::new();
+            // 8189 ASCII 'a' characters = 8189 bytes
+            for _ in 0..8189 {
+                body.push('a');
+            }
+            // Crab emoji (🦀) is 4 bytes in UTF-8: F0 9F A6 80
+            // Placing it now puts byte 8192 inside it (byte 8189+3=8192 is the 4th byte of the emoji)
+            body.push_str("🦀");
+            // Add more content to make it clear we truncated
+            body.push_str("extra_content_after_boundary");
+
+            HttpResponse::text(200, "OK", &body)
+        }));
+
+        let input = json!({
+            "url": format!("http://{}/test", server.addr()),
+            "method": "GET"
+        });
+
+        // This should not panic on the current head (with char_boundary check).
+        // On main (with &body[..8192]), this would panic because byte 8192
+        // is in the middle of the 4-byte crab emoji.
+        let result = execute_tool("RemoteTrigger", &input).expect("tool should succeed");
+        let output: serde_json::Value =
+            serde_json::from_str(&result).expect("result should be valid JSON");
+
+        // Verify the response was truncated
+        let body = output["body"].as_str().expect("body should be string");
+        assert!(body.contains("[response truncated"));
+        // The body should not contain the full extra_content_after_boundary
+        assert!(!body.contains("extra_content_after_boundary"));
+        // The truncation should have left us with valid UTF-8 (no partial emoji)
+        let _ = body.to_string(); // This validates it's valid Rust string (which is valid UTF-8)
+    }
 }
