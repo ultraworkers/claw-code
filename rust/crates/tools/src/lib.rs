@@ -5997,7 +5997,7 @@ fn execute_notebook_edit(input: NotebookEditInput) -> Result<NotebookEditOutput,
         NotebookEditMode::Insert => {
             let resolved_cell_type = resolved_cell_type
                 .ok_or_else(|| String::from("insert mode requires a cell type"))?;
-            let new_id = make_cell_id(cells.len());
+            let new_id = make_cell_id(cells);
             let new_cell = build_notebook_cell(&new_id, resolved_cell_type, &new_source);
             let insert_at = target_index.map_or(cells.len(), |index| index + 1);
             cells.insert(insert_at, new_cell);
@@ -7022,8 +7022,11 @@ fn format_notebook_edit_mode(mode: NotebookEditMode) -> String {
     }
 }
 
-fn make_cell_id(index: usize) -> String {
-    format!("cell-{}", index + 1)
+fn make_cell_id(cells: &[Value]) -> String {
+    (cells.len() + 1..)
+        .map(|n| format!("cell-{n}"))
+        .find(|id| !cells.iter().any(|cell| cell["id"] == id.as_str()))
+        .expect("there is always a free id")
 }
 
 fn parse_skill_description(contents: &str) -> Option<String> {
@@ -9869,11 +9872,23 @@ mod tests {
         assert!(deleted_output["cell_type"].is_null());
         assert_eq!(deleted_output["new_source"], "");
 
+        let reinserted = execute_tool(
+            "NotebookEdit",
+            &json!({
+                "notebook_path": path.display().to_string(),
+                "new_source": "print(4)\n",
+                "edit_mode": "insert"
+            }),
+        )
+        .expect("NotebookEdit insert after delete should succeed");
+        let reinserted_output: serde_json::Value = serde_json::from_str(&reinserted).expect("json");
+        assert_eq!(reinserted_output["cell_id"], "cell-4");
+
         let final_notebook: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).expect("read notebook"))
                 .expect("valid notebook json");
         let cells = final_notebook["cells"].as_array().expect("cells array");
-        assert_eq!(cells.len(), 2);
+        assert_eq!(cells.len(), 3);
         assert_eq!(cells[0]["cell_type"], "markdown");
         assert!(cells[0].get("outputs").is_none());
         assert_eq!(cells[1]["cell_type"], "code");
