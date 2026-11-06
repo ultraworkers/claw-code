@@ -9897,6 +9897,94 @@ mod tests {
     }
 
     #[test]
+    fn notebook_edit_replace_switches_cell_type_and_rejects_unknown_ids() {
+        let path = temp_path("retype.ipynb");
+        std::fs::write(
+            &path,
+            r##"{
+  "cells": [
+    {"cell_type": "markdown", "id": "cell-2", "metadata": {}, "source": ["# title\n"]}
+  ],
+  "metadata": {},
+  "nbformat": 4,
+  "nbformat_minor": 5
+}"##,
+        )
+        .expect("write notebook");
+
+        let kept_type = execute_tool(
+            "NotebookEdit",
+            &json!({
+                "notebook_path": path.display().to_string(),
+                "cell_id": "cell-2",
+                "new_source": "# renamed\n"
+            }),
+        )
+        .expect("NotebookEdit default replace should succeed");
+        let kept_output: serde_json::Value = serde_json::from_str(&kept_type).expect("json");
+        assert_eq!(kept_output["edit_mode"], "replace");
+        assert_eq!(kept_output["cell_type"], "markdown");
+        assert_eq!(kept_output["language"], "python");
+
+        let retyped = execute_tool(
+            "NotebookEdit",
+            &json!({
+                "notebook_path": path.display().to_string(),
+                "cell_id": "cell-2",
+                "new_source": "print(1)\n",
+                "cell_type": "code",
+                "edit_mode": "replace"
+            }),
+        )
+        .expect("NotebookEdit replace to code should succeed");
+        let retyped_output: serde_json::Value = serde_json::from_str(&retyped).expect("json");
+        assert_eq!(retyped_output["cell_type"], "code");
+
+        let inserted = execute_tool(
+            "NotebookEdit",
+            &json!({
+                "notebook_path": path.display().to_string(),
+                "new_source": "print(2)\n",
+                "edit_mode": "insert"
+            }),
+        )
+        .expect("NotebookEdit insert should succeed");
+        let inserted_output: serde_json::Value = serde_json::from_str(&inserted).expect("json");
+        assert_eq!(inserted_output["cell_id"], "cell-3");
+
+        let before_missing = std::fs::read_to_string(&path).expect("read notebook");
+        let missing = execute_tool(
+            "NotebookEdit",
+            &json!({
+                "notebook_path": path.display().to_string(),
+                "cell_id": "missing",
+                "new_source": "print(3)\n",
+                "edit_mode": "replace"
+            }),
+        )
+        .expect_err("unknown cell id should fail");
+        assert!(missing.contains("Cell id not found: missing"));
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read notebook"),
+            before_missing
+        );
+
+        let final_notebook: serde_json::Value =
+            serde_json::from_str(&before_missing).expect("valid notebook json");
+        let cells = final_notebook["cells"].as_array().expect("cells array");
+        assert_eq!(cells.len(), 2);
+        assert_eq!(cells[0]["cell_type"], "code");
+        assert_eq!(cells[0]["source"], json!(["print(1)\n"]));
+        assert_eq!(cells[0]["outputs"], json!([]));
+        assert_eq!(
+            cells[0].get("execution_count"),
+            Some(&serde_json::Value::Null)
+        );
+        assert_eq!(cells[1]["id"], "cell-3");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn notebook_edit_rejects_invalid_inputs() {
         let text_path = temp_path("notebook.txt");
         fs::write(&text_path, "not a notebook").expect("write text file");
