@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.12] - 2026-11-08
+
+### Fixed
+
+- Git Bash discovery works when only Git's `cmd` directory is on `PATH` (#3378)
+- REPL and PowerShell executables resolve from `PATH`, honoring Windows `PATHEXT` (#3378)
+- Quoted hook and plugin script paths containing spaces are preserved through `cmd /D /S /C` (#3378)
+- Windows verbatim and native paths are handled correctly in glob matching and workspace-containment checks (#3378)
+- OAuth PKCE and state use OS-backed randomness instead of `/dev/urandom` (#3378)
+
+### Changed
+
+- Windows hooks now run with `cmd /D`, which disables AutoRun (#3378)
+- CI runs the full Rust workspace test suite on Windows (#3378)
+
 ## [0.1.11] - 2026-11-04
 
 ### Fixed
