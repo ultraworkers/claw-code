@@ -564,11 +564,11 @@ fn assert_write_file_allowed(workspace: &HarnessWorkspace, run: &ScenarioRun) {
         run.response["tool_uses"][0]["name"],
         Value::String("write_file".to_string())
     );
-    assert!(run.response["message"]
-        .as_str()
-        .expect("message text")
-        .replace('\\', "/")
-        .contains("generated/output.txt"));
+    let message = run.response["message"].as_str().expect("message text");
+    assert!(
+        message.contains("write_file succeeded"),
+        "expected successful write confirmation in assistant message: {message:?}"
+    );
     let generated = workspace.root.join("generated").join("output.txt");
     let contents = fs::read_to_string(&generated).expect("generated file should exist");
     assert_eq!(contents, "created by mock service\n");

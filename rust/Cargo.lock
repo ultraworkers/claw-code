@@ -2142,6 +2142,7 @@ dependencies = [
  "glob",
  "plugins",
  "regex",
+ "same-file",
  "serde",
  "serde_json",
  "sha2",

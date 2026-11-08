@@ -13,6 +13,7 @@ plugins = { path = "../plugins" }
 regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json.workspace = true
+same-file = "1.0.6"
 telemetry = { path = "../telemetry" }
 tokio = { version = "1", features = ["io-std", "io-util", "macros", "process", "rt", "rt-multi-thread", "time"] }
 walkdir = "2"
