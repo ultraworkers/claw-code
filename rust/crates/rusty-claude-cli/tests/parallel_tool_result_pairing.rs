@@ -13,6 +13,8 @@
 //! mock service does not validate pairing itself, which is why the assertion
 //! lives here.
 
+mod support;
+
 use std::fs;
 use std::path::PathBuf;
 use std::process::{Command, Output};
@@ -121,12 +123,12 @@ fn run_claw(workspace: &PathBuf, config_home: &PathBuf, home: &PathBuf, base_url
     Command::new(env!("CARGO_BIN_EXE_claw"))
         .current_dir(workspace)
         .env_clear()
+        .envs(support::process_environment())
         .env("ANTHROPIC_API_KEY", "test-parallel-tool-key")
         .env("ANTHROPIC_BASE_URL", base_url)
         .env("CLAW_CONFIG_HOME", config_home)
         .env("HOME", home)
         .env("NO_COLOR", "1")
-        .env("PATH", "/usr/bin:/bin")
         .args([
             "--model",
             "sonnet",

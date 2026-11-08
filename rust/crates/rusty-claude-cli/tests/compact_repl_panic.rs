@@ -1,3 +1,5 @@
+mod support;
+
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
@@ -55,15 +57,15 @@ fn run_claw_repl(
     home: &std::path::Path,
     stdin: &str,
 ) -> Output {
-    let mut command = python_pty_command(env!("CARGO_BIN_EXE_claw"));
+    let mut command = python_terminal_command(env!("CARGO_BIN_EXE_claw"));
     let mut child = command
         .current_dir(cwd)
         .env_clear()
+        .envs(support::process_environment())
         .env("ANTHROPIC_API_KEY", "test-compact-repl-key")
         .env("CLAW_CONFIG_HOME", config_home)
         .env("HOME", home)
         .env("NO_COLOR", "1")
-        .env("PATH", "/usr/bin:/bin")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -80,30 +82,12 @@ fn run_claw_repl(
     child.wait_with_output().expect("claw should finish")
 }
 
-fn python_pty_command(claw: &str) -> Command {
-    let mut command = Command::new("python3");
-    command.args([
-        "-c",
-        r#"
-import os
-import pty
-import subprocess
-import sys
-
-claw = sys.argv[1]
-payload = sys.stdin.buffer.read()
-master, slave = pty.openpty()
-child = subprocess.Popen([claw], stdin=slave, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-os.close(slave)
-os.write(master, payload)
-stdout, stderr = child.communicate(timeout=30)
-os.close(master)
-sys.stdout.buffer.write(stdout)
-sys.stderr.buffer.write(stderr)
-raise SystemExit(child.returncode)
-"#,
-        claw,
-    ]);
+fn python_terminal_command(claw: &str) -> Command {
+    let mut command = Command::new(if cfg!(windows) { "python" } else { "python3" });
+    command.arg(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/support/repl_console.py"),
+    );
+    command.arg(claw);
     command
 }
 

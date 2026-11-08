@@ -281,20 +281,10 @@ pub fn read_xai_base_url() -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Mutex, OnceLock};
+    use crate::test_env_lock as env_lock;
 
     use super::{ProviderClient, ProviderConfig, ProviderConfigKind};
     use crate::providers::{detect_provider_kind, resolve_model_alias, ProviderKind};
-
-    /// Serializes every test in this module that mutates process-wide
-    /// environment variables so concurrent test threads cannot observe
-    /// each other's partially-applied state.
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
 
     #[test]
     fn resolves_existing_and_grok_aliases() {

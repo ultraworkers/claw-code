@@ -1705,9 +1705,9 @@ mod tests {
         ));
         let hook_command = format!("echo compromised >> \"{}\"", marker.display());
         let features = RuntimeFeatureConfig::default().with_hooks(RuntimeHookConfig::new(
-            vec![shell_snippet(&hook_command)],
-            vec![shell_snippet(&hook_command)],
-            vec![shell_snippet(&hook_command)],
+            vec![hook_command.clone()],
+            vec![hook_command.clone()],
+            vec![hook_command.clone()],
         ));
         let mut runtime = ConversationRuntime::new_with_features(
             Session::new(),
@@ -1858,7 +1858,7 @@ mod tests {
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
             vec!["system".to_string()],
             &RuntimeFeatureConfig::default().with_hooks(RuntimeHookConfig::new(
-                vec![shell_snippet("printf 'blocked by hook'; exit 2")],
+                vec![crate::test_hook("blocked by hook", "", 2, 0)],
                 Vec::new(),
                 Vec::new(),
             )),
@@ -1921,7 +1921,7 @@ mod tests {
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
             vec!["system".to_string()],
             &RuntimeFeatureConfig::default().with_hooks(RuntimeHookConfig::new(
-                vec![shell_snippet("printf 'broken hook'; exit 1")],
+                vec![crate::test_hook("broken hook", "", 1, 0)],
                 Vec::new(),
                 Vec::new(),
             )),
@@ -1990,8 +1990,8 @@ mod tests {
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
             vec!["system".to_string()],
             &RuntimeFeatureConfig::default().with_hooks(RuntimeHookConfig::new(
-                vec![shell_snippet("printf 'pre hook ran'")],
-                vec![shell_snippet("printf 'post hook ran'")],
+                vec![crate::test_hook("pre hook ran", "", 0, 0)],
+                vec![crate::test_hook("post hook ran", "", 0, 0)],
                 Vec::new(),
             )),
         );
@@ -2068,8 +2068,8 @@ mod tests {
             vec!["system".to_string()],
             &RuntimeFeatureConfig::default().with_hooks(RuntimeHookConfig::new(
                 Vec::new(),
-                vec![shell_snippet("printf 'post hook should not run'")],
-                vec![shell_snippet("printf 'failure hook ran'")],
+                vec![crate::test_hook("post hook should not run", "", 0, 0)],
+                vec![crate::test_hook("failure hook ran", "", 0, 0)],
             )),
         );
 
@@ -2261,16 +2261,6 @@ mod tests {
             .expect("system time should be after epoch")
             .as_nanos();
         std::env::temp_dir().join(format!("runtime-conversation-{label}-{nanos}.json"))
-    }
-
-    #[cfg(windows)]
-    fn shell_snippet(script: &str) -> String {
-        script.replace('\'', "\"")
-    }
-
-    #[cfg(not(windows))]
-    fn shell_snippet(script: &str) -> String {
-        script.to_string()
     }
 
     #[test]

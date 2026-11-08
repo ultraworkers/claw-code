@@ -2,7 +2,7 @@ use std::cmp::Reverse;
 use std::collections::HashSet;
 use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::Instant;
 
 use glob::Pattern;
@@ -44,7 +44,7 @@ fn is_binary_file(path: &Path) -> io::Result<bool> {
 fn validate_workspace_boundary(resolved: &Path, workspace_root: &Path) -> io::Result<()> {
     let workspace_root = normalize_for_comparison(workspace_root);
     let comparable = normalize_for_comparison(resolved);
-    if comparable.starts_with(&workspace_root) || resolves_within(resolved, &workspace_root) {
+    if resolves_within(resolved, &workspace_root) {
         return Ok(());
     }
     Err(io::Error::new(
@@ -61,13 +61,87 @@ fn validate_workspace_boundary(resolved: &Path, workspace_root: &Path) -> io::Re
 /// filesystem resolves it. Windows accepts several spellings of one location
 /// that [`Path::starts_with`] treats as different: letter case (a working
 /// directory typed as `c:\users\...` for `C:\Users\...`), the `\\.\` device
-/// namespace, and 8.3 short names. Only consulted after the lexical comparison
-/// fails, so it can accept such a spelling but never widens what already
-/// compared inside, and a path whose canonical form is outside stays rejected.
+/// namespace, and 8.3 short names. Existing ancestors are canonicalized so
+/// equivalent names are accepted while symlink and parent traversal escapes
+/// remain outside the workspace.
 fn resolves_within(resolved: &Path, workspace_root: &Path) -> bool {
-    resolved
-        .canonicalize()
-        .is_ok_and(|canonical| normalize_for_comparison(&canonical).starts_with(workspace_root))
+    if let Ok(canonical) = resolved.canonicalize() {
+        if normalize_for_comparison(&canonical).starts_with(workspace_root) {
+            return true;
+        }
+    }
+
+    // Writes can target a path whose parent directories do not exist yet, so
+    // canonicalizing the whole path may not be possible. Resolve the nearest
+    // existing ancestor (including symlinks), then check its canonical path
+    // and file identity before applying only the missing suffix.
+    let mut existing_ancestor = resolved;
+    loop {
+        match fs::symlink_metadata(existing_ancestor) {
+            Ok(_) => break,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let Some(parent) = existing_ancestor.parent() else {
+                    return false;
+                };
+                existing_ancestor = parent;
+            }
+            Err(_) => return false,
+        }
+    }
+
+    let Ok(canonical_ancestor) = existing_ancestor.canonicalize() else {
+        // In particular, do not treat a dangling symlink as a missing path.
+        return false;
+    };
+    #[cfg(windows)]
+    if has_workspace_ancestor(&canonical_ancestor, workspace_root) {
+        return resolved
+            .strip_prefix(existing_ancestor)
+            .is_ok_and(|suffix| {
+                suffix.components().all(|component| {
+                    !matches!(
+                        component,
+                        Component::ParentDir | Component::Prefix(_) | Component::RootDir
+                    )
+                })
+            });
+    }
+
+    let Ok(missing_suffix) = resolved.strip_prefix(existing_ancestor) else {
+        return false;
+    };
+    let mut canonical_path = normalize_for_comparison(&canonical_ancestor);
+    for component in missing_suffix.components() {
+        match component {
+            Component::CurDir => {}
+            // A parent component after a missing component could later
+            // traverse a symlink once the missing directory is created.
+            Component::ParentDir => return false,
+            Component::Normal(name) => canonical_path.push(name),
+            Component::Prefix(_) | Component::RootDir => return false,
+        }
+    }
+
+    canonical_path.starts_with(workspace_root)
+}
+
+/// Compare Windows directory identities when canonical paths use different
+/// long/8.3 spellings. Path strings alone cannot establish this relationship.
+#[cfg(windows)]
+fn has_workspace_ancestor(path: &Path, workspace_root: &Path) -> bool {
+    let mut ancestor = path;
+    loop {
+        if same_file::is_same_file(ancestor, workspace_root).unwrap_or(false) {
+            return true;
+        }
+        let Some(parent) = ancestor.parent() else {
+            return false;
+        };
+        if parent == ancestor {
+            return false;
+        }
+        ancestor = parent;
+    }
 }
 
 /// Text payload returned by file-reading operations.
@@ -649,6 +723,11 @@ fn glob_search_impl(
         base_dir.join(pattern).to_string_lossy().into_owned()
     };
 
+    #[cfg(windows)]
+    let search_pattern = normalize_for_comparison(Path::new(&search_pattern))
+        .to_string_lossy()
+        .replace('\\', "/");
+
     // The `glob` crate does not support brace expansion ({a,b,c}).
     // Expand braces into multiple patterns so patterns like
     // `Assets/**/*.{cs,uxml,uss}` work correctly.
@@ -1123,14 +1202,15 @@ fn expand_braces(pattern: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    #[cfg(any(unix, windows))]
+    use super::write_file_in_workspace;
     use super::{
         component_contains_glob, derive_glob_walk_root, edit_file, expand_braces, glob_search,
         grep_search, is_symlink_escape, normalize_for_comparison, read_file,
-        read_file_in_workspace, write_file, write_file_in_workspace, GrepSearchInput,
-        MAX_WRITE_SIZE,
+        read_file_in_workspace, write_file, GrepSearchInput, MAX_WRITE_SIZE,
     };
 
     fn temp_path(name: &str) -> std::path::PathBuf {
@@ -1217,9 +1297,9 @@ mod tests {
         let outside = temp_path("symlink-target.txt");
         std::fs::write(&outside, "target content").expect("target should write");
 
-        let link_path = workspace.join("escape-link.txt");
         #[cfg(unix)]
         {
+            let link_path = workspace.join("escape-link.txt");
             std::os::unix::fs::symlink(&outside, &link_path).expect("symlink should create");
             assert!(is_symlink_escape(&link_path, &workspace).expect("check should succeed"));
         }
@@ -1339,6 +1419,69 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
+    fn writes_inside_workspace_through_short_path_with_missing_nested_directories() {
+        let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") else {
+            return;
+        };
+        let long_temp = PathBuf::from(local_app_data).join("Temp");
+        let short_temp = std::env::temp_dir();
+        if !long_temp.is_dir()
+            || !short_temp.is_dir()
+            || long_temp == short_temp
+            || !same_file::is_same_file(&long_temp, &short_temp).unwrap_or(false)
+        {
+            // Some Windows hosts disable short-name generation or configure
+            // TEMP outside the user's local application data directory.
+            return;
+        }
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time should move forward")
+            .as_nanos();
+        let workspace = long_temp.join(format!("clawd-native-short-path-{unique}"));
+        std::fs::create_dir_all(&workspace).expect("workspace dir should be created");
+        let root = workspace
+            .canonicalize()
+            .expect("workspace should canonicalize");
+        let short_workspace = short_temp.join(
+            workspace
+                .file_name()
+                .expect("workspace should have a file name"),
+        );
+        let target = short_workspace.join("nested").join("demo.txt");
+
+        write_file_in_workspace(&target.to_string_lossy(), "safe content", &root)
+            .expect("an equivalent short path inside the workspace should be accepted");
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("nested/demo.txt"))
+                .expect("written file should be readable"),
+            "safe content"
+        );
+
+        let update = write_file_in_workspace(&target.to_string_lossy(), "updated content", &root)
+            .expect("an existing file through an equivalent short path should be accepted");
+        assert_eq!(update.kind, "update");
+        assert_eq!(update.original_file.as_deref(), Some("safe content"));
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("nested/demo.txt"))
+                .expect("updated file should be readable"),
+            "updated content"
+        );
+
+        let escaping_target = short_workspace
+            .join("not-created")
+            .join("..")
+            .join("..")
+            .join("escape.txt");
+        write_file_in_workspace(&escaping_target.to_string_lossy(), "must not escape", &root)
+            .expect_err("parent traversal from a missing path must stay outside the boundary");
+
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
     #[cfg(unix)]
     fn workspace_write_rejects_parent_symlink_escape_regression_3007_class() {
         let workspace = temp_path("workspace-write-symlink-escape");
@@ -1366,6 +1509,21 @@ mod tests {
         assert!(
             !outside.join("created.txt").exists(),
             "write should not create through an escaping symlink"
+        );
+
+        let escaped_nested_child = link_dir.join("not-created").join("nested.txt");
+        let result = write_file_in_workspace(
+            escaped_nested_child.to_string_lossy().as_ref(),
+            "must not escape",
+            &workspace,
+        );
+        assert!(
+            result.is_err(),
+            "a missing descendant under an escaping symlink must be rejected"
+        );
+        assert!(
+            !outside.join("not-created").exists(),
+            "write should not create missing directories through an escaping symlink"
         );
 
         let _ = std::fs::remove_dir_all(&workspace);
@@ -1476,11 +1634,11 @@ mod tests {
         assert!(result
             .filenames
             .iter()
-            .any(|path| path.ends_with("src/AGENTS.md")));
+            .any(|path| Path::new(path).ends_with("src/AGENTS.md")));
         assert!(result
             .filenames
             .iter()
-            .any(|path| path.ends_with("docs/AGENTS.md")));
+            .any(|path| Path::new(path).ends_with("docs/AGENTS.md")));
         assert!(!result
             .filenames
             .iter()

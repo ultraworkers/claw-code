@@ -1,5 +1,7 @@
 #![allow(clippy::while_let_on_iterator)]
 
+mod support;
+
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
@@ -655,12 +657,12 @@ fn run_claw(
     command
         .current_dir(cwd)
         .env_clear()
+        .envs(support::process_environment())
         .env("ANTHROPIC_API_KEY", "test-compact-key")
         .env("ANTHROPIC_BASE_URL", base_url)
         .env("CLAW_CONFIG_HOME", config_home)
         .env("HOME", home)
         .env("NO_COLOR", "1")
-        .env("PATH", "/usr/bin:/bin")
         .args(args);
     command.output().expect("claw should launch")
 }
@@ -676,12 +678,12 @@ fn run_claw_with_stdin(
     let mut child = Command::new(env!("CARGO_BIN_EXE_claw"))
         .current_dir(cwd)
         .env_clear()
+        .envs(support::process_environment())
         .env("ANTHROPIC_API_KEY", "test-compact-key")
         .env("ANTHROPIC_BASE_URL", base_url)
         .env("CLAW_CONFIG_HOME", config_home)
         .env("HOME", home)
         .env("NO_COLOR", "1")
-        .env("PATH", "/usr/bin:/bin")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -708,10 +710,10 @@ fn run_claw_closed_stdin_with_timeout(
     let mut child = Command::new(env!("CARGO_BIN_EXE_claw"))
         .current_dir(cwd)
         .env_clear()
+        .envs(support::process_environment())
         .env("CLAW_CONFIG_HOME", config_home)
         .env("HOME", home)
         .env("NO_COLOR", "1")
-        .env("PATH", "/usr/bin:/bin")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

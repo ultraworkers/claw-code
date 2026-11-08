@@ -1863,6 +1863,7 @@ mod tests {
         StreamState,
     };
     use crate::error::ApiError;
+    use crate::test_env_lock as env_lock;
     use crate::types::{
         ContentBlockDelta, ContentBlockDeltaEvent, ContentBlockStartEvent, ContentBlockStopEvent,
         InputContentBlock, InputMessage, MessageRequest, OutputContentBlock, StreamEvent,
@@ -1871,7 +1872,6 @@ mod tests {
     use serde_json::json;
     use std::borrow::Cow;
     use std::collections::BTreeMap;
-    use std::sync::{Mutex, OnceLock};
 
     #[test]
     fn request_translation_uses_openai_compatible_shape() {
@@ -2369,13 +2369,6 @@ mod tests {
             stream: false,
             ..Default::default()
         }
-    }
-
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .expect("env lock")
     }
 
     #[test]

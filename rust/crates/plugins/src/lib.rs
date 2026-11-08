@@ -2502,20 +2502,42 @@ mod tests {
 
     fn write_lifecycle_plugin(root: &Path, name: &str, version: &str) -> PathBuf {
         let log_path = root.join("lifecycle.log");
+        let extension = if cfg!(windows) { "cmd" } else { "sh" };
+        let (init_script, shutdown_script) = if cfg!(windows) {
+            (
+                "@echo off\r\necho init>>lifecycle.log\r\n",
+                "@echo off\r\necho shutdown>>lifecycle.log\r\n",
+            )
+        } else {
+            (
+                "#!/bin/sh\nprintf 'init\\n' >> lifecycle.log\n",
+                "#!/bin/sh\nprintf 'shutdown\\n' >> lifecycle.log\n",
+            )
+        };
         write_file(
-            root.join("lifecycle").join("init.sh").as_path(),
-            "#!/bin/sh\nprintf 'init\\n' >> lifecycle.log\n",
+            root.join("lifecycle")
+                .join(format!("init.{extension}"))
+                .as_path(),
+            init_script,
         );
         write_file(
-            root.join("lifecycle").join("shutdown.sh").as_path(),
-            "#!/bin/sh\nprintf 'shutdown\\n' >> lifecycle.log\n",
+            root.join("lifecycle")
+                .join(format!("shutdown.{extension}"))
+                .as_path(),
+            shutdown_script,
         );
         write_file(
             root.join(MANIFEST_RELATIVE_PATH).as_path(),
-            format!(
-                "{{\n  \"name\": \"{name}\",\n  \"version\": \"{version}\",\n  \"description\": \"lifecycle plugin\",\n  \"lifecycle\": {{\n    \"Init\": [\"./lifecycle/init.sh\"],\n    \"Shutdown\": [\"./lifecycle/shutdown.sh\"]\n  }}\n}}"
-            )
-            .as_str(),
+            &serde_json::json!({
+                "name": name,
+                "version": version,
+                "description": "lifecycle plugin",
+                "lifecycle": {
+                    "Init": [format!("./lifecycle/init.{extension}")],
+                    "Shutdown": [format!("./lifecycle/shutdown.{extension}")]
+                }
+            })
+            .to_string(),
         );
         log_path
     }
@@ -2525,25 +2547,28 @@ mod tests {
     }
 
     fn write_tool_plugin_with_name(root: &Path, name: &str, version: &str, tool_name: &str) {
-        let script_path = root.join("tools").join("echo-json.sh");
+        let script_path = root.join("tools").join("echo-json.py");
         write_file(
             &script_path,
-            "#!/bin/sh\nINPUT=$(cat)\nprintf '{\"plugin\":\"%s\",\"tool\":\"%s\",\"input\":%s}\\n' \"$CLAWD_PLUGIN_ID\" \"$CLAWD_TOOL_NAME\" \"$INPUT\"\n",
+            r#"import json, os, sys
+print(json.dumps({"plugin": os.environ["CLAWD_PLUGIN_ID"], "tool": os.environ["CLAWD_TOOL_NAME"], "input": json.load(sys.stdin)}))
+"#,
         );
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-
-            let mut permissions = fs::metadata(&script_path).expect("metadata").permissions();
-            permissions.set_mode(0o755);
-            fs::set_permissions(&script_path, permissions).expect("chmod");
-        }
         write_file(
             root.join(MANIFEST_RELATIVE_PATH).as_path(),
-            format!(
-                "{{\n  \"name\": \"{name}\",\n  \"version\": \"{version}\",\n  \"description\": \"tool plugin\",\n  \"tools\": [\n    {{\n      \"name\": \"{tool_name}\",\n      \"description\": \"Echo JSON input\",\n      \"inputSchema\": {{\"type\": \"object\", \"properties\": {{\"message\": {{\"type\": \"string\"}}}}, \"required\": [\"message\"], \"additionalProperties\": false}},\n      \"command\": \"./tools/echo-json.sh\",\n      \"requiredPermission\": \"workspace-write\"\n    }}\n  ]\n}}"
-            )
-            .as_str(),
+            &serde_json::json!({
+                "name": name,
+                "version": version,
+                "description": "tool plugin",
+                "tools": [{
+                    "name": tool_name,
+                    "description": "Echo JSON input",
+                    "inputSchema": {"type": "object", "properties": {"message": {"type": "string"}}, "required": ["message"], "additionalProperties": false},
+                    "command": if cfg!(windows) { "python" } else { "python3" },
+                    "args": ["tools/echo-json.py"],
+                    "requiredPermission": "workspace-write"
+                }]
+            }).to_string(),
         );
     }
 
@@ -3623,7 +3648,7 @@ mod tests {
         registry.shutdown().expect("shutdown should succeed");
 
         let log = fs::read_to_string(&log_path).expect("lifecycle log should exist");
-        assert_eq!(log, "init\nshutdown\n");
+        assert_eq!(log.replace("\r\n", "\n"), "init\nshutdown\n");
 
         let _ = fs::remove_dir_all(config_home);
         let _ = fs::remove_dir_all(source_root);
@@ -3820,7 +3845,7 @@ mod tests {
                                 if registry.initialize().is_ok() && registry.shutdown().is_ok() {
                                     // Verify lifecycle.log exists and has expected content
                                     if let Ok(log) = fs::read_to_string(&log_path) {
-                                        if log == "init\nshutdown\n" {
+                                        if log.replace("\r\n", "\n") == "init\nshutdown\n" {
                                             success_count.fetch_add(1, AtomicOrdering::Relaxed);
                                         }
                                     }

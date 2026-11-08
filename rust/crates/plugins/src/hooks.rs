@@ -1,5 +1,4 @@
 use std::ffi::OsStr;
-#[cfg(not(windows))]
 use std::path::Path;
 use std::process::Command;
 
@@ -282,8 +281,18 @@ fn format_hook_warning(command: &str, code: i32, stdout: Option<&str>, stderr: &
 fn shell_command(command: &str) -> CommandWithStdin {
     #[cfg(windows)]
     let command_builder = {
+        use std::os::windows::process::CommandExt;
+
+        // This is a configured shell command, not a single argv value. cmd
+        // does not understand the C-runtime backslash escaping used by arg().
+        let command = if Path::new(command).is_file() {
+            format!("\"{command}\"")
+        } else {
+            command.to_string()
+        };
         let mut command_builder = Command::new("cmd");
-        command_builder.arg("/C").arg(command);
+        command_builder.args(["/D", "/S", "/C"]);
+        command_builder.raw_arg(format!("\"{command}\""));
         CommandWithStdin::new(command_builder)
     };
 
@@ -381,6 +390,14 @@ mod tests {
         std::env::temp_dir().join(format!("plugins-hook-runner-{label}-{nanos}"))
     }
 
+    fn plugin_hook(message: &str, code: i32) -> String {
+        if cfg!(windows) {
+            format!("echo {message}& exit /b {code}")
+        } else {
+            format!("printf '%s' '{message}'; exit {code}")
+        }
+    }
+
     fn make_executable(path: &Path) {
         #[cfg(unix)]
         {
@@ -403,34 +420,34 @@ mod tests {
         fs::create_dir_all(root.join(".claude-plugin")).expect("manifest dir");
         fs::create_dir_all(root.join("hooks")).expect("hooks dir");
 
-        let pre_path = root.join("hooks").join("pre.sh");
-        fs::write(
-            &pre_path,
-            format!("#!/bin/sh\nprintf '%s\\n' '{pre_message}'\n"),
-        )
-        .expect("write pre hook");
-        make_executable(&pre_path);
-
-        let post_path = root.join("hooks").join("post.sh");
-        fs::write(
-            &post_path,
-            format!("#!/bin/sh\nprintf '%s\\n' '{post_message}'\n"),
-        )
-        .expect("write post hook");
-        make_executable(&post_path);
-
-        let failure_path = root.join("hooks").join("failure.sh");
-        fs::write(
-            &failure_path,
-            format!("#!/bin/sh\nprintf '%s\\n' '{failure_message}'\n"),
-        )
-        .expect("write failure hook");
-        make_executable(&failure_path);
+        let extension = if cfg!(windows) { "cmd" } else { "sh" };
+        for (phase, message) in [
+            ("pre", pre_message),
+            ("post", post_message),
+            ("failure", failure_message),
+        ] {
+            let path = root.join("hooks").join(format!("{phase}.{extension}"));
+            let script = if cfg!(windows) {
+                format!("@echo off\r\necho {message}\r\n")
+            } else {
+                format!("#!/bin/sh\nprintf '%s\\n' '{message}'\n")
+            };
+            fs::write(&path, script).expect("write hook");
+            make_executable(&path);
+        }
         fs::write(
             root.join(".claude-plugin").join("plugin.json"),
-            format!(
-                "{{\n  \"name\": \"{name}\",\n  \"version\": \"1.0.0\",\n  \"description\": \"hook plugin\",\n  \"hooks\": {{\n    \"PreToolUse\": [\"./hooks/pre.sh\"],\n    \"PostToolUse\": [\"./hooks/post.sh\"],\n    \"PostToolUseFailure\": [\"./hooks/failure.sh\"]\n  }}\n}}"
-            ),
+            serde_json::json!({
+                "name": name,
+                "version": "1.0.0",
+                "description": "hook plugin",
+                "hooks": {
+                    "PreToolUse": [format!("./hooks/pre.{extension}")],
+                    "PostToolUse": [format!("./hooks/post.{extension}")],
+                    "PostToolUseFailure": [format!("./hooks/failure.{extension}")]
+                }
+            })
+            .to_string(),
         )
         .expect("write plugin manifest");
     }
@@ -439,7 +456,7 @@ mod tests {
     fn collects_and_runs_hooks_from_enabled_plugins() {
         // given
         let config_home = temp_dir("config");
-        let first_source_root = temp_dir("source-a");
+        let first_source_root = temp_dir("source a");
         let second_source_root = temp_dir("source-b");
         write_hook_plugin(
             &first_source_root,
@@ -500,7 +517,7 @@ mod tests {
     fn pre_tool_use_denies_when_plugin_hook_exits_two() {
         // given
         let runner = HookRunner::new(crate::PluginHooks {
-            pre_tool_use: vec!["printf 'blocked by plugin'; exit 2".to_string()],
+            pre_tool_use: vec![plugin_hook("blocked by plugin", 2)],
             post_tool_use: Vec::new(),
             post_tool_use_failure: Vec::new(),
         });
@@ -514,12 +531,27 @@ mod tests {
     }
 
     #[test]
+    fn preserves_quoted_arguments_in_plugin_hooks() {
+        let python = if cfg!(windows) { "python" } else { "python3" };
+        let runner = HookRunner::new(crate::PluginHooks {
+            pre_tool_use: vec![format!(
+                "{python} -c \"import sys; sys.stdout.write('quoted plugin hook'); sys.exit(2)\""
+            )],
+            post_tool_use: Vec::new(),
+            post_tool_use_failure: Vec::new(),
+        });
+        let result = runner.run_pre_tool_use("Read", r#"{"path":"README.md"}"#);
+        assert!(result.is_denied(), "{result:?}");
+        assert_eq!(result.messages(), &["quoted plugin hook".to_string()]);
+    }
+
+    #[test]
     fn propagates_plugin_hook_failures() {
         // given
         let runner = HookRunner::new(crate::PluginHooks {
             pre_tool_use: vec![
-                "printf 'broken plugin hook'; exit 1".to_string(),
-                "printf 'later plugin hook'".to_string(),
+                plugin_hook("broken plugin hook", 1),
+                plugin_hook("later plugin hook", 0),
             ],
             post_tool_use: Vec::new(),
             post_tool_use_failure: Vec::new(),

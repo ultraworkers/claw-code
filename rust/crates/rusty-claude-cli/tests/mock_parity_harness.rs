@@ -1,3 +1,5 @@
+mod support;
+
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
@@ -312,12 +314,12 @@ fn run_case(case: ScenarioCase, workspace: &HarnessWorkspace, base_url: &str) ->
     command
         .current_dir(&workspace.root)
         .env_clear()
+        .envs(support::process_environment())
         .env("ANTHROPIC_API_KEY", "test-parity-key")
         .env("ANTHROPIC_BASE_URL", base_url)
         .env("CLAW_CONFIG_HOME", &workspace.config_home)
         .env("HOME", &workspace.home)
         .env("NO_COLOR", "1")
-        .env("PATH", "/usr/bin:/bin")
         .args([
             "--model",
             "sonnet",
@@ -411,6 +413,33 @@ fn prepare_multi_tool_fixture(workspace: &HarnessWorkspace) {
 }
 
 fn prepare_plugin_fixture(workspace: &HarnessWorkspace) {
+    // A Windows `python` command can be an install-manager launcher whose
+    // bootstrap messages go to stdout. Resolve it before entering the isolated
+    // CLI environment, then execute the interpreter itself for the JSON tool.
+    let python = Command::new(if cfg!(windows) { "python" } else { "python3" })
+        .args([
+            "-I",
+            "-c",
+            "import json, sys; print(json.dumps(sys.executable))",
+        ])
+        .output()
+        .expect("Python interpreter discovery should launch");
+    assert!(
+        python.status.success(),
+        "Python interpreter discovery failed: {}",
+        String::from_utf8_lossy(&python.stderr)
+    );
+    let discovery_stdout = String::from_utf8(python.stdout).expect("Python discovery UTF-8");
+    let interpreter: String = serde_json::from_str(
+        discovery_stdout
+            .lines()
+            .last()
+            .expect("Python interpreter path"),
+    )
+    .expect("Python discovery must end with its JSON-encoded executable path");
+    assert!(Path::new(&interpreter).is_absolute());
+    assert!(Path::new(&interpreter).is_file());
+
     let plugin_root = workspace
         .root
         .join("external-plugins")
@@ -420,45 +449,36 @@ fn prepare_plugin_fixture(workspace: &HarnessWorkspace) {
     fs::create_dir_all(&tool_dir).expect("plugin tools dir");
     fs::create_dir_all(&manifest_dir).expect("plugin manifest dir");
 
-    let script_path = tool_dir.join("echo-json.sh");
+    let script_path = tool_dir.join("echo-json.py");
     fs::write(
         &script_path,
-        "#!/bin/sh\nINPUT=$(cat)\nprintf '{\"plugin\":\"%s\",\"tool\":\"%s\",\"input\":%s}\\n' \"$CLAWD_PLUGIN_ID\" \"$CLAWD_TOOL_NAME\" \"$INPUT\"\n",
+        r#"import json, os, sys
+print(json.dumps({"plugin": os.environ["CLAWD_PLUGIN_ID"], "tool": os.environ["CLAWD_TOOL_NAME"], "input": json.load(sys.stdin)}))
+"#,
     )
     .expect("plugin script should write");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut permissions = fs::metadata(&script_path)
-            .expect("plugin script metadata")
-            .permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&script_path, permissions).expect("plugin script should be executable");
-    }
 
     fs::write(
         manifest_dir.join("plugin.json"),
-        r#"{
-  "name": "parity-plugin",
-  "version": "1.0.0",
-  "description": "mock parity plugin",
-  "tools": [
-    {
-      "name": "plugin_echo",
-      "description": "Echo JSON input",
-      "inputSchema": {
-        "type": "object",
-        "properties": {
-          "message": { "type": "string" }
-        },
-        "required": ["message"],
-        "additionalProperties": false
-      },
-      "command": "./tools/echo-json.sh",
-      "requiredPermission": "workspace-write"
-    }
-  ]
-}"#,
+        json!({
+            "name": "parity-plugin",
+            "version": "1.0.0",
+            "description": "mock parity plugin",
+            "tools": [{
+                "name": "plugin_echo",
+                "description": "Echo JSON input",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {"message": {"type": "string"}},
+                    "required": ["message"],
+                    "additionalProperties": false
+                },
+                "command": interpreter,
+                "args": ["-I", "tools/echo-json.py"],
+                "requiredPermission": "workspace-write"
+            }]
+        })
+        .to_string(),
     )
     .expect("plugin manifest should write");
 
@@ -504,8 +524,16 @@ fn assert_read_file_roundtrip(workspace: &HarnessWorkspace, run: &ScenarioRun) {
     let output = run.response["tool_results"][0]["output"]
         .as_str()
         .expect("tool output");
-    assert!(output.contains(&workspace.root.join("fixture.txt").display().to_string()));
-    assert!(output.contains("alpha parity line"));
+    let payload: Value = serde_json::from_str(output).expect("read_file output JSON");
+    let actual_path = payload["file"]["filePath"].as_str().expect("filePath");
+    assert_eq!(
+        fs::canonicalize(actual_path).expect("canonical reported file"),
+        fs::canonicalize(workspace.root.join("fixture.txt")).expect("canonical fixture file")
+    );
+    assert!(payload["file"]["content"]
+        .as_str()
+        .expect("file content")
+        .contains("alpha parity line"));
 }
 
 fn assert_grep_chunk_assembly(_: &HarnessWorkspace, run: &ScenarioRun) {
@@ -536,10 +564,11 @@ fn assert_write_file_allowed(workspace: &HarnessWorkspace, run: &ScenarioRun) {
         run.response["tool_uses"][0]["name"],
         Value::String("write_file".to_string())
     );
-    assert!(run.response["message"]
-        .as_str()
-        .expect("message text")
-        .contains("generated/output.txt"));
+    let message = run.response["message"].as_str().expect("message text");
+    assert!(
+        message.contains("write_file succeeded"),
+        "expected successful write confirmation in assistant message: {message:?}"
+    );
     let generated = workspace.root.join("generated").join("output.txt");
     let contents = fs::read_to_string(&generated).expect("generated file should exist");
     assert_eq!(contents, "created by mock service\n");
@@ -676,7 +705,13 @@ fn assert_plugin_tool_roundtrip(_: &HarnessWorkspace, run: &ScenarioRun) {
     let tool_output = run.response["tool_results"][0]["output"]
         .as_str()
         .expect("tool output");
-    let parsed: Value = serde_json::from_str(tool_output).expect("plugin output json");
+    assert_eq!(
+        run.response["tool_results"][0]["is_error"],
+        Value::Bool(false),
+        "plugin tool failed: {tool_output}"
+    );
+    let parsed: Value = serde_json::from_str(tool_output)
+        .unwrap_or_else(|err| panic!("plugin output is not JSON: {err}; output: {tool_output:?}"));
     assert_eq!(
         parsed["plugin"],
         Value::String("parity-plugin@external".to_string())

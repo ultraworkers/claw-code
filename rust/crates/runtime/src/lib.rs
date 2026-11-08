@@ -214,3 +214,17 @@ pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
+
+#[cfg(test)]
+pub(crate) fn test_hook(stdout: &str, stderr: &str, exit_code: i32, delay: u32) -> String {
+    let python = if cfg!(windows) { "python" } else { "python3" };
+    let encode = |text: &str| {
+        text.bytes()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    };
+    format!(
+        "{python} -c \"import sys,time; time.sleep({delay}); sys.stdout.write(bytes.fromhex('{}').decode()); sys.stderr.write(bytes.fromhex('{}').decode()); sys.exit({exit_code})\"",
+        encode(stdout), encode(stderr)
+    )
+}
