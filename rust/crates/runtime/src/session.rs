@@ -262,6 +262,12 @@ impl Session {
 
     pub fn load_from_path(path: impl AsRef<Path>) -> Result<Self, SessionError> {
         let path = path.as_ref();
+        if fs::metadata(path)?.is_dir() {
+            return Err(SessionError::Io(std::io::Error::new(
+                std::io::ErrorKind::IsADirectory,
+                format!("session_path_is_directory: {}", path.display()),
+            )));
+        }
         let contents = fs::read_to_string(path)?;
         let session = match JsonValue::parse(&contents) {
             Ok(value)

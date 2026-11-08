@@ -891,8 +891,8 @@ pub(crate) fn dotenv_value(key: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use crate::test_env_lock as env_lock;
     use std::ffi::OsString;
-    use std::sync::{Mutex, OnceLock};
 
     use serde_json::json;
 
@@ -909,17 +909,6 @@ mod tests {
         provider_diagnostics_for_request, resolve_model_alias, ProviderFeatureSupport,
         ProviderKind, ProviderWireProtocol,
     };
-
-    /// Serializes every test in this module that mutates process-wide
-    /// environment variables so concurrent test threads cannot observe
-    /// each other's partially-applied state while probing the foreign
-    /// provider credential sniffer.
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
 
     /// Snapshot-restore guard for a single environment variable. Captures
     /// the original value on construction, applies the requested override

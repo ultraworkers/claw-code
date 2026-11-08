@@ -1083,9 +1083,9 @@ struct AnthropicErrorBody {
 #[cfg(test)]
 mod tests {
     use super::{ALT_REQUEST_ID_HEADER, REQUEST_ID_HEADER};
+    use crate::test_env_lock as env_lock;
     use std::io::{Read, Write};
     use std::net::TcpListener;
-    use std::sync::{Mutex, OnceLock};
     use std::thread;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -1096,13 +1096,6 @@ mod tests {
         resolve_startup_auth_source, AnthropicClient, AuthSource, OAuthTokenSet,
     };
     use crate::types::{ContentBlockDelta, MessageRequest};
-
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
 
     fn temp_config_home() -> std::path::PathBuf {
         std::env::temp_dir().join(format!(

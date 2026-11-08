@@ -7,6 +7,7 @@ publish.workspace = true
 
 [dependencies]
 sha2 = "0.10"
+getrandom = "0.2"
 glob = "0.3"
 plugins = { path = "../plugins" }
 regex = "1"

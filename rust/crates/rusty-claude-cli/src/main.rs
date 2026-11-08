@@ -460,7 +460,10 @@ fn classify_error_kind(message: &str) -> &'static str {
         // error message is "failed to restore session: legacy session is missing workspace
         // binding: ...", so the specific arm must be checked first.
         "legacy_session_no_workspace_binding"
-    } else if message.contains("Is a directory") || message.contains("os error 21") {
+    } else if message.contains("session_path_is_directory:")
+        || message.contains("Is a directory")
+        || message.contains("os error 21")
+    {
         // #787: --resume given a directory path instead of a .jsonl file
         "session_path_is_directory"
     } else if message.contains("failed to restore session") {
@@ -517,7 +520,10 @@ fn classify_error_kind(message: &str) -> &'static str {
         "api_http_error"
     } else if message.contains("mcpServers") {
         "malformed_mcp_config"
-    } else if message.contains(".claw/settings.json") || message.contains(".claw.json") {
+    } else if message.contains(".claw/settings.json")
+        || message.contains(r".claw\settings.json")
+        || message.contains(".claw.json")
+    {
         // #763: config file JSON parse / validation errors (e.g. unterminated string, type mismatch)
         "config_parse_error"
     } else if message.starts_with("empty prompt") {
@@ -16697,7 +16703,10 @@ mod tests {
 
         // Phase 1 contract: workspace/git/sandbox fields are still populated
         // (independent of config parse). Sandbox falls back to defaults.
-        assert_eq!(context.cwd, cwd.canonicalize().unwrap_or(cwd.clone()));
+        assert_eq!(
+            context.cwd.canonicalize().expect("canonical cwd"),
+            cwd.canonicalize().expect("canonical workspace")
+        );
         assert_eq!(
             context.loaded_config_files, 0,
             "loaded_config_files should be 0 when config parse fails"
@@ -17037,6 +17046,16 @@ mod tests {
         assert_eq!(
             classify_error_kind("failed to restore session: Is a directory (os error 21)"),
             "session_path_is_directory"
+        );
+        assert_eq!(
+            classify_error_kind(
+                r"failed to restore session: session_path_is_directory: C:\sessions"
+            ),
+            "session_path_is_directory"
+        );
+        assert_eq!(
+            classify_error_kind(r"C:\workspace\.claw\settings.json: model must be a string"),
+            "config_parse_error"
         );
         assert_eq!(
             classify_error_kind("unrecognized argument `--foo` for subcommand `doctor`"),
@@ -20315,21 +20334,19 @@ UU conflicted.rs",
         write_mcp_server_fixture(&script_path);
         fs::write(
             config_home.join("settings.json"),
-            format!(
-                r#"{{
-                  "mcpServers": {{
-                    "alpha": {{
-                      "command": "python3",
-                      "args": ["{}"]
-                    }},
-                    "broken": {{
-                      "command": "python3",
-                      "args": ["-c", "import sys; sys.exit(0)"]
-                    }}
-                  }}
-                }}"#,
-                script_path.to_string_lossy()
-            ),
+            serde_json::json!({
+                "mcpServers": {
+                    "alpha": {
+                        "command": if cfg!(windows) { "python" } else { "python3" },
+                        "args": [script_path]
+                    },
+                    "broken": {
+                        "command": if cfg!(windows) { "python" } else { "python3" },
+                        "args": ["-c", "import sys; sys.exit(0)"]
+                    }
+                }
+            })
+            .to_string(),
         )
         .expect("write mcp settings");
 

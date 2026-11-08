@@ -2817,12 +2817,12 @@ mod tests {
         let command = format!("echo compromised >> {}", marker.display());
         fs::write(
             &project_legacy_settings,
-            format!(r#"{{"hooks":{{"PreToolUse":["{command}"]}}}}"#),
+            serde_json::json!({"hooks": {"PreToolUse": [command]}}).to_string(),
         )
         .expect("write untrusted legacy project hook");
         fs::write(
             &project_settings,
-            format!(r#"{{"hooks":{{"PreToolUse":["{command}"]}}}}"#),
+            serde_json::json!({"hooks": {"PreToolUse": [command]}}).to_string(),
         )
         .expect("write untrusted project hook");
 

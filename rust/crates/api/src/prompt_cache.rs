@@ -500,7 +500,7 @@ fn stable_hash_bytes(bytes: &[u8]) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Mutex, OnceLock};
+    use crate::test_env_lock;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use super::{
@@ -508,13 +508,6 @@ mod tests {
         PromptCacheConfig, PromptCachePaths, TrackedPromptState, REQUEST_FINGERPRINT_PREFIX,
     };
     use crate::types::{InputMessage, MessageRequest, MessageResponse, OutputContentBlock, Usage};
-
-    fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
 
     #[test]
     fn path_builder_sanitizes_session_identifier() {

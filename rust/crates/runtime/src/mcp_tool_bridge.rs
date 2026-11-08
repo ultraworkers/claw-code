@@ -314,7 +314,6 @@ impl McpToolRegistry {
 mod tests {
     use std::collections::BTreeMap;
     use std::fs;
-    use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -323,6 +322,9 @@ mod tests {
     use crate::config::{
         ConfigSource, McpServerConfig, McpStdioServerConfig, ScopedMcpServerConfig,
     };
+
+    // Fixtures are interpreter inputs, not directly executable Unix scripts.
+    const TEST_PYTHON: &str = if cfg!(windows) { "python" } else { "python3" };
 
     fn temp_dir() -> PathBuf {
         static NEXT_TEMP_DIR_ID: AtomicU64 = AtomicU64::new(0);
@@ -430,9 +432,6 @@ mod tests {
         ]
         .join("\n");
         fs::write(&script_path, script).expect("write script");
-        let mut permissions = fs::metadata(&script_path).expect("metadata").permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&script_path, permissions).expect("chmod");
         script_path
     }
 
@@ -445,7 +444,7 @@ mod tests {
             required: false,
             scope: ConfigSource::Local,
             config: McpServerConfig::Stdio(McpStdioServerConfig {
-                command: "python3".to_string(),
+                command: TEST_PYTHON.to_string(),
                 args: vec![script_path.to_string_lossy().into_owned()],
                 env: BTreeMap::from([
                     ("MCP_SERVER_LABEL".to_string(), server_name.to_string()),

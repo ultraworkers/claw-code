@@ -2728,7 +2728,7 @@ fn path_within_current_workspace(path: &str, allow_missing: bool) -> bool {
             '"' | '\'' | '`' | ',' | ';' | ')' | '(' | '[' | ']' | '{' | '}'
         )
     });
-    if looks_like_windows_absolute_path(trimmed) {
+    if !cfg!(windows) && looks_like_windows_absolute_path(trimmed) {
         return false;
     }
 
@@ -6433,15 +6433,19 @@ fn execute_repl(input: ReplInput) -> Result<ReplOutput, String> {
 }
 
 struct ReplRuntime {
-    program: &'static str,
+    program: PathBuf,
     args: &'static [&'static str],
 }
 
 fn resolve_repl_runtime(language: &str) -> Result<ReplRuntime, String> {
     match language.trim().to_ascii_lowercase().as_str() {
         "python" | "py" => Ok(ReplRuntime {
-            program: detect_first_command(&["python3", "python"])
-                .ok_or_else(|| String::from("python runtime not found"))?,
+            program: detect_first_command(if cfg!(windows) {
+                &["python", "python3"]
+            } else {
+                &["python3", "python"]
+            })
+            .ok_or_else(|| String::from("python runtime not found"))?,
             args: &["-c"],
         }),
         "javascript" | "js" | "node" => Ok(ReplRuntime {
@@ -6458,11 +6462,8 @@ fn resolve_repl_runtime(language: &str) -> Result<ReplRuntime, String> {
     }
 }
 
-fn detect_first_command(commands: &[&'static str]) -> Option<&'static str> {
-    commands
-        .iter()
-        .copied()
-        .find(|command| command_exists(command))
+fn detect_first_command(commands: &[&str]) -> Option<PathBuf> {
+    commands.iter().find_map(|command| resolve_command(command))
 }
 
 #[derive(Clone, Copy)]
@@ -6786,37 +6787,62 @@ fn execute_powershell(input: PowerShellInput) -> std::io::Result<runtime::BashCo
     }
     let shell = detect_powershell_shell()?;
     execute_shell_command(
-        shell,
+        &shell,
         &input.command,
         input.timeout,
         input.run_in_background,
     )
 }
 
-fn detect_powershell_shell() -> std::io::Result<&'static str> {
-    if command_exists("pwsh") {
-        Ok("pwsh")
-    } else if command_exists("powershell") {
-        Ok("powershell")
-    } else {
-        Err(std::io::Error::new(
+fn detect_powershell_shell() -> std::io::Result<PathBuf> {
+    detect_first_command(&["pwsh", "powershell"]).ok_or_else(|| {
+        std::io::Error::new(
             std::io::ErrorKind::NotFound,
             "PowerShell executable not found (expected `pwsh` or `powershell` in PATH)",
-        ))
-    }
+        )
+    })
 }
 
-fn command_exists(command: &str) -> bool {
-    std::process::Command::new("sh")
-        .arg("-lc")
-        .arg(format!("command -v {command} >/dev/null 2>&1"))
-        .status()
-        .is_ok_and(|status| status.success())
+// Resolve the same executable that we will launch, without invoking a login
+// shell (which can replace PATH). Windows also needs the selected extension:
+// Command does not apply PATHEXT when given a bare program name.
+fn resolve_command(command: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    #[cfg(windows)]
+    let extensions = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
+    for directory in std::env::split_paths(&path) {
+        let candidate = directory.join(command);
+        #[cfg(windows)]
+        {
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+            for extension in extensions
+                .split(';')
+                .filter(|extension| !extension.is_empty())
+            {
+                let candidate = directory.join(format!("{command}{extension}"));
+                if candidate.is_file() {
+                    return Some(candidate);
+                }
+            }
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if std::fs::metadata(&candidate).is_ok_and(|metadata| {
+                metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+            }) {
+                return Some(candidate);
+            }
+        }
+    }
+    None
 }
 
 #[allow(clippy::too_many_lines)]
 fn execute_shell_command(
-    shell: &str,
+    shell: &Path,
     command: &str,
     timeout: Option<u64>,
     run_in_background: Option<bool>,
@@ -7352,7 +7378,7 @@ mod tests {
         fs::create_dir_all(&claw_dir).expect("create .claw dir");
         // Use the actual OS temp dir so the worktree path matches the allowlist
         let tmp_root = std::env::temp_dir().to_str().expect("utf-8").to_string();
-        let settings = format!("{{\"trustedRoots\": [\"{tmp_root}\"]}}");
+        let settings = json!({"trustedRoots": [tmp_root]}).to_string();
         fs::write(claw_dir.join("settings.json"), settings).expect("write settings");
 
         // WorkerCreate with no per-call trusted_roots — config should supply them
@@ -8603,6 +8629,7 @@ mod tests {
         assert!(output["path"]
             .as_str()
             .expect("path")
+            .replace('\\', "/")
             .ends_with("/help/SKILL.md"));
         assert!(output["prompt"]
             .as_str()
@@ -8622,6 +8649,7 @@ mod tests {
         assert!(dollar_output["path"]
             .as_str()
             .expect("path")
+            .replace('\\', "/")
             .ends_with("/help/SKILL.md"));
 
         if let Some(home) = original_home {
@@ -8661,6 +8689,7 @@ mod tests {
         assert!(skill_output["path"]
             .as_str()
             .expect("path")
+            .replace('\\', "/")
             .ends_with(".claw/skills/plan/SKILL.md"));
 
         let command_result = execute_tool("Skill", &json!({ "skill": "/handoff" }))
@@ -8670,6 +8699,7 @@ mod tests {
         assert!(command_output["path"]
             .as_str()
             .expect("path")
+            .replace('\\', "/")
             .ends_with(".claw/commands/handoff.md"));
 
         std::env::set_current_dir(&original_dir).expect("restore cwd");
@@ -8708,6 +8738,7 @@ mod tests {
         assert!(output["path"]
             .as_str()
             .expect("path")
+            .replace('\\', "/")
             .ends_with(".claude/skills/trace/SKILL.md"));
         assert_eq!(output["description"], "Project-local trace helper");
 
@@ -8770,11 +8801,13 @@ mod tests {
         assert!(omc_output["path"]
             .as_str()
             .expect("path")
+            .replace('\\', "/")
             .ends_with(".omc/skills/hud/SKILL.md"));
         assert_eq!(omc_output["description"], "Project-local OMC HUD helper");
         assert!(agents_output["path"]
             .as_str()
             .expect("path")
+            .replace('\\', "/")
             .ends_with(".agents/skills/trace/SKILL.md"));
         assert_eq!(
             agents_output["description"],
@@ -8830,6 +8863,7 @@ mod tests {
         assert!(output["path"]
             .as_str()
             .expect("path")
+            .replace('\\', "/")
             .ends_with("skills/omc-learned/learned/SKILL.md"));
         assert_eq!(output["description"], "Learned OMC skill");
 
@@ -8889,6 +8923,7 @@ mod tests {
         assert!(direct_skill_output["path"]
             .as_str()
             .expect("path")
+            .replace('\\', "/")
             .ends_with("skills/statusline/SKILL.md"));
         assert_eq!(direct_skill_output["description"], "Claude config skill");
 
@@ -8899,6 +8934,7 @@ mod tests {
         assert!(legacy_command_output["path"]
             .as_str()
             .expect("path")
+            .replace('\\', "/")
             .ends_with("commands/doctor-check.md"));
         assert_eq!(
             legacy_command_output["description"],
@@ -8956,6 +8992,7 @@ mod tests {
         assert!(output["path"]
             .as_str()
             .expect("path")
+            .replace('\\', "/")
             .ends_with(".claude/commands/team.md"));
         assert_eq!(output["description"], "Legacy team workflow");
 
@@ -10301,6 +10338,7 @@ mod tests {
         assert!(globbed_output["filenames"][0]
             .as_str()
             .expect("filename")
+            .replace('\\', "/")
             .ends_with("nested/lib.rs"));
 
         let glob_error = execute_tool("glob_search", &json!({ "pattern": "[" }))
@@ -10753,7 +10791,14 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&dir).expect("create dir");
-        let script = dir.join("pwsh");
+        let script = dir.join(if cfg!(windows) { "pwsh.cmd" } else { "pwsh" });
+        #[cfg(windows)]
+        std::fs::write(
+            &script,
+            "@echo off\r\n<nul set /p \"=pwsh:%~4\"\r\nexit /b 0\r\n",
+        )
+        .expect("write Windows shell stub");
+        #[cfg(unix)]
         std::fs::write(
             &script,
             r#"#!/bin/sh
@@ -10763,13 +10808,15 @@ printf 'pwsh:%s' "$1"
 "#,
         )
         .expect("write script");
-        std::process::Command::new("/bin/chmod")
-            .arg("+x")
-            .arg(&script)
-            .status()
-            .expect("chmod");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+                .expect("make shell stub executable");
+        }
         let original_path = std::env::var("PATH").unwrap_or_default();
-        std::env::set_var("PATH", format!("{}:{}", dir.display(), original_path));
+        let paths = std::iter::once(dir.clone()).chain(std::env::split_paths(&original_path));
+        std::env::set_var("PATH", std::env::join_paths(paths).expect("fixture PATH"));
 
         let result = execute_tool(
             "PowerShell",
