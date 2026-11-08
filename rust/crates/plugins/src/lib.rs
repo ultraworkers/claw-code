@@ -2502,20 +2502,42 @@ mod tests {
 
     fn write_lifecycle_plugin(root: &Path, name: &str, version: &str) -> PathBuf {
         let log_path = root.join("lifecycle.log");
+        let extension = if cfg!(windows) { "cmd" } else { "sh" };
+        let (init_script, shutdown_script) = if cfg!(windows) {
+            (
+                "@echo off\r\necho init>>lifecycle.log\r\n",
+                "@echo off\r\necho shutdown>>lifecycle.log\r\n",
+            )
+        } else {
+            (
+                "#!/bin/sh\nprintf 'init\\n' >> lifecycle.log\n",
+                "#!/bin/sh\nprintf 'shutdown\\n' >> lifecycle.log\n",
+            )
+        };
         write_file(
-            root.join("lifecycle").join("init.sh").as_path(),
-            "#!/bin/sh\nprintf 'init\\n' >> lifecycle.log\n",
+            root.join("lifecycle")
+                .join(format!("init.{extension}"))
+                .as_path(),
+            init_script,
         );
         write_file(
-            root.join("lifecycle").join("shutdown.sh").as_path(),
-            "#!/bin/sh\nprintf 'shutdown\\n' >> lifecycle.log\n",
+            root.join("lifecycle")
+                .join(format!("shutdown.{extension}"))
+                .as_path(),
+            shutdown_script,
         );
         write_file(
             root.join(MANIFEST_RELATIVE_PATH).as_path(),
-            format!(
-                "{{\n  \"name\": \"{name}\",\n  \"version\": \"{version}\",\n  \"description\": \"lifecycle plugin\",\n  \"lifecycle\": {{\n    \"Init\": [\"./lifecycle/init.sh\"],\n    \"Shutdown\": [\"./lifecycle/shutdown.sh\"]\n  }}\n}}"
-            )
-            .as_str(),
+            &serde_json::json!({
+                "name": name,
+                "version": version,
+                "description": "lifecycle plugin",
+                "lifecycle": {
+                    "Init": [format!("./lifecycle/init.{extension}")],
+                    "Shutdown": [format!("./lifecycle/shutdown.{extension}")]
+                }
+            })
+            .to_string(),
         );
         log_path
     }
@@ -3626,7 +3648,7 @@ print(json.dumps({"plugin": os.environ["CLAWD_PLUGIN_ID"], "tool": os.environ["C
         registry.shutdown().expect("shutdown should succeed");
 
         let log = fs::read_to_string(&log_path).expect("lifecycle log should exist");
-        assert_eq!(log, "init\nshutdown\n");
+        assert_eq!(log.replace("\r\n", "\n"), "init\nshutdown\n");
 
         let _ = fs::remove_dir_all(config_home);
         let _ = fs::remove_dir_all(source_root);
@@ -3823,7 +3845,7 @@ print(json.dumps({"plugin": os.environ["CLAWD_PLUGIN_ID"], "tool": os.environ["C
                                 if registry.initialize().is_ok() && registry.shutdown().is_ok() {
                                     // Verify lifecycle.log exists and has expected content
                                     if let Ok(log) = fs::read_to_string(&log_path) {
-                                        if log == "init\nshutdown\n" {
+                                        if log.replace("\r\n", "\n") == "init\nshutdown\n" {
                                             success_count.fetch_add(1, AtomicOrdering::Relaxed);
                                         }
                                     }
