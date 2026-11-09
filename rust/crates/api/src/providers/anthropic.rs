@@ -889,7 +889,7 @@ async fn expect_success(response: reqwest::Response) -> Result<reqwest::Response
     let request_id = request_id_from_headers(&headers).map(String::into_boxed_str);
     let body = response.text().await.unwrap_or_else(|_| String::new());
     let parsed_error = serde_json::from_str::<AnthropicErrorEnvelope>(&body).ok();
-    let retryable = is_retryable_status(status);
+    let retryable = is_retryable_status(status) || is_retryable_400(status, &body);
     let retry_after = parse_retry_after(&headers, status).map(Box::new);
 
     Err(ApiError::Api {
@@ -923,7 +923,10 @@ fn parse_retry_after(
 }
 
 const fn is_retryable_status(status: reqwest::StatusCode) -> bool {
-    matches!(status.as_u16(), 408 | 409 | 429 | 500 | 502 | 503 | 504)
+    matches!(
+        status.as_u16(),
+        408 | 409 | 429 | 500 | 502 | 503 | 504 | 529
+    )
 }
 
 /// Some providers return HTTP 400 with an unparseable body when a gateway
@@ -1146,6 +1149,56 @@ mod tests {
         format!("http://{address}/oauth/token")
     }
 
+    fn spawn_status_server(status: u16, body: &'static str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let address = listener.local_addr().expect("local addr");
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept connection");
+            let mut buffer = [0_u8; 4096];
+            let _ = stream.read(&mut buffer).expect("read request");
+            let response = format!(
+                "HTTP/1.1 {status} STATUS\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write response");
+        });
+        format!("http://{address}/v1/messages")
+    }
+
+    #[tokio::test]
+    async fn expect_success_marks_529_overloaded_retryable() {
+        let url = spawn_status_server(
+            529,
+            r#"{"error":{"type":"overloaded_error","message":"Overloaded"}}"#,
+        );
+        let response = reqwest::get(&url).await.expect("response");
+        let error = super::expect_success(response)
+            .await
+            .expect_err("529 should error");
+        assert!(error.is_retryable(), "529 overloaded must be retryable");
+    }
+
+    #[tokio::test]
+    async fn expect_success_marks_gateway_flake_400_retryable() {
+        let url = spawn_status_server(400, "HTTP 400 from backend (no parseable body)");
+        let response = reqwest::get(&url).await.expect("response");
+        let error = super::expect_success(response)
+            .await
+            .expect_err("400 should error");
+        assert!(
+            error.is_retryable(),
+            "gateway-flake 400 body must be retryable"
+        );
+        let url = spawn_status_server(400, "invalid request: max_tokens must be positive");
+        let response = reqwest::get(&url).await.expect("response");
+        let error = super::expect_success(response)
+            .await
+            .expect_err("400 should error");
+        assert!(!error.is_retryable(), "a real 400 must not be retried");
+    }
     #[test]
     fn read_api_key_requires_presence() {
         let _guard = env_lock();
@@ -1444,6 +1497,40 @@ mod tests {
         ));
         assert!(!super::is_retryable_status(
             reqwest::StatusCode::UNAUTHORIZED
+        ));
+        // Anthropic returns the non-standard 529 when the API is overloaded;
+        // it is transient and must be retried like a 503.
+        assert!(super::is_retryable_status(
+            reqwest::StatusCode::from_u16(529).expect("529 is a valid status")
+        ));
+        assert!(!super::is_retryable_status(
+            reqwest::StatusCode::BAD_REQUEST
+        ));
+    }
+
+    #[test]
+    fn gateway_flake_400_bodies_are_retryable() {
+        // Gateways and proxies surface transient network failures as HTTP 400
+        // with an unparseable body; is_retryable_400 detects them so
+        // expect_success marks the resulting error retryable.
+        for body in [
+            "HTTP 400 from backend (no parseable body)",
+            "upstream connection reset by peer",
+            "Broken pipe while reading response",
+            "Empty reply from server",
+        ] {
+            assert!(
+                super::is_retryable_400(reqwest::StatusCode::BAD_REQUEST, body),
+                "body should be retryable: {body}"
+            );
+        }
+        assert!(!super::is_retryable_400(
+            reqwest::StatusCode::BAD_REQUEST,
+            "invalid request: max_tokens must be positive"
+        ));
+        assert!(!super::is_retryable_400(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            "connection reset"
         ));
     }
 
