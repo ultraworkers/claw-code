@@ -191,6 +191,29 @@ curl -sS "https://api.uberllm.dev/v1/models" \
   | jq -r '.data[] | "\(.id)\t\(.max_output_tokens)"'
 ```
 
+## Standard Compute
+
+[Standard Compute](https://standardcompute.com) is an OpenAI-compatible gateway. Set `OPENAI_BASE_URL` to `https://api.stdcmpt.com/v1` and `OPENAI_API_KEY` to your Standard Compute key.
+
+```bash
+export STANDARDCOMPUTE_API_KEY="your-standardcompute-api-key"
+export OPENAI_BASE_URL="https://api.stdcmpt.com/v1"
+export OPENAI_API_KEY="$STANDARDCOMPUTE_API_KEY"
+claw --model "local/StandardCompute" prompt "Reply exactly HELLO_WORLD_123"
+```
+
+`StandardCompute` is the routed model: each request goes to the cheapest enabled model that can handle it, with automatic fallback. It is a bare name on a remote gateway, so it needs the `local/` hatch, which selects the OpenAI-compatible transport and is removed before the request.
+
+To pin one model, use a vendor-prefixed id from the catalog with the same hatch, for example `--model "local/deepseek/deepseek-v4-flash"`. A bare vendor prefix can pick a native route instead of the gateway.
+
+The public model list does not need a key:
+
+```bash
+curl -sS "https://api.stdcmpt.com/v1/models" | jq -r '.data[].id'
+```
+
+See the [Standard Compute docs](https://docs.standardcompute.com) for keys and account setup.
+
 ## Local skills install from disk
 
 Skills are discovered from Claw skill roots such as `.claw/skills/` in a workspace and `~/.claw/skills/` for user-level installs. Legacy `.codex/skills/` roots may also be scanned for compatibility, but new local Claw projects should prefer `.claw/skills/`.
