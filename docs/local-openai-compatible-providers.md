@@ -202,7 +202,7 @@ export OPENAI_API_KEY="$STANDARDCOMPUTE_API_KEY"
 claw --model "local/StandardCompute" prompt "Reply exactly HELLO_WORLD_123"
 ```
 
-`StandardCompute` is the routed model: each request goes to the cheapest enabled model that can handle it, with automatic fallback. It is a bare name on a remote gateway, so it needs the `local/` hatch, which selects the OpenAI-compatible transport and is removed before the request.
+`StandardCompute` is the routed model: the router picks from the models enabled on your account using your quality preference, so harder tasks go to stronger models and simpler ones to cheaper models ([routing docs](https://docs.standardcompute.com/models#smart-routing)). It is a bare name on a remote gateway, so it needs the `local/` hatch, which selects the OpenAI-compatible transport and is removed before the request.
 
 To pin one model, use a vendor-prefixed id from the catalog with the same hatch, for example `--model "local/deepseek/deepseek-v4-flash"`. A bare vendor prefix can pick a native route instead of the gateway.
 
