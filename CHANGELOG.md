@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.13] - 2026-11-09
+
+### Fixed
+
+- Anthropic and OpenAI-compatible providers now retry HTTP 529 (overloaded) responses and transient gateway HTTP 400 responses (empty or unparseable body, connection reset, broken pipe, empty reply) with the existing bounded backoff, instead of failing the request immediately (#3381)
+
 ## [0.1.12] - 2026-11-08
 
 ### Fixed
