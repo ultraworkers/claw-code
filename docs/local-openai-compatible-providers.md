@@ -214,6 +214,28 @@ curl -sS "https://api.stdcmpt.com/v1/models" | jq -r '.data[].id'
 
 See the [Standard Compute docs](https://docs.standardcompute.com) for keys and account setup.
 
+## HopBase
+
+[HopBase](https://hop-base.com) is an OpenAI-compatible API for Claude, GPT, GLM, DeepSeek, Qwen, and other model families. Set `OPENAI_BASE_URL` to `https://api.hop-base.com/v1` and `OPENAI_API_KEY` to your HopBase key.
+
+```bash
+export HOPBASE_API_KEY="your-hopbase-api-key"
+export OPENAI_BASE_URL="https://api.hop-base.com/v1"
+export OPENAI_API_KEY="$HOPBASE_API_KEY"
+claw --model "local/glm-5.3-flash" prompt "Reply exactly HELLO_WORLD_123"
+```
+
+HopBase ids are bare names without a vendor prefix (`glm-5.3-flash`, `gpt-5.6-luna`, `claude-sonnet-5-5`). Put `local/` in front of every one: the hatch selects the OpenAI-compatible transport and is removed, so the id goes out unchanged. Without it, a bare `claude-` id picks the native Anthropic route, and a bare `qwen-` or `kimi-` id goes to DashScope.
+
+The model list needs your key and shows the ids that key can call:
+
+```bash
+curl -sS "https://api.hop-base.com/v1/models" \
+  -H "Authorization: Bearer $OPENAI_API_KEY" | jq -r '.data[].id'
+```
+
+See the [HopBase docs](https://hop-base.com/en/docs) for keys and account setup.
+
 ## Local skills install from disk
 
 Skills are discovered from Claw skill roots such as `.claw/skills/` in a workspace and `~/.claw/skills/` for user-level installs. Legacy `.codex/skills/` roots may also be scanned for compatibility, but new local Claw projects should prefer `.claw/skills/`.
