@@ -18289,6 +18289,7 @@ mod tests {
 
     #[test]
     fn session_exists_resume_command_reports_json_contract() {
+        let _cwd_guard = cwd_guard();
         let session = Session::new();
         let path = PathBuf::from("missing-session.jsonl");
         let outcome = run_resume_command(
@@ -18811,6 +18812,8 @@ mod tests {
     #[test]
     fn boot_preflight_snapshot_reports_machine_readable_contract_fields() {
         let _guard = env_lock();
+        // Binary availability probes inherit cwd even though Git probes use workspace.
+        let _cwd_guard = cwd_guard();
         let workspace = temp_workspace("boot-preflight-json");
         fs::create_dir_all(&workspace).expect("workspace should create");
         git(&["init", "--quiet"], &workspace);
@@ -19084,6 +19087,8 @@ UU conflicted.rs",
 
     #[test]
     fn status_context_reads_real_workspace_metadata() {
+        // Reading cwd and launching helpers must serialize with cwd-changing tests.
+        let _cwd_guard = cwd_guard();
         let context = status_context(None).expect("status context should load");
         assert!(context.cwd.is_absolute());
         assert!(context.discovered_config_files >= context.loaded_config_files);
@@ -20346,6 +20351,9 @@ UU conflicted.rs",
     #[test]
     #[allow(clippy::too_many_lines)]
     fn build_runtime_plugin_state_discovers_mcp_tools_and_surfaces_pending_servers() {
+        // MCP children inherit the process cwd. Keep it stable until shutdown so
+        // they cannot hold another test's temporary directory open on Windows.
+        let _cwd_guard = cwd_guard();
         let config_home = temp_dir();
         let workspace = temp_dir();
         fs::create_dir_all(&config_home).expect("config home");
