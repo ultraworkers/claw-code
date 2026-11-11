@@ -7391,6 +7391,7 @@ struct PromptHistoryEntry {
 
 struct RuntimePluginState {
     feature_config: runtime::RuntimeFeatureConfig,
+    max_output_tokens: Option<u32>,
     tool_registry: GlobalToolRegistry,
     plugin_registry: PluginRegistry,
     mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
@@ -12467,6 +12468,7 @@ fn build_runtime_plugin_state_with_loader(
         .with_runtime_tools(runtime_tools)?;
     Ok(RuntimePluginState {
         feature_config,
+        max_output_tokens: runtime_config.plugins().max_output_tokens(),
         tool_registry,
         plugin_registry,
         mcp_state,
@@ -12896,6 +12898,7 @@ fn build_runtime_with_plugin_state(
     }
     let RuntimePluginState {
         feature_config,
+        max_output_tokens,
         tool_registry,
         plugin_registry,
         mcp_state,
@@ -12916,6 +12919,7 @@ fn build_runtime_with_plugin_state(
             tool_registry.clone(),
             progress_reporter,
             provider_config,
+            max_output_tokens,
         )?,
         CliToolExecutor::new(
             allowed_tools.clone(),
@@ -13189,6 +13193,7 @@ struct AnthropicRuntimeClient {
     client: ApiProviderClient,
     session_id: String,
     model: String,
+    max_output_tokens: Option<u32>,
     enable_tools: bool,
     emit_output: bool,
     terminal_tail: TerminalTail,
@@ -13212,6 +13217,7 @@ impl AnthropicRuntimeClient {
         tool_registry: GlobalToolRegistry,
         progress_reporter: Option<InternalPromptProgressReporter>,
         provider_config: Option<api::ProviderConfig>,
+        max_output_tokens: Option<u32>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         // Explicit persisted provider configuration takes precedence.
         // When absent, preserve the existing model-based provider detection.
@@ -13277,6 +13283,7 @@ impl AnthropicRuntimeClient {
             client,
             session_id: session_id.to_string(),
             model,
+            max_output_tokens,
             enable_tools,
             emit_output,
             terminal_tail,
@@ -13326,7 +13333,10 @@ impl ApiClient for AnthropicRuntimeClient {
         let enable_local_tools = self.enable_tools && model_supports_local_tools(&self.model);
         let message_request = MessageRequest {
             model: self.model.clone(),
-            max_tokens: max_tokens_for_model(&self.model),
+            max_tokens: api::max_tokens_for_model_with_override(
+                &self.model,
+                self.max_output_tokens,
+            ),
             messages: convert_messages(&request.messages),
             system: (!request.system_prompt.is_empty()).then(|| request.system_prompt.join("\n\n")),
             tools: enable_local_tools
@@ -18289,6 +18299,7 @@ mod tests {
 
     #[test]
     fn session_exists_resume_command_reports_json_contract() {
+        let _cwd_guard = cwd_guard();
         let session = Session::new();
         let path = PathBuf::from("missing-session.jsonl");
         let outcome = run_resume_command(
@@ -18811,6 +18822,8 @@ mod tests {
     #[test]
     fn boot_preflight_snapshot_reports_machine_readable_contract_fields() {
         let _guard = env_lock();
+        // Binary availability probes inherit cwd even though Git probes use workspace.
+        let _cwd_guard = cwd_guard();
         let workspace = temp_workspace("boot-preflight-json");
         fs::create_dir_all(&workspace).expect("workspace should create");
         git(&["init", "--quiet"], &workspace);
@@ -19084,6 +19097,8 @@ UU conflicted.rs",
 
     #[test]
     fn status_context_reads_real_workspace_metadata() {
+        // Reading cwd and launching helpers must serialize with cwd-changing tests.
+        let _cwd_guard = cwd_guard();
         let context = status_context(None).expect("status context should load");
         assert!(context.cwd.is_absolute());
         assert!(context.discovered_config_files >= context.loaded_config_files);
@@ -20231,6 +20246,7 @@ UU conflicted.rs",
             GlobalToolRegistry::builtin(),
             None,
             Some(config),
+            None,
         )
         .expect("runtime client should construct from explicit model provider hint");
 
@@ -20329,6 +20345,7 @@ UU conflicted.rs",
             GlobalToolRegistry::builtin(),
             None,
             Some(provider_config),
+            state.max_output_tokens,
         )
         .expect("runtime client should construct from persisted provider configuration");
 
@@ -20346,6 +20363,9 @@ UU conflicted.rs",
     #[test]
     #[allow(clippy::too_many_lines)]
     fn build_runtime_plugin_state_discovers_mcp_tools_and_surfaces_pending_servers() {
+        // MCP children inherit the process cwd. Keep it stable until shutdown so
+        // they cannot hold another test's temporary directory open on Windows.
+        let _cwd_guard = cwd_guard();
         let config_home = temp_dir();
         let workspace = temp_dir();
         fs::create_dir_all(&config_home).expect("config home");
