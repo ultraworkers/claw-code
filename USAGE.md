@@ -389,6 +389,27 @@ These are the models registered in the built-in alias table with known token lim
 
 Any model name that does not match an alias is passed through verbatim after provider routing is resolved. This is how you use OpenRouter model slugs (`openai/gpt-4.1-mini` with a custom `OPENAI_BASE_URL`), Ollama tags (`llama3.2` or `qwen2.5-coder:7b`), slash-containing local IDs (`local/Qwen/Qwen3.6-27B-FP8`), or full Anthropic model IDs (`claude-sonnet-4-20250514`).
 
+### Output token limit
+
+Set `plugins.maxOutputTokens` in a settings file, such as
+`.claw/settings.local.json`, to override the output token allowance sent by the
+`claw` CLI:
+
+```json
+{
+  "plugins": {
+    "maxOutputTokens": 1024
+  }
+}
+```
+
+The CLI loads this setting when constructing the conversation client and applies
+it to each model request, including requests after tool results. When omitted,
+the existing per-model defaults remain in effect. Choose a positive limit that
+fits the server's output allowance and leaves room for the input within its
+context window. This setting does not automatically query server limits and
+does not configure separate sub-agent clients or the `claw-analog` binary.
+
 ### User-defined aliases
 
 You can add custom aliases in any settings file (`~/.claw/settings.json`, `.claw/settings.json`, or `.claw/settings.local.json`):
