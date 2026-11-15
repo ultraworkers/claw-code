@@ -25,6 +25,10 @@ impl ModelPricing {
         )
     }
 
+    const fn from_rates([input, output, cache_creation, cache_read]: [f64; 4]) -> Self {
+        Self::per_million(input, output, cache_creation, cache_read)
+    }
+
     const fn per_million(input: f64, output: f64, cache_creation: f64, cache_read: f64) -> Self {
         Self {
             input_cost_per_million: input,
@@ -83,8 +87,8 @@ pub fn pricing_for_model(model: &str) -> Option<ModelPricing> {
             return Some(ModelPricing::per_million(0.8, 4.0, 1.0, 0.08));
         }
         return Some(match family_version(&normalized, "haiku") {
-            // Haiku 5.5 bills prompts over 100K tokens at 5x; usage totals are not
-            // tracked per request, so estimates use the base tier.
+            // Haiku 5.5 bills prompts over 100K tokens at 5x; aggregated usage uses the
+            // base tier, and `pricing_for_request` applies the higher one per request.
             Some((5, 5)) => ModelPricing::per_million(0.1, 0.5, 0.125, 0.01),
             _ => ModelPricing::per_million(1.0, 5.0, 1.25, 0.1),
         });
@@ -134,9 +138,9 @@ const GROK_BUILD: [f64; 4] = [1.0, 2.0, 1.0, 0.2];
 /// OpenAI-compatible providers, keyed by model id.
 ///
 /// An id also matches its dated snapshots and `-latest` alias (e.g. `gpt-4.1-2025-04-14`),
-/// so a specific snapshot must precede its base id. Long-context and higher input tiers
-/// are not modeled because usage is aggregated across requests. Cache writes without a
-/// separate charge, and models without a cached-input discount, use the input rate.
+/// so a specific snapshot must precede its base id. Long-context tiers live in
+/// [`LONG_CONTEXT_PRICING`]. Cache writes without a separate charge, and models without a
+/// cached-input discount, use the input rate.
 const OPENAI_COMPATIBLE_PRICING: &[(&str, [f64; 4])] = &[
     // OpenAI standard tier (<https://developers.openai.com/api/docs/pricing>).
     ("gpt-6-astra", [10.0, 50.0, 12.5, 1.0]),
@@ -147,14 +151,19 @@ const OPENAI_COMPATIBLE_PRICING: &[(&str, [f64; 4])] = &[
     ("gpt-5.6-terra", [2.0, 12.0, 2.5, 0.2]),
     ("gpt-5.6-luna", [0.2, 1.2, 0.25, 0.02]),
     ("gpt-5.5", [5.0, 30.0, 5.0, 0.5]),
+    ("gpt-5.5-pro", [30.0, 180.0, 30.0, 30.0]),
     ("gpt-5.4", [2.5, 15.0, 2.5, 0.25]),
+    ("gpt-5.4-pro", [30.0, 180.0, 30.0, 30.0]),
     ("gpt-5.4-mini", [0.75, 4.5, 0.75, 0.075]),
     ("gpt-5.4-nano", [0.2, 1.25, 0.2, 0.02]),
+    ("gpt-5.3-codex", [1.75, 14.0, 1.75, 0.175]),
     ("gpt-5.2", [1.75, 14.0, 1.75, 0.175]),
+    ("gpt-5.2-pro", [21.0, 168.0, 21.0, 21.0]),
     ("gpt-5.1", [1.25, 10.0, 1.25, 0.125]),
     ("gpt-5", [1.25, 10.0, 1.25, 0.125]),
     ("gpt-5-mini", [0.25, 2.0, 0.25, 0.025]),
     ("gpt-5-nano", [0.05, 0.4, 0.05, 0.005]),
+    ("gpt-5-pro", [15.0, 120.0, 15.0, 15.0]),
     ("gpt-4.1", [2.0, 8.0, 2.0, 0.5]),
     ("gpt-4.1-mini", [0.4, 1.6, 0.4, 0.1]),
     ("gpt-4.1-nano", [0.1, 0.4, 0.1, 0.025]),
@@ -162,9 +171,24 @@ const OPENAI_COMPATIBLE_PRICING: &[(&str, [f64; 4])] = &[
     ("gpt-4o", [2.5, 10.0, 2.5, 1.25]),
     ("gpt-4o-mini", [0.15, 0.6, 0.15, 0.075]),
     ("o1", [15.0, 60.0, 15.0, 7.5]),
+    ("o1-pro", [150.0, 600.0, 150.0, 150.0]),
     ("o3", [2.0, 8.0, 2.0, 0.5]),
+    ("o3-pro", [20.0, 80.0, 20.0, 20.0]),
     ("o3-mini", [1.1, 4.4, 1.1, 0.55]),
     ("o4-mini", [1.1, 4.4, 1.1, 0.275]),
+    // Google Gemini API paid tier (<https://ai.google.dev/gemini-api/docs/pricing>),
+    // reachable through its OpenAI-compatible endpoint and gateways. Context caching
+    // bills storage per hour rather than a write premium, so writes use the input rate.
+    ("gemini-4-argon", [2.0, 10.0, 2.0, 0.1]),
+    ("gemini-3.8-flash", [0.75, 3.75, 0.75, 0.075]),
+    ("gemini-3.6-flash", [0.75, 3.75, 0.75, 0.075]),
+    ("gemini-3.5-flash-lite", [0.3, 2.5, 0.3, 0.03]),
+    ("gemini-3.1-flash-lite", [0.25, 1.5, 0.25, 0.025]),
+    ("gemini-3.1-pro-preview", [2.0, 12.0, 2.0, 0.2]),
+    ("gemini-3-flash-preview", [0.5, 3.0, 0.5, 0.05]),
+    ("gemini-2.5-pro", [1.25, 10.0, 1.25, 0.125]),
+    ("gemini-2.5-flash", [0.3, 2.5, 0.3, 0.03]),
+    ("gemini-2.5-flash-lite", [0.1, 0.4, 0.1, 0.01]),
     // xAI (<https://docs.x.ai/docs/models>).
     ("grok-4.7", [2.0, 6.0, 2.0, 0.5]),
     ("grok-4.6", [2.0, 6.0, 2.0, 0.5]),
@@ -189,9 +213,52 @@ const OPENAI_COMPATIBLE_PRICING: &[(&str, [f64; 4])] = &[
     ("kimi-k2.5", [0.574, 3.011, 0.574, 0.1148]),
 ];
 
+/// Rates that replace the base tier once a single request's prompt (input plus cache
+/// reads and writes) exceeds the threshold, keyed like [`OPENAI_COMPATIBLE_PRICING`].
+const LONG_CONTEXT_PRICING: &[(&str, (u32, [f64; 4]))] = &[
+    ("gpt-6-astra", (272_000, [20.0, 75.0, 25.0, 2.0])),
+    ("gpt-6.1-sol", (272_000, [4.0, 15.0, 5.0, 0.2])),
+    ("gpt-6-sol", (272_000, [4.0, 15.0, 5.0, 0.4])),
+    ("gpt-6-luna", (272_000, [0.2, 0.75, 0.25, 0.02])),
+    ("gpt-5.6-sol", (272_000, [8.0, 30.0, 10.0, 0.8])),
+    ("gpt-5.6-terra", (272_000, [4.0, 18.0, 5.0, 0.4])),
+    ("gpt-5.6-luna", (272_000, [0.4, 1.8, 0.5, 0.04])),
+    ("gpt-5.5", (272_000, [10.0, 45.0, 10.0, 1.0])),
+    ("gpt-5.5-pro", (272_000, [60.0, 270.0, 60.0, 60.0])),
+    ("gpt-5.4", (272_000, [5.0, 22.5, 5.0, 0.5])),
+    ("gpt-5.4-pro", (272_000, [60.0, 270.0, 60.0, 60.0])),
+    ("gemini-3.1-pro-preview", (200_000, [4.0, 18.0, 4.0, 0.4])),
+    ("gemini-2.5-pro", (200_000, [2.5, 15.0, 2.5, 0.25])),
+];
+
+const HAIKU_5_5_LONG_CONTEXT: (u32, [f64; 4]) = (100_000, [0.5, 2.5, 0.625, 0.05]);
+
+/// Returns pricing for a single request whose prompt (input plus cache reads and writes)
+/// is `prompt_tokens` long, applying the long-context tiers that [`pricing_for_model`]
+/// leaves out because it also prices usage aggregated across requests.
+#[must_use]
+pub fn pricing_for_request(model: &str, prompt_tokens: u32) -> Option<ModelPricing> {
+    let normalized = model.to_ascii_lowercase();
+    let long_context = if family_version(&normalized, "haiku") == Some((5, 5)) {
+        Some(HAIKU_5_5_LONG_CONTEXT)
+    } else {
+        find_model(LONG_CONTEXT_PRICING, &normalized)
+    };
+    match long_context {
+        Some((threshold, rates)) if prompt_tokens > threshold => {
+            Some(ModelPricing::from_rates(rates))
+        }
+        _ => pricing_for_model(model),
+    }
+}
+
 fn openai_compatible_pricing(normalized: &str) -> Option<ModelPricing> {
+    find_model(OPENAI_COMPATIBLE_PRICING, normalized).map(ModelPricing::from_rates)
+}
+
+fn find_model<T: Copy>(table: &[(&str, T)], normalized: &str) -> Option<T> {
     let id = normalized.rsplit_once('/').map_or(normalized, |(_, id)| id);
-    OPENAI_COMPATIBLE_PRICING
+    table
         .iter()
         .find(|(model, _)| {
             id.strip_prefix(model).is_some_and(|rest| {
@@ -201,9 +268,7 @@ fn openai_compatible_pricing(normalized: &str) -> Option<ModelPricing> {
                     })
             })
         })
-        .map(|&(_, [input, output, cache_write, cache_read])| {
-            ModelPricing::per_million(input, output, cache_write, cache_read)
-        })
+        .map(|&(_, value)| value)
 }
 
 /// Parses the `(major, minor)` version after `family` in ids such as
@@ -354,7 +419,7 @@ impl UsageTracker {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_usd, pricing_for_model, TokenUsage, UsageTracker};
+    use super::{format_usd, pricing_for_model, pricing_for_request, TokenUsage, UsageTracker};
     use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
 
     #[test]
@@ -507,6 +572,13 @@ mod tests {
         assert_eq!(total_for("qwen/qwen-max"), "$1.1025");
         assert_eq!(total_for("qwen-plus-latest"), "$0.2815");
         assert_eq!(total_for("kimi-k2.5"), "$2.1943");
+        assert_eq!(total_for("gpt-5.5-pro"), "$150.0000");
+        assert_eq!(total_for("gpt-5.3-codex"), "$8.9250");
+        assert_eq!(total_for("o3-pro-2025-06-10"), "$80.0000");
+        assert_eq!(total_for("o3"), "$6.5000");
+        assert_eq!(total_for("google/gemini-2.5-pro"), "$6.3750");
+        assert_eq!(total_for("gemini-2.5-flash-lite"), "$0.3100");
+        assert_eq!(total_for("gemini-3.1-pro-preview"), "$8.2000");
         for unpriced in [
             "o1-mini",
             "grok-3-mini",
@@ -515,6 +587,31 @@ mod tests {
         ] {
             assert_eq!(pricing_for_model(unpriced), None, "{unpriced}");
         }
+    }
+
+    #[test]
+    fn applies_long_context_tiers_per_request() {
+        let rates = |model: &str, prompt_tokens: u32| {
+            let pricing = pricing_for_request(model, prompt_tokens).expect("known model pricing");
+            (
+                pricing.input_cost_per_million,
+                pricing.output_cost_per_million,
+            )
+        };
+
+        assert_eq!(rates("claude-haiku-5-5", 100_000), (0.1, 0.5));
+        assert_eq!(rates("claude-haiku-5-5-20260301", 100_001), (0.5, 2.5));
+        assert_eq!(rates("claude-haiku-4-5", 500_000), (1.0, 5.0));
+        assert_eq!(rates("gpt-5.4", 272_000), (2.5, 15.0));
+        assert_eq!(rates("openai/gpt-5.4", 272_001), (5.0, 22.5));
+        assert_eq!(rates("gpt-5.4-mini", 900_000), (0.75, 4.5));
+        assert_eq!(rates("gemini-2.5-pro", 200_001), (2.5, 15.0));
+        assert_eq!(rates("claude-sonnet-4-6", 900_000), (3.0, 15.0));
+        assert_eq!(
+            pricing_for_request("gpt-5.5", 1_000),
+            pricing_for_model("gpt-5.5")
+        );
+        assert_eq!(pricing_for_request("custom-model", 1_000_000), None);
     }
 
     #[test]
