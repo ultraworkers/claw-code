@@ -236,6 +236,30 @@ curl -sS "https://api.hop-base.com/v1/models" \
 
 See the [HopBase docs](https://hop-base.com/en/docs) for keys and account setup.
 
+## Requesty
+
+[Requesty](https://www.requesty.ai) is an OpenAI-compatible gateway that routes to first-party providers such as OpenAI, Anthropic, and Google. Set `OPENAI_BASE_URL` to `https://router.requesty.ai/v1` (or `https://router.eu.requesty.ai/v1` for the EU endpoint) and `OPENAI_API_KEY` to your Requesty key.
+
+```bash
+export REQUESTY_API_KEY="your-requesty-api-key"
+export OPENAI_BASE_URL="https://router.requesty.ai/v1"
+export OPENAI_API_KEY="$REQUESTY_API_KEY"
+claw --model "local/anthropic/claude-sonnet-5-5" prompt "Reply exactly HELLO_WORLD_123"
+```
+
+Requesty ids are vendor-prefixed (`openai/gpt-4o-mini`, `anthropic/claude-sonnet-5-5`, `google/gemini-3.6-flash`). Put `local/` in front of every one: the hatch selects the OpenAI-compatible transport and is removed, so the catalog id goes out unchanged. Without it, an `anthropic/` id picks the native Anthropic route and asks for `ANTHROPIC_API_KEY`.
+
+Requesty also serves the Anthropic Messages API, so the native route works as well: set `ANTHROPIC_BASE_URL` to `https://router.requesty.ai` (no `/v1`) and `ANTHROPIC_API_KEY` to the same key, then run `--model "anthropic/claude-sonnet-5-5"`.
+
+The public model list does not need a key:
+
+```bash
+curl -sS "https://router.requesty.ai/v1/models" \
+  | jq -r '.data[] | "\(.id)\t\(.max_output_tokens)"'
+```
+
+See the [Requesty docs](https://docs.requesty.ai) for keys and account setup.
+
 ## Local skills install from disk
 
 Skills are discovered from Claw skill roots such as `.claw/skills/` in a workspace and `~/.claw/skills/` for user-level installs. Legacy `.codex/skills/` roots may also be scanned for compatibility, but new local Claw projects should prefer `.claw/skills/`.
