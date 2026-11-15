@@ -200,7 +200,8 @@ pub use task_registry::{LaneBoard, LaneBoardEntry, LaneFreshness, LaneHeartbeat}
 #[cfg(test)]
 pub use trust_resolver::{TrustConfig, TrustDecision, TrustEvent, TrustPolicy, TrustResolver};
 pub use usage::{
-    format_usd, pricing_for_model, ModelPricing, TokenUsage, UsageCostEstimate, UsageTracker,
+    format_usd, pricing_for_model, pricing_for_request, ModelPricing, TokenUsage,
+    UsageCostEstimate, UsageTracker,
 };
 pub use worker_boot::{
     Worker, WorkerEvent, WorkerEventKind, WorkerEventPayload, WorkerFailure, WorkerFailureKind,
