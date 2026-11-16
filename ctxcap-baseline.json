@@ -1,0 +1,13 @@
+{
+  "AGENTS.md": 1643,
+  "CLAUDE.md": 250,
+  "rust/AGENTS.md": 1005,
+  "rust/CLAUDE.md": 226,
+  "rust/crates/api/AGENTS.md": 762,
+  "rust/crates/commands/AGENTS.md": 819,
+  "rust/crates/plugins/AGENTS.md": 652,
+  "rust/crates/runtime/AGENTS.md": 983,
+  "rust/crates/rusty-claude-cli/AGENTS.md": 1034,
+  "rust/crates/tools/AGENTS.md": 836,
+  "src/AGENTS.md": 798
+}
