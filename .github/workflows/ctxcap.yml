@@ -1,0 +1,38 @@
+name: context budget
+
+# AGENTS.md and CLAUDE.md are loaded by every harness working in this repo, so
+# their token cost is part of the repo's interface. This measures the delta a PR
+# introduces against the merge base and fails when it grows.
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'AGENTS.md'
+      - 'CLAUDE.md'
+      - 'rust/AGENTS.md'
+      - 'rust/CLAUDE.md'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ctxcap-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  context-budget:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: Naeha-S/ctxcap@v1
+        with:
+          fail-on: increase
+          stale: true
