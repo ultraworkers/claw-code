@@ -506,13 +506,14 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "read_file",
-            description: "Read a text file from the workspace.",
+            description: "Read a text file from the workspace. Optional `selector` (1-indexed lines; overrides `offset`/`limit`): `50` single line, `50-200` inclusive range, `50+150` start plus count, `5-16,960-973` comma-separated (returned as one block from the first to the last selected line), `raw` for the full file, or `conflicts` for a summary of unresolved git merge conflicts. Without `selector`, `offset` (0-based) and `limit` pick the lines; with neither, the whole file is read.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "path": { "type": "string" },
                     "offset": { "type": "integer", "minimum": 0 },
-                    "limit": { "type": "integer", "minimum": 1 }
+                    "limit": { "type": "integer", "minimum": 1 },
+                    "selector": { "type": "string" }
                 },
                 "required": ["path"],
                 "additionalProperties": false
@@ -7208,6 +7209,19 @@ mod tests {
             spec.input_schema["properties"]["format"]["enum"],
             json!(["patch", "stat", "metadata"])
         );
+    }
+
+    #[test]
+    fn read_file_schema_exposes_selector() {
+        let spec = mvp_tool_specs()
+            .into_iter()
+            .find(|spec| spec.name == "read_file")
+            .expect("read_file spec");
+        assert_eq!(
+            spec.input_schema["properties"]["selector"],
+            json!({ "type": "string" })
+        );
+        assert!(spec.description.contains("selector"));
     }
 
     #[test]
