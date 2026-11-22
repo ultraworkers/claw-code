@@ -36,6 +36,10 @@ jobs:
             os: windows-latest
             bin: claw.exe
             artifact_name: claw-windows-x64.exe
+          - name: windows-arm64
+            os: windows-11-arm
+            bin: claw.exe
+            artifact_name: claw-windows-arm64.exe
     defaults:
       run:
         working-directory: rust

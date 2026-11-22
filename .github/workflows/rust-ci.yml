@@ -126,8 +126,15 @@ jobs:
         run: cargo clippy --workspace
 
   windows-smoke:
-    name: Windows tests and PowerShell smoke
-    runs-on: windows-latest
+    name: Windows tests and PowerShell smoke (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner:
+          - windows-latest
+          - windows-11-arm
+  
     defaults:
       run:
         working-directory: rust
