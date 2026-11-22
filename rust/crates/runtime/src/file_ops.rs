@@ -950,8 +950,13 @@ fn normalize_for_comparison(path: &Path) -> PathBuf {
     path.to_path_buf()
 }
 
+/// Whether a directory below the search root is one of the heavy
+/// directories (VCS data, dependencies, build output) that glob and grep
+/// searches skip. The root itself is always searched, so a search the caller
+/// points into one of these directories still works.
 fn should_skip_glob_dir(entry: &DirEntry) -> bool {
-    entry.file_type().is_dir()
+    entry.depth() > 0
+        && entry.file_type().is_dir()
         && entry
             .file_name()
             .to_str()
@@ -989,7 +994,10 @@ fn collect_search_files(base_path: &Path) -> io::Result<Vec<PathBuf>> {
     }
 
     let mut files = Vec::new();
-    for entry in WalkDir::new(base_path) {
+    for entry in WalkDir::new(base_path)
+        .into_iter()
+        .filter_entry(|entry| !should_skip_glob_dir(entry))
+    {
         let entry = entry.map_err(|error| io::Error::other(error.to_string()))?;
         if entry.file_type().is_file() {
             files.push(entry.path().to_path_buf());
@@ -1566,6 +1574,50 @@ mod tests {
     }
 
     #[test]
+    fn grep_search_skips_common_heavy_directories() {
+        let dir = temp_path("grep-ignored-dirs");
+        for sub in ["src", ".git/refs", "node_modules/pkg", "target/debug/build"] {
+            std::fs::create_dir_all(dir.join(sub)).unwrap();
+            std::fs::write(dir.join(sub).join("notes.txt"), "needle").unwrap();
+        }
+        let grep = |path: PathBuf| {
+            grep_search(&GrepSearchInput {
+                pattern: String::from("needle"),
+                path: Some(path.to_string_lossy().into_owned()),
+                glob: None,
+                output_mode: Some(String::from("files_with_matches")),
+                before: None,
+                after: None,
+                context_short: None,
+                context: None,
+                line_numbers: None,
+                case_insensitive: None,
+                file_type: None,
+                head_limit: None,
+                offset: None,
+                multiline: None,
+            })
+            .expect("grep should succeed")
+            .filenames
+        };
+
+        let filenames = grep(dir.clone());
+        assert_eq!(
+            filenames.len(),
+            1,
+            "ignored dirs should be pruned: {filenames:?}"
+        );
+        assert!(Path::new(&filenames[0]).ends_with("src/notes.txt"));
+
+        // A search rooted inside an ignored directory still searches it.
+        let filenames = grep(dir.join("node_modules"));
+        assert_eq!(filenames.len(), 1, "{filenames:?}");
+        assert!(Path::new(&filenames[0]).ends_with("node_modules/pkg/notes.txt"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn expand_braces_no_braces() {
         assert_eq!(expand_braces("*.rs"), vec!["*.rs"]);
     }
@@ -1645,6 +1697,12 @@ mod tests {
             .any(|path| path.contains("node_modules")
                 || path.contains(".build")
                 || path.contains("/target/")));
+
+        // A glob rooted inside an ignored directory still searches it.
+        let inside = dir.join("node_modules");
+        let result = glob_search("**/AGENTS.md", Some(inside.to_str().unwrap()))
+            .expect("glob should succeed");
+        assert_eq!(result.num_files, 1, "{:?}", result.filenames);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
