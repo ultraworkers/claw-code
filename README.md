@@ -298,6 +298,10 @@ Claw Code is built in the open alongside the broader UltraWorkers toolchain:
 - [gajae-code](https://github.com/Yeachan-Heo/gajae-code)
 - [UltraWorkers Discord](https://discord.gg/5TUQKqFWd)
 
+Community integrations:
+
+- [deja-vu](https://github.com/vshulcz/deja-vu) — local BM25 session memory across Claw Code (`~/.claw/sessions/`) and 46 other coding agents
+
 ## Ownership / affiliation disclaimer
 
 - This repository does **not** claim ownership of the original Claude Code source material.
