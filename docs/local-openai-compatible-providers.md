@@ -308,6 +308,30 @@ curl -sS "https://onomeo.com/v1/models" \
 
 See the [onomeo integration guides](https://onomeo.com/integrations) for keys and account setup.
 
+## Straitly
+
+[Straitly](https://straitly.ai) is an AI gateway with one OpenAI-compatible API key for 150+ models, including Claude, GPT, Gemini, Grok and DeepSeek. Set `OPENAI_BASE_URL` to `https://api.straitly.ai/v1` and `OPENAI_API_KEY` to your Straitly key.
+
+```bash
+export STRAITLY_API_KEY="your-straitly-api-key"
+export OPENAI_BASE_URL="https://api.straitly.ai/v1"
+export OPENAI_API_KEY="$STRAITLY_API_KEY"
+claw --model "local/deepseek/deepseek-v4-1-flash" prompt "Reply exactly HELLO_WORLD_123"
+```
+
+Straitly ids are vendor-prefixed (`owner/model`, such as `deepseek/deepseek-v4-1-flash`). Put `local/` in front of every one: the hatch selects the OpenAI-compatible transport and is removed, so the catalog id goes out unchanged. Without it, an id that starts with `anthropic/` picks the native Anthropic route and asks for `ANTHROPIC_API_KEY`.
+
+Claw asks for up to 64,000 output tokens on these routes, so pick a model whose output limit is at least that. `deepseek/deepseek-v4-1-flash` allows 1,048,576. Each model's limit is listed as `top_provider.max_completion_tokens` in the catalog below.
+
+The public model list does not need a key:
+
+```bash
+curl -sS "https://api.straitly.ai/v1/models" \
+  | jq -r '.data[] | "\(.id)\t\(.context_length)\t\(.top_provider.max_completion_tokens)"'
+```
+
+See the [Straitly quickstart](https://straitly.ai/docs/quickstart) for keys and account setup.
+
 ## Local skills install from disk
 
 Skills are discovered from Claw skill roots such as `.claw/skills/` in a workspace and `~/.claw/skills/` for user-level installs. Legacy `.codex/skills/` roots may also be scanned for compatibility, but new local Claw projects should prefer `.claw/skills/`.
