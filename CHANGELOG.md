@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.14] - 2026-11-23
+
+### Fixed
+
+- Respect configured output token limits in message requests (#3385)
+- Match CRLF line endings in edit_file tool (#3387)
+- Prune heavy directories in grep_search to improve query performance (#3388)
+
+### Added
+
+- Gemini and OpenAI pro and long-context pricing tiers for token usage calculations (#3389)
+- Expose selector in read_file schema to enable iteration over file sections (#3395)
+- Windows ARM64 CI build and test support (#3393)
+
+### Changed
+
+- Documentation: list deja-vu in ecosystem section (#3390)
+- Documentation: document HopBase OpenAI-compatible gateway setup (#3384)
+- Documentation: document Standard Compute OpenAI-compatible gateway setup (#3383)
+- Documentation: document UberLLM OpenAI-compatible gateway setup (#3391)
+
 ## [0.1.13] - 2026-11-09
 
 ### Fixed
