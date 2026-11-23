@@ -27,8 +27,8 @@ fn max_output_tokens_reaches_openai_compatible_tool_roundtrip() {
     let server = thread::spawn(move || {
         let mut requests = Vec::new();
         for turn in 0..2 {
-            // Windows runners are slower; use a longer timeout on Windows to avoid spurious failures.
-            let deadline_secs = if cfg!(windows) { 60 } else { 30 };
+            // Windows runners are significantly slower; use a much longer timeout on Windows to avoid spurious failures.
+            let deadline_secs = if cfg!(windows) { 90 } else { 30 };
             let deadline = Instant::now() + Duration::from_secs(deadline_secs);
             let mut stream = loop {
                 match listener.accept() {
@@ -277,8 +277,8 @@ fn output_with_deadline(command: &mut Command) -> Output {
     let mut child = command.spawn().expect("claw should launch");
     // Release the parent's file handles before workspace cleanup on Windows.
     command.stdout(Stdio::null()).stderr(Stdio::null());
-    // Windows runners are slower; use a longer timeout on Windows to avoid spurious failures.
-    let timeout_secs = if cfg!(windows) { 120 } else { 60 };
+    // Windows runners are significantly slower; use a much longer timeout on Windows to avoid spurious failures.
+    let timeout_secs = if cfg!(windows) { 180 } else { 60 };
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
     let (status, timed_out) = loop {
         if let Some(status) = child.try_wait().expect("poll claw") {
