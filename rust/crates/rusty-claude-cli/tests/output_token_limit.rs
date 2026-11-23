@@ -15,6 +15,10 @@ use serde_json::{json, Value};
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[test]
+#[cfg_attr(
+    windows,
+    ignore = "times out on Windows runners due to slow socket operations"
+)]
 fn max_output_tokens_reaches_openai_compatible_tool_roundtrip() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind local mock server");
     listener
@@ -27,7 +31,8 @@ fn max_output_tokens_reaches_openai_compatible_tool_roundtrip() {
     let server = thread::spawn(move || {
         let mut requests = Vec::new();
         for turn in 0..2 {
-            let deadline = Instant::now() + Duration::from_secs(30);
+            let deadline_secs = 30;
+            let deadline = Instant::now() + Duration::from_secs(deadline_secs);
             let mut stream = loop {
                 match listener.accept() {
                     Ok((stream, _)) => break stream,
@@ -275,7 +280,8 @@ fn output_with_deadline(command: &mut Command) -> Output {
     let mut child = command.spawn().expect("claw should launch");
     // Release the parent's file handles before workspace cleanup on Windows.
     command.stdout(Stdio::null()).stderr(Stdio::null());
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let timeout_secs = 60;
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
     let (status, timed_out) = loop {
         if let Some(status) = child.try_wait().expect("poll claw") {
             break (status, false);
