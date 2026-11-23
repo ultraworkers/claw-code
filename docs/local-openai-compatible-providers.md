@@ -260,6 +260,30 @@ curl -sS "https://router.requesty.ai/v1/models" \
 
 See the [Requesty docs](https://docs.requesty.ai) for keys and account setup.
 
+## WorldRouter
+
+[WorldRouter](https://www.worldrouter.ai) is an OpenAI-compatible gateway for Claude, GPT, Gemini, DeepSeek, Kimi, and GLM models. Set `OPENAI_BASE_URL` to `https://inference-api.worldrouter.ai/v1` and `OPENAI_API_KEY` to your WorldRouter key.
+
+```bash
+export WORLDROUTER_API_KEY="your-worldrouter-api-key"
+export OPENAI_BASE_URL="https://inference-api.worldrouter.ai/v1"
+export OPENAI_API_KEY="$WORLDROUTER_API_KEY"
+claw --model "local/deepseek-v4-flash" prompt "Reply exactly HELLO_WORLD_123"
+```
+
+WorldRouter ids are bare names without a vendor prefix (`deepseek-v4-flash`, `gpt-5.4`, `claude-sonnet-5-5`, `gemini-4-neon`). Put `local/` in front of every one: the hatch selects the OpenAI-compatible transport and is removed, so the id goes out unchanged. Without it, a bare `claude-` id picks the native Anthropic route and asks for `ANTHROPIC_API_KEY`.
+
+WorldRouter also serves the Anthropic Messages API, so the native route works as well: set `ANTHROPIC_BASE_URL` to `https://inference-api.worldrouter.ai` (no `/v1`) and `ANTHROPIC_API_KEY` to the same key, then run `--model "claude-sonnet-5-5"`.
+
+The model list needs your key and shows the ids that key can call:
+
+```bash
+curl -sS "https://inference-api.worldrouter.ai/v1/models" \
+  -H "Authorization: Bearer $OPENAI_API_KEY" | jq -r '.data[].id'
+```
+
+See the [WorldRouter quickstart](https://www.worldrouter.ai/docs/quickstart) for keys and account setup.
+
 ## Local skills install from disk
 
 Skills are discovered from Claw skill roots such as `.claw/skills/` in a workspace and `~/.claw/skills/` for user-level installs. Legacy `.codex/skills/` roots may also be scanned for compatibility, but new local Claw projects should prefer `.claw/skills/`.
