@@ -332,6 +332,28 @@ curl -sS "https://api.straitly.ai/v1/models" \
 
 See the [Straitly quickstart](https://straitly.ai/docs/quickstart) for keys and account setup.
 
+## TeamoRouter
+
+[TeamoRouter](https://teamorouter.com) is an OpenAI-compatible gateway for GLM, Kimi, DeepSeek, Qwen, Claude, GPT, Gemini and other model families behind one key. Set `OPENAI_BASE_URL` to `https://api.teamorouter.com/v1` and `OPENAI_API_KEY` to your TeamoRouter key.
+
+```bash
+export TEAMOROUTER_API_KEY="your-teamorouter-api-key"
+export OPENAI_BASE_URL="https://api.teamorouter.com/v1"
+export OPENAI_API_KEY="$TEAMOROUTER_API_KEY"
+claw --model "local/glm-5.3" prompt "Reply exactly HELLO_WORLD_123"
+```
+
+TeamoRouter ids are bare names without a vendor prefix (`glm-5.3`, `deepseek-v4-flash`, `claude-sonnet-5-5`). Put `local/` in front of every one: the hatch selects the OpenAI-compatible transport and is removed, so the id goes out unchanged. Without it, a bare `claude-` id picks the native Anthropic route, and a bare `qwen` or `kimi` id goes to DashScope.
+
+Claw asks for up to 64,000 output tokens on these routes. `glm-5.3`, `deepseek-v4-flash` and `claude-sonnet-5-5` accept that; models with a lower cap list it as `max_output_tokens` in the public catalog, which does not need a key:
+
+```bash
+curl -sS "https://api.teamorouter.com/v1/models/pricing" \
+  | jq -r '.models[] | "\(.id)\t\(.context_window)\t\(.max_output_tokens)"'
+```
+
+See the [TeamoRouter docs](https://teamorouter.com/docs) for keys and account setup.
+
 ## Local skills install from disk
 
 Skills are discovered from Claw skill roots such as `.claw/skills/` in a workspace and `~/.claw/skills/` for user-level installs. Legacy `.codex/skills/` roots may also be scanned for compatibility, but new local Claw projects should prefer `.claw/skills/`.
