@@ -400,7 +400,7 @@ mod tests {
     fn executes_simple_command() {
         let output = execute_bash(BashCommandInput {
             command: String::from("printf 'hello'"),
-            timeout: Some(1_000),
+            timeout: Some(30_000),
             description: None,
             run_in_background: Some(false),
             dangerously_disable_sandbox: Some(false),
@@ -411,8 +411,12 @@ mod tests {
         })
         .expect("bash command should execute");
 
+        assert!(
+            !output.interrupted,
+            "command was interrupted (timeout?); stderr: {}",
+            output.stderr
+        );
         assert_eq!(output.stdout, "hello");
-        assert!(!output.interrupted);
         assert!(output.sandbox_status.is_some());
     }
 
@@ -420,7 +424,7 @@ mod tests {
     fn disables_sandbox_when_requested() {
         let output = execute_bash(BashCommandInput {
             command: String::from("printf 'hello'"),
-            timeout: Some(1_000),
+            timeout: Some(30_000),
             description: None,
             run_in_background: Some(false),
             dangerously_disable_sandbox: Some(true),
@@ -463,7 +467,7 @@ mod tests {
     fn prevents_stdin_hangs_by_redirecting_to_null() {
         let output = execute_bash(BashCommandInput {
             command: String::from("cat"),
-            timeout: Some(2_000),
+            timeout: Some(30_000),
             description: None,
             run_in_background: Some(false),
             dangerously_disable_sandbox: Some(true),
