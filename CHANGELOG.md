@@ -13,7 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- Documentation: document WorldRouter OpenAI-compatible gateway setup (#3399)
+- Documentation: document WorldRouter OpenAI-compatible gateway setup (d53a0882)
+- Documentation: document onomeo OpenAI-compatible gateway setup (#3399)
 - Documentation: document Straitly OpenAI-compatible gateway setup (#3400)
 - Documentation: document TeamoRouter OpenAI-compatible gateway setup (#3402)
 - Documentation: document TrustedRouter OpenAI-compatible gateway setup (#3403)
