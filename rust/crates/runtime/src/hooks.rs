@@ -802,7 +802,16 @@ impl CommandWithStdin {
     ) -> std::io::Result<CommandExecution> {
         let mut child = self.command.spawn()?;
         if let Some(mut child_stdin) = child.stdin.take() {
-            child_stdin.write_all(stdin)?;
+            // A hook that exits without reading all of its stdin closes the pipe
+            // while the payload is still being written, which fails with
+            // `BrokenPipe`. That is not a hook failure: its exit status and
+            // output are still collected below. Same handling as the plugin hook
+            // runner in `plugins/src/hooks.rs`.
+            match child_stdin.write_all(stdin) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => {}
+                Err(error) => return Err(error),
+            }
         }
 
         loop {
@@ -856,6 +865,24 @@ mod tests {
         ));
 
         let result = runner.run_pre_tool_use("Read", r#"{"path":"README.md"}"#);
+
+        assert_eq!(result, HookRunResult::allow(vec!["pre ok".to_string()]));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn hook_that_ignores_stdin_is_not_failed_by_a_payload_larger_than_the_pipe() {
+        // The hook never reads stdin and exits while the runner is still writing
+        // a payload that does not fit in the pipe buffer, so the write fails with
+        // `BrokenPipe`. The hook itself succeeded and must not be reported as failed.
+        let runner = HookRunner::new(RuntimeHookConfig::new(
+            vec![crate::test_hook("pre ok", "", 0, 0)],
+            Vec::new(),
+            Vec::new(),
+        ));
+        let tool_input = serde_json::json!({ "content": "x".repeat(70_000) }).to_string();
+
+        let result = runner.run_pre_tool_use("write_file", &tool_input);
 
         assert_eq!(result, HookRunResult::allow(vec!["pre ok".to_string()]));
     }
