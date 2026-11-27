@@ -1,4 +1,5 @@
 use crate::error::ApiError;
+use crate::extra_headers::ExtraHeadersHook;
 use crate::prompt_cache::{PromptCache, PromptCacheRecord, PromptCacheStats};
 use crate::providers::anthropic::{self, AnthropicClient, AuthSource};
 use crate::providers::openai_compat::{self, OpenAiCompatClient, OpenAiCompatConfig};
@@ -197,6 +198,21 @@ impl ProviderClient {
         match self {
             Self::Anthropic(client) => Self::Anthropic(client.with_prompt_cache(prompt_cache)),
             other => other,
+        }
+    }
+
+    /// Install a provider that may add outbound headers to each model request.
+    ///
+    /// Applies to every provider variant. Without a provider the request is
+    /// unchanged.
+    #[must_use]
+    pub fn with_extra_headers_provider(self, provider: ExtraHeadersHook) -> Self {
+        match self {
+            Self::Anthropic(client) => {
+                Self::Anthropic(client.with_extra_headers_provider(provider))
+            }
+            Self::Xai(client) => Self::Xai(client.with_extra_headers_provider(provider)),
+            Self::OpenAi(client) => Self::OpenAi(client.with_extra_headers_provider(provider)),
         }
     }
 

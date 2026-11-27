@@ -13,6 +13,7 @@ use serde_json::{Map, Value};
 use telemetry::{AnalyticsEvent, AnthropicRequestProfile, ClientIdentity, SessionTracer};
 
 use crate::error::ApiError;
+use crate::extra_headers::{ExtraHeadersContext, ExtraHeadersHook};
 use crate::http_client::build_http_client_or_default;
 use crate::prompt_cache::{PromptCache, PromptCacheRecord, PromptCacheStats};
 
@@ -121,6 +122,7 @@ pub struct AnthropicClient {
     request_profile: AnthropicRequestProfile,
     session_tracer: Option<SessionTracer>,
     prompt_cache: Option<PromptCache>,
+    extra_headers: Option<ExtraHeadersHook>,
     last_prompt_cache_record: Arc<Mutex<Option<PromptCacheRecord>>>,
 }
 
@@ -137,6 +139,7 @@ impl AnthropicClient {
             request_profile: AnthropicRequestProfile::default(),
             session_tracer: None,
             prompt_cache: None,
+            extra_headers: None,
             last_prompt_cache_record: Arc::new(Mutex::new(None)),
         }
     }
@@ -153,6 +156,7 @@ impl AnthropicClient {
             request_profile: AnthropicRequestProfile::default(),
             session_tracer: None,
             prompt_cache: None,
+            extra_headers: None,
             last_prompt_cache_record: Arc::new(Mutex::new(None)),
         }
     }
@@ -251,6 +255,16 @@ impl AnthropicClient {
     #[must_use]
     pub fn with_prompt_cache(mut self, prompt_cache: PromptCache) -> Self {
         self.prompt_cache = Some(prompt_cache);
+        self
+    }
+
+    /// Install a provider that may add outbound headers to each model request.
+    ///
+    /// The provider sees the final JSON body and can only add headers. Only
+    /// real model requests reach it: `count_tokens` does not.
+    #[must_use]
+    pub fn with_extra_headers_provider(mut self, provider: ExtraHeadersHook) -> Self {
+        self.extra_headers = Some(provider);
         self
     }
 
@@ -488,7 +502,17 @@ impl AnthropicClient {
     ) -> Result<reqwest::Response, ApiError> {
         let request_url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
         let request_body = render_standard_messages_body(&self.request_profile, request)?;
-        let request_builder = self.build_request(&request_url).json(&request_body);
+        let mut request_builder = self.build_request(&request_url).json(&request_body);
+        if let Some(extra_headers) = &self.extra_headers {
+            request_builder = extra_headers.apply(
+                request_builder,
+                &ExtraHeadersContext {
+                    provider: "Anthropic",
+                    model: &request.model,
+                    body: &request_body,
+                },
+            );
+        }
         request_builder.send().await.map_err(ApiError::from)
     }
 
@@ -1098,7 +1122,8 @@ mod tests {
         now_unix_timestamp, oauth_token_is_expired, resolve_saved_oauth_token,
         resolve_startup_auth_source, AnthropicClient, AuthSource, OAuthTokenSet,
     };
-    use crate::types::{ContentBlockDelta, MessageRequest};
+    use crate::extra_headers::ExtraHeadersHook;
+    use crate::types::{ContentBlockDelta, InputMessage, MessageRequest};
 
     fn temp_config_home() -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
@@ -1890,5 +1915,59 @@ mod tests {
             enriched,
             crate::error::ApiError::InvalidSseFrame(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn extra_headers_provider_annotates_the_wire_request() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let address = listener.local_addr().expect("local addr");
+        let (request_tx, request_rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept connection");
+            let mut buffer = [0_u8; 8192];
+            let read = stream.read(&mut buffer).expect("read request");
+            request_tx
+                .send(String::from_utf8_lossy(&buffer[..read]).into_owned())
+                .expect("send request");
+            let body = r#"{"id":"msg_test","type":"message","role":"assistant","model":"claude-sonnet-4","content":[],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write response");
+        });
+
+        let client = AnthropicClient::new("test-key")
+            .with_base_url(format!("http://{address}"))
+            .with_extra_headers_provider(ExtraHeadersHook::new(
+                |ctx: &crate::extra_headers::ExtraHeadersContext<'_>| {
+                    vec![(
+                        "x-route".to_string(),
+                        format!("{}/{}", ctx.provider, ctx.model),
+                    )]
+                },
+            ));
+        let request = MessageRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 16,
+            messages: vec![InputMessage::user_text("hello")],
+            ..Default::default()
+        };
+
+        let response = client.send_raw_request(&request).await.expect("response");
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+
+        let captured = request_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("captured request");
+        assert!(
+            captured
+                .to_lowercase()
+                .contains("x-route: anthropic/claude-sonnet-4"),
+            "wire request must carry the provider header: {captured}"
+        );
     }
 }
