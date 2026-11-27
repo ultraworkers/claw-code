@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.15] - 2026-11-27
+
+### Added
+
+- Outbound extra-headers hook for AnthropicClient, OpenAiCompatClient, and ProviderClient to add custom headers to model requests (#3407)
+
+### Changed
+
+- Documentation: document WorldRouter OpenAI-compatible gateway setup (#3399)
+- Documentation: document Straitly OpenAI-compatible gateway setup (#3400)
+- Documentation: document TeamoRouter OpenAI-compatible gateway setup (#3402)
+- Documentation: document TrustedRouter OpenAI-compatible gateway setup (#3403)
+- Documentation: rename UberLLM to MartLLM in gateway setup documentation (#3405)
+
+### Internal/Tests
+
+- Windows ARM64 bash test timeout hardening (#3406)
+
 ## [0.1.14] - 2026-11-23
 
 ### Fixed
