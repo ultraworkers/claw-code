@@ -1,6 +1,7 @@
 mod client;
 
 mod error;
+mod extra_headers;
 mod http_client;
 mod prompt_cache;
 mod providers;
@@ -13,6 +14,7 @@ pub use client::{
     ProviderConfigKind,
 };
 pub use error::ApiError;
+pub use extra_headers::{ExtraHeadersContext, ExtraHeadersHook, ExtraHeadersProvider};
 pub use http_client::{
     build_http_client, build_http_client_or_default, build_http_client_with,
     build_http_client_with_opts, ProxyConfig, TimeoutConfig,

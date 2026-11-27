@@ -8,6 +8,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::error::ApiError;
+use crate::extra_headers::{ExtraHeadersContext, ExtraHeadersHook};
 use crate::http_client::build_http_client_or_default;
 use crate::types::{
     ContentBlockDelta, ContentBlockDeltaEvent, ContentBlockStartEvent, ContentBlockStopEvent,
@@ -129,6 +130,7 @@ pub struct OpenAiCompatClient {
     max_retries: u32,
     initial_backoff: Duration,
     max_backoff: Duration,
+    extra_headers: Option<ExtraHeadersHook>,
 }
 
 impl OpenAiCompatClient {
@@ -150,6 +152,7 @@ impl OpenAiCompatClient {
             max_retries: DEFAULT_MAX_RETRIES,
             initial_backoff: DEFAULT_INITIAL_BACKOFF,
             max_backoff: DEFAULT_MAX_BACKOFF,
+            extra_headers: None,
         }
     }
 
@@ -185,6 +188,7 @@ impl OpenAiCompatClient {
             max_retries: DEFAULT_MAX_RETRIES,
             initial_backoff: DEFAULT_INITIAL_BACKOFF,
             max_backoff: DEFAULT_MAX_BACKOFF,
+            extra_headers: None,
         })
     }
 
@@ -222,6 +226,15 @@ impl OpenAiCompatClient {
             timeout,
         )
         .unwrap_or_else(|_| reqwest::Client::new());
+        self
+    }
+
+    /// Install a provider that may add outbound headers to each model request.
+    ///
+    /// The provider sees the final JSON body and can only add headers.
+    #[must_use]
+    pub fn with_extra_headers_provider(mut self, provider: ExtraHeadersHook) -> Self {
+        self.extra_headers = Some(provider);
         self
     }
 
@@ -353,18 +366,25 @@ impl OpenAiCompatClient {
         check_request_body_size_for_base_url(request, self.config(), &self.base_url)?;
 
         let request_url = chat_completions_endpoint(&self.base_url);
-        self.http
+        let request_body =
+            build_chat_completion_request_for_base_url(request, self.config(), &self.base_url);
+        let mut request_builder = self
+            .http
             .post(&request_url)
             .header("content-type", "application/json")
             .bearer_auth(&self.api_key)
-            .json(&build_chat_completion_request_for_base_url(
-                request,
-                self.config(),
-                &self.base_url,
-            ))
-            .send()
-            .await
-            .map_err(ApiError::from)
+            .json(&request_body);
+        if let Some(extra_headers) = &self.extra_headers {
+            request_builder = extra_headers.apply(
+                request_builder,
+                &ExtraHeadersContext {
+                    provider: self.config.provider_name,
+                    model: &request.model,
+                    body: &request_body,
+                },
+            );
+        }
+        request_builder.send().await.map_err(ApiError::from)
     }
 
     fn backoff_for_attempt(&self, attempt: u32) -> Result<Duration, ApiError> {
@@ -1866,6 +1886,7 @@ mod tests {
         OpenAiCompatClient, OpenAiCompatConfig, StreamState,
     };
     use crate::error::ApiError;
+    use crate::extra_headers::ExtraHeadersHook;
     use crate::test_env_lock as env_lock;
     use crate::types::{
         ContentBlockDelta, ContentBlockDeltaEvent, ContentBlockStartEvent, ContentBlockStopEvent,
@@ -3141,5 +3162,59 @@ mod tests {
         assert_eq!(super::strip_routing_prefix("kimi/kimi-k2.5"), "kimi-k2.5");
         assert_eq!(super::strip_routing_prefix("kimi-k2.5"), "kimi-k2.5"); // no prefix, unchanged
         assert_eq!(super::strip_routing_prefix("kimi/kimi-k1.5"), "kimi-k1.5");
+    }
+
+    #[tokio::test]
+    async fn extra_headers_provider_annotates_the_wire_request() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let address = listener.local_addr().expect("local addr");
+        let (request_tx, request_rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept connection");
+            let mut buffer = [0_u8; 8192];
+            let read = stream.read(&mut buffer).expect("read request");
+            request_tx
+                .send(String::from_utf8_lossy(&buffer[..read]).into_owned())
+                .expect("send request");
+            let body = r#"{"id":"chatcmpl-test","object":"chat.completion","created":0,"model":"gpt-4o-mini","choices":[],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write response");
+        });
+
+        let client = OpenAiCompatClient::new("test-key", OpenAiCompatConfig::openai())
+            .with_base_url(format!("http://{address}"))
+            .with_extra_headers_provider(ExtraHeadersHook::new(
+                |ctx: &crate::extra_headers::ExtraHeadersContext<'_>| {
+                    vec![(
+                        "x-route".to_string(),
+                        format!("{}/{}", ctx.provider, ctx.model),
+                    )]
+                },
+            ));
+        let request = MessageRequest {
+            model: "gpt-4o-mini".to_string(),
+            max_tokens: 16,
+            messages: vec![InputMessage::user_text("hello")],
+            ..Default::default()
+        };
+
+        let response = client.send_raw_request(&request).await.expect("response");
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+
+        let captured = request_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("captured request");
+        assert!(
+            captured
+                .to_lowercase()
+                .contains("x-route: openai/gpt-4o-mini"),
+            "wire request must carry the provider header: {captured}"
+        );
     }
 }
